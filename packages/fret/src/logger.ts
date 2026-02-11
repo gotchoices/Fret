@@ -1,9 +1,7 @@
-import debug from 'debug'
+import { logger, type Logger } from '@libp2p/logger'
 
 const BASE_NAMESPACE = 'optimystic:fret'
 
-export function createLogger(subNamespace: string): debug.Debugger {
-	return debug(`${BASE_NAMESPACE}:${subNamespace}`)
+export function createLogger(subNamespace: string): Logger {
+	return logger(`${BASE_NAMESPACE}:${subNamespace}`)
 }
-
-

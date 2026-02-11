@@ -1,4 +1,5 @@
 import type { Libp2p } from 'libp2p';
+import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { PROTOCOL_PING, encodeJson, decodeJson } from './protocols.js';
 import { createLogger } from '../logger.js';
@@ -19,7 +20,7 @@ export function registerPing(
 	protocol = PROTOCOL_PING,
 	getSizeEstimate?: SizeEstimateProvider
 ): void {
-	node.handle(protocol, async ({ stream }) => {
+	void node.handle(protocol, async (stream: Stream) => {
 		const response: PingResponseV1 = { ok: true, ts: Date.now() };
 
 		// Add network size hint if provider available
@@ -31,61 +32,31 @@ export function registerPing(
 					response.confidence = sizeInfo.confidence;
 				}
 			} catch (err) {
-				log('getSizeEstimate failed - %o', err);
+				log.error('getSizeEstimate failed - %e', err);
 			}
 		}
 
-		await stream.sink(
-			(async function* () {
-				yield await encodeJson(response);
-			})()
-		);
+		stream.send(await encodeJson(response));
+		await stream.close();
 	});
 }
 
 export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_PING): Promise<{ ok: boolean; rttMs: number; size_estimate?: number; confidence?: number }> {
 	const start = Date.now();
 	const pid = peerIdFromString(peer);
-	let stream: any;
+	let stream: Stream | undefined;
 	try {
-		try {
-			const conns = (node as any).getConnections?.(pid) ?? [];
-			if (Array.isArray(conns) && conns.length > 0 && typeof conns[0]?.newStream === 'function') {
-				stream = await conns[0].newStream([protocol]);
-			} else {
-				const conn = await (node as any).dialProtocol(pid, [protocol]);
-				stream = (conn as any).stream ?? conn;
-			}
-		} catch (e) {
-			// fallback to dial if newStream path failed
-			const conn = await (node as any).dialProtocol(pid, [protocol]);
-			stream = (conn as any).stream ?? conn;
+		const conns = node.getConnections(pid);
+		if (conns.length > 0) {
+			stream = await conns[0].newStream([protocol]);
+		} else {
+			stream = await node.dialProtocol(pid, [protocol]);
 		}
-		let first: Uint8Array | null = null;
-		for await (const chunk of stream.source) {
-			if (chunk == null) continue;
-			try {
-				if (chunk instanceof Uint8Array) { first = chunk; break; }
-				if (typeof (chunk as any).subarray === 'function') {
-					const maybe = (chunk as any).subarray();
-					if (maybe instanceof Uint8Array) { first = maybe; break; }
-					if (ArrayBuffer.isView(maybe)) {
-						first = new Uint8Array(maybe.buffer, maybe.byteOffset, maybe.byteLength);
-						break;
-					}
-				}
-				if (ArrayBuffer.isView(chunk)) {
-					first = new Uint8Array((chunk as ArrayBufferView).buffer, (chunk as ArrayBufferView).byteOffset, (chunk as ArrayBufferView).byteLength);
-					break;
-				}
-			} catch (err) { log('sendPing chunk handling failed - %o', err) }
-		}
+		const bytes = await readAll(stream);
 		const rttMs = Math.max(0, Date.now() - start);
-		if (!first || first.length === 0) return { ok: false, rttMs };
-		const text = new TextDecoder().decode(first).trim();
-		if (!text || text[0] !== '{' || !text.endsWith('}')) return { ok: false, rttMs };
+		if (bytes.length === 0) return { ok: false, rttMs };
 		try {
-			const res = await decodeJson<PingResponseV1>(first);
+			const res = await decodeJson<PingResponseV1>(bytes);
 			return {
 				ok: Boolean(res.ok),
 				rttMs,
@@ -93,24 +64,31 @@ export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_P
 				confidence: res.confidence
 			};
 		} catch (err) {
-			log('sendPing decode failed - %o', err)
+			log.error('sendPing decode failed - %e', err);
 			return { ok: false, rttMs };
 		}
 	} finally {
-		if (stream) {
+		if (stream != null) {
 			try { await stream.close(); } catch { }
 		}
 	}
 }
 
-function concat(chunks: Uint8Array[]): Uint8Array {
+function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {
+	if (chunk instanceof Uint8Array) return chunk;
+	return chunk.subarray();
+}
+
+async function readAll(stream: Stream): Promise<Uint8Array> {
+	const parts: Uint8Array[] = [];
+	for await (const chunk of stream) parts.push(toBytes(chunk));
 	let len = 0;
-	for (const c of chunks) len += c.length;
+	for (const p of parts) len += p.length;
 	const out = new Uint8Array(len);
 	let o = 0;
-	for (const c of chunks) {
-		out.set(c, o);
-		o += c.length;
+	for (const p of parts) {
+		out.set(p, o);
+		o += p.length;
 	}
 	return out;
 }

@@ -1,9 +1,9 @@
-import { createLibp2p } from 'libp2p'
+import { createLibp2p, type Libp2p } from 'libp2p'
 import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
 import { tcp } from '@libp2p/tcp'
 
-export async function createMemoryNode() {
+export async function createMemoryNode(): Promise<Libp2p> {
 	const node = await createLibp2p({
 		addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
 		transports: [tcp()],

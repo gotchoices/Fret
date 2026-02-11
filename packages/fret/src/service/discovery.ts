@@ -11,6 +11,6 @@ export function seedDiscovery(node: Libp2p, store: DigitreeStore): void {
 		try {
 			const pid = peerIdFromString(entry.id)
 			anyNode.dispatchEvent?.(new CustomEvent('peer:discovery', { detail: { id: pid, multiaddrs: [] } as any }))
-		} catch (err) { log('seedDiscovery failed for %s - %o', entry.id, err) }
+		} catch (err) { log.error('seedDiscovery failed for %s - %e', entry.id, err) }
 	}
 }

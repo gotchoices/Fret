@@ -1,4 +1,5 @@
 import type { Libp2p } from 'libp2p';
+import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_NEIGHBORS,
@@ -7,7 +8,6 @@ import {
 	decodeJson,
 } from './protocols.js';
 import type { NeighborSnapshotV1 } from '../index.js';
-import type { Stream } from '@libp2p/interface';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:neighbors');
@@ -18,35 +18,27 @@ export function registerNeighbors(
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE }
 ): void {
-	node.handle(protocols.PROTOCOL_NEIGHBORS, async ({ stream }) => {
+	void node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream) => {
 		try {
 			const snap = await getSnapshot();
-			await stream.sink(
-				(async function* () {
-					yield await encodeJson(snap);
-				})()
-			);
-			try { (stream as any).close?.(); } catch { }
+			stream.send(await encodeJson(snap));
+			await stream.close();
 		} catch (err) {
-			console.error('neighbors handler error:', err);
+			log.error('neighbors handler error - %e', err);
 		}
 	});
 
 	// Optional: accept pushed announcements of neighbor snapshots
 	if (onAnnounce) {
-		node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async ({ stream }) => {
+		void node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream) => {
 			try {
 				const bytes = await readAll(stream);
 				const snap = await decodeJson<NeighborSnapshotV1>(bytes);
 				onAnnounce(snap.from, snap);
-				await stream.sink(
-					(async function* () {
-						yield await encodeJson({ ok: true });
-					})()
-				);
-				try { (stream as any).close?.(); } catch { }
+				stream.send(await encodeJson({ ok: true }));
+				await stream.close();
 			} catch (err) {
-				console.error('neighbors announce handler error:', err);
+				log.error('neighbors announce handler error - %e', err);
 			}
 		});
 	}
@@ -58,22 +50,21 @@ export async function fetchNeighbors(
 	protocol = PROTOCOL_NEIGHBORS
 ): Promise<NeighborSnapshotV1> {
 	const pid = peerIdFromString(peerIdOrStr);
-	// Prefer existing connection stream to avoid dials
-	const conns = (node as any).getConnections?.(pid) ?? [];
-	if (!Array.isArray(conns) || conns.length === 0 || typeof conns[0]?.newStream !== 'function') {
+	const conns = node.getConnections(pid);
+	if (conns.length === 0) {
 		// No existing connection - skip to reduce churn
 		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
 	}
-	let stream: any;
+	let stream: Stream | undefined;
 	try {
 		stream = await conns[0].newStream([protocol]);
 		const bytes = await readAll(stream);
 		return await decodeJson<NeighborSnapshotV1>(bytes);
 	} catch (err) {
-		log('fetchNeighbors decode failed for %s - %o', peerIdOrStr, err);
+		log.error('fetchNeighbors decode failed for %s - %e', peerIdOrStr, err);
 		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
 	} finally {
-		if (stream) {
+		if (stream != null) {
 			try { await stream.close(); } catch {}
 		}
 	}
@@ -86,42 +77,32 @@ export async function announceNeighbors(
 	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const conns = (node as any).getConnections?.(pid) ?? [];
-	if (!Array.isArray(conns) || conns.length === 0 || typeof conns[0]?.newStream !== 'function') {
+	const conns = node.getConnections(pid);
+	if (conns.length === 0) {
 		return; // skip if not connected
 	}
-	let stream: any;
+	let stream: Stream | undefined;
 	try {
 		stream = await conns[0].newStream([protocol]);
-		await stream.sink(
-			(async function* () {
-				yield await encodeJson(snapshot);
-			})()
-		);
+		stream.send(await encodeJson(snapshot));
+		await stream.close();
 	} catch (err) {
-		log('announceNeighbors failed to %s - %o', peerIdOrStr, err);
+		log.error('announceNeighbors failed to %s - %e', peerIdOrStr, err);
 	} finally {
-		if (stream) {
+		if (stream != null) {
 			try { await stream.close(); } catch {}
 		}
 	}
 }
 
-function toBytes(chunk: unknown): Uint8Array {
+function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {
 	if (chunk instanceof Uint8Array) return chunk;
-	const maybe = chunk as { subarray?: (start?: number, end?: number) => Uint8Array } & ArrayBufferView;
-	if (typeof maybe?.subarray === 'function') {
-		try { return maybe.subarray(0); } catch (err) { log('toBytes subarray failed - %o', err) }
-	}
-	if (ArrayBuffer.isView(maybe)) {
-		return new Uint8Array(maybe.buffer, maybe.byteOffset, maybe.byteLength);
-	}
-	throw new Error('Unsupported chunk type in neighbors read');
+	return chunk.subarray();
 }
 
 async function readAll(stream: Stream): Promise<Uint8Array> {
 	const parts: Uint8Array[] = [];
-	for await (const chunk of stream.source as AsyncIterable<unknown>) parts.push(toBytes(chunk));
+	for await (const chunk of stream) parts.push(toBytes(chunk));
 	let len = 0;
 	for (const p of parts) len += p.length;
 	const out = new Uint8Array(len);

@@ -11,15 +11,13 @@ describe('RPC codec fuzzing (maybeAct)', function () {
 		registerMaybeAct(a, async (_msg: any) => ({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 1, confidence: 0 }))
 		const b = await createMemoryNode(); await b.start(); await b.dial(a.getMultiaddrs()[0]!)
 		// send malformed payload
-		const conn = await (b as any).dialProtocol(a.peerId, [PROTOCOL_MAYBE_ACT])
-		const stream = conn.stream ?? conn
-		await stream.sink((async function*(){ yield new TextEncoder().encode('{ not: json }') })())
+		const stream = await b.dialProtocol(a.peerId, [PROTOCOL_MAYBE_ACT])
+		stream.send(new TextEncoder().encode('{ not: json }'))
+		await stream.close()
 		// read or timeout after short delay then close
-		const timer = setTimeout(() => { try { stream.abort?.() } catch {} }, 500)
-		try { for await (const _ of stream.source) break } catch {}
+		const timer = setTimeout(() => { try { stream.abort(new Error('timeout')) } catch {} }, 500)
+		try { for await (const _ of stream) break } catch {}
 		clearTimeout(timer)
 		await b.stop(); await a.stop()
 	})
 })
-
-

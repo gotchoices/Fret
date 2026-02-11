@@ -174,7 +174,7 @@ export class FretService implements IFretService, Startable {
 		this.node.addEventListener('peer:connect', async (evt: any) => {
 			if (this.postBootstrapAnnounced) return;
 			this.postBootstrapAnnounced = true;
-			try { await this.announceNeighborsBounded(8); } catch (err) { log('postBootstrap announce failed - %o', err) }
+			try { await this.announceNeighborsBounded(8); } catch (err) { log.error('postBootstrap announce failed - %e', err) }
 		});
 		this.node.addEventListener('peer:connect', async (evt: any) => {
 			try {
@@ -183,7 +183,7 @@ export class FretService implements IFretService, Startable {
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 				this.store.setState(id, 'connected');
 				await this.applyTouch(id, coord);
-			} catch (err) { log('peer:connect handler failed - %o', err) }
+			} catch (err) { log.error('peer:connect handler failed - %e', err) }
 		});
 		this.node.addEventListener('peer:disconnect', async (evt: any) => {
 			try {
@@ -192,7 +192,7 @@ export class FretService implements IFretService, Startable {
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 				this.store.setState(id, 'disconnected');
 				await this.applyFailure(id, coord);
-			} catch (err) { log('peer:disconnect handler failed - %o', err) }
+			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
 		});
 	}
 
@@ -312,10 +312,10 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
 				if (this.isConnected(id) || this.hasAddresses(id)) {
-					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log('preconnectNeighbors ping failed for %s - %o', id, err) }
+					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('preconnectNeighbors ping failed for %s - %e', id, err) }
 				}
 			}
-		} catch (err) { log('preconnectNeighbors outer failed - %o', err) }
+		} catch (err) { log.error('preconnectNeighbors outer failed - %e', err) }
 	}
 
 	private startActivePreconnectLoop(): void {
@@ -333,10 +333,10 @@ export class FretService implements IFretService, Startable {
 				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
 					if (this.isConnected(id) || this.hasAddresses(id)) {
-						try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log('active preconnect ping failed for %s - %o', id, err) }
-					}
+					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('active preconnect ping failed for %s - %e', id, err) }
 				}
-			} catch (err) { log('active preconnect tick failed - %o', err) }
+			}
+			} catch (err) { log.error('active preconnect tick failed - %e', err) }
 			setTimeout(tick, 1000);
 		};
 		void tick();
@@ -352,9 +352,9 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr).slice(0, 8);
 		const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
 		for (const id of ids) {
-			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log('sendLeave failed for %s - %o', id, err) }
+			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 		}
-		} catch (err) { log('sendLeaveToNeighbors outer failed - %o', err) }
+		} catch (err) { log.error('sendLeaveToNeighbors outer failed - %e', err) }
 	}
 
 	private async handleLeave(peerId: string): Promise<void> {
@@ -436,7 +436,7 @@ export class FretService implements IFretService, Startable {
 					if (!this.store.getById(s.id)) discovered.push(s.id);
 					this.store.upsert(s.id, coord);
 					await this.applyTouch(s.id, coord);
-					} catch (err) { log('mergeAnnounceSnapshot sample upsert failed for %s - %o', s.id, err) }
+					} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
 			}
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
@@ -504,8 +504,8 @@ export class FretService implements IFretService, Startable {
 				if (bootstrapEntry.startsWith('/')) {
 					try {
 						const ma = multiaddr(bootstrapEntry);
-						const peerIdStr = ma.getPeerId();
-						if (peerIdStr) id = peerIdStr;
+						const p2p = ma.getComponents().find((c) => c.name === 'p2p');
+						if (p2p?.value) id = p2p.value;
 					} catch {
 						// Not a valid multiaddr, assume it's already a peer ID
 					}
@@ -585,7 +585,7 @@ export class FretService implements IFretService, Startable {
 						if (!this.store.getById(s.id)) announced.push(s.id);
 						this.store.upsert(s.id, coord);
 						await this.applyTouch(s.id, coord);
-				} catch (err) { log('mergeNeighborSnapshots sample upsert failed for %s - %o', s.id, err) }
+				} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
 				}
 			} catch (err) {
 				console.warn('fetchNeighbors failed for', id, err);
