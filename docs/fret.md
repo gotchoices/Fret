@@ -221,7 +221,8 @@ Notes:
 - Routing store (Digitree) & indices (A2)
   - Ordered B+Tree keyed by ring coordinate; secondary relevance index.
   - Bounded capacity with victim selection; infinite relevance for S/P.
-  - Import/export compact snapshots for bootstrap and neighbors.
+  - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
+  - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
 - Neighbor management & snapshots (A3)
   - RPC: neighbors (request/response with caps, tokens, compression).
   - Merge policy with de-dup, score updates, health checks.
@@ -375,6 +376,51 @@ interface NearAnchorV1 {
   confidence: number;           // [0, 1]
 }
 ```
+
+#### Serialized routing table (JSON)
+```
+interface SerializedPeerEntry {
+  id: string;                   // PeerId (base58btc)
+  coord: string;                // base64url ring coordinate (32 bytes)
+  relevance: number;            // float score at time of export
+  lastAccess: number;           // unix ms
+  state: PeerState;             // 'connected' | 'disconnected' | 'dead'
+  accessCount: number;
+  successCount: number;
+  failureCount: number;
+  avgLatencyMs: number;
+  metadata?: Record<string, any>;
+}
+
+interface SerializedTable {
+  v: 1;
+  peerId: string;               // exporter's PeerId
+  timestamp: number;            // unix ms at export time
+  entries: SerializedPeerEntry[];
+}
+```
+
+### Routing table persistence
+FRET's routing table (Digitree store) is in-memory by default. The `exportTable` / `importTable` API allows callers to snapshot and restore the full routing table across restarts, avoiding cold-start bootstrap latency.
+
+- **Export**: `exportTable()` returns a `SerializedTable` containing every peer entry in the Digitree, with `Uint8Array` coordinates encoded as base64url strings. The envelope includes the exporter's peer ID and a timestamp.
+- **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
+- **Persistence layer is external**: FRET only handles serialization/deserialization. The caller decides where and how to store the JSON (filesystem, IndexedDB, database, etc.).
+- **JSON-safe**: The `SerializedTable` structure is fully JSON-serializable and survives `JSON.stringify` / `JSON.parse` round-trips.
+
+Typical usage:
+```
+// Before shutdown
+const table = fret.exportTable();
+await fs.writeFile('fret-table.json', JSON.stringify(table));
+
+// On startup
+const saved = JSON.parse(await fs.readFile('fret-table.json', 'utf-8'));
+const count = fret.importTable(saved);
+// count entries restored; stabilization loop re-validates liveness
+```
+
+After import, the normal stabilization loop probes restored peers to update connection states and relevance scores. This makes import safe even with stale data — unreachable peers will be decayed and eventually evicted.
 
 ### Implementation notes
 

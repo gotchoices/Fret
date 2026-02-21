@@ -92,6 +92,71 @@ if (fretService.detectPartition()) {
 }
 ```
 
+## Routing Table Persistence
+
+FRET's routing table is in-memory by default. The `exportTable` / `importTable` API lets you snapshot and restore it across restarts, avoiding cold-start bootstrap latency.
+
+### API
+
+```typescript
+interface FretService {
+  // Export the full routing table as a JSON-serializable snapshot
+  exportTable(): SerializedTable;
+
+  // Import a previously exported snapshot; returns number of entries loaded
+  importTable(table: SerializedTable): number;
+}
+
+interface SerializedTable {
+  v: 1;
+  peerId: string;               // exporter's PeerId
+  timestamp: number;            // unix ms at export time
+  entries: SerializedPeerEntry[];
+}
+
+interface SerializedPeerEntry {
+  id: string;                   // PeerId
+  coord: string;                // base64url ring coordinate
+  relevance: number;
+  lastAccess: number;
+  state: PeerState;
+  accessCount: number;
+  successCount: number;
+  failureCount: number;
+  avgLatencyMs: number;
+  metadata?: Record<string, any>;
+}
+```
+
+### Usage
+
+```typescript
+import { createFret, type SerializedTable } from 'p2p-fret';
+import fs from 'node:fs/promises';
+
+const fret = createFret(libp2pNode, { capacity: 2048 });
+
+// Save before shutdown
+const table = fret.exportTable();
+await fs.writeFile('fret-table.json', JSON.stringify(table));
+
+// Restore on startup (before or after start())
+const saved: SerializedTable = JSON.parse(
+  await fs.readFile('fret-table.json', 'utf-8')
+);
+const count = fret.importTable(saved);
+console.log(`Restored ${count} routing entries`);
+
+await fret.start();
+```
+
+### Behavior
+
+- **State reset**: All imported entries get `state: 'disconnected'` regardless of their exported state — connection liveness must be re-established through pings and stabilization.
+- **Capacity enforcement**: `importTable` enforces the configured capacity after loading. A table exported from a node with a larger capacity won't exceed the importer's limit.
+- **Stale data safety**: After import, the normal stabilization loop probes peers to update connection states and relevance scores. Unreachable peers are decayed and eventually evicted.
+- **JSON round-trip safe**: `SerializedTable` survives `JSON.stringify` / `JSON.parse`.
+
 ## Test harness (local meshes)
 
 A minimal harness will spin up a small libp2p mesh in-process and exercise:

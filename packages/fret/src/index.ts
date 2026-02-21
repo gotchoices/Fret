@@ -1,3 +1,5 @@
+import type { SerializedPeerEntry, SerializedTable } from './store/digitree-store.js';
+
 export type FretMode = 'active' | 'passive';
 
 export interface FretConfig {
@@ -71,8 +73,13 @@ export interface FretService {
 	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number };
 	getNetworkChurn(): number;
 	detectPartition(): boolean;
+
+	// Routing table persistence
+	exportTable(): SerializedTable;
+	importTable(table: SerializedTable): number;
 }
 
+export type { SerializedPeerEntry, SerializedTable };
 export { FretService as FretServiceImpl } from './service/fret-service.js';
 import { FretService as FretServiceClass } from './service/fret-service.js';
 export { seedDiscovery } from './service/discovery.js';

@@ -1,6 +1,6 @@
 {
   "name": "p2p-fret",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "type": "module",
   "description": "FRET: Finger Ring Ensemble Topology (libp2p ring overlay with Digitree)",
   "main": "dist/src/index.js",

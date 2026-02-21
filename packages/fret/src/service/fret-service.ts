@@ -7,6 +7,7 @@ import type {
 	RouteAndMaybeActV1,
 	NearAnchorV1,
 	NeighborSnapshotV1,
+	SerializedTable,
 } from '../index.js';
 import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
@@ -932,5 +933,20 @@ export class FretService implements IFretService, Startable {
 			id: entry.id,
 			metadata: entry.metadata
 		}));
+	}
+
+	exportTable(): SerializedTable {
+		return {
+			v: 1,
+			peerId: this.node.peerId.toString(),
+			timestamp: Date.now(),
+			entries: this.store.exportEntries(),
+		};
+	}
+
+	importTable(table: SerializedTable): number {
+		const count = this.store.importEntries(table.entries);
+		this.enforceCapacity();
+		return count;
 	}
 }

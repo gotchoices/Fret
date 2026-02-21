@@ -1,4 +1,5 @@
 import { BTree } from 'digitree';
+import { coordToBase64url, base64urlToCoord } from '../ring/hash.js';
 
 export type PeerState = 'connected' | 'disconnected' | 'dead';
 
@@ -13,6 +14,26 @@ export interface PeerEntry {
 	failureCount: number;
 	avgLatencyMs: number;
 	metadata?: Record<string, any>;
+}
+
+export interface SerializedPeerEntry {
+	id: string;
+	coord: string; // base64url
+	relevance: number;
+	lastAccess: number;
+	state: PeerState;
+	accessCount: number;
+	successCount: number;
+	failureCount: number;
+	avgLatencyMs: number;
+	metadata?: Record<string, any>;
+}
+
+export interface SerializedTable {
+	v: 1;
+	peerId: string;
+	timestamp: number;
+	entries: SerializedPeerEntry[];
 }
 
 function coordToHex(coord: Uint8Array): string {
@@ -180,5 +201,42 @@ export class DigitreeStore {
 			i++;
 		}
 		return Array.from(new Set(out));
+	}
+
+	exportEntries(): SerializedPeerEntry[] {
+		return this.list().map((e) => ({
+			id: e.id,
+			coord: coordToBase64url(e.coord),
+			relevance: e.relevance,
+			lastAccess: e.lastAccess,
+			state: e.state,
+			accessCount: e.accessCount,
+			successCount: e.successCount,
+			failureCount: e.failureCount,
+			avgLatencyMs: e.avgLatencyMs,
+			...(e.metadata ? { metadata: e.metadata } : {}),
+		}));
+	}
+
+	importEntries(entries: SerializedPeerEntry[]): number {
+		let count = 0;
+		for (const s of entries) {
+			const coord = base64urlToCoord(s.coord);
+			const entry: PeerEntry = {
+				id: s.id,
+				coord,
+				relevance: s.relevance,
+				lastAccess: s.lastAccess,
+				state: 'disconnected',
+				accessCount: s.accessCount,
+				successCount: s.successCount,
+				failureCount: s.failureCount,
+				avgLatencyMs: s.avgLatencyMs,
+				...(s.metadata ? { metadata: s.metadata } : {}),
+			};
+			this.insert(entry);
+			count++;
+		}
+		return count;
 	}
 }

@@ -1,6 +1,6 @@
 import type { Startable } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
-import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent } from '../index.js';
+import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
 import { seedDiscovery } from './discovery.js';
 
@@ -107,6 +107,14 @@ export class Libp2pFretService implements Startable {
 
 	listPeers(): Array<{ id: string; metadata?: Record<string, any> }> {
 		return this.ensure().listPeers();
+	}
+
+	exportTable(): SerializedTable {
+		return this.ensure().exportTable();
+	}
+
+	importTable(table: SerializedTable): number {
+		return this.ensure().importTable(table);
 	}
 }
 
