@@ -1,8 +1,10 @@
 export type SimEvent = {
 	time: number
-	type: 'join' | 'leave' | 'connect' | 'disconnect' | 'stabilize'
+	type: 'join' | 'leave' | 'connect' | 'disconnect' | 'stabilize' | 'route'
 	peerId?: string
 	targetId?: string
+	targetCoord?: Uint8Array
+	count?: number
 }
 
 export class EventScheduler {
@@ -11,6 +13,11 @@ export class EventScheduler {
 
 	schedule(event: Omit<SimEvent, 'time'>, delayMs: number): void {
 		this.events.push({ ...event, time: this.currentTime + delayMs })
+		this.events.sort((a, b) => a.time - b.time)
+	}
+
+	scheduleAt(event: Omit<SimEvent, 'time'>, absoluteTime: number): void {
+		this.events.push({ ...event, time: absoluteTime })
 		this.events.sort((a, b) => a.time - b.time)
 	}
 
@@ -42,4 +49,3 @@ export class EventScheduler {
 		return this.events[0]
 	}
 }
-

@@ -1,3 +1,8 @@
+export interface CoverageSnapshot {
+	time: number
+	coverage: number
+}
+
 export interface SimMetrics {
 	totalJoins: number
 	totalLeaves: number
@@ -10,6 +15,12 @@ export interface SimMetrics {
 	convergenceTimeMs: number
 	dropRate: number
 	maxHopCount: number
+	coverageTimeSeries: CoverageSnapshot[]
+	routingAttempts: number
+	routingSuccesses: number
+	routingHops: number[]
+	routingSuccessRate: number
+	avgRoutingHops: number
 }
 
 export class MetricsCollector {
@@ -25,6 +36,12 @@ export class MetricsCollector {
 		convergenceTimeMs: 0,
 		dropRate: 0,
 		maxHopCount: 0,
+		coverageTimeSeries: [],
+		routingAttempts: 0,
+		routingSuccesses: 0,
+		routingHops: [],
+		routingSuccessRate: 0,
+		avgRoutingHops: 0,
 	}
 
 	private neighborCounts: number[] = []
@@ -64,6 +81,16 @@ export class MetricsCollector {
 		this.metrics.convergenceTimeMs = timeMs
 	}
 
+	recordCoverage(time: number, coverage: number): void {
+		this.metrics.coverageTimeSeries.push({ time, coverage })
+	}
+
+	recordRoute(success: boolean, hops: number): void {
+		this.metrics.routingAttempts++
+		if (success) this.metrics.routingSuccesses++
+		this.metrics.routingHops.push(hops)
+	}
+
 	finalize(): SimMetrics {
 		if (this.neighborCounts.length > 0) {
 			this.metrics.avgNeighborCount =
@@ -77,11 +104,17 @@ export class MetricsCollector {
 		if (totalAttempts > 0) {
 			this.metrics.dropRate = this.metrics.totalDisconnections / totalAttempts
 		}
-		return { ...this.metrics }
+		if (this.metrics.routingAttempts > 0) {
+			this.metrics.routingSuccessRate = this.metrics.routingSuccesses / this.metrics.routingAttempts
+		}
+		if (this.metrics.routingHops.length > 0) {
+			this.metrics.avgRoutingHops =
+				this.metrics.routingHops.reduce((a, b) => a + b, 0) / this.metrics.routingHops.length
+		}
+		return { ...this.metrics, coverageTimeSeries: [...this.metrics.coverageTimeSeries] }
 	}
 
 	getMetrics(): Readonly<SimMetrics> {
 		return this.metrics
 	}
 }
-
