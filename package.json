@@ -13,7 +13,6 @@
     "clean": "cd packages/fret && yarn clean",
     "build": "cd packages/fret && yarn build",
     "build:parallel": "cd packages/fret && yarn build",
-    "lint": "cd packages/fret && yarn lint",
     "test": "cd packages/fret && yarn test",
     "format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
     "format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
