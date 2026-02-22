@@ -229,10 +229,12 @@ Notes:
 - Cohort assembly primitives (A4)
   - Two-sided alternating walk with wants ≤ k; filter/expand API.
   - Membership test helper; repo-capability tagging for members.
-- RouteAndMaybeAct pipeline (A5)
-  - Async generator for progressive results; breadcrumbs/TTL.
-  - Next-hop selector with connected-first bias, distance, link quality, backoff, confidence.
-  - Activity callback interface and threshold tracking (minSigs).
+- RouteAndMaybeAct pipeline (A5) ✓
+  - Async generator (`iterativeLookup`) for progressive results; breadcrumbs/TTL.
+  - Next-hop selector: cost-function mode with near/far behavior, backoff penalty, confidence weighting; legacy connected-first fallback.
+  - Payload inclusion heuristic: `shouldIncludePayload` based on distance to key vs cluster span and confidence.
+  - Correlation-ID dedup cache; breadcrumb loop rejection.
+  - Activity callback interface (`setActivityHandler`) for threshold signature tracking (minSigs).
 - Stabilization & health (A6)
   - Periodic S/P verification, finger probes; jitter; skip if recent traffic.
   - Failure pruning and decay; reinsert on recovery.

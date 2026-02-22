@@ -53,6 +53,34 @@ export interface ReportEvent {
 	reason?: string;
 }
 
+/** Callback for performing an activity (pend/commit) when in-cluster. */
+export type ActivityHandler = (
+	activity: string,
+	cohort: string[],
+	minSigs: number,
+	correlationId: string
+) => Promise<{ commitCertificate: string }>;
+
+/** Progressive result events emitted by iterative lookup. */
+export interface RouteProgress {
+	type: 'probing' | 'forwarding' | 'near_anchor' | 'activity_sent' | 'complete' | 'exhausted';
+	hop?: number;
+	peerId?: string;
+	nearAnchor?: NearAnchorV1;
+	result?: { commitCertificate: string };
+	ttlRemaining?: number;
+}
+
+/** Options for initiating an iterative lookup. */
+export interface LookupOptions {
+	wantK: number;
+	minSigs: number;
+	activity?: string;
+	digest?: string;
+	ttl?: number;
+	maxAttempts?: number;
+}
+
 export interface FretService {
 	start(): Promise<void>;
 	stop(): Promise<void>;
@@ -74,6 +102,12 @@ export interface FretService {
 	getNetworkChurn(): number;
 	detectPartition(): boolean;
 
+	// Activity handler for in-cluster actions
+	setActivityHandler(handler: ActivityHandler): void;
+
+	// Iterative lookup (client-side driver)
+	iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress>;
+
 	// Routing table persistence
 	exportTable(): SerializedTable;
 	importTable(table: SerializedTable): number;
@@ -85,6 +119,8 @@ import { FretService as FretServiceClass } from './service/fret-service.js';
 export { seedDiscovery } from './service/discovery.js';
 export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js';
 export { hashKey, hashPeerId } from './ring/hash.js';
+export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
+export { DedupCache } from './service/dedup-cache.js';
 
 export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg) as FretService;

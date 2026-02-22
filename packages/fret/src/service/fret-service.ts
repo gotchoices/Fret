@@ -8,6 +8,9 @@ import type {
 	NearAnchorV1,
 	NeighborSnapshotV1,
 	SerializedTable,
+	ActivityHandler,
+	RouteProgress,
+	LookupOptions,
 } from '../index.js';
 import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
@@ -22,7 +25,10 @@ import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
-import { chooseNextHop } from '../selector/next-hop.js';
+import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
+import { DedupCache } from './dedup-cache.js';
+import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js';
+import { xorDistance } from '../ring/distance.js';
 import {
     createSparsityModel,
     normalizedLogDistance,
@@ -56,6 +62,9 @@ export class FretService implements IFretService, Startable {
 	private preconnectRunning = false;
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
 	private metadata?: Record<string, any>;
+	private activityHandler?: ActivityHandler;
+	private readonly dedupCache = new DedupCache<NearAnchorV1 | { commitCertificate: string }>();
+	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
@@ -245,7 +254,17 @@ export class FretService implements IFretService, Startable {
 	private async handleMaybeAct(
 		msg: RouteAndMaybeActV1
 	): Promise<NearAnchorV1 | { commitCertificate: string }> {
-		// quick guards
+		// Breadcrumb loop detection: reject if self already visited
+		const selfId = this.node.peerId.toString();
+		if (msg.breadcrumbs?.includes(selfId)) return await this.nearAnchorOnly(msg);
+
+		// Correlation-ID dedup: return cached result if seen before
+		if (msg.correlation_id) {
+			const cached = this.dedupCache.get(msg.correlation_id);
+			if (cached) return cached;
+		}
+
+		// Quick guards
 		if (msg.ttl <= 0) return await this.nearAnchorOnly(msg);
 		if (msg.activity && msg.activity.length > 128 * 1024) return await this.nearAnchorOnly(msg);
 		if (!this.bucketMaybeAct.tryTake()) return await this.nearAnchorOnly(msg);
@@ -253,9 +272,12 @@ export class FretService implements IFretService, Startable {
 		if (this.inflightAct >= limit) return this.nearAnchorOnly(msg);
 		this.inflightAct++;
 		try {
-			return await this.routeAct(msg);
+			const result = await this.routeAct(msg);
+			// Cache result for dedup
+			if (msg.correlation_id) this.dedupCache.set(msg.correlation_id, result);
+			return result;
 		} catch (err) {
-			console.error('routeAct failed:', err);
+			log.error('routeAct failed - %e', err);
 			return await this.nearAnchorOnly(msg);
 		} finally {
 			this.inflightAct--;
@@ -747,24 +769,66 @@ export class FretService implements IFretService, Startable {
 	async routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }> {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 		const coord = await hashKey(keyBytes);
-		// If we are not near the anchor, forward using maybeAct with ttl and breadcrumbs
 		const selfId = this.node.peerId.toString();
-		const distIdx = this.neighborDistance(selfId, coord, 2);
-		if (distIdx > 1 && msg.ttl > 0) {
+		const selfCoord = await this.selfCoord();
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+
+		// In-cluster test
+		const distIdx = this.neighborDistance(selfId, coord, Math.max(2, msg.want_k ?? this.cfg.k));
+		const inCluster = distIdx <= 1;
+
+		if (inCluster) {
+			// In-cluster with activity → perform via callback
+			if (msg.activity && this.activityHandler) {
+				const cohort = this.assembleCohort(coord, msg.want_k ?? this.cfg.k);
+				const result = await this.activityHandler(
+					msg.activity, cohort, msg.min_sigs, msg.correlation_id
+				);
+				return result;
+			}
+			// In-cluster without activity → return NearAnchor inviting resend
+			return this.buildNearAnchor(coord, n, confidence);
+		}
+
+		// Not in-cluster: forward if TTL allows
+		if (msg.ttl > 0) {
 			const exclude = new Set([...(msg.breadcrumbs ?? []), selfId]);
-			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m)).filter((id) => !exclude.has(id));
-			const linkQ = (_id: string) => 0.5;
-			const next = chooseNextHop(this.store, coord, candidates, (id) => this.isConnected(id), linkQ);
+			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m))
+				.filter((id) => !exclude.has(id));
+
+			const hopOpts = this.buildNextHopOptions(n, confidence);
+			const linkQ = (id: string) => this.linkQuality(id);
+			const next = chooseNextHop(
+				this.store, coord, candidates,
+				(id) => this.isConnected(id), linkQ, hopOpts
+			);
+
 			if (next) {
-			const fwd: RouteAndMaybeActV1 = {
-				...msg,
-				ttl: msg.ttl - 1,
-				breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
-			};
-			try { return await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT); } catch (err) { console.warn('forward maybeAct failed to', next, err); }
+				const fwd: RouteAndMaybeActV1 = {
+					...msg,
+					ttl: msg.ttl - 1,
+					breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
+				};
+				try {
+					this.diag.maybeActForwarded++;
+					const result = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT);
+					// Record successful forwarding
+					const nextCoord = this.store.getById(next)?.coord ?? (await hashPeerId(peerIdFromString(next)));
+					await this.applySuccess(next, nextCoord, 0);
+					this.clearBackoff(next);
+					return result;
+				} catch (err) {
+					log.error('forward maybeAct failed to %s - %e', next, err);
+					this.recordBackoff(next);
+				}
 			}
 		}
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+
+		// Fallback: return NearAnchor with best hints
+		return this.buildNearAnchor(coord, n, confidence);
+	}
+
+	private buildNearAnchor(coord: Uint8Array, n: number, confidence: number): NearAnchorV1 {
 		const right = this.getNeighbors(coord, 'right', this.cfg.m);
 		const left = this.getNeighbors(coord, 'left', this.cfg.m);
 		const anchors = this.pickAnchors([...right.slice(0, 4), ...left.slice(0, 4)]);
@@ -775,6 +839,43 @@ export class FretService implements IFretService, Startable {
 			estimated_cluster_size: Math.max(this.cfg.k, n),
 			confidence,
 		};
+	}
+
+	private buildNextHopOptions(sizeEstimate: number, confidence: number): NextHopOptions {
+		return {
+			nearRadius: computeNearRadius(sizeEstimate, this.cfg.k),
+			confidence,
+			backoffPenalty: (id) => this.getBackoffPenalty(id),
+		};
+	}
+
+	private linkQuality(id: string): number {
+		const entry = this.store.getById(id);
+		if (!entry) return 0;
+		const total = entry.successCount + entry.failureCount;
+		if (total === 0) return 0.5;
+		return entry.successCount / total;
+	}
+
+	private recordBackoff(id: string): void {
+		const existing = this.backoffMap.get(id);
+		const factor = existing ? Math.min(existing.factor * 2, 32) : 1;
+		const baseMs = 1000;
+		this.backoffMap.set(id, { until: Date.now() + baseMs * factor, factor });
+	}
+
+	private clearBackoff(id: string): void {
+		this.backoffMap.delete(id);
+	}
+
+	private getBackoffPenalty(id: string): number {
+		const bo = this.backoffMap.get(id);
+		if (!bo) return 0;
+		if (bo.until < Date.now()) {
+			this.backoffMap.delete(id);
+			return 0;
+		}
+		return Math.min(1, bo.factor / 32);
 	}
 
 	report(_evt: ReportEvent): void {
@@ -917,6 +1018,134 @@ export class FretService implements IFretService, Startable {
 		const churnThreshold = current.size_estimate * 0.1; // 10% per minute is suspicious
 
 		return churn > churnThreshold;
+	}
+
+	setActivityHandler(handler: ActivityHandler): void {
+		this.activityHandler = handler;
+	}
+
+	async *iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {
+		const coord = await hashKey(key);
+		const selfId = this.node.peerId.toString();
+		const selfCoord = await this.selfCoord();
+		const ttl = options.ttl ?? 8;
+		const maxAttempts = options.maxAttempts ?? ttl + 2;
+		const correlationId = `${selfId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+		let hop = 0;
+		let currentActivity = options.activity;
+		let bestAnchors: string[] = [];
+
+		for (let attempt = 0; attempt < maxAttempts; attempt++) {
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+
+			// Decide whether to include payload
+			const distToKey = xorDistance(selfCoord, coord);
+			const includePayload = currentActivity
+				? shouldIncludePayload(distToKey, n, confidence, options.wantK)
+				: false;
+
+			// Pick candidates: use anchors from prior hints if available, else local cohort
+			const exclude = new Set([selfId]);
+			const candidates = bestAnchors.length > 0
+				? bestAnchors.filter((id) => !exclude.has(id))
+				: this.assembleCohort(coord, Math.max(4, this.cfg.m)).filter((id) => !exclude.has(id));
+
+			if (candidates.length === 0) {
+				yield { type: 'exhausted', hop };
+				return;
+			}
+
+			const hopOpts = this.buildNextHopOptions(n, confidence);
+			const linkQ = (id: string) => this.linkQuality(id);
+			const target = chooseNextHop(
+				this.store, coord, candidates,
+				(id) => this.isConnected(id), linkQ, hopOpts
+			);
+
+			if (!target) {
+				yield { type: 'exhausted', hop };
+				return;
+			}
+
+			yield { type: 'probing', hop, peerId: target, ttlRemaining: ttl - hop };
+
+			const msg: RouteAndMaybeActV1 = {
+				v: 1,
+				key: coordToBase64url(key),
+				want_k: options.wantK,
+				ttl: ttl - hop,
+				min_sigs: options.minSigs,
+				digest: options.digest,
+				activity: includePayload ? currentActivity : undefined,
+				breadcrumbs: [selfId],
+				correlation_id: correlationId,
+				timestamp: Date.now(),
+				signature: '',
+			};
+
+			try {
+				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT);
+
+				if ('commitCertificate' in result) {
+					yield { type: 'complete', hop, result, peerId: target };
+					return;
+				}
+
+				// NearAnchor response
+				const anchor = result as NearAnchorV1;
+				yield { type: 'near_anchor', hop, nearAnchor: anchor, peerId: target };
+
+				// If we have activity but didn't include it, resend with activity to the anchor
+				if (currentActivity && !includePayload && anchor.anchors.length > 0) {
+					const actTarget = anchor.anchors[0]!;
+					yield { type: 'activity_sent', hop: hop + 1, peerId: actTarget };
+
+					const actMsg: RouteAndMaybeActV1 = {
+						...msg,
+						activity: currentActivity,
+						ttl: 1,
+						breadcrumbs: [selfId, target],
+					};
+
+					try {
+						const actResult = await sendMaybeAct(
+							this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT
+						);
+						if ('commitCertificate' in actResult) {
+							yield { type: 'complete', hop: hop + 1, result: actResult, peerId: actTarget };
+							return;
+						}
+						// Got another NearAnchor from the activity target
+						bestAnchors = (actResult as NearAnchorV1).anchors;
+					} catch (err) {
+						log.error('activity send to anchor %s failed - %e', actTarget, err);
+						this.recordBackoff(actTarget);
+					}
+				} else {
+					bestAnchors = anchor.anchors;
+				}
+
+				// Update hints for next iteration
+				if (anchor.cohort_hint.length > 0) {
+					for (const hint of anchor.cohort_hint) {
+						try {
+							const hCoord = this.store.getById(hint)?.coord ?? (await hashPeerId(peerIdFromString(hint)));
+							this.store.upsert(hint, hCoord);
+						} catch {}
+					}
+				}
+
+				hop++;
+			} catch (err) {
+				log.error('iterativeLookup hop %d to %s failed - %e', hop, target, err);
+				this.recordBackoff(target);
+				bestAnchors = bestAnchors.filter((id) => id !== target);
+				hop++;
+			}
+		}
+
+		yield { type: 'exhausted', hop };
 	}
 
 	setMetadata(metadata: Record<string, any>): void {
