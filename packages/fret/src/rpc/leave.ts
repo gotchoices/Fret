@@ -13,6 +13,17 @@ export interface LeaveNoticeV1 {
 	timestamp: number;
 }
 
+const MAX_REPLACEMENTS = 12;
+
+function sanitizeReplacements(ids: string[] | undefined): string[] | undefined {
+	if (!ids || ids.length === 0) return undefined;
+	const valid: string[] = [];
+	for (const id of ids.slice(0, MAX_REPLACEMENTS)) {
+		try { peerIdFromString(id); valid.push(id); } catch { /* drop unparseable */ }
+	}
+	return valid.length > 0 ? valid : undefined;
+}
+
 export function registerLeave(
 	node: Libp2p,
 	onLeave: (notice: LeaveNoticeV1) => Promise<void> | void,
@@ -22,6 +33,7 @@ export function registerLeave(
 		try {
 			const bytes = await readAllBounded(stream, 4096);
 			const msg = await decodeJson<LeaveNoticeV1>(bytes);
+			msg.replacements = sanitizeReplacements(msg.replacements);
 			await onLeave(msg);
 			stream.send(await encodeJson({ ok: true }));
 			await stream.close();
@@ -54,4 +66,3 @@ export async function sendLeave(
 		}
 	}
 }
-

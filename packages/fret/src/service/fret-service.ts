@@ -398,6 +398,21 @@ export class FretService implements IFretService, Startable {
 		void tick();
 	}
 
+	private computeReplacements(selfCoord: Uint8Array, spNeighborIds: Set<string>, selfStr: string): string[] {
+		const maxReplacements = 6;
+		const wider = Array.from(new Set([
+			...this.store.neighborsRight(selfCoord, this.cfg.m * 2),
+			...this.store.neighborsLeft(selfCoord, this.cfg.m * 2),
+		])).filter((id) => id !== selfStr && !spNeighborIds.has(id));
+		wider.sort((a, b) => {
+			const connA = this.isConnected(a) ? 1 : 0;
+			const connB = this.isConnected(b) ? 1 : 0;
+			if (connA !== connB) return connB - connA;
+			return (this.store.getById(b)?.relevance ?? 0) - (this.store.getById(a)?.relevance ?? 0);
+		});
+		return wider.slice(0, maxReplacements);
+	}
+
 	private async sendLeaveToNeighbors(): Promise<void> {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
@@ -406,14 +421,23 @@ export class FretService implements IFretService, Startable {
 				...this.getNeighbors(selfCoord, 'right', this.cfg.m),
 				...this.getNeighbors(selfCoord, 'left', this.cfg.m)
 			])).filter((id) => id !== selfStr).slice(0, 8);
-		const notice = { v: 1, from: this.node.peerId.toString(), timestamp: Date.now() } as const;
+			const spSet = new Set(ids);
+			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
+		const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 		for (const id of ids) {
 			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
+		}
+		// Bounded fan-out beyond S/P (connected peers only)
+		const fanOut = this.cfg.profile === 'core' ? 4 : 2;
+		const expanded = this.expandCohort(ids, selfCoord, fanOut, new Set([selfStr]));
+		const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
+		for (const id of extra) {
+			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
 		}
 		} catch (err) { log.error('sendLeaveToNeighbors outer failed - %e', err) }
 	}
 
-	private async handleLeave(notice: { from: string; timestamp: number }): Promise<void> {
+	private async handleLeave(notice: { from: string; replacements?: string[]; timestamp: number }): Promise<void> {
 		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }
 		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		const peerId = notice.from;
@@ -435,7 +459,10 @@ export class FretService implements IFretService, Startable {
 				try { await this.applyFailure(peerId, coord); } catch {}
 			}
 			if (!coord) return;
-			// compute baseline neighbors and expand breadth to refill coverage
+			// Merge suggested replacements from notice with locally computed ones
+			const suggested = (notice.replacements ?? []).filter((id) => {
+				try { peerIdFromString(id); return true; } catch { return false; }
+			});
 			const base = Array.from(
 				new Set([
 					...this.store.neighborsRight(coord, this.cfg.m),
@@ -444,7 +471,17 @@ export class FretService implements IFretService, Startable {
 			);
 			const expanded = this.expandCohort(base, coord, Math.max(2, Math.ceil(this.cfg.m / 2)));
 			const baseSet = new Set(base);
-			const newIds = expanded.filter((id) => !baseSet.has(id));
+			const localNew = expanded.filter((id) => !baseSet.has(id));
+			// Suggested first (departing peer vouched for them), then locally discovered
+			const selfStr = this.node.peerId.toString();
+			const seen = new Set([peerId, selfStr, ...base]);
+			const newIds: string[] = [];
+			for (const id of suggested) {
+				if (!seen.has(id)) { newIds.push(id); seen.add(id); }
+			}
+			for (const id of localNew) {
+				if (!seen.has(id)) { newIds.push(id); seen.add(id); }
+			}
 			// proactively warm a bounded number of replacements and merge their neighbor views
 			const warm = newIds.slice(0, Math.min(newIds.length, 6));
 			for (const id of warm) {
@@ -459,8 +496,26 @@ export class FretService implements IFretService, Startable {
 				}
 			}
 			await this.mergeNeighborSnapshots(warm.slice(0, 4));
+			// Announce replacement info to immediate neighbors
+			void this.announceReplacementsToNeighbors(coord);
 		} catch (err) {
 			console.error('handleLeave failed for', peerId, err);
+		}
+	}
+
+	private async announceReplacementsToNeighbors(aroundCoord: Uint8Array): Promise<void> {
+		const selfStr = this.node.peerId.toString();
+		const neighbors = Array.from(new Set([
+			...this.store.neighborsRight(aroundCoord, this.cfg.m),
+			...this.store.neighborsLeft(aroundCoord, this.cfg.m),
+		])).filter((id) => id !== selfStr && this.isConnected(id)).slice(0, 4);
+		const snap = await this.snapshot();
+		for (const id of neighbors) {
+			try {
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+			} catch (err) {
+				log.error('announceReplacementsToNeighbors failed for %s - %e', id, err);
+			}
 		}
 	}
 
@@ -725,11 +780,14 @@ export class FretService implements IFretService, Startable {
 		let si = 0,
 			pi = 0;
 		while (out.length < wants && (si < succIds.length || pi < predIds.length)) {
-			if (out.length % 2 === 0) {
+			if (out.length % 2 === 0 && si < succIds.length) {
 				const id = succIds[si++];
 				if (id && !ex.has(id)) out.push(id);
-			} else {
+			} else if (pi < predIds.length) {
 				const id = predIds[pi++];
+				if (id && !ex.has(id)) out.push(id);
+			} else if (si < succIds.length) {
+				const id = succIds[si++];
 				if (id && !ex.has(id)) out.push(id);
 			}
 		}
