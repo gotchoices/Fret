@@ -47,6 +47,12 @@ export interface NearAnchorV1 {
 	confidence: number;
 }
 
+export interface BusyResponseV1 {
+	v: 1;
+	busy: true;
+	retry_after_ms: number;
+}
+
 export interface ReportEvent {
 	peerId: string;
 	type: 'good' | 'bad';
@@ -121,6 +127,7 @@ export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js
 export { hashKey, hashPeerId } from './ring/hash.js';
 export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
 export { DedupCache } from './service/dedup-cache.js';
+export { validateTimestamp, readAllBounded } from './rpc/protocols.js';
 
 export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg) as FretService;

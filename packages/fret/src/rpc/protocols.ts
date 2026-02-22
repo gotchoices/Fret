@@ -33,3 +33,30 @@ export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
 	const text = new TextDecoder().decode(bytes.subarray(start, end));
 	return JSON.parse(text) as T;
 }
+
+export function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {
+	if (chunk instanceof Uint8Array) return chunk;
+	return chunk.subarray();
+}
+
+export async function readAllBounded(stream: AsyncIterable<Uint8Array | { subarray(): Uint8Array }>, maxBytes: number): Promise<Uint8Array> {
+	const parts: Uint8Array[] = [];
+	let len = 0;
+	for await (const chunk of stream) {
+		const bytes = toBytes(chunk);
+		len += bytes.length;
+		if (len > maxBytes) throw new Error(`payload too large: ${len} exceeds ${maxBytes} byte limit`);
+		parts.push(bytes);
+	}
+	const out = new Uint8Array(len);
+	let o = 0;
+	for (const p of parts) {
+		out.set(p, o);
+		o += p.length;
+	}
+	return out;
+}
+
+export function validateTimestamp(ts: number, maxDriftMs = 300_000): boolean {
+	return Math.abs(Date.now() - ts) <= maxDriftMs;
+}

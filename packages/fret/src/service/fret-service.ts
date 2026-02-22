@@ -6,6 +6,7 @@ import type {
 	ReportEvent,
 	RouteAndMaybeActV1,
 	NearAnchorV1,
+	BusyResponseV1,
 	NeighborSnapshotV1,
 	SerializedTable,
 	ActivityHandler,
@@ -15,7 +16,7 @@ import type {
 import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
-import { makeProtocols } from '../rpc/protocols.js';
+import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
@@ -41,6 +42,10 @@ import { createLogger } from '../logger.js';
 
 const log = createLogger('service:fret');
 
+function isBusy(res: unknown): res is BusyResponseV1 {
+	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
+}
+
 interface WithPeerStore {
 	peerStore?: { getPeers?: () => Array<{ id: PeerId }> };
 }
@@ -65,6 +70,8 @@ export class FretService implements IFretService, Startable {
 	private activityHandler?: ActivityHandler;
 	private readonly dedupCache = new DedupCache<NearAnchorV1 | { commitCertificate: string }>();
 	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
+	private readonly bucketPing: TokenBucket;
+	private readonly bucketLeave: TokenBucket;
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
@@ -74,6 +81,12 @@ export class FretService implements IFretService, Startable {
 		pingsFail: 0,
 		maybeActForwarded: 0,
 		evictions: 0,
+		rejected: {
+			payloadTooLarge: 0,
+			timestampBounds: 0,
+			ttlExpired: 0,
+			rateLimited: 0,
+		},
 	};
 
 	// Network size observation tracking
@@ -110,6 +123,14 @@ export class FretService implements IFretService, Startable {
 		this.bucketMaybeAct = new TokenBucket(
 			this.cfg.profile === 'core' ? 32 : 8,
 			this.cfg.profile === 'core' ? 16 : 4
+		);
+		this.bucketPing = new TokenBucket(
+			this.cfg.profile === 'core' ? 30 : 10,
+			this.cfg.profile === 'core' ? 15 : 5
+		);
+		this.bucketLeave = new TokenBucket(
+			this.cfg.profile === 'core' ? 20 : 8,
+			this.cfg.profile === 'core' ? 10 : 4
 		);
 	}
 
@@ -218,6 +239,9 @@ export class FretService implements IFretService, Startable {
 
 	async ready(): Promise<void> {}
 
+	private maxBytesNeighbors(): number { return this.cfg.profile === 'core' ? 128 * 1024 : 64 * 1024; }
+	private maxBytesMaybeAct(): number { return this.cfg.profile === 'core' ? 512 * 1024 : 256 * 1024; }
+
 	// RPC registration
 	private registerRpcHandlers(): void {
 		registerNeighbors(
@@ -226,34 +250,37 @@ export class FretService implements IFretService, Startable {
 			(from, snap) => {
 				void this.mergeAnnounceSnapshot(from, snap);
 			},
-			this.protocols
+			this.protocols,
+			this.maxBytesNeighbors()
 		);
-		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT);
-		registerLeave(this.node, async (notice) => this.handleLeave(notice.from), this.protocols.PROTOCOL_LEAVE);
+		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct());
+		registerLeave(this.node, async (notice) => this.handleLeave(notice), this.protocols.PROTOCOL_LEAVE);
 		registerPing(
 			this.node,
 			this.protocols.PROTOCOL_PING,
-			() => this.getNetworkSizeEstimate()
+			() => this.handlePingRequest()
 		);
 	}
 
-	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1> {
+	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1 | BusyResponseV1> {
 		if (!this.bucketNeighbors.tryTake()) {
-			return {
-				v: 1,
-				from: this.node.peerId.toString(),
-				timestamp: Date.now(),
-				successors: [],
-				predecessors: [],
-				sig: '',
-			};
+			this.diag.rejected.rateLimited++;
+			return { v: 1, busy: true, retry_after_ms: this.bucketNeighbors.retryAfterMs() };
 		}
 		return await this.snapshot();
 	}
 
+	private handlePingRequest(): { size_estimate?: number; confidence?: number } | BusyResponseV1 {
+		if (!this.bucketPing.tryTake()) {
+			this.diag.rejected.rateLimited++;
+			return { v: 1, busy: true, retry_after_ms: this.bucketPing.retryAfterMs() } satisfies BusyResponseV1;
+		}
+		return this.getNetworkSizeEstimate();
+	}
+
 	private async handleMaybeAct(
 		msg: RouteAndMaybeActV1
-	): Promise<NearAnchorV1 | { commitCertificate: string }> {
+	): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }> {
 		// Breadcrumb loop detection: reject if self already visited
 		const selfId = this.node.peerId.toString();
 		if (msg.breadcrumbs?.includes(selfId)) return await this.nearAnchorOnly(msg);
@@ -264,12 +291,18 @@ export class FretService implements IFretService, Startable {
 			if (cached) return cached;
 		}
 
+		// Timestamp freshness: reject messages outside ±5 min window
+		if (!validateTimestamp(msg.timestamp)) {
+			this.diag.rejected.timestampBounds++;
+			return await this.nearAnchorOnly(msg);
+		}
+
 		// Quick guards
-		if (msg.ttl <= 0) return await this.nearAnchorOnly(msg);
-		if (msg.activity && msg.activity.length > 128 * 1024) return await this.nearAnchorOnly(msg);
-		if (!this.bucketMaybeAct.tryTake()) return await this.nearAnchorOnly(msg);
+		if (msg.ttl <= 0) { this.diag.rejected.ttlExpired++; return await this.nearAnchorOnly(msg); }
+		if (msg.activity && msg.activity.length > 128 * 1024) { this.diag.rejected.payloadTooLarge++; return await this.nearAnchorOnly(msg); }
+		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
 		const limit = this.cfg.profile === 'core' ? 16 : 4;
-		if (this.inflightAct >= limit) return this.nearAnchorOnly(msg);
+		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 		this.inflightAct++;
 		try {
 			const result = await this.routeAct(msg);
@@ -380,7 +413,10 @@ export class FretService implements IFretService, Startable {
 		} catch (err) { log.error('sendLeaveToNeighbors outer failed - %e', err) }
 	}
 
-	private async handleLeave(peerId: string): Promise<void> {
+	private async handleLeave(notice: { from: string; timestamp: number }): Promise<void> {
+		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }
+		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }
+		const peerId = notice.from;
 		try {
 			let coord: Uint8Array | null = null;
 			const entry = this.store.getById(peerId);
@@ -429,6 +465,7 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
+		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		try {
 			const self = peerIdFromString(from);
 			const selfCoord = await hashPeerId(self);
@@ -812,11 +849,14 @@ export class FretService implements IFretService, Startable {
 				try {
 					this.diag.maybeActForwarded++;
 					const result = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT);
-					// Record successful forwarding
-					const nextCoord = this.store.getById(next)?.coord ?? (await hashPeerId(peerIdFromString(next)));
-					await this.applySuccess(next, nextCoord, 0);
-					this.clearBackoff(next);
-					return result;
+					if (isBusy(result)) {
+						this.recordBackoff(next);
+					} else {
+						const nextCoord = this.store.getById(next)?.coord ?? (await hashPeerId(peerIdFromString(next)));
+						await this.applySuccess(next, nextCoord, 0);
+						this.clearBackoff(next);
+						return result;
+					}
 				} catch (err) {
 					log.error('forward maybeAct failed to %s - %e', next, err);
 					this.recordBackoff(next);
@@ -1087,6 +1127,11 @@ export class FretService implements IFretService, Startable {
 			try {
 				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT);
 
+				if (isBusy(result)) {
+					this.recordBackoff(target);
+					continue;
+				}
+
 				if ('commitCertificate' in result) {
 					yield { type: 'complete', hop, result, peerId: target };
 					return;
@@ -1112,12 +1157,14 @@ export class FretService implements IFretService, Startable {
 						const actResult = await sendMaybeAct(
 							this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT
 						);
-						if ('commitCertificate' in actResult) {
+						if (isBusy(actResult)) {
+							this.recordBackoff(actTarget);
+						} else if ('commitCertificate' in actResult) {
 							yield { type: 'complete', hop: hop + 1, result: actResult, peerId: actTarget };
 							return;
+						} else {
+							bestAnchors = (actResult as NearAnchorV1).anchors;
 						}
-						// Got another NearAnchor from the activity target
-						bestAnchors = (actResult as NearAnchorV1).anchors;
 					} catch (err) {
 						log.error('activity send to anchor %s failed - %e', actTarget, err);
 						this.recordBackoff(actTarget);

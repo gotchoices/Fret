@@ -1,7 +1,7 @@
 import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
-import { PROTOCOL_LEAVE, encodeJson, decodeJson } from './protocols.js';
+import { PROTOCOL_LEAVE, encodeJson, decodeJson, readAllBounded } from './protocols.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:leave');
@@ -20,7 +20,7 @@ export function registerLeave(
 ): void {
 	void node.handle(protocol, async (stream: Stream) => {
 		try {
-			const bytes = await readAll(stream);
+			const bytes = await readAllBounded(stream, 4096);
 			const msg = await decodeJson<LeaveNoticeV1>(bytes);
 			await onLeave(msg);
 			stream.send(await encodeJson({ ok: true }));
@@ -55,21 +55,3 @@ export async function sendLeave(
 	}
 }
 
-function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {
-	if (chunk instanceof Uint8Array) return chunk;
-	return chunk.subarray();
-}
-
-async function readAll(stream: Stream): Promise<Uint8Array> {
-	const parts: Uint8Array[] = [];
-	for await (const chunk of stream) parts.push(toBytes(chunk));
-	let len = 0;
-	for (const p of parts) len += p.length;
-	const out = new Uint8Array(len);
-	let o = 0;
-	for (const p of parts) {
-		out.set(p, o);
-		o += p.length;
-	}
-	return out;
-}

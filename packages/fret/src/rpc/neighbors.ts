@@ -6,17 +6,19 @@ import {
 	PROTOCOL_NEIGHBORS_ANNOUNCE,
 	encodeJson,
 	decodeJson,
+	readAllBounded,
 } from './protocols.js';
-import type { NeighborSnapshotV1 } from '../index.js';
+import type { NeighborSnapshotV1, BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:neighbors');
 
 export function registerNeighbors(
 	node: Libp2p,
-	getSnapshot: () => NeighborSnapshotV1 | Promise<NeighborSnapshotV1>,
+	getSnapshot: () => NeighborSnapshotV1 | BusyResponseV1 | Promise<NeighborSnapshotV1 | BusyResponseV1>,
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
-	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE }
+	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
+	maxBytes = 128 * 1024
 ): void {
 	void node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream) => {
 		try {
@@ -28,11 +30,10 @@ export function registerNeighbors(
 		}
 	});
 
-	// Optional: accept pushed announcements of neighbor snapshots
 	if (onAnnounce) {
 		void node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream) => {
 			try {
-				const bytes = await readAll(stream);
+				const bytes = await readAllBounded(stream, maxBytes);
 				const snap = await decodeJson<NeighborSnapshotV1>(bytes);
 				onAnnounce(snap.from, snap);
 				stream.send(await encodeJson({ ok: true }));
@@ -58,8 +59,12 @@ export async function fetchNeighbors(
 	let stream: Stream | undefined;
 	try {
 		stream = await conns[0].newStream([protocol]);
-		const bytes = await readAll(stream);
-		return await decodeJson<NeighborSnapshotV1>(bytes);
+		const bytes = await readAllBounded(stream, 128 * 1024);
+		const res = await decodeJson<NeighborSnapshotV1 | BusyResponseV1>(bytes);
+		if ('busy' in res && (res as BusyResponseV1).busy) {
+			return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
+		}
+		return res as NeighborSnapshotV1;
 	} catch (err) {
 		log.error('fetchNeighbors decode failed for %s - %e', peerIdOrStr, err);
 		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
@@ -95,21 +100,3 @@ export async function announceNeighbors(
 	}
 }
 
-function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {
-	if (chunk instanceof Uint8Array) return chunk;
-	return chunk.subarray();
-}
-
-async function readAll(stream: Stream): Promise<Uint8Array> {
-	const parts: Uint8Array[] = [];
-	for await (const chunk of stream) parts.push(toBytes(chunk));
-	let len = 0;
-	for (const p of parts) len += p.length;
-	const out = new Uint8Array(len);
-	let o = 0;
-	for (const p of parts) {
-		out.set(p, o);
-		o += p.length;
-	}
-	return out;
-}
