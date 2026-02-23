@@ -1,7 +1,6 @@
 import { describe, it } from 'mocha'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { hashKey } from '../src/ring/hash.js'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
 
 async function makeMesh(n: number) {

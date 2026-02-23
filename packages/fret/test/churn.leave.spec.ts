@@ -1,6 +1,6 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { createMemNode, createMemoryNode, connectLine, stopAll } from './helpers/libp2p.js'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { sendLeave, type LeaveNoticeV1 } from '../src/rpc/leave.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
