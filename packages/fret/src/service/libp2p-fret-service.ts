@@ -1,7 +1,8 @@
-import type { Startable } from '@libp2p/interface';
+import type { PeerDiscovery, Startable } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
 import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
+import { FretPeerDiscovery, type FretPeerDiscoveryConfig } from './peer-discovery.js';
 import { seedDiscovery } from './discovery.js';
 
 type Components = { libp2p?: Libp2p };
@@ -9,8 +10,12 @@ type Components = { libp2p?: Libp2p };
 export class Libp2pFretService implements Startable {
 	private inner: FretService | null = null;
 	private nodeRef: Libp2p | null = null;
+	private discovery: FretPeerDiscovery | null = null;
+	private readonly discoveryCfg?: FretPeerDiscoveryConfig;
 
-	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>) { }
+	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>, discoveryCfg?: FretPeerDiscoveryConfig) {
+		this.discoveryCfg = discoveryCfg;
+	}
 
 	get [Symbol.toStringTag](): string {
 		return '@optimystic/fret';
@@ -25,26 +30,38 @@ export class Libp2pFretService implements Startable {
 		this.nodeRef = node;
 	}
 
-	private ensure(): FretService {
+	private ensure(): CoreFretService {
 		if (!this.inner) {
 			if (!this.nodeRef) {
 				throw new Error('Libp2pFretService: libp2p node not injected');
 			}
 			this.inner = new CoreFretService(this.nodeRef, this.cfg);
 		}
-		return this.inner;
+		return this.inner as CoreFretService;
+	}
+
+	/** Returns a libp2p-compatible PeerDiscovery backed by the Digitree store. */
+	getPeerDiscovery(): PeerDiscovery {
+		const core = this.ensure();
+		if (!this.discovery) {
+			this.discovery = new FretPeerDiscovery(core.getStore(), this.discoveryCfg);
+		}
+		return this.discovery;
 	}
 
 	async start(): Promise<void> {
-		// Ensure inner service is constructed with a valid libp2p instance
-		this.ensure();
-		// Emit any currently known peers to libp2p discovery
+		const core = this.ensure();
 		if (!this.nodeRef) throw new Error('Libp2pFretService.start: libp2p node not injected');
-		seedDiscovery(this.nodeRef, (this.inner as any)?.store ?? ({} as any));
-		await this.ensure().start();
+		seedDiscovery(this.nodeRef, core.getStore());
+		await core.start();
+		if (!this.discovery) {
+			this.discovery = new FretPeerDiscovery(core.getStore(), this.discoveryCfg);
+		}
+		await this.discovery.start();
 	}
 
 	async stop(): Promise<void> {
+		await this.discovery?.stop();
 		await this.inner?.stop();
 	}
 
@@ -118,6 +135,6 @@ export class Libp2pFretService implements Startable {
 	}
 }
 
-export function fretService(cfg?: Partial<FretConfig>) {
-	return (components: Components & { fret: Libp2pFretService }) => new Libp2pFretService(components as Components, cfg);
+export function fretService(cfg?: Partial<FretConfig>, discoveryCfg?: FretPeerDiscoveryConfig) {
+	return (components: Components & { fret: Libp2pFretService }) => new Libp2pFretService(components as Components, cfg, discoveryCfg);
 }

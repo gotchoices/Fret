@@ -138,6 +138,10 @@ export class FretService implements IFretService, Startable {
 		return this.diag;
 	}
 
+	public getStore(): DigitreeStore {
+		return this.store;
+	}
+
 	private async selfCoord(): Promise<Uint8Array> {
 		if (this.cachedSelfCoord) return this.cachedSelfCoord;
 		this.cachedSelfCoord = await hashPeerId(this.node.peerId);
