@@ -64,6 +64,16 @@ Bootstrap peer ID extraction now uses proper `@multiformats/multiaddr` parsing i
   - Malformed maybeAct payload handling
   - Confirms graceful error handling without crashes
 
+- **Payload bounds & TTL validation** (`test/payload-bounds-ttl.spec.ts`)
+  - `validateTimestamp`: accepts within ±5 min, rejects outside, supports custom drift
+  - `readAllBounded`: reads within limit, rejects single-chunk and multi-chunk overflow
+  - Oversized maybeAct payload at RPC layer rejected without crash
+  - Stale/future timestamp rejection with diagnostic counters
+  - TTL ≤ 0 rejection with diagnostic counter
+  - `BusyResponseV1` when maybeAct/neighbors buckets exhausted
+  - Valid message passes through normally
+  - Multiple rejection types tracked independently
+
 - **Network isolation** (`test/network.isolation.spec.ts`)
   - Different networkNames cannot exchange snapshots (protocol mismatch)
   - Same networkName enables discovery and stabilization
@@ -138,11 +148,12 @@ Deterministic simulation harness with event scheduler and metrics collection:
    - Add `hasAddresses()` check to avoid NoValidAddressesError
 
 ## Test Results
-- **18 passing** (11s)
+- **67 passing**
 - All property tests pass with fast-check
 - Integration tests validate RPC flows and mesh behavior
 - Simulation tests demonstrate convergence and churn resilience
 - Network isolation tests confirm protocol-based network segmentation
+- Payload bounds, TTL, and rate-limit tests validate input hardening
 
 ## Next Steps (Optional)
 1. **Path length measurement**: Track hop counts in simulation routing
