@@ -18,7 +18,7 @@ describe('Churn scenario simulations', function () {
 
 		// Warm up for 3s
 		for (const evt of sim.scheduler.advanceTo(3000)) {
-			(sim as any).handleEvent(evt)
+			sim.processEvent(evt)
 		}
 
 		const preChurnCoverage = sim.snapshotCoverage()
@@ -32,7 +32,7 @@ describe('Churn scenario simulations', function () {
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 12000) break
-			;(sim as any).handleEvent(evt)
+			;sim.processEvent(evt)
 		}
 
 		const metrics = sim.metrics.finalize()
@@ -63,7 +63,7 @@ describe('Churn scenario simulations', function () {
 
 		// Warm up for 2s
 		for (const evt of sim.scheduler.advanceTo(2000)) {
-			(sim as any).handleEvent(evt)
+			sim.processEvent(evt)
 		}
 
 		console.log('  Pre-burst alive:', sim.aliveCount())
@@ -75,7 +75,7 @@ describe('Churn scenario simulations', function () {
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 10000) break
-			;(sim as any).handleEvent(evt)
+			;sim.processEvent(evt)
 		}
 
 		const metrics = sim.metrics.finalize()
@@ -114,7 +114,7 @@ describe('Churn scenario simulations', function () {
 
 		// Warm up for 2s
 		for (const evt of sim.scheduler.advanceTo(2000)) {
-			(sim as any).handleEvent(evt)
+			sim.processEvent(evt)
 		}
 
 		// Schedule mixed churn: alternating joins and leaves at 2/s from t=2000 to t=15000
@@ -135,7 +135,7 @@ describe('Churn scenario simulations', function () {
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 15000) break
-			;(sim as any).handleEvent(evt)
+			;sim.processEvent(evt)
 		}
 
 		const metrics = sim.metrics.finalize()
@@ -176,7 +176,7 @@ describe('Churn scenario simulations', function () {
 
 		// Warm up for 2s
 		for (const evt of sim.scheduler.advanceTo(2000)) {
-			(sim as any).handleEvent(evt)
+			sim.processEvent(evt)
 		}
 
 		// Remove 5 peers at t=2001
@@ -186,7 +186,7 @@ describe('Churn scenario simulations', function () {
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 8000) break
-			;(sim as any).handleEvent(evt)
+			;sim.processEvent(evt)
 		}
 
 		// Check dead neighbor ratio
@@ -214,7 +214,7 @@ describe('Churn scenario simulations', function () {
 
 		// Warm up for 3s
 		for (const evt of sim.scheduler.advanceTo(3000)) {
-			(sim as any).handleEvent(evt)
+			sim.processEvent(evt)
 		}
 
 		// Schedule 20 route lookups spread across t=3500 to t=13000
@@ -234,7 +234,7 @@ describe('Churn scenario simulations', function () {
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 15000) break
-			;(sim as any).handleEvent(evt)
+			;sim.processEvent(evt)
 		}
 
 		const metrics = sim.metrics.finalize()

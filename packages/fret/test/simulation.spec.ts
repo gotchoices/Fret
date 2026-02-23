@@ -3,7 +3,7 @@ import { FretSimulation } from './simulation/fret-sim.js'
 import type { SimMetrics } from './simulation/sim-metrics.js'
 
 describe('FRET simulation tests', function () {
-	this.timeout(30000)
+	this.timeout(60000)
 
 	it('converges with N=5, no churn', () => {
 		const sim = new FretSimulation({

@@ -69,7 +69,7 @@ export class FretSimulation {
 		const id = `peer-${index.toString().padStart(4, '0')}`
 		const coord = new Uint8Array(32)
 		const bigIndex = BigInt(index)
-		const range = (1n << 256n) / BigInt(Math.max(1, this.config.n + this.nextPeerIndex - this.config.n))
+		const range = (1n << 256n) / BigInt(Math.max(1, this.nextPeerIndex))
 		const val = bigIndex * range
 		for (let i = 0; i < 32; i++) {
 			coord[31 - i] = Number((val >> BigInt(i * 8)) & 0xffn)
@@ -126,6 +126,11 @@ export class FretSimulation {
 		}
 
 		return this.metrics.finalize()
+	}
+
+	/** Process a single simulation event (public entry point for manual stepping). */
+	processEvent(evt: SimEvent): void {
+		this.handleEvent(evt)
 	}
 
 	private handleEvent(evt: SimEvent): void {
