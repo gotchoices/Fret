@@ -35,10 +35,6 @@ describe('Churn leave handling', function () {
 		await connectLine(nodes)
 		const services = [] as CoreFretService[]
 
-		// Intercept leave notices received by node 1
-		const receivedNotices: LeaveNoticeV1[] = []
-		const protocols = makeProtocols('default')
-
 		for (let i = 0; i < nodes.length; i++) {
 			const svc = new CoreFretService(nodes[i], {
 				profile: 'core',
@@ -49,17 +45,10 @@ describe('Churn leave handling', function () {
 			services.push(svc)
 		}
 
-		// Intercept leave messages on node 1 by watching what arrives
-		void nodes[1].handle(protocols.PROTOCOL_LEAVE + '/spy', async () => {})
-
 		await new Promise(r => setTimeout(r, 2000))
 
-		// Spy on sendLeave: wrap node[2]'s stop to capture the notice
-		const originalSend = sendLeave
-		let capturedNotice: LeaveNoticeV1 | undefined
 		const node2Id = nodes[2].peerId.toString()
 
-		// Instead of monkey-patching, we check the store state after leave
 		// Stop node 2 (the middle node) — it should send leave with replacements
 		await services[2].stop()
 		await nodes[2].stop()
@@ -70,8 +59,7 @@ describe('Churn leave handling', function () {
 			if (idx === 2) continue
 			const peers = svc.listPeers()
 			const hasLeavingPeer = peers.some(p => p.id === node2Id)
-			// The leaving peer should eventually be removed via leave notice or stabilization
-			// (In a 6-node mesh, the leave notice propagates to S/P neighbors)
+			expect(hasLeavingPeer).to.equal(false, `service ${idx} should have removed leaving peer`)
 		}
 
 		await Promise.all(services.map((s, i) => i === 2 ? Promise.resolve() : s.stop()))
@@ -154,46 +142,37 @@ describe('Churn leave handling', function () {
 		for (let i = 0; i < 3; i++) { const n = await createMemoryNode(); await n.start(); nodes.push(n) }
 		await connectLine(nodes)
 
-		const services = [] as CoreFretService[]
-		let processedNotice = false
-
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'edge',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-		await new Promise(r => setTimeout(r, 1500))
-
-		// Send a crafted leave notice with >12 replacements to node 0
-		// The sanitizeNotice in registerLeave should truncate to 12
-		const fakeReplacements = Array.from({ length: 20 }, (_, i) =>
-			nodes[1].peerId.toString() // valid peer IDs, repeated for simplicity
-		)
 		const protocols = makeProtocols('default')
+		let capturedReplacements: string[] | undefined
+
+		// Register a custom leave handler on node 0 to capture the sanitized notice
+		// First, unhandle any existing leave handler, then register our spy
+		try { await nodes[0].unhandle(protocols.PROTOCOL_LEAVE) } catch {}
+
+		const { registerLeave: regLeave } = await import('../src/rpc/leave.js')
+		regLeave(nodes[0], async (notice: LeaveNoticeV1) => {
+			capturedReplacements = notice.replacements
+		}, protocols.PROTOCOL_LEAVE)
+
+		await new Promise(r => setTimeout(r, 500))
+
+		// Send a crafted leave notice with 20 replacements (exceeds MAX_REPLACEMENTS=12)
+		const fakeReplacements = Array.from({ length: 20 }, () =>
+			nodes[1].peerId.toString()
+		)
 		const notice: LeaveNoticeV1 = {
 			v: 1,
 			from: nodes[2].peerId.toString(),
 			replacements: fakeReplacements,
 			timestamp: Date.now(),
 		}
-		// Send from node 1 to node 0 — this goes through registerLeave's sanitizeNotice
-		try {
-			await sendLeave(nodes[1], nodes[0].peerId.toString(), notice, protocols.PROTOCOL_LEAVE)
-			processedNotice = true
-		} catch {
-			// May fail if handler isn't ready; still validates the truncation path
-		}
-
+		await sendLeave(nodes[1], nodes[0].peerId.toString(), notice, protocols.PROTOCOL_LEAVE)
 		await new Promise(r => setTimeout(r, 500))
 
-		// The notice should have been processed without error
-		// (we can't easily assert truncation without deeper introspection,
-		// but the fact that it processed without throwing validates the path)
-		await Promise.all(services.map(s => s.stop()))
+		// Verify truncation: sanitizeReplacements caps at 12
+		expect(capturedReplacements).to.be.an('array')
+		expect(capturedReplacements!.length).to.be.at.most(12)
+
 		await stopAll(nodes)
 	})
 })

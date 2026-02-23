@@ -423,17 +423,17 @@ export class FretService implements IFretService, Startable {
 			])).filter((id) => id !== selfStr).slice(0, 8);
 			const spSet = new Set(ids);
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
-		const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
-		for (const id of ids) {
-			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
-		}
-		// Bounded fan-out beyond S/P (connected peers only)
-		const fanOut = this.cfg.profile === 'core' ? 4 : 2;
-		const expanded = this.expandCohort(ids, selfCoord, fanOut, new Set([selfStr]));
-		const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
-		for (const id of extra) {
-			try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
-		}
+			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
+			for (const id of ids) {
+				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
+			}
+			// Bounded fan-out beyond S/P (connected peers only)
+			const fanOut = this.cfg.profile === 'core' ? 4 : 2;
+			const expanded = this.expandCohort(ids, selfCoord, fanOut, new Set([selfStr]));
+			const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
+			for (const id of extra) {
+				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
+			}
 		} catch (err) { log.error('sendLeaveToNeighbors outer failed - %e', err) }
 	}
 
@@ -452,12 +452,8 @@ export class FretService implements IFretService, Startable {
 					console.warn('handleLeave: could not hash departing peer id', peerId, e);
 				}
 			}
-			// remove leaving peer
+			// remove leaving peer from the store
 			this.store.remove(peerId);
-			// penalize the departed peer slightly (if re-seen soon, it must rebuild)
-			if (coord) {
-				try { await this.applyFailure(peerId, coord); } catch {}
-			}
 			if (!coord) return;
 			// Merge suggested replacements from notice with locally computed ones
 			const suggested = (notice.replacements ?? []).filter((id) => {

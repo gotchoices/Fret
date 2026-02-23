@@ -379,6 +379,16 @@ interface NearAnchorV1 {
 }
 ```
 
+#### LeaveNotice (JSON)
+```
+interface LeaveNoticeV1 {
+  v: 1;
+  from: string;                 // departing PeerId (base58btc)
+  replacements?: string[];      // suggested replacement PeerIds (max 12, sanitized by receiver)
+  timestamp: number;            // unix ms
+}
+```
+
 #### Serialized routing table (JSON)
 ```
 interface SerializedPeerEntry {
