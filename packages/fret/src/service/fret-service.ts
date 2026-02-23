@@ -72,10 +72,16 @@ export class FretService implements IFretService, Startable {
 	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
+	private readonly bucketAnnounce: TokenBucket;
+	private readonly announceFanout: number;
+	private readonly departureDebounce = new Map<string, number>();
+	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
+	private firstStabilizeDone = false;
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
 		announcementsSent: 0,
+		announcementsSkipped: 0,
 		pingsSent: 0,
 		pingsOk: 0,
 		pingsFail: 0,
@@ -132,6 +138,11 @@ export class FretService implements IFretService, Startable {
 			this.cfg.profile === 'core' ? 20 : 8,
 			this.cfg.profile === 'core' ? 10 : 4
 		);
+		this.bucketAnnounce = new TokenBucket(
+			this.cfg.profile === 'core' ? 16 : 6,
+			this.cfg.profile === 'core' ? 8 : 2
+		);
+		this.announceFanout = this.cfg.profile === 'core' ? 8 : 4;
 	}
 
 	public getDiagnostics(): Readonly<typeof this.diag> {
@@ -202,7 +213,7 @@ export class FretService implements IFretService, Startable {
 	async start(): Promise<void> {
 		await this.seedFromPeerStore();
 		this.registerRpcHandlers();
-		await this.proactiveAnnounceOnStart();
+		// Defer proactive announce to after first stabilization tick (table is richer)
 		this.startStabilizationLoop();
 		if (this.mode === 'active') void this.preconnectNeighbors();
 		// One-time post-bootstrap announce when first remote connects
@@ -228,8 +239,13 @@ export class FretService implements IFretService, Startable {
 				const id = evt?.detail?.toString?.();
 				if (!id) return;
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+				const wasNear = this.isNearNeighbor(id, coord);
 				this.store.setState(id, 'disconnected');
 				await this.applyFailure(id, coord);
+				// Proactive: announce to neighbors around departed peer if it was a near neighbor
+				if (wasNear) {
+					void this.announceOnDeparture(id, coord);
+				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
 		});
 	}
@@ -350,18 +366,22 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	private async announceNeighborsBounded(maxCount: number): Promise<void> {
+	private async announceNeighborsBounded(maxCount?: number): Promise<void> {
+		const fanout = maxCount ?? this.announceFanout;
 		const selfCoord = await hashPeerId(this.node.peerId);
 		const selfStr = this.node.peerId.toString();
-		const ids = Array.from(new Set([
+		const all = Array.from(new Set([
 			...this.getNeighbors(selfCoord, 'right', this.cfg.m),
 			...this.getNeighbors(selfCoord, 'left', this.cfg.m)
-		])).filter((id) => id !== selfStr).slice(0, maxCount);
+		])).filter((id) => id !== selfStr);
+		// Prefer non-connected peers (connected learn via normal exchange)
+		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
+		const connected = all.filter((id) => this.isConnected(id));
+		const ids = [...nonConnected, ...connected].slice(0, fanout);
 		const snap = await this.snapshot();
 		for (const id of ids) {
-			if (this.isConnected(id) || this.hasAddresses(id)) {
-				try { await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE); this.diag.announcementsSent++; } catch (err) { console.warn('announce failed', id, err); }
-			}
+			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
+			try { await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE); this.diag.announcementsSent++; } catch (err) { log.error('announce failed to %s - %e', id, err); }
 		}
 	}
 
@@ -514,10 +534,75 @@ export class FretService implements IFretService, Startable {
 		])).filter((id) => id !== selfStr && this.isConnected(id)).slice(0, 4);
 		const snap = await this.snapshot();
 		for (const id of neighbors) {
+			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
 				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+				this.diag.announcementsSent++;
 			} catch (err) {
 				log.error('announceReplacementsToNeighbors failed for %s - %e', id, err);
+			}
+		}
+	}
+
+	private async announceOnDeparture(departedId: string, coord: Uint8Array): Promise<void> {
+		// Debounce: skip if we recently announced for this coordinate region
+		const regionKey = coordToBase64url(coord);
+		const now = Date.now();
+		const lastAnnounce = this.departureDebounce.get(regionKey) ?? 0;
+		if (now - lastAnnounce < FretService.DEPARTURE_DEBOUNCE_MS) return;
+		this.departureDebounce.set(regionKey, now);
+		// Prune stale debounce entries
+		if (this.departureDebounce.size > 256) {
+			for (const [k, v] of this.departureDebounce) { if (now - v > FretService.DEPARTURE_DEBOUNCE_MS * 2) this.departureDebounce.delete(k); }
+		}
+
+		const selfStr = this.node.peerId.toString();
+		const all = Array.from(new Set([
+			...this.store.neighborsRight(coord, this.cfg.m),
+			...this.store.neighborsLeft(coord, this.cfg.m),
+		])).filter((id) => id !== selfStr && id !== departedId);
+		// Prefer non-connected peers; connected peers learn via normal exchange
+		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
+		const connected = all.filter((id) => this.isConnected(id));
+		const targets = [...nonConnected, ...connected].slice(0, this.announceFanout);
+		if (targets.length === 0) return;
+		const snap = await this.snapshot();
+		for (const id of targets) {
+			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
+			try {
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+				this.diag.announcementsSent++;
+			} catch (err) {
+				log.error('announceOnDeparture failed for %s - %e', id, err);
+			}
+		}
+	}
+
+	private isNearNeighbor(id: string, coord: Uint8Array): boolean {
+		const selfStr = this.node.peerId.toString();
+		const selfCoord = this.cachedSelfCoord;
+		if (!selfCoord) return false;
+		const near = Array.from(new Set([
+			...this.store.neighborsRight(selfCoord, this.cfg.m),
+			...this.store.neighborsLeft(selfCoord, this.cfg.m),
+		])).filter((nid) => nid !== selfStr);
+		return near.includes(id);
+	}
+
+	private async announceToNewPeers(ids: string[]): Promise<void> {
+		const selfStr = this.node.peerId.toString();
+		const targets = ids
+			.filter((id) => id !== selfStr && !this.isConnected(id) && this.hasAddresses(id))
+			.slice(0, this.announceFanout);
+		if (targets.length === 0) return;
+		const snap = await this.snapshot();
+		for (const id of targets) {
+			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
+			try {
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+				this.diag.announcementsSent++;
+			} catch (err) {
+				log.error('announceToNewPeers failed for %s - %e', id, err);
 			}
 		}
 	}
@@ -558,6 +643,7 @@ export class FretService implements IFretService, Startable {
 			}
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
+			if (discovered.length > 0) void this.announceToNewPeers(discovered);
 		} catch (err) {
 			console.warn('mergeAnnounceSnapshot failed for', from, err);
 		}
@@ -602,6 +688,11 @@ export class FretService implements IFretService, Startable {
 				await this.seedFromPeerStore();
 				await this.seedFromBootstraps();
 				await this.stabilizeOnce();
+				// Proactive announce after first stabilization (table populated)
+				if (!this.firstStabilizeDone) {
+					this.firstStabilizeDone = true;
+					void this.proactiveAnnounceOnStart();
+				}
 			} catch (err) {
 				console.error('stabilize tick failed:', err);
 			} finally {
@@ -711,6 +802,7 @@ export class FretService implements IFretService, Startable {
 		}
 		this.enforceCapacity();
 		this.emitDiscovered(announced);
+		if (announced.length > 0) void this.announceToNewPeers(announced);
 	}
 
 	// Snapshots
