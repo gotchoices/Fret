@@ -155,9 +155,10 @@ function chooseNextHopCost(
 		if (!entry) continue;
 		const dist = xorDistance(entry.coord, targetCoord);
 		const near = isNear(dist, nearRadius);
+		const connected = isConnected(id);
 		const w = weightsForContext(near, confidence);
-		const costVal = cost(normalizeDistance(dist), isConnected(id), linkQ(id), backoff(id), w);
-		scored.push({ id, dist, near, connected: isConnected(id), costVal });
+		const costVal = cost(normalizeDistance(dist), connected, linkQ(id), backoff(id), w);
+		scored.push({ id, dist, near, connected, costVal });
 	}
 
 	if (scored.length === 0) return undefined;
