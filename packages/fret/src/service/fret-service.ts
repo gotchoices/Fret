@@ -209,16 +209,19 @@ export class FretService implements IFretService, Startable {
 		});
 		this.node.addEventListener('peer:connect', async (evt: any) => {
 			try {
-				const id = evt?.detail?.id?.toString?.();
+				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
+				const id = evt?.detail?.toString?.();
 				if (!id) return;
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+				this.store.upsert(id, coord);
 				this.store.setState(id, 'connected');
 				await this.applyTouch(id, coord);
 			} catch (err) { log.error('peer:connect handler failed - %e', err) }
 		});
 		this.node.addEventListener('peer:disconnect', async (evt: any) => {
 			try {
-				const id = evt?.detail?.id?.toString?.();
+				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
+				const id = evt?.detail?.toString?.();
 				if (!id) return;
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 				this.store.setState(id, 'disconnected');

@@ -1,5 +1,5 @@
 import { describe, it } from 'mocha'
-import { createMemoryNode, connectLine, stopAll } from './helpers/libp2p.js'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { hashKey } from '../src/ring/hash.js'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
@@ -7,17 +7,22 @@ import { fromString as u8FromString } from 'uint8arrays/from-string'
 async function makeMesh(n: number) {
 	const nodes = [] as any[]
 	for (let i = 0; i < n; i++) {
-		const node = await createMemoryNode()
+		const node = await createMemNode()
 		await node.start()
 		nodes.push(node)
 	}
-	await connectLine(nodes)
+	// Start services BEFORE connections so peer:connect handlers fire
 	const services = [] as CoreFretService[]
 	for (let i = 0; i < n; i++) {
 		const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()]
 		const svc = new CoreFretService(nodes[i], { profile: 'edge', k: 7, bootstraps: boot })
 		await svc.start()
 		services.push(svc)
+	}
+	// Star topology: all nodes connect to bootstrap
+	for (let i = 1; i < n; i++) {
+		const ma = nodes[0]!.getMultiaddrs()[0]!
+		await nodes[i]!.dial(ma)
 	}
 	return { nodes, services }
 }

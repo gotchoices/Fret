@@ -39,15 +39,41 @@ export function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Ar
 	return chunk.subarray();
 }
 
-export async function readAllBounded(stream: AsyncIterable<Uint8Array | { subarray(): Uint8Array }>, maxBytes: number): Promise<Uint8Array> {
+export async function readAllBounded(
+	stream: AsyncIterable<Uint8Array | { subarray(): Uint8Array }>,
+	maxBytes: number,
+	timeoutMs = 5000
+): Promise<Uint8Array> {
 	const parts: Uint8Array[] = [];
 	let len = 0;
-	for await (const chunk of stream) {
-		const bytes = toBytes(chunk);
+	const iter = stream[Symbol.asyncIterator]();
+	const deadline = Date.now() + timeoutMs;
+	// Short idle timeout after first data arrives — works around muxer
+	// implementations that fail to propagate remote-close EOF.
+	const idleMs = 100;
+
+	while (true) {
+		const remaining = deadline - Date.now();
+		if (remaining <= 0) break;
+		const chunkTimeout = len > 0 ? Math.min(remaining, idleMs) : remaining;
+
+		let timer: ReturnType<typeof setTimeout> | undefined;
+		const timeout = new Promise<IteratorResult<any>>(r => {
+			timer = setTimeout(() => r({ done: true, value: undefined }), chunkTimeout);
+		});
+		const next = iter.next();
+		next.catch(() => {}); // Prevent unhandled rejection if timeout wins
+		const result = await Promise.race([next, timeout]);
+		clearTimeout(timer);
+
+		if (result.done) break;
+
+		const bytes = toBytes(result.value);
 		len += bytes.length;
 		if (len > maxBytes) throw new Error(`payload too large: ${len} exceeds ${maxBytes} byte limit`);
 		parts.push(bytes);
 	}
+
 	const out = new Uint8Array(len);
 	let o = 0;
 	for (const p of parts) {
