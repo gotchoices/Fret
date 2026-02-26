@@ -362,7 +362,17 @@ export class FretService implements IFretService, Startable {
 		try {
 			await this.announceNeighborsBounded(8);
 		} catch (err) {
-			console.warn('proactiveAnnounceOnStart failed', err);
+			log.error('proactiveAnnounceOnStart failed - %e', err);
+		}
+	}
+
+	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
+		for (const id of ids) {
+			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
+			try {
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+				this.diag.announcementsSent++;
+			} catch (err) { log.error('announce failed to %s - %e', id, err); }
 		}
 	}
 
@@ -378,11 +388,7 @@ export class FretService implements IFretService, Startable {
 		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
 		const connected = all.filter((id) => this.isConnected(id));
 		const ids = [...nonConnected, ...connected].slice(0, fanout);
-		const snap = await this.snapshot();
-		for (const id of ids) {
-			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
-			try { await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE); this.diag.announcementsSent++; } catch (err) { log.error('announce failed to %s - %e', id, err); }
-		}
+		await this.sendAnnouncementsRateLimited(ids, await this.snapshot());
 	}
 
 	private async preconnectNeighbors(): Promise<void> {
@@ -510,19 +516,20 @@ export class FretService implements IFretService, Startable {
 			for (const id of warm) {
 				try {
 					await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
-					if (!this.isConnected(id)) {
+					if (!this.isConnected(id) && this.bucketAnnounce.tryTake()) {
 						const snap = await this.snapshot();
 						await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+						this.diag.announcementsSent++;
 					}
 				} catch (err) {
-					console.warn('warm/announce failed for', id, err);
+					log.error('warm/announce failed for %s - %e', id, err);
 				}
 			}
 			await this.mergeNeighborSnapshots(warm.slice(0, 4));
 			// Announce replacement info to immediate neighbors
 			void this.announceReplacementsToNeighbors(coord);
 		} catch (err) {
-			console.error('handleLeave failed for', peerId, err);
+			log.error('handleLeave failed for %s - %e', peerId, err);
 		}
 	}
 
@@ -532,16 +539,7 @@ export class FretService implements IFretService, Startable {
 			...this.store.neighborsRight(aroundCoord, this.cfg.m),
 			...this.store.neighborsLeft(aroundCoord, this.cfg.m),
 		])).filter((id) => id !== selfStr && this.isConnected(id)).slice(0, 4);
-		const snap = await this.snapshot();
-		for (const id of neighbors) {
-			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
-			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
-				this.diag.announcementsSent++;
-			} catch (err) {
-				log.error('announceReplacementsToNeighbors failed for %s - %e', id, err);
-			}
-		}
+		await this.sendAnnouncementsRateLimited(neighbors, await this.snapshot());
 	}
 
 	private async announceOnDeparture(departedId: string, coord: Uint8Array): Promise<void> {
@@ -566,19 +564,10 @@ export class FretService implements IFretService, Startable {
 		const connected = all.filter((id) => this.isConnected(id));
 		const targets = [...nonConnected, ...connected].slice(0, this.announceFanout);
 		if (targets.length === 0) return;
-		const snap = await this.snapshot();
-		for (const id of targets) {
-			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
-			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
-				this.diag.announcementsSent++;
-			} catch (err) {
-				log.error('announceOnDeparture failed for %s - %e', id, err);
-			}
-		}
+		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
 	}
 
-	private isNearNeighbor(id: string, coord: Uint8Array): boolean {
+	private isNearNeighbor(id: string, _coord: Uint8Array): boolean {
 		const selfStr = this.node.peerId.toString();
 		const selfCoord = this.cachedSelfCoord;
 		if (!selfCoord) return false;
@@ -595,16 +584,7 @@ export class FretService implements IFretService, Startable {
 			.filter((id) => id !== selfStr && !this.isConnected(id) && this.hasAddresses(id))
 			.slice(0, this.announceFanout);
 		if (targets.length === 0) return;
-		const snap = await this.snapshot();
-		for (const id of targets) {
-			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
-			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
-				this.diag.announcementsSent++;
-			} catch (err) {
-				log.error('announceToNewPeers failed for %s - %e', id, err);
-			}
-		}
+		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
 	}
 
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
@@ -629,23 +609,23 @@ export class FretService implements IFretService, Startable {
 					this.store.upsert(pid, coord);
 					await this.applyTouch(pid, coord);
 				} catch (err) {
-					console.warn('mergeAnnounceSnapshot: failed for', pid, err);
+					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
 				}
 			}
 			// merge bounded sample if present
 			for (const s of snap.sample ?? []) {
-					try {
+				try {
 					const coord = u8FromString(s.coord, 'base64url');
 					if (!this.store.getById(s.id)) discovered.push(s.id);
 					this.store.upsert(s.id, coord);
 					await this.applyTouch(s.id, coord);
-					} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
+				} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
 			}
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
 			if (discovered.length > 0) void this.announceToNewPeers(discovered);
 		} catch (err) {
-			console.warn('mergeAnnounceSnapshot failed for', from, err);
+			log.error('mergeAnnounceSnapshot failed for %s - %e', from, err);
 		}
 	}
 
@@ -788,13 +768,13 @@ export class FretService implements IFretService, Startable {
 					}
 				}
 				const capSample = this.cfg.profile === 'core' ? 8 : 6;
-		for (const s of (snap.sample ?? []).slice(0, capSample)) {
-			try {
+				for (const s of (snap.sample ?? []).slice(0, capSample)) {
+					try {
 						const coord = u8FromString(s.coord, 'base64url');
 						if (!this.store.getById(s.id)) announced.push(s.id);
 						this.store.upsert(s.id, coord);
 						await this.applyTouch(s.id, coord);
-				} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
+					} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
 				}
 			} catch (err) {
 				console.warn('fetchNeighbors failed for', id, err);
