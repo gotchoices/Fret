@@ -28,12 +28,11 @@ describe('Proactive announcements', function () {
 		// Wait for first stabilization + announce
 		await new Promise(r => setTimeout(r, 3000))
 
-		// All services should have sent at least one announcement
-		for (const svc of services) {
-			const diag = svc.getDiagnostics()
-			// After stabilization, announcements should have been attempted
-			expect(diag.announcementsSent + diag.announcementsSkipped).to.be.greaterThanOrEqual(0)
-		}
+		// All services should have attempted announcements after stabilization
+		const totalAttempted = services.reduce(
+			(sum, svc) => sum + svc.getDiagnostics().announcementsSent + svc.getDiagnostics().announcementsSkipped, 0
+		)
+		expect(totalAttempted).to.be.greaterThan(0)
 
 		await Promise.all(services.map(s => s.stop()))
 		await stopAll(nodes)

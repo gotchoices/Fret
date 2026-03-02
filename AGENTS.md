@@ -1,22 +1,31 @@
 ## General
 
-* Don't create useless summary documents, or make giant summaries to the user.  Keep the existing project documents up to date.
-* Comments should only be non-obvious, and should be timeless (no "added this", etc.)
-* Prefix with `_` for unused arguments.
-* Enclose `case` blocks in braces if any consts/variables introduced.
-* Prefix intentional calls to unused promises (micro-tasks) with `void`.
-* ES Modules
-* This project uses @.editorconfig.  Summary: Tab indentation,  Single quotes for strings.  Complete configuration in [.editorconfig](mdc:.editorconfig).
-* "satisfies" better than casting when possible
-* Don't use "any" lazily; only for dynamic typing.  Don't "monkey patch" attributes into objects; use proper types and interfaces.
-* Inline imports() only for dynamic loading
-* Avoid "swallowing" exceptions; exceptions should be exceptional - use results for expected conditions.
-* Prefer expressive over imperative.
-* Small, single-purpose functions/methods.  Decompose into separate functions over documented sub-sections - function names document the semantics.
-* We want to be platform agnostic (browser, node, RN, etc.) unless we're explicitly building something platform specific
+- Use lowercase SQL reserved words (e.g., `select * from Table`)
+- Don't use inline `import()` unless dynamically loading
+- Don't create summary documents; update existing documentation
+- Stay DRY
+- No lengthy summaries
+- Don't worry about backwards compatibility yet
+- Use yarn
+- Prefix unused arguments with `_`
+- Enclose `case` blocks in braces if any consts/variables
+- Prefix calls to unused promises (micro-tasks) with `void`
+- ES Modules
+- Don't be type lazy - avoid `any`
+- Don't eat exceptions w/o at least logging; exceptions should be exceptional - not control flow
+- Small, single-purpose functions/methods.  Decomposed sub-functions over grouped code sections
+- No half-baked janky parsers; use a full-fledged parser or better, brainstorm with the dev for another way
+- Think cross-platform (browser, node, RN, etc.)
+- .editorconfig contains formatting (tabs for code)
 
 ## Tasks
 
 - If the user mentions tasks (e.g. work task...), read @tasks/AGENTS.md to know what to do
 
 This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/fret.md to come up to speed - also maintain this document.
+
+## Tickets (tess)
+
+This project uses [tess](tess/) for AI-driven ticket management.
+Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
+Tickets are in the [tickets/](tickets/) directory.
