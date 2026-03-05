@@ -1,3 +1,58 @@
+## Project layout
+
+```
+Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
+├── docs/fret.md                   # Design document — keep up to date
+├── packages/fret/                 # Only package — workspace name: "p2p-fret"
+│   ├── register.mjs              # ESM loader hook for running TS directly
+│   ├── src/
+│   │   ├── service/fret-service.ts  # Main service (~1400 lines)
+│   │   ├── service/libp2p-fret-service.ts
+│   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
+│   │   ├── store/{digitree-store,relevance}.ts
+│   │   ├── ring/{distance,hash}.ts
+│   │   ├── rpc/{protocols,neighbors,maybe-act,leave,ping}.ts
+│   │   ├── selector/next-hop.ts
+│   │   ├── estimate/size-estimator.ts
+│   │   └── utils/token-bucket.ts
+│   └── test/
+│       ├── helpers/libp2p.ts      # In-memory libp2p node factory
+│       ├── simulation/            # Deterministic simulation harness
+│       └── *.spec.ts              # Mocha + Chai
+├── tess/                          # Git submodule — ticket tooling
+│   └── agent-rules/tickets.md    # Ticket workflow rules
+└── tickets/{plan,implement,review,blocked,complete}/
+```
+
+## Development quickstart
+
+**All commands run from `packages/fret/`** (or use `yarn <script>` from root which proxies there).
+
+| Action | Command |
+|---|---|
+| Type-check | `cd packages/fret && npx tsc --noEmit` |
+| Build | `cd packages/fret && yarn build` |
+| Run all tests | `cd packages/fret && yarn test` |
+| Run one test | `cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/<name>.spec.ts" --timeout 30000` |
+
+- **Workspace name**: `p2p-fret` (not `fret`, not `@nichetech/fret`)
+- **Test framework**: Mocha + Chai; tests are `*.spec.ts` (not `*.test.ts`)
+- **TS execution**: uses `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
+- **No root tsconfig** — always run `tsc` from `packages/fret/`
+- **Formatting**: tabs for indentation (see tsconfig and existing code)
+
+## Agent efficiency
+
+- **Read this file first** — the project layout and quickstart above answer most structural questions. Don't explore to discover what's already documented here.
+- When spawning sub-agents, pass them the relevant file paths from the tree above rather than letting them `find`/`ls`/`Glob` their way to discovery.
+- `fret-service.ts` is large (~1400 lines). Read targeted line ranges rather than the full file multiple times. Key regions:
+  - Constructor + profile config: lines ~1–150
+  - RPC handlers: lines ~300–600
+  - Stabilization: lines ~680–790
+  - Neighbor snapshot: lines ~790–950
+  - Iterative lookup: lines ~1200+
+- Run tests directly — don't guess at invocations. See the quickstart table above.
+
 ## General
 
 - Use lowercase SQL reserved words (e.g., `select * from Table`)
@@ -16,13 +71,13 @@
 - Small, single-purpose functions/methods.  Decomposed sub-functions over grouped code sections
 - No half-baked janky parsers; use a full-fledged parser or better, brainstorm with the dev for another way
 - Think cross-platform (browser, node, RN, etc.)
-- .editorconfig contains formatting (tabs for code)
+- Tabs for indentation; follow existing code style
 
 ## Tasks
 
 - If the user mentions tasks (e.g. work task...), read @tasks/AGENTS.md to know what to do
 
-This is an important system; write production-grade, maintainble, and expressive code that we don't have to revisit later.  Read @docs/fret.md to come up to speed - also maintain this document.
+This is an important system; write production-grade, maintainable, and expressive code that we don't have to revisit later.  Read @docs/fret.md to come up to speed — also maintain this document.
 
 ## Tickets (tess)
 
