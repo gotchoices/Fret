@@ -190,20 +190,46 @@ Notes:
   - Higher inbound concurrency; buffered backpressure with bounded queues
 
 ### Security and abuse considerations
+
+See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling and [threat-rir-mitigated.md](threat-rir-mitigated.md) for residual posture with Right-is-Right.
+
+#### Current state
+- Timestamp bounds (±5 min) for message freshness
+- Correlation ID dedup cache (30s TTL, 1024 entries) for maybeAct
+- Rate limiting via global token buckets (per-protocol, profile-tuned Edge/Core)
+- Breadcrumb loop detection and TTL limits on routing
+- Capacity-bounded routing table (C=2048) with relevance-based eviction
+
+#### Not yet implemented (planned — see tickets/)
 - Message authentication:
-  - All messages signed with sender's private key
-  - Correlation IDs prevent replay attacks
-  - Timestamp bounds (±5 min) for freshness
+  - Verify `from` field against transport-authenticated `connection.remotePeer` on all RPC handlers
+  - Sign all messages with sender's private key; verify on receipt
+  - Verify ring coordinates in sample entries (re-hash rather than trust provided coords)
+- Replay hardening:
+  - Align dedup TTL with timestamp window (tighten to ±30s)
+  - Cryptographically strong correlation IDs (`crypto.randomUUID`)
+  - Dedup protection for leave notices
+- Leave authentication:
+  - Require signature from departing peer
+  - Liveness ping before removal
+  - Treat suggested replacements as untrusted hints
+- Per-peer rate limiting alongside global buckets; rate limit inbound announce handler
+- Admission control (dual-path):
+  - Open path: density-based friction using consensus size estimate and regional peer counts
+  - Application-controlled path: `AdmissionPolicy` hook receives peer ID, credential (via metadata), connection origin (IP, relay status, full multiaddr); application returns admit/deny/default
+  - Enables flash-join use cases (e.g., voting) where credentialed peers bypass density friction while open-path peers face Sybil resistance
 - Sybil resistance:
-  - Proof-based validation failures whispered (validation via hooks)
-  - Gradual trust building through successful interactions
-  - Diversity requirements in cohort selection (IP ranges, AS numbers)
+  - Bounded gossip size consensus for network-wide density detection
+  - Constrained join with graduated resistance in over-populated ring regions
+  - Identity cost (PoW or similar) for open-path admission (design TBD)
 - Eclipse attack mitigation:
-  - Mandatory bootstrap verification through multiple paths
-  - Periodic random walks to discover new peers
+  - Periodic random walks to discover peers outside immediate neighborhood
+  - Multi-path bootstrap verification
   - Alert on sudden S/P set changes
-- Rate limiting and backpressure on neighbor snapshots and route.maybeAct payloads
-- Reputation exclusions locally enforced; evidence objects are signed and bounded
+- Cohort diversity requirements (IP range, AS number)
+- End-to-end payload encryption (activity readable only by target cluster, not forwarding hops)
+- Breadcrumb/routing metadata privacy (path obfuscation)
+- Reputation exclusions locally enforced; evidence objects signed and bounded
 
 ### Migration plan (high-level)
 1. Introduce FRET module (routing table, S/P/F management, stabilization loops).
@@ -457,5 +483,7 @@ After import, the normal stabilization loop probes restored peers to update conn
 ### Open questions / next steps
 - Exact relevance weight tuning based on network simulations
 - Optimal CBOR vs protobuf tradeoffs for different message types
-- Proof-of-work difficulty or stake requirements for Sybil resistance
+- Identity cost mechanism for open-path Sybil resistance (PoW difficulty, stake, or hybrid)
+- End-to-end payload encryption scheme compatible with progressive routing (cluster key agreement, onion encryption, or coordinator-targeted encryption with re-encryption on redirect)
+- VRF-based ring coordinate rotation (epoch nonce rotates positions, preventing permanent ID grinding)
 - Integration timeline with existing KadDHT-dependent code
