@@ -30,5 +30,28 @@ export class DeterministicRNG {
 		}
 		return copy
 	}
+
+	/** Box-Muller transform: returns a standard normal deviate (mean=0, stddev=1). */
+	nextGaussian(): number {
+		const u1 = this.next()
+		const u2 = this.next()
+		// Clamp u1 away from 0 to avoid log(0)
+		const safeU1 = Math.max(1e-10, u1)
+		return Math.sqrt(-2 * Math.log(safeU1)) * Math.cos(2 * Math.PI * u2)
+	}
+
+	/** Generate a random BigInt uniformly distributed in [0, 2^bits). */
+	nextBigInt(bits: number): bigint {
+		let result = 0n
+		let remaining = bits
+		while (remaining > 0) {
+			const chunk = Math.min(remaining, 30) // stay within safe integer range
+			const maxVal = 1 << chunk
+			const val = this.nextInt(0, maxVal)
+			result = (result << BigInt(chunk)) | BigInt(val)
+			remaining -= chunk
+		}
+		return result
+	}
 }
 

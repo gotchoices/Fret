@@ -21,6 +21,7 @@ export interface SimMetrics {
 	routingHops: number[]
 	routingSuccessRate: number
 	avgRoutingHops: number
+	messageDrops: number
 }
 
 export class MetricsCollector {
@@ -42,6 +43,7 @@ export class MetricsCollector {
 		routingHops: [],
 		routingSuccessRate: 0,
 		avgRoutingHops: 0,
+		messageDrops: 0,
 	}
 
 	private neighborCounts: number[] = []
@@ -83,6 +85,10 @@ export class MetricsCollector {
 
 	recordCoverage(time: number, coverage: number): void {
 		this.metrics.coverageTimeSeries.push({ time, coverage })
+	}
+
+	recordMessageDrop(): void {
+		this.metrics.messageDrops++
 	}
 
 	recordRoute(success: boolean, hops: number): void {

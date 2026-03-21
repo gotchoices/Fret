@@ -1,6 +1,7 @@
 import { DeterministicRNG } from './deterministic-rng.js'
 import { EventScheduler, type SimEvent } from './event-scheduler.js'
 import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
+import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
 import { DigitreeStore } from '../../src/store/digitree-store.js'
 
 export interface SimPeer {
@@ -11,6 +12,13 @@ export interface SimPeer {
 	neighbors: Set<string>
 }
 
+export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed'
+
+export interface ClusterConfig {
+	numClusters: number
+	spreadBits: number
+}
+
 export interface SimConfig {
 	seed: number
 	n: number // initial peers
@@ -19,6 +27,10 @@ export interface SimConfig {
 	churnRatePerSec: number // peers leaving/joining per second
 	stabilizationIntervalMs: number
 	durationMs: number
+	messageBus?: MessageBusConfig
+	placement?: PlacementStrategy
+	clusterConfig?: ClusterConfig
+	capacity?: number // max store entries per peer
 }
 
 export class FretSimulation {
@@ -28,7 +40,11 @@ export class FretSimulation {
 	private readonly config: SimConfig
 	private readonly peers = new Map<string, SimPeer>()
 	private readonly stores = new Map<string, DigitreeStore>()
+	private readonly bus: SimMessageBus | undefined
 	private nextPeerIndex: number
+
+	// Placement state for clustered mode
+	private clusterCenters: bigint[] | undefined
 
 	constructor(config: SimConfig) {
 		this.config = config
@@ -36,6 +52,17 @@ export class FretSimulation {
 		this.scheduler = new EventScheduler()
 		this.metrics = new MetricsCollector()
 		this.nextPeerIndex = config.n
+
+		if (config.messageBus) {
+			this.bus = new SimMessageBus(this.rng, config.messageBus, this.metrics)
+		}
+
+		if (config.placement === 'clustered' && config.clusterConfig) {
+			this.clusterCenters = []
+			for (let i = 0; i < config.clusterConfig.numClusters; i++) {
+				this.clusterCenters.push(this.rng.nextBigInt(256))
+			}
+		}
 	}
 
 	initialize(): void {
@@ -67,6 +94,25 @@ export class FretSimulation {
 
 	private createPeer(index: number): SimPeer {
 		const id = `peer-${index.toString().padStart(4, '0')}`
+		const coord = this.generateCoord(index)
+		return { id, coord, alive: true, connected: new Set(), neighbors: new Set() }
+	}
+
+	/** Generate a ring coordinate based on placement strategy. */
+	private generateCoord(index: number): Uint8Array {
+		const placement = this.config.placement ?? 'uniform'
+		switch (placement) {
+			case 'uniform':
+				return this.uniformCoord(index)
+			case 'clustered':
+				return this.clusteredCoord()
+			case 'skewed':
+				return this.skewedCoord()
+		}
+	}
+
+	/** Evenly spaced on the 256-bit ring. */
+	private uniformCoord(index: number): Uint8Array {
 		const coord = new Uint8Array(32)
 		const bigIndex = BigInt(index)
 		const range = (1n << 256n) / BigInt(Math.max(1, this.nextPeerIndex))
@@ -74,7 +120,33 @@ export class FretSimulation {
 		for (let i = 0; i < 32; i++) {
 			coord[31 - i] = Number((val >> BigInt(i * 8)) & 0xffn)
 		}
-		return { id, coord, alive: true, connected: new Set(), neighbors: new Set() }
+		return coord
+	}
+
+	/** Gaussian spread around cluster centers. */
+	private clusteredCoord(): Uint8Array {
+		const centers = this.clusterCenters!
+		const center = centers[this.rng.nextInt(0, centers.length)]!
+		const spreadBits = this.config.clusterConfig?.spreadBits ?? 32
+		const offset = BigInt(Math.round(this.rng.nextGaussian() * Number(1n << BigInt(spreadBits))))
+		const ringSize = 1n << 256n
+		// Wrap around ring
+		let val = (center + offset) % ringSize
+		if (val < 0n) val += ringSize
+		return bigintToCoord(val)
+	}
+
+	/** Power-law distribution — some ring regions are dense, most are sparse. */
+	private skewedCoord(): Uint8Array {
+		// Generate power-law via inverse transform: x = u^(1/(1-alpha)) mapped to ring
+		const u = this.rng.next()
+		const alpha = 2.0 // Pareto exponent
+		const pareto = Math.pow(u, 1 / (1 - alpha)) // values in [1, inf) concentrated near 1
+		// Normalize to [0, 1) and map to ring
+		const normalized = (pareto - 1) / pareto // concentrated near 0
+		const ringSize = 1n << 256n
+		const val = BigInt(Math.floor(normalized * Number(ringSize >> 128n))) << 128n
+		return bigintToCoord(val % ringSize)
 	}
 
 	private scheduleStabilization(): void {
@@ -150,6 +222,59 @@ export class FretSimulation {
 			case 'route':
 				if (evt.peerId && evt.targetCoord) this.handleRoute(evt.peerId, evt.targetCoord)
 				break
+			case 'message-deliver':
+				this.handleMessageDeliver()
+				break
+		}
+
+		// After any event, deliver pending bus messages
+		if (this.bus) {
+			this.deliverPendingMessages()
+		}
+	}
+
+	/** Deliver and process all bus messages ready at the current time. */
+	private deliverPendingMessages(): void {
+		if (!this.bus) return
+		const time = this.scheduler.getCurrentTime()
+		const messages = this.bus.deliver(time)
+		for (const msg of messages) {
+			this.processDeliveredMessage(msg)
+		}
+	}
+
+	/** Process a delivered message from the bus. */
+	private processDeliveredMessage(msg: SimMessage): void {
+		const peer = this.peers.get(msg.to)
+		if (!peer || !peer.alive) return
+
+		const store = this.stores.get(msg.to)
+		if (!store) return
+
+		switch (msg.type) {
+			case 'neighbor-response': {
+				// Payload is an array of { id, coord } entries to merge
+				const entries = msg.payload as Array<{ id: string; coord: Uint8Array }>
+				for (const entry of entries) {
+					const p = this.peers.get(entry.id)
+					if (p && p.alive) {
+						store.upsert(p.id, p.coord)
+					}
+				}
+				if (this.config.capacity) {
+					this.enforceCapacity(msg.to, store)
+				}
+				break
+			}
+			case 'leave-notice': {
+				const leavingId = msg.payload as string
+				store.remove(leavingId)
+				peer.connected.delete(leavingId)
+				peer.neighbors.delete(leavingId)
+				break
+			}
+			default:
+				break
 		}
 	}
 
@@ -168,6 +293,10 @@ export class FretSimulation {
 			peer.connected.add(other.id)
 			this.metrics.recordConnection()
 		}
+
+		if (this.config.capacity) {
+			this.enforceCapacity(peerId, store)
+		}
 	}
 
 	private handleLeave(peerId: string): void {
@@ -179,14 +308,25 @@ export class FretSimulation {
 		peer.neighbors.clear()
 		this.metrics.recordLeave()
 
-		// Remove departed peer from other peers' stores (simulates leave notification)
-		for (const [otherId, otherStore] of this.stores) {
-			if (otherId === peerId) continue
-			const otherPeer = this.peers.get(otherId)
-			if (!otherPeer || !otherPeer.alive) continue
-			otherStore.remove(peerId)
-			otherPeer.connected.delete(peerId)
-			otherPeer.neighbors.delete(peerId)
+		if (this.bus) {
+			// Send leave notices through the bus
+			const time = this.scheduler.getCurrentTime()
+			for (const [otherId, _otherStore] of this.stores) {
+				if (otherId === peerId) continue
+				const otherPeer = this.peers.get(otherId)
+				if (!otherPeer || !otherPeer.alive) continue
+				this.bus.send(peerId, otherId, 'leave-notice', peerId, time)
+			}
+		} else {
+			// Instant mode: directly remove from all stores
+			for (const [otherId, otherStore] of this.stores) {
+				if (otherId === peerId) continue
+				const otherPeer = this.peers.get(otherId)
+				if (!otherPeer || !otherPeer.alive) continue
+				otherStore.remove(peerId)
+				otherPeer.connected.delete(peerId)
+				otherPeer.neighbors.delete(peerId)
+			}
 		}
 	}
 
@@ -221,31 +361,12 @@ export class FretSimulation {
 			peer.neighbors = neighbors
 			this.metrics.recordNeighbors(neighbors.size)
 
-			// Exchange neighbor info with each neighbor (simulates snapshot exchange)
-			for (const nid of neighbors) {
-				const neighbor = this.peers.get(nid)
-				if (!neighbor || !neighbor.alive) continue
-
-				const nstore = this.stores.get(nid)
-				if (!nstore) continue
-
-				// Share S/P sets bidirectionally
-				const peerRight = store.neighborsRight(peer.coord, this.config.m)
-				const peerLeft = store.neighborsLeft(peer.coord, this.config.m)
-				const nRight = nstore.neighborsRight(neighbor.coord, this.config.m)
-				const nLeft = nstore.neighborsLeft(neighbor.coord, this.config.m)
-
-				// Merge neighbor's view into peer's store
-				for (const id of [...nRight, ...nLeft]) {
-					const p = this.peers.get(id)
-					if (p && p.alive) store.upsert(p.id, p.coord)
-				}
-
-				// Merge peer's view into neighbor's store
-				for (const id of [...peerRight, ...peerLeft]) {
-					const p = this.peers.get(id)
-					if (p && p.alive) nstore.upsert(p.id, p.coord)
-				}
+			if (this.bus) {
+				// Send neighbor snapshots through the bus
+				this.sendNeighborSnapshots(peer, store, neighbors, time)
+			} else {
+				// Instant mode: direct exchange
+				this.exchangeNeighborsDirect(peer, store, neighbors)
 			}
 
 			// Prune dead peers from store
@@ -254,11 +375,110 @@ export class FretSimulation {
 				const p = this.peers.get(entry.id)
 				if (!p || !p.alive) store.remove(entry.id)
 			}
+
+			// Enforce capacity
+			if (this.config.capacity) {
+				this.enforceCapacity(peer.id, store)
+			}
 		}
 
 		// Record coverage snapshot
 		const coverage = this.snapshotCoverage()
 		this.metrics.recordCoverage(time, coverage)
+	}
+
+	/** Send neighbor snapshots through the message bus. */
+	private sendNeighborSnapshots(
+		peer: SimPeer,
+		store: DigitreeStore,
+		neighbors: Set<string>,
+		time: number,
+	): void {
+		const peerRight = store.neighborsRight(peer.coord, this.config.m)
+		const peerLeft = store.neighborsLeft(peer.coord, this.config.m)
+		const myEntries = [...peerRight, ...peerLeft]
+			.filter((id) => {
+				const p = this.peers.get(id)
+				return p && p.alive
+			})
+			.map((id) => {
+				const p = this.peers.get(id)!
+				return { id: p.id, coord: p.coord }
+			})
+
+		for (const nid of neighbors) {
+			const neighbor = this.peers.get(nid)
+			if (!neighbor || !neighbor.alive) continue
+
+			// Send our neighbors to the neighbor
+			this.bus!.send(peer.id, nid, 'neighbor-response', myEntries, time)
+
+			// Also request their neighbors (they send back)
+			const nstore = this.stores.get(nid)
+			if (!nstore) continue
+			const nRight = nstore.neighborsRight(neighbor.coord, this.config.m)
+			const nLeft = nstore.neighborsLeft(neighbor.coord, this.config.m)
+			const theirEntries = [...nRight, ...nLeft]
+				.filter((id) => {
+					const p = this.peers.get(id)
+					return p && p.alive
+				})
+				.map((id) => {
+					const p = this.peers.get(id)!
+					return { id: p.id, coord: p.coord }
+				})
+			this.bus!.send(nid, peer.id, 'neighbor-response', theirEntries, time)
+		}
+	}
+
+	/** Direct (instant) neighbor exchange — original behavior. */
+	private exchangeNeighborsDirect(
+		peer: SimPeer,
+		store: DigitreeStore,
+		neighbors: Set<string>,
+	): void {
+		for (const nid of neighbors) {
+			const neighbor = this.peers.get(nid)
+			if (!neighbor || !neighbor.alive) continue
+
+			const nstore = this.stores.get(nid)
+			if (!nstore) continue
+
+			const peerRight = store.neighborsRight(peer.coord, this.config.m)
+			const peerLeft = store.neighborsLeft(peer.coord, this.config.m)
+			const nRight = nstore.neighborsRight(neighbor.coord, this.config.m)
+			const nLeft = nstore.neighborsLeft(neighbor.coord, this.config.m)
+
+			// Merge neighbor's view into peer's store
+			for (const id of [...nRight, ...nLeft]) {
+				const p = this.peers.get(id)
+				if (p && p.alive) store.upsert(p.id, p.coord)
+			}
+
+			// Merge peer's view into neighbor's store
+			for (const id of [...peerRight, ...peerLeft]) {
+				const p = this.peers.get(id)
+				if (p && p.alive) nstore.upsert(p.id, p.coord)
+			}
+
+			if (this.config.capacity) {
+				this.enforceCapacity(nid, nstore)
+			}
+		}
+	}
+
+	/** Enforce store capacity by evicting lowest-relevance entries. */
+	private enforceCapacity(peerId: string, store: DigitreeStore): void {
+		const cap = this.config.capacity!
+		while (store.size() > cap) {
+			const entries = store.list()
+			// Never evict self
+			const evictable = entries.filter((e) => e.id !== peerId)
+			if (evictable.length === 0) break
+			// Sort by relevance ascending; evict lowest
+			evictable.sort((a, b) => a.relevance - b.relevance)
+			store.remove(evictable[0]!.id)
+		}
 	}
 
 	private handleRoute(fromPeerId: string, targetCoord: Uint8Array): void {
@@ -312,6 +532,10 @@ export class FretSimulation {
 		}
 
 		this.metrics.recordRoute(false, hops)
+	}
+
+	private handleMessageDeliver(): void {
+		this.deliverPendingMessages()
 	}
 
 	snapshotCoverage(): number {
@@ -385,4 +609,19 @@ export class FretSimulation {
 	getStores(): ReadonlyMap<string, DigitreeStore> {
 		return this.stores
 	}
+
+	getBus(): SimMessageBus | undefined {
+		return this.bus
+	}
+}
+
+/** Convert a BigInt to a 32-byte Uint8Array (big-endian). */
+function bigintToCoord(val: bigint): Uint8Array {
+	const coord = new Uint8Array(32)
+	let v = val
+	for (let i = 31; i >= 0; i--) {
+		coord[i] = Number(v & 0xffn)
+		v >>= 8n
+	}
+	return coord
 }

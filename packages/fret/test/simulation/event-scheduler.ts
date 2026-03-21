@@ -1,6 +1,6 @@
 export type SimEvent = {
 	time: number
-	type: 'join' | 'leave' | 'connect' | 'disconnect' | 'stabilize' | 'route'
+	type: 'join' | 'leave' | 'connect' | 'disconnect' | 'stabilize' | 'route' | 'message-deliver'
 	peerId?: string
 	targetId?: string
 	targetCoord?: Uint8Array
