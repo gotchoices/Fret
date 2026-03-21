@@ -16,11 +16,13 @@
     "test": "cd packages/fret && yarn test",
     "format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
     "format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
+    "bump": "bumpp --recursive",
     "pub": "yarn pub:fret",
-    "pub:fret": "cd packages/fret && yarn clean && yarn build && npx bumpp --no-push --no-commit --no-tag --no-git-check -y && yarn npm publish --access public"
+    "pub:fret": "node scripts/publish-package.js fret"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
+    "bumpp": "^10.4.0",
     "prettier": "^3.6.2"
   }
 }
