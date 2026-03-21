@@ -4,12 +4,39 @@ import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
 import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
 import { DigitreeStore } from '../../src/store/digitree-store.js'
 
+export interface SimPeerConfig {
+	profile: 'edge' | 'core'
+	snapshotCap: { successors: number; predecessors: number; sample: number }
+	stabilizationIntervalMs: number
+	maxConnections: number
+}
+
+export const EDGE_PROFILE: SimPeerConfig = {
+	profile: 'edge',
+	snapshotCap: { successors: 6, predecessors: 6, sample: 6 },
+	stabilizationIntervalMs: 2000,
+	maxConnections: 4,
+}
+
+export const CORE_PROFILE: SimPeerConfig = {
+	profile: 'core',
+	snapshotCap: { successors: 12, predecessors: 12, sample: 8 },
+	stabilizationIntervalMs: 500,
+	maxConnections: 12,
+}
+
+export interface ProfileMix {
+	edge: number
+	core: number
+}
+
 export interface SimPeer {
 	id: string
 	coord: Uint8Array
 	alive: boolean
 	connected: Set<string>
 	neighbors: Set<string>
+	profileConfig: SimPeerConfig
 }
 
 export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed'
@@ -31,6 +58,7 @@ export interface SimConfig {
 	placement?: PlacementStrategy
 	clusterConfig?: ClusterConfig
 	capacity?: number // max store entries per peer
+	profileMix?: ProfileMix
 }
 
 export class FretSimulation {
@@ -42,6 +70,7 @@ export class FretSimulation {
 	private readonly stores = new Map<string, DigitreeStore>()
 	private readonly bus: SimMessageBus | undefined
 	private nextPeerIndex: number
+	private readonly lastStabilized = new Map<string, number>()
 
 	// Placement state for clustered mode
 	private clusterCenters: bigint[] | undefined
@@ -92,10 +121,19 @@ export class FretSimulation {
 		return peer
 	}
 
+	private assignProfile(): SimPeerConfig {
+		const mix = this.config.profileMix
+		if (!mix) return CORE_PROFILE
+		const total = mix.edge + mix.core
+		const edgeThreshold = mix.edge / total
+		return this.rng.next() < edgeThreshold ? EDGE_PROFILE : CORE_PROFILE
+	}
+
 	private createPeer(index: number): SimPeer {
 		const id = `peer-${index.toString().padStart(4, '0')}`
 		const coord = this.generateCoord(index)
-		return { id, coord, alive: true, connected: new Set(), neighbors: new Set() }
+		const profileConfig = this.assignProfile()
+		return { id, coord, alive: true, connected: new Set(), neighbors: new Set(), profileConfig }
 	}
 
 	/** Generate a ring coordinate based on placement strategy. */
@@ -150,7 +188,10 @@ export class FretSimulation {
 	}
 
 	private scheduleStabilization(): void {
-		const interval = this.config.stabilizationIntervalMs
+		// Use the fastest cadence among all profiles so no peer misses its window
+		const interval = this.config.profileMix
+			? Math.min(EDGE_PROFILE.stabilizationIntervalMs, CORE_PROFILE.stabilizationIntervalMs)
+			: this.config.stabilizationIntervalMs
 		for (let t = interval; t < this.config.durationMs; t += interval) {
 			this.scheduler.schedule({ type: 'stabilize' }, t)
 		}
@@ -285,9 +326,10 @@ export class FretSimulation {
 		const store = this.stores.get(peerId)
 		if (!store) return
 
+		const maxConn = peer.profileConfig.maxConnections
 		const alivePeers = Array.from(this.peers.values())
 			.filter((p) => p.id !== peerId && p.alive)
-		const sample = this.rng.shuffle(alivePeers).slice(0, Math.min(5, alivePeers.length))
+		const sample = this.rng.shuffle(alivePeers).slice(0, Math.min(maxConn, alivePeers.length))
 		for (const other of sample) {
 			store.upsert(other.id, other.coord)
 			peer.connected.add(other.id)
@@ -344,6 +386,13 @@ export class FretSimulation {
 		for (const peer of this.peers.values()) {
 			if (!peer.alive) continue
 
+			// Per-profile cadence gating: skip if this peer hasn't waited long enough
+			if (this.config.profileMix) {
+				const lastTime = this.lastStabilized.get(peer.id) ?? 0
+				if (time - lastTime < peer.profileConfig.stabilizationIntervalMs) continue
+			}
+			this.lastStabilized.set(peer.id, time)
+
 			const store = this.stores.get(peer.id)
 			if (!store) continue
 
@@ -387,16 +436,15 @@ export class FretSimulation {
 		this.metrics.recordCoverage(time, coverage)
 	}
 
-	/** Send neighbor snapshots through the message bus. */
-	private sendNeighborSnapshots(
+	/** Collect snapshot entries for a peer, respecting profile snapshot caps. */
+	private collectSnapshotEntries(
 		peer: SimPeer,
 		store: DigitreeStore,
-		neighbors: Set<string>,
-		time: number,
-	): void {
-		const peerRight = store.neighborsRight(peer.coord, this.config.m)
-		const peerLeft = store.neighborsLeft(peer.coord, this.config.m)
-		const myEntries = [...peerRight, ...peerLeft]
+	): Array<{ id: string; coord: Uint8Array }> {
+		const cap = peer.profileConfig.snapshotCap
+		const peerRight = store.neighborsRight(peer.coord, cap.successors)
+		const peerLeft = store.neighborsLeft(peer.coord, cap.predecessors)
+		return [...peerRight, ...peerLeft]
 			.filter((id) => {
 				const p = this.peers.get(id)
 				return p && p.alive
@@ -405,33 +453,33 @@ export class FretSimulation {
 				const p = this.peers.get(id)!
 				return { id: p.id, coord: p.coord }
 			})
+	}
+
+	/** Send neighbor snapshots through the message bus. */
+	private sendNeighborSnapshots(
+		peer: SimPeer,
+		_store: DigitreeStore,
+		neighbors: Set<string>,
+		time: number,
+	): void {
+		const myEntries = this.collectSnapshotEntries(peer, this.stores.get(peer.id)!)
 
 		for (const nid of neighbors) {
 			const neighbor = this.peers.get(nid)
 			if (!neighbor || !neighbor.alive) continue
 
-			// Send our neighbors to the neighbor
+			// Send our neighbors to the neighbor (capped by sender's profile)
 			this.bus!.send(peer.id, nid, 'neighbor-response', myEntries, time)
 
-			// Also request their neighbors (they send back)
+			// Also request their neighbors (they send back, capped by their profile)
 			const nstore = this.stores.get(nid)
 			if (!nstore) continue
-			const nRight = nstore.neighborsRight(neighbor.coord, this.config.m)
-			const nLeft = nstore.neighborsLeft(neighbor.coord, this.config.m)
-			const theirEntries = [...nRight, ...nLeft]
-				.filter((id) => {
-					const p = this.peers.get(id)
-					return p && p.alive
-				})
-				.map((id) => {
-					const p = this.peers.get(id)!
-					return { id: p.id, coord: p.coord }
-				})
+			const theirEntries = this.collectSnapshotEntries(neighbor, nstore)
 			this.bus!.send(nid, peer.id, 'neighbor-response', theirEntries, time)
 		}
 	}
 
-	/** Direct (instant) neighbor exchange — original behavior. */
+	/** Direct (instant) neighbor exchange — respects profile snapshot caps. */
 	private exchangeNeighborsDirect(
 		peer: SimPeer,
 		store: DigitreeStore,
@@ -444,10 +492,13 @@ export class FretSimulation {
 			const nstore = this.stores.get(nid)
 			if (!nstore) continue
 
-			const peerRight = store.neighborsRight(peer.coord, this.config.m)
-			const peerLeft = store.neighborsLeft(peer.coord, this.config.m)
-			const nRight = nstore.neighborsRight(neighbor.coord, this.config.m)
-			const nLeft = nstore.neighborsLeft(neighbor.coord, this.config.m)
+			const nCap = neighbor.profileConfig.snapshotCap
+			const nRight = nstore.neighborsRight(neighbor.coord, nCap.successors)
+			const nLeft = nstore.neighborsLeft(neighbor.coord, nCap.predecessors)
+
+			const pCap = peer.profileConfig.snapshotCap
+			const peerRight = store.neighborsRight(peer.coord, pCap.successors)
+			const peerLeft = store.neighborsLeft(peer.coord, pCap.predecessors)
 
 			// Merge neighbor's view into peer's store
 			for (const id of [...nRight, ...nLeft]) {
@@ -612,6 +663,10 @@ export class FretSimulation {
 
 	getBus(): SimMessageBus | undefined {
 		return this.bus
+	}
+
+	getConfig(): Readonly<SimConfig> {
+		return this.config
 	}
 }
 

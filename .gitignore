@@ -4,3 +4,4 @@ dist
 .yarnrc.yml
 
 tasks/.logs/
+packages/fret/test/simulation/output/
