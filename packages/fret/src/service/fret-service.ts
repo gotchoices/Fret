@@ -33,6 +33,7 @@ import { xorDistance } from '../ring/distance.js';
 import {
     createSparsityModel,
     normalizedLogDistance,
+    sparsityBonus,
     touch as scoreTouch,
     recordSuccess as scoreSuccess,
     recordFailure as scoreFailure,
@@ -48,6 +49,33 @@ function isBusy(res: unknown): res is BusyResponseV1 {
 
 interface WithPeerStore {
 	peerStore?: { getPeers?: () => Array<{ id: PeerId }> };
+}
+
+/**
+ * Select sample entries spread across diverse ring positions using sparsity-biased scoring.
+ * Excludes self and entries already in successors/predecessors (they're redundant).
+ */
+export function selectDiverseSample(
+	store: DigitreeStore,
+	selfCoord: Uint8Array,
+	sparsity: SparsityModel,
+	excludeIds: Set<string>,
+	cap: number,
+): Array<{ id: string; coord: string; relevance: number }> {
+	const entries = store.list();
+	const candidates: Array<{ entry: PeerEntry; bonus: number }> = [];
+	for (const entry of entries) {
+		if (excludeIds.has(entry.id)) continue;
+		const x = normalizedLogDistance(selfCoord, entry.coord);
+		const bonus = sparsityBonus(sparsity, x);
+		candidates.push({ entry, bonus });
+	}
+	candidates.sort((a, b) => b.bonus - a.bonus);
+	return candidates.slice(0, cap).map(({ entry }) => ({
+		id: entry.id,
+		coord: coordToBase64url(entry.coord),
+		relevance: entry.relevance,
+	}));
 }
 
 export class FretService implements IFretService, Startable {
@@ -621,6 +649,10 @@ export class FretService implements IFretService, Startable {
 					await this.applyTouch(s.id, coord);
 				} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
 			}
+			// Calibrate local size estimator from snapshot's estimate
+			if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
+				this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + from);
+			}
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
 			if (discovered.length > 0) void this.announceToNewPeers(discovered);
@@ -776,6 +808,10 @@ export class FretService implements IFretService, Startable {
 						await this.applyTouch(s.id, coord);
 					} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
 				}
+				// Calibrate local size estimator from snapshot's estimate
+				if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
+					this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + id);
+				}
 			} catch (err) {
 				console.warn('fetchNeighbors failed for', id, err);
 			}
@@ -796,12 +832,9 @@ export class FretService implements IFretService, Startable {
 		const rawPred = this.getNeighbors(selfCoord, 'left', this.cfg.m);
 		const successors = rawSucc.slice(0, capSucc);
 		const predecessors = rawPred.slice(0, capPred);
-		const sampleIds = Array.from(new Set([...successors.slice(0, 4), ...predecessors.slice(0, 4)])).slice(0, capSample);
-		const sample = await Promise.all(sampleIds.map(async (id) => {
-			const entry = this.store.getById(id);
-			if (!entry) return { id, coord: '', relevance: 0 } as { id: string; coord: string; relevance: number };
-			return { id, coord: coordToBase64url(entry.coord), relevance: entry.relevance } as { id: string; coord: string; relevance: number };
-		}));
+		const selfStr = this.node.peerId.toString();
+		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
+		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample);
 		return {
 			v: 1,
 			from: this.node.peerId.toString(),
