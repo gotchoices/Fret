@@ -30,6 +30,7 @@ import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
 import { DedupCache } from './dedup-cache.js';
 import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js';
 import { xorDistance } from '../ring/distance.js';
+import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import {
     createSparsityModel,
     normalizedLogDistance,
@@ -881,25 +882,7 @@ export class FretService implements IFretService, Startable {
 	}
 
 	assembleCohort(hashedCoord: Uint8Array, wants: number, exclude?: Set<string>): string[] {
-		const out: string[] = [];
-		const ex = exclude ?? new Set<string>();
-		const succIds = this.store.neighborsRight(hashedCoord, wants * 2);
-		const predIds = this.store.neighborsLeft(hashedCoord, wants * 2);
-		let si = 0,
-			pi = 0;
-		while (out.length < wants && (si < succIds.length || pi < predIds.length)) {
-			if (out.length % 2 === 0 && si < succIds.length) {
-				const id = succIds[si++];
-				if (id && !ex.has(id)) out.push(id);
-			} else if (pi < predIds.length) {
-				const id = predIds[pi++];
-				if (id && !ex.has(id)) out.push(id);
-			} else if (si < succIds.length) {
-				const id = succIds[si++];
-				if (id && !ex.has(id)) out.push(id);
-			}
-		}
-		return Array.from(new Set(out)).slice(0, wants);
+		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude);
 	}
 
 	expandCohort(
