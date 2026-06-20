@@ -1,6 +1,6 @@
 {
   "name": "fret-workspace",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "private": true,
   "type": "module",
   "packageManager": "yarn@4.12.0",
@@ -16,9 +16,13 @@
     "test": "cd packages/fret && yarn test",
     "format": "prettier --cache --log-level warn --write \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
     "format:check": "prettier --cache --log-level warn --check \"packages/fret/src/**/*.{ts,tsx,js,jsx}\"",
+    "typecheck": "cd packages/fret && npx tsc --noEmit",
+    "check": "yarn typecheck && yarn build && yarn test",
     "bump": "bumpp --recursive",
     "pub": "yarn pub:fret",
-    "pub:fret": "node scripts/publish-package.js fret"
+    "pub:fret": "node scripts/publish-package.js fret",
+    "gh-release": "node scripts/gh-release.js",
+    "release": "node -e \"console.log('\\n*** Releasing: typecheck + build + test, then bump, publish, GitHub release. Ctrl+C within 5s to abort. ***\\n');setTimeout(()=>{},5000)\" && yarn check && yarn bump && yarn pub && yarn gh-release"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",
