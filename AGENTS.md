@@ -34,12 +34,27 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 | Build | `cd packages/fret && yarn build` |
 | Run all tests | `cd packages/fret && yarn test` |
 | Run one test | `cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/<name>.spec.ts" --timeout 30000` |
+| Pre-release check | `yarn check` (typecheck + build + test, from root) |
+| Cut a release | `yarn release` (from root) |
 
 - **Workspace name**: `p2p-fret` (not `fret`, not `@nichetech/fret`)
 - **Test framework**: Mocha + Chai; tests are `*.spec.ts` (not `*.test.ts`)
 - **TS execution**: uses `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
 - **No root tsconfig** — always run `tsc` from `packages/fret/`
 - **Formatting**: tabs for indentation (see tsconfig and existing code)
+
+### Releasing
+
+`yarn release` (from root) runs the full flow: 5s abort window → `yarn check`
+(typecheck + build + test) → `yarn bump` (bumpp: pick version, commit, tag
+`v<version>`, push) → `yarn pub` (clean, build, `yarn npm publish`) →
+`yarn gh-release` (GitHub release for the new tag).
+
+- **Release notes**: drop an untracked `.release-notes.pending.md` at the repo
+  root to use as the release body; otherwise GitHub auto-generates notes. The
+  pending file is consumed (deleted) on success.
+- **Publish only** (no version bump / GitHub release): `yarn pub`.
+- **Prereqs**: authenticated `gh` CLI and npm publish rights for `p2p-fret`.
 
 ## Agent efficiency
 
