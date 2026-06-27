@@ -7,6 +7,7 @@ import {
 	encodeJson,
 	decodeJson,
 	readAllBounded,
+	openRpcStream,
 } from './protocols.js';
 import type { NeighborSnapshotV1, BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
@@ -51,14 +52,13 @@ export async function fetchNeighbors(
 	protocol = PROTOCOL_NEIGHBORS
 ): Promise<NeighborSnapshotV1> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const conns = node.getConnections(pid);
-	if (conns.length === 0) {
-		// No existing connection - skip to reduce churn
-		return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
-	}
 	let stream: Stream | undefined;
 	try {
-		stream = await conns[0].newStream([protocol]);
+		stream = await openRpcStream(node, pid, [protocol], { requireExisting: true });
+		if (stream == null) {
+			// No existing connection - skip to reduce churn
+			return { v: 1, from: peerIdOrStr, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
+		}
 		const bytes = await readAllBounded(stream, 128 * 1024);
 		const res = await decodeJson<NeighborSnapshotV1 | BusyResponseV1>(bytes);
 		if ('busy' in res && (res as BusyResponseV1).busy) {
@@ -82,13 +82,12 @@ export async function announceNeighbors(
 	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdOrStr);
-	const conns = node.getConnections(pid);
-	if (conns.length === 0) {
-		return; // skip if not connected
-	}
 	let stream: Stream | undefined;
 	try {
-		stream = await conns[0].newStream([protocol]);
+		stream = await openRpcStream(node, pid, [protocol], { requireExisting: true });
+		if (stream == null) {
+			return; // skip if not connected
+		}
 		stream.send(await encodeJson(snapshot));
 		await stream.close();
 	} catch (err) {

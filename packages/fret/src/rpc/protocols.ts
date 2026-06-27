@@ -1,3 +1,6 @@
+import type { Libp2p } from 'libp2p';
+import type { Connection, PeerId, Stream } from '@libp2p/interface';
+
 export function makeProtocols(networkName = 'default') {
 	const prefix = `/optimystic/${networkName}/fret/1.0.0`;
 	return {
@@ -85,4 +88,47 @@ export async function readAllBounded(
 
 export function validateTimestamp(ts: number, maxDriftMs = 300_000): boolean {
 	return Math.abs(Date.now() - ts) <= maxDriftMs;
+}
+
+/**
+ * True for a circuit-relay ("limited") connection. libp2p stamps a relayed
+ * connection with `limits` (per-circuit data/duration caps); we additionally
+ * sniff the multiaddr for `/p2p-circuit` as a fallback for transports/versions
+ * that don't populate `limits`.
+ */
+function isLimitedConnection(c: Connection): boolean {
+	if ((c as { limits?: unknown }).limits != null) return true;
+	const addr = c.remoteAddr?.toString?.();
+	return addr != null && addr.includes('/p2p-circuit');
+}
+
+/**
+ * Open an RPC stream to `pid`, preferring a DIRECT open connection and falling
+ * back to a limited (circuit-relay) one.
+ *
+ * `runOnLimitedConnection: true` is REQUIRED for the relayed path — libp2p
+ * rejects a stream over a limited connection without it — and is a harmless
+ * no-op on a direct connection. Preferring a direct connection avoids riding a
+ * circuit that the relay can reset once a per-circuit cap or reservation lapses
+ * (and which briefly coexists with the upgraded direct link after DCUtR).
+ *
+ * When `requireExisting` is set the caller skips dialing if no connection
+ * exists (neighbors fetch/announce reduce churn this way) and `undefined` is
+ * returned; otherwise we `dialProtocol`.
+ */
+export async function openRpcStream(
+	node: Libp2p,
+	pid: PeerId,
+	protocols: string[],
+	opts: { requireExisting?: boolean } = {}
+): Promise<Stream | undefined> {
+	const open = node.getConnections(pid)
+		.filter(c => c?.status === 'open' && typeof c?.newStream === 'function');
+	// Prefer a direct connection; fall back to the limited one only when it is
+	// the only open path (the steady state for browsers and NATed peers).
+	const chosen = open.find(c => !isLimitedConnection(c)) ?? open[0];
+	const streamOpts = { runOnLimitedConnection: true, negotiateFully: false } as const;
+	if (chosen) return chosen.newStream(protocols, streamOpts);
+	if (opts.requireExisting) return undefined;
+	return node.dialProtocol(pid, protocols, streamOpts);
 }

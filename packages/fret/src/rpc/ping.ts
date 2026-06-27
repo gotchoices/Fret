@@ -1,7 +1,7 @@
 import type { Libp2p } from 'libp2p';
 import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
-import { PROTOCOL_PING, encodeJson, decodeJson, readAllBounded } from './protocols.js';
+import { PROTOCOL_PING, encodeJson, decodeJson, readAllBounded, openRpcStream } from './protocols.js';
 import type { BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
 
@@ -57,13 +57,8 @@ export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_P
 	const pid = peerIdFromString(peer);
 	let stream: Stream | undefined;
 	try {
-		const conns = node.getConnections(pid);
-		if (conns.length > 0) {
-			stream = await conns[0].newStream([protocol]);
-		} else {
-			stream = await node.dialProtocol(pid, [protocol]);
-		}
-		const bytes = await readAllBounded(stream, 1024);
+		stream = await openRpcStream(node, pid, [protocol]);
+		const bytes = await readAllBounded(stream!, 1024);
 		const rttMs = Math.max(0, Date.now() - start);
 		if (bytes.length === 0) return { ok: false, rttMs };
 		try {
