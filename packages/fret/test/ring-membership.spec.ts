@@ -311,6 +311,86 @@ describe('Ring membership gating (member-scoped reads)', () => {
 	})
 })
 
+describe('Foreign re-probe backoff growth', function () {
+	this.timeout(10000)
+
+	let node: Libp2p
+	let svc: CoreFretService
+
+	afterEach(async () => {
+		try { await svc?.stop() } catch {}
+		try { await node?.stop() } catch {}
+	})
+
+	// A genuinely-foreign peer should be re-probed at a rate that decreases each window
+	// (doubling factor, capped at 32×), not at a fixed low rate. The bug was that
+	// `getBackoffPenalty` deleted the record on expiry, so `recordBackoff` always re-seeded
+	// factor=1 instead of doubling the prior factor.
+	it('backoff window grows on repeated confirmed-foreign probes', async () => {
+		node = await createMemNode()
+		await node.start()
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		await svc.start()
+
+		const bo = (svc as any).backoffMap as Map<string, { until: number; factor: number }>
+		const record = (id: string): void => (svc as any).recordBackoff(id)
+		const penalty = (id: string): number => (svc as any).getBackoffPenalty(id)
+
+		const id = 'peer-x'
+
+		// First probe: no prior entry → factor=1, window ~1 s.
+		record(id)
+		const firstEntry = bo.get(id)!
+		expect(firstEntry.factor).to.equal(1)
+
+		// Simulate the window expiring.
+		bo.set(id, { ...firstEntry, until: Date.now() - 1 })
+
+		// Eligibility check (penalty === 0) must NOT delete the entry.
+		expect(penalty(id)).to.equal(0)
+		expect(bo.has(id)).to.equal(true, 'expired entry must be retained for backoff growth')
+		expect(bo.get(id)!.factor).to.equal(1, 'factor must survive the expiry check')
+
+		// Second probe: existing factor=1 → factor doubles to 2.
+		record(id)
+		const secondEntry = bo.get(id)!
+		expect(secondEntry.factor).to.equal(2)
+		expect(secondEntry.until - Date.now()).to.be.greaterThan(
+			firstEntry.until - Date.now(),
+			'second backoff window must be strictly longer than the first'
+		)
+	})
+
+	it('backoff caps at factor 32 and prunes evicted peers', async () => {
+		node = await createMemNode()
+		await node.start()
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		await svc.start()
+
+		const bo = (svc as any).backoffMap as Map<string, { until: number; factor: number }>
+		const record = (id: string): void => (svc as any).recordBackoff(id)
+		const prune = (): void => (svc as any).pruneBackoffMap()
+
+		// Drive factor to cap: 1 → 2 → 4 → 8 → 16 → 32.
+		const id = 'peer-y'
+		record(id) // factor = 1
+		for (let i = 0; i < 5; i++) {
+			bo.set(id, { ...bo.get(id)!, until: Date.now() - 1 }) // simulate window expiry
+			record(id) // doubles the factor each iteration
+		}
+		expect(bo.get(id)!.factor).to.equal(32)
+
+		// A peer not in the store must be pruned from the backoff map.
+		const ghost = 'ghost-peer'
+		bo.set(ghost, { until: Date.now() + 60000, factor: 4 })
+		expect(bo.has(ghost)).to.equal(true)
+		prune()
+		expect(bo.has(ghost)).to.equal(false, 'evicted peer backoff entry must be pruned')
+		// peer-y was not in the store either (no upsert), also pruned
+		expect(bo.has(id)).to.equal(false, 'evicted peer-y entry must also be pruned')
+	})
+})
+
 describe('Ring membership classification (probe-based, no identify)', function () {
 	this.timeout(30000)
 

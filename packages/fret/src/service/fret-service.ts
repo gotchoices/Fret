@@ -977,6 +977,7 @@ export class FretService implements IFretService, Startable {
 	 * foreign peer is re-probed at most ~once per backoff window rather than every tick.
 	 */
 	private async reprobeForeignPeers(): Promise<void> {
+		this.pruneBackoffMap();
 		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 2 : 1;
 		const foreign = this.store.list().filter(
@@ -1017,11 +1018,8 @@ export class FretService implements IFretService, Startable {
 			if (isUnsupportedProtocolError(err)) {
 				// Confirmed foreign. Back off so the occasional foreign re-probe (which exists
 				// to recover a *mislabeled* same-network peer) does not hammer a genuinely-
-				// foreign peer that keeps returning this error.
-				// NOTE: this backoff does NOT currently grow across windows — reprobeForeignPeers
-				// only picks peers whose backoff has expired, and getBackoffPenalty deletes the
-				// record on expiry, so recordBackoff always re-seeds factor=1. Net throttle is a
-				// fixed ~1s window, not a taper. Tracked by debt-foreign-reprobe-backoff-growth.
+				// foreign peer that keeps returning this error. The backoff grows exponentially
+				// (factor doubles each window, up to 32×) so probing tapers toward ~once/32s.
 				this.markForeign(id);
 				this.recordBackoff(id);
 			} else {
@@ -1323,11 +1321,16 @@ export class FretService implements IFretService, Startable {
 	private getBackoffPenalty(id: string): number {
 		const bo = this.backoffMap.get(id);
 		if (!bo) return 0;
-		if (bo.until < Date.now()) {
-			this.backoffMap.delete(id);
-			return 0;
-		}
+		if (bo.until < Date.now()) return 0; // expired: retain entry so factor grows on the next recordBackoff
 		return Math.min(1, bo.factor / 32);
+	}
+
+	// Remove backoff entries for peers that have been evicted from the store; called
+	// once per stabilization tick so the map stays bounded by the store's capacity.
+	private pruneBackoffMap(): void {
+		for (const id of this.backoffMap.keys()) {
+			if (!this.store.getById(id)) this.backoffMap.delete(id);
+		}
 	}
 
 	report(_evt: ReportEvent): void {
