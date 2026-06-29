@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-06-29T14:37:01.077Z (agent: claude)
+  Log file: C:\projects\Fret\tickets\.logs\1-ring-membership-classification.review.2026-06-29T14-37-01-077Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: Each node now tags every peer it knows about as belonging to its own network, a different network, or not-yet-determined. This adds the label and the logic that fills it in; nothing reads the label for routing yet — that is the follow-on gating change.
 prereq:
 files:
