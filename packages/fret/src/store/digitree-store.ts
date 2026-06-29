@@ -160,10 +160,10 @@ export class DigitreeStore {
 		this.update(id, { membership });
 	}
 
-	protectedIdsAround(coord: Uint8Array, breadth: number): Set<string> {
+	protectedIdsAround(coord: Uint8Array, breadth: number, filter?: (e: PeerEntry) => boolean): Set<string> {
 		const ids = new Set<string>();
-		for (const id of this.neighborsRight(coord, breadth)) ids.add(id);
-		for (const id of this.neighborsLeft(coord, breadth)) ids.add(id);
+		for (const id of this.neighborsRight(coord, breadth, filter)) ids.add(id);
+		for (const id of this.neighborsLeft(coord, breadth, filter)) ids.add(id);
 		return ids;
 	}
 
@@ -183,55 +183,104 @@ export class DigitreeStore {
 		return p;
 	}
 
-	successorOfCoord(coord: Uint8Array): PeerEntry | undefined {
+	// The ordered-walk methods below take an optional `filter` predicate. The store stays
+	// network-agnostic — it never names `membership`; callers (e.g. ring gating in
+	// FretService) supply the predicate. When a filter is given the walk *skips and keeps
+	// advancing* on a miss rather than stopping, and a bounded-scan guard caps total
+	// entries visited at `size()` (one full traversal) so a ring with zero matching
+	// entries can't spin forever on the wrap-around. With no filter (the default) the
+	// behavior is byte-for-byte unchanged: simulator and direct-store callers are unaffected.
+	//
+	// NOTE: a filtered walk is worst-case O(size()) when matching entries are sparse near
+	// the coord (e.g. a large, mostly-foreign shared-infra ring) — it skip-scans past every
+	// non-match. Fine while rings are member-dominated; if a large mostly-foreign ring shows
+	// up as slow here, maintain a member-only secondary index and walk that instead of
+	// skip-scanning the full ordered index.
+
+	successorOfCoord(coord: Uint8Array, filter?: (e: PeerEntry) => boolean): PeerEntry | undefined {
 		const hex = coordToHex(coord);
-		const p = this.ceilPath(hex);
-		if (p.on) return this.byKey.at(p);
-		// if p is off-end, wrap to first
-		const f = this.byKey.first();
-		return f.on ? this.byKey.at(f) : undefined;
+		let p = this.ceilPath(hex);
+		p = p.on ? p : this.byKey.first();
+		if (!filter) return p.on ? this.byKey.at(p) : undefined;
+		const maxScan = this.size();
+		let scanned = 0;
+		while (scanned < maxScan) {
+			if (!p.on) {
+				p = this.byKey.first();
+				if (!p.on) return undefined;
+			}
+			const e = this.byKey.at(p)!;
+			scanned++;
+			if (filter(e)) return e;
+			p = this.byKey.next(p);
+		}
+		return undefined;
 	}
 
-	predecessorOfCoord(coord: Uint8Array): PeerEntry | undefined {
+	predecessorOfCoord(coord: Uint8Array, filter?: (e: PeerEntry) => boolean): PeerEntry | undefined {
 		const hex = coordToHex(coord);
-		const p = this.floorPath(hex);
-		if (p.on) return this.byKey.at(p);
-		const l = this.byKey.last();
-		return l.on ? this.byKey.at(l) : undefined;
+		let p = this.floorPath(hex);
+		p = p.on ? p : this.byKey.last();
+		if (!filter) return p.on ? this.byKey.at(p) : undefined;
+		const maxScan = this.size();
+		let scanned = 0;
+		while (scanned < maxScan) {
+			if (!p.on) {
+				p = this.byKey.last();
+				if (!p.on) return undefined;
+			}
+			const e = this.byKey.at(p)!;
+			scanned++;
+			if (filter(e)) return e;
+			p = this.byKey.prior(p);
+		}
+		return undefined;
 	}
 
-	neighborsRight(coord: Uint8Array, count: number): string[] {
+	neighborsRight(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
 		const out: string[] = [];
 		const hex = coordToHex(coord);
 		let p = this.ceilPath(hex);
 		p = p.on ? p : this.byKey.first();
+		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
 		let i = 0;
-		while (i < count) {
+		let scanned = 0;
+		while (i < count && scanned < maxScan) {
 			if (!p.on) {
 				p = this.byKey.first();
 				if (!p.on) break;
 			}
-			out.push(this.byKey.at(p)!.id);
+			const e = this.byKey.at(p)!;
+			scanned++;
+			if (!filter || filter(e)) {
+				out.push(e.id);
+				i++;
+			}
 			p = this.byKey.next(p);
-			i++;
 		}
 		return Array.from(new Set(out));
 	}
 
-	neighborsLeft(coord: Uint8Array, count: number): string[] {
+	neighborsLeft(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
 		const out: string[] = [];
 		const hex = coordToHex(coord);
 		let p = this.floorPath(hex);
 		p = p.on ? p : this.byKey.last();
+		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
 		let i = 0;
-		while (i < count) {
+		let scanned = 0;
+		while (i < count && scanned < maxScan) {
 			if (!p.on) {
 				p = this.byKey.last();
 				if (!p.on) break;
 			}
-			out.push(this.byKey.at(p)!.id);
+			const e = this.byKey.at(p)!;
+			scanned++;
+			if (!filter || filter(e)) {
+				out.push(e.id);
+				i++;
+			}
 			p = this.byKey.prior(p);
-			i++;
 		}
 		return Array.from(new Set(out));
 	}

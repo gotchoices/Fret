@@ -65,6 +65,7 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 - Recipients of leave notification immediately remove departing peer and probe suggested replacements
 
 ### Determining cluster membership and coordinator (two-sided cohort)
+- The cohort and its anchors are drawn only from same-network **members** (see *Network-scoped admission*): the alternating walk skips `foreign` / `unknown` entries, so a co-resident foreign network never contributes a cohort member, anchor, or coordinator for this network.
 - Two anchors: aSucc = successor(h); aPred = predecessor(h).
 - Cohort build (alternating two-sided): [aSucc, aPred, succ¹(aSucc), pred¹(aPred), …] until we collect min(k, n) unique peers, or satisfy a caller-provided wants ≤ k.
 - Local membership test: peer p locally computes the alternating two-sided cohort using its S/P index and checks if p is within the first k (or wants) entries.
@@ -114,6 +115,7 @@ Payload inclusion heuristic:
 - Cluster expansion compensates for excluded peers to maintain k where possible.
 
 ### Network size estimation
+- **Member-scoped.** The estimate counts only this network's members (`membership === 'member'`), so a co-resident foreign network sharing the transport cannot inflate `n_est` or the derived cluster span / near-radius. `estimateSizeAndConfidence` takes an optional member filter that `FretService` supplies; the exported standalone defaults to counting every entry, leaving the simulator unaffected.
 - Maintain online estimate (n_est, confidence ∈ [0,1]):
   - Arc length method: average gap between consecutive S/P members; n_est = 2^B / avg_gap
   - Finger sampling: probe random points, measure hop counts; use exponential decay model
@@ -129,7 +131,7 @@ Payload inclusion heuristic:
   - Near-radius r_near = β * cluster_span where β ∈ [1.5, 3]
 
 ### libp2p integration
-- Discovery: implement a libp2p peerDiscovery-compatible interface backed by FRET's Digitree. Emits peers from S/P/F (pruned, debounced).
+- Discovery: implement a libp2p peerDiscovery-compatible interface backed by FRET's Digitree. Emits peers from S/P/F (pruned, debounced). **Member-only**: both the periodic `FretPeerDiscovery.scan` and `FretService.emitDiscovered` emit only `member` peers, so a foreign peer is never surfaced to libp2p's discovery pipeline (which would re-seed it into selection upstream). `scan` re-scans the whole store each tick, so a peer is emitted as soon as the probe pass classifies it `member`.
 - Protocol IDs and message formats (length-prefixed UTF-8 JSON):
   - /fret/1.0.0/neighbors - JSON-encoded NeighborSnapshot
   - /fret/1.0.0/maybeAct - JSON-encoded RouteAndMaybeAct
@@ -159,11 +161,20 @@ How labels are resolved:
 - **Successful namespaced RPC → `member`.** Any completed ping / maybeAct over this network's protocols proves membership; normal traffic confirms members for free.
 - **Unsupported-protocol error → `foreign`.** libp2p throws `UnsupportedProtocolError` when the remote doesn't support the dialed protocol. This is distinguished from a timeout / transient failure (which leaves the peer `unknown` for a later retry) — only the explicit error demotes to `foreign`.
 - **peerStore protocols (when `identify` has run).** On `peer:identify` / `peer:update`, the peer's negotiated-protocol list is checked: contains one of ours → `member`; non-empty but contains none → `foreign`; empty → left `unknown`. This also delivers re-admission — a peer that later starts serving this network re-identifies and is re-evaluated `foreign → member`.
-- **Classification probe pass.** Because the gating work (see below) will exclude `unknown` peers from the ring, a bounded pass on each stabilization tick pings up to N `unknown` peers directly from the store (preferring connected / has-addresses ones) so an unclassified same-network peer is resolved within ~1 tick rather than starved. The pass runs only while unknowns exist; in single-network steady state every peer becomes `member` and it is a no-op.
+- **Classification probe pass.** Because the member-only ring views (below) exclude `unknown` peers, a bounded pass on each stabilization tick pings up to N `unknown` peers directly from the store (preferring connected / has-addresses ones) so an unclassified same-network peer is resolved within ~1 tick rather than starved. It reads the store directly, *not* the gated ring views, which is how it still sees unknowns. The pass runs only while unknowns exist; in single-network steady state every peer becomes `member` and it is a no-op.
+- **Foreign re-probe pass.** A smaller companion pass re-probes a couple of `foreign` peers per tick. Before the member-only ring views landed, a same-network peer that was *mislabeled* `foreign` (e.g. `identify` completed before it had registered our handlers) self-healed for free — `probeNeighborsLatency` pinged near ring peers regardless of label. Gating excludes foreign peers from the ring, closing that path, so this RPC backstop replaces it: a successful namespaced ping re-admits a mislabeled peer to `member`. It is self-limiting — a confirmed-foreign probe records a growing backoff, so a *genuinely* foreign peer is re-probed at most about once per backoff window, not every tick. (The `peer:update` identify path above also re-admits, but it is not guaranteed — it depends on the remote pushing an identify update — so the re-probe is the dependable path.)
 
 Labels are durable across the network-agnostic re-seeds (`upsert` preserves an existing entry's membership) and reversible in both directions (no state is permanent). Foreign peers are tagged and retained rather than evicted — an evicted foreign peer is just re-added by the next connect/seed and re-probed in a loop.
 
-The store only stores and exposes the label; **no read path consumes it for exclusion yet** — that gating (scoping ring/cohort/estimate to members) lands in a follow-on change, which will read membership via a caller-supplied predicate so direct store users (e.g. the simulator) stay unaffected.
+#### Network-scoped admission (member-only ring views)
+
+Every ring-shaped read is **member-only**: a peer participates in this network's ring only once its `membership` is `member`. Concretely, a peer that is `foreign` (or still `unknown`) is never a neighbor, cohort member, routing candidate, size-estimate contributor, snapshot sample entry, or discovery emission for this network. Self is seeded `member`, so it always participates; a single-node ring still self-reports a size estimate of 1.
+
+The gate is applied **inside the ordered ring walk**, not by post-filtering the result. `DigitreeStore`'s `neighborsRight` / `neighborsLeft` / `successorOfCoord` / `predecessorOfCoord` take an optional `filter` predicate; on a miss they **skip and keep advancing** rather than stopping, so a cluster of foreign peers sitting nearest a key cannot starve the cohort (the alternating walk over-fetches `wants * 2` and still collects `wants` members). A bounded-scan guard caps a filtered walk at one full traversal (`size()` entries) so a ring with zero matching entries terminates instead of spinning on the wrap-around. The store itself stays network-agnostic — it never names `membership`; `FretService` owns the predicate `e => e.membership === 'member'` and passes it. With no filter (the default) behavior is byte-for-byte unchanged, so direct store users (e.g. the design simulator) and the exported `assembleCohort` / `estimateSizeAndConfidence` / `selectDiverseSample` standalones are unaffected.
+
+`unknown` peers are excluded from the ring because they are not yet confirmed same-network. They are not starved: the classification probe pass (above) reads the store **directly** — not the gated ring views — so it still resolves them, typically promoting a same-network peer to `member` within ~1 tick, after which it appears in the ring. The outgoing snapshot's neighbor lists and sparsity sample are also member-scoped, so neighbor-exchange never re-introduces a foreign peer to same-network peers (the transitive-propagation guard); inbound merges still upsert received ids as `unknown` and let classification vet them before any ring use. Capacity eviction protects only member neighbors around self, so a foreign peer (relevance ~0) becomes a preferred eviction victim rather than squatting in a protected slot.
+
+In a single-network deployment every peer is `member` after warm-up, so member-scoping is a no-op on results — the only cost is the per-entry membership comparison while walking.
 
 ### Active vs passive state (network manager)
 - Passive: background stabilization at a modest cadence; only gentle maintenance (no aggressive dialing).

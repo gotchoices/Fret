@@ -53,8 +53,21 @@ interface WithPeerStore {
 }
 
 /**
+ * Ring views are scoped to this network: a peer participates in the ring (neighbor set,
+ * cohort, size estimate, sample, discovery) only once confirmed to serve this network's
+ * FRET protocol. Self is seeded `member`, so it always passes. `unknown` peers are excluded
+ * until the classification probe pass (see `classifyUnknownPeers`) resolves them — typically
+ * within ~1 tick — so they are not permanently starved.
+ */
+const isMember = (e: PeerEntry): boolean => e.membership === 'member';
+
+/**
  * Select sample entries spread across diverse ring positions using sparsity-biased scoring.
  * Excludes self and entries already in successors/predecessors (they're redundant).
+ *
+ * `filter` scopes the candidate set (FretService passes the member predicate so an outgoing
+ * snapshot never advertises a foreign peer to same-network neighbors). Defaults to no filter,
+ * leaving the exported standalone unchanged.
  */
 export function selectDiverseSample(
 	store: DigitreeStore,
@@ -62,6 +75,7 @@ export function selectDiverseSample(
 	sparsity: SparsityModel,
 	excludeIds: Set<string>,
 	cap: number,
+	filter?: (e: PeerEntry) => boolean,
 ): Array<{ id: string; coord: string; relevance: number }> {
 	// NOTE: scans + scores + sorts the entire store (bounded by capacity C, default 2048) on every
 	// snapshot build. Fine at current scale; if C grows or snapshots become hot, switch to a
@@ -70,6 +84,7 @@ export function selectDiverseSample(
 	const candidates: Array<{ entry: PeerEntry; bonus: number }> = [];
 	for (const entry of entries) {
 		if (excludeIds.has(entry.id)) continue;
+		if (filter && !filter(entry)) continue;
 		const x = normalizedLogDistance(selfCoord, entry.coord);
 		const bonus = sparsityBonus(sparsity, x);
 		candidates.push({ entry, bonus });
@@ -199,7 +214,10 @@ export class FretService implements IFretService, Startable {
 		// Protect immediate neighbors around self
 		const self = this.cachedSelfCoord;
 		if (!self) return;
-		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m));
+		// Protect only *member* neighbors around self (member-scoped walk). A foreign peer
+		// can no longer squat in a protected slot, so with relevance ~0 it becomes a
+		// preferred eviction victim — exactly what we want.
+		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isMember);
 		// Evict the lowest relevance non-protected entries until under cap
 		const entries = this.store.list();
 		entries.sort((a, b) => a.relevance - b.relevance);
@@ -512,9 +530,13 @@ export class FretService implements IFretService, Startable {
 		const fanout = maxCount ?? this.announceFanout;
 		const selfCoord = await hashPeerId(this.node.peerId);
 		const selfStr = this.node.peerId.toString();
+		// Announce *targets* walk the store unfiltered (member-scoped `getNeighbors` would drop
+		// a freshly-connected peer that is still `unknown`, stalling bootstrap before the probe
+		// pass can classify it). Only the snapshot *contents* are member-scoped. Matches the
+		// sibling maintenance walks (announceOnDeparture / sendLeaveToNeighbors / etc.).
 		const all = Array.from(new Set([
-			...this.getNeighbors(selfCoord, 'right', this.cfg.m),
-			...this.getNeighbors(selfCoord, 'left', this.cfg.m)
+			...this.store.neighborsRight(selfCoord, this.cfg.m),
+			...this.store.neighborsLeft(selfCoord, this.cfg.m)
 		])).filter((id) => id !== selfStr);
 		// Prefer non-connected peers (connected learn via normal exchange)
 		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
@@ -527,9 +549,11 @@ export class FretService implements IFretService, Startable {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
 			const selfStr = this.node.peerId.toString();
+			// Unfiltered store walk: preconnect/warm-up must reach not-yet-classified peers (a
+			// ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
 			const ids = Array.from(new Set([
-				...this.getNeighbors(selfCoord, 'right', Math.min(6, this.cfg.m)),
-				...this.getNeighbors(selfCoord, 'left', Math.min(6, this.cfg.m))
+				...this.store.neighborsRight(selfCoord, Math.min(6, this.cfg.m)),
+				...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
 			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
 				if (this.isConnected(id) || this.hasAddresses(id)) {
@@ -548,9 +572,10 @@ export class FretService implements IFretService, Startable {
 				const selfCoord = await this.selfCoord();
 				const selfStr = this.node.peerId.toString();
 				const budget = this.cfg.profile === 'core' ? 6 : 3;
+				// Unfiltered store walk (warm-up must reach unclassified peers; ring reads use getNeighbors).
 				const ids = Array.from(new Set([
-					...this.getNeighbors(selfCoord, 'right', Math.min(12, this.cfg.m)),
-					...this.getNeighbors(selfCoord, 'left', Math.min(12, this.cfg.m))
+					...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
+					...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
 				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
 					if (this.isConnected(id) || this.hasAddresses(id)) {
@@ -582,9 +607,11 @@ export class FretService implements IFretService, Startable {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
 			const selfStr = this.node.peerId.toString();
+			// Unfiltered store walk: leave notices go to all ring neighbors (matches handleLeave /
+			// computeReplacements). Ring reads elsewhere use member-scoped getNeighbors.
 			const ids = Array.from(new Set([
-				...this.getNeighbors(selfCoord, 'right', this.cfg.m),
-				...this.getNeighbors(selfCoord, 'left', this.cfg.m)
+				...this.store.neighborsRight(selfCoord, this.cfg.m),
+				...this.store.neighborsLeft(selfCoord, this.cfg.m)
 			])).filter((id) => id !== selfStr).slice(0, 8);
 			const spSet = new Set(ids);
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
@@ -871,6 +898,7 @@ export class FretService implements IFretService, Startable {
 		await this.probeNeighborsLatency(near.slice(0, 4));
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
 		await this.classifyUnknownPeers();
+		await this.reprobeForeignPeers();
 	}
 
 	private async probeNeighborsLatency(ids: string[]): Promise<void> {
@@ -920,12 +948,6 @@ export class FretService implements IFretService, Startable {
 		// NOTE: scans the whole store (O(table size)) every tick to find unknowns, even
 		// once steady state has none. Fine at C=2048; if capacity or tick rate grows a lot,
 		// track an unknown-count or unknown-id set so a no-op tick costs O(1).
-		// NOTE: this pass only re-probes `unknown` peers — never `foreign`. A same-network
-		// peer mislabeled foreign (e.g. identify completed before it registered our handlers)
-		// is re-admitted only via peer:update re-identify or a successful namespaced RPC.
-		// Self-heals today (probeNeighborsLatency still pings near peers regardless of label);
-		// once the gating follow-on excludes foreign from the ring, that RPC path closes —
-		// gating must add an occasional foreign re-probe or guarantee the peer:update path.
 		const unknown = this.store.list().filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && this.getBackoffPenalty(e.id) === 0
 		);
@@ -933,6 +955,37 @@ export class FretService implements IFretService, Startable {
 		// Only peers we can actually reach are probeable; prefer connected over has-addresses.
 		const connected = unknown.filter((e) => this.isConnected(e.id));
 		const reachable = unknown.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id));
+		const targets = [...connected, ...reachable].slice(0, budget);
+		for (const e of targets) {
+			if (this.stopped) break;
+			await this.probeMembership(e.id);
+		}
+	}
+
+	/**
+	 * Occasionally re-probe a few `foreign` peers so a same-network peer that was *mislabeled*
+	 * foreign (e.g. identify completed before the peer registered our protocol handlers) is
+	 * re-admitted via a successful namespaced ping. Before ring-membership gating this self-
+	 * healed for free — `probeNeighborsLatency` pinged near ring peers regardless of label —
+	 * but gating excludes foreign peers from the ring, closing that path. The `peer:update`
+	 * identify path also re-admits, but it is not guaranteed (it depends on the remote pushing
+	 * an identify update), so this RPC path is the backstop the gating work owes (per the
+	 * `ring-membership-classification` review tripwire).
+	 *
+	 * Bounded and self-limiting: only a couple of off-backoff foreign peers per tick, and a
+	 * confirmed-foreign probe records a growing backoff (see `probeMembership`), so a genuinely
+	 * foreign peer is re-probed at most ~once per backoff window rather than every tick.
+	 */
+	private async reprobeForeignPeers(): Promise<void> {
+		const selfStr = this.node.peerId.toString();
+		const budget = this.cfg.profile === 'core' ? 2 : 1;
+		const foreign = this.store.list().filter(
+			(e) => e.id !== selfStr && e.membership === 'foreign' && this.getBackoffPenalty(e.id) === 0
+		);
+		if (foreign.length === 0) return;
+		// Only reachable peers are probeable; prefer connected over has-addresses.
+		const connected = foreign.filter((e) => this.isConnected(e.id));
+		const reachable = foreign.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id));
 		const targets = [...connected, ...reachable].slice(0, budget);
 		for (const e of targets) {
 			if (this.stopped) break;
@@ -951,7 +1004,7 @@ export class FretService implements IFretService, Startable {
 			this.diag.pingsSent++;
 			if (res.ok) {
 				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
-				await this.applySuccess(id, coord, res.rttMs); // marks member
+				await this.applySuccess(id, coord, res.rttMs); // marks member (and clears backoff)
 				this.diag.pingsOk++;
 				this.clearBackoff(id);
 			} else {
@@ -962,7 +1015,11 @@ export class FretService implements IFretService, Startable {
 		} catch (err) {
 			this.diag.pingsFail++;
 			if (isUnsupportedProtocolError(err)) {
-				this.markForeign(id); // resolved — no backoff, no further probing needed
+				// Confirmed foreign. Back off (growing) so the occasional foreign re-probe
+				// below — which exists to recover a *mislabeled* same-network peer — does not
+				// hammer a genuinely-foreign peer that keeps returning this error.
+				this.markForeign(id);
+				this.recordBackoff(id);
 			} else {
 				this.recordBackoff(id); // timeout / transient — retry a later tick
 			}
@@ -1012,7 +1069,10 @@ export class FretService implements IFretService, Startable {
 	// Snapshots
 	private async snapshot(): Promise<NeighborSnapshotV1> {
 		const selfCoord = await hashPeerId(this.node.peerId);
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+		// Size estimate, neighbors, and sample are all member-scoped so the snapshot we
+		// advertise describes only this network — and never re-introduces a foreign peer to
+		// same-network neighbors via the sample (the transitive-propagation guard).
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -1022,7 +1082,7 @@ export class FretService implements IFretService, Startable {
 		const predecessors = rawPred.slice(0, capPred);
 		const selfStr = this.node.peerId.toString();
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
-		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample);
+		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isMember);
 		return {
 			v: 1,
 			from: this.node.peerId.toString(),
@@ -1052,10 +1112,13 @@ export class FretService implements IFretService, Startable {
 		wants: number
 	): string[] {
 		const ids: string[] = [];
+		// Member-scoped: foreign / unclassified peers are never neighbors, routing
+		// candidates, or cohort members for this network. The store walk skips non-members
+		// and keeps advancing, so a foreign cluster near the coord can't starve the result.
 		if (direction === 'right' || direction === 'both')
-			ids.push(...this.store.neighborsRight(hashedCoord, wants));
+			ids.push(...this.store.neighborsRight(hashedCoord, wants, isMember));
 		if (direction === 'left' || direction === 'both')
-			ids.push(...this.store.neighborsLeft(hashedCoord, wants));
+			ids.push(...this.store.neighborsLeft(hashedCoord, wants, isMember));
 		return Array.from(new Set(ids)).slice(0, wants);
 	}
 
@@ -1069,7 +1132,7 @@ export class FretService implements IFretService, Startable {
 	}
 
 	assembleCohort(hashedCoord: Uint8Array, wants: number, exclude?: Set<string>): string[] {
-		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude);
+		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude, isMember);
 	}
 
 	expandCohort(
@@ -1108,6 +1171,13 @@ export class FretService implements IFretService, Startable {
 		const target = this.node as unknown as { dispatchEvent?: (evt: Event) => void };
 		let emitted = 0;
 		for (const id of Array.from(new Set(ids))) {
+			// Member-scoped: never surface a foreign / unclassified peer to libp2p's discovery
+			// pipeline, which would re-seed it into selection upstream.
+			// NOTE: callers pass freshly-learned id deltas, so a same-network peer is usually
+			// still `unknown` here and is skipped on first sight; the durable emission path is
+			// FretPeerDiscovery.scan, which re-scans the whole store each tick and emits the
+			// peer once the classification probe promotes it to `member` (~1 tick later).
+			if (this.store.getById(id)?.membership !== 'member') continue;
 			const exp = this.announcedIds.get(id) ?? 0;
 			if (exp > now) continue;
 			if (!this.bucketDiscovery.tryTake()) break;
@@ -1144,7 +1214,7 @@ export class FretService implements IFretService, Startable {
 		const coord = await hashKey(keyBytes);
 		const selfId = this.node.peerId.toString();
 		const selfCoord = await this.selfCoord();
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 
 		// In-cluster test
 		const distIdx = this.neighborDistance(selfId, coord, Math.max(2, msg.want_k ?? this.cfg.k));
@@ -1286,8 +1356,9 @@ export class FretService implements IFretService, Startable {
 	 * Get enhanced network size estimate combining FRET's estimate with external observations
 	 */
 	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
-		// Get FRET's own estimate
-		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m);
+		// Get FRET's own estimate (member-scoped: a co-resident foreign network must not
+		// inflate this network's size estimate or the derived cluster span / near-radius).
+		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 
 		// Add FRET estimate as an observation
 		const now = Date.now();
@@ -1415,7 +1486,7 @@ export class FretService implements IFretService, Startable {
 		let bestAnchors: string[] = [];
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m);
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 
 			// Decide whether to include payload
 			const distToKey = xorDistance(selfCoord, coord);

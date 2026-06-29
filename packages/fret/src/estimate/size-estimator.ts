@@ -1,4 +1,4 @@
-import type { DigitreeStore } from '../store/digitree-store.js'
+import type { DigitreeStore, PeerEntry } from '../store/digitree-store.js'
 
 export type SizeEstimate = { n: number; confidence: number };
 
@@ -15,8 +15,14 @@ function medianBigInt(values: bigint[]): bigint {
 	return arr.length % 2 === 0 ? (arr[mid - 1]! + arr[mid]!) / 2n : arr[mid]!;
 }
 
-export function estimateSizeAndConfidence(store: DigitreeStore, m: number): SizeEstimate {
-	const peers = store.list();
+/**
+ * Online network-size estimate from inter-peer ring gaps. An optional `filter` scopes the
+ * estimate to a subset of the store (e.g. same-network members only) so foreign peers from
+ * a co-resident network can't inflate `n_est` and the derived cluster span / near-radius.
+ * Defaults to counting every entry, leaving the standalone/simulator path unchanged.
+ */
+export function estimateSizeAndConfidence(store: DigitreeStore, m: number, filter?: (e: PeerEntry) => boolean): SizeEstimate {
+	const peers = filter ? store.list().filter(filter) : store.list();
 	const count = peers.length;
 	if (count === 0) return { n: 0, confidence: 0 };
 	if (count === 1) return { n: 1, confidence: 0.2 };

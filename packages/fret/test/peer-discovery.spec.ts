@@ -8,10 +8,13 @@ import { createMemNode, stopAll } from './helpers/libp2p.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
 import type { Libp2p } from 'libp2p';
 
+// Discovery is now member-scoped: FretPeerDiscovery.scan only emits peers labeled `member`
+// (same-network). These fixtures represent confirmed same-network peers, so mark them member.
 function makeStore(ids: string[], coords: Uint8Array[]): DigitreeStore {
 	const store = new DigitreeStore();
 	for (let i = 0; i < ids.length; i++) {
 		store.upsert(ids[i]!, coords[i]!);
+		store.setMembership(ids[i]!, 'member');
 	}
 	return store;
 }
@@ -92,6 +95,31 @@ describe('FretPeerDiscovery', function () {
 		const emittedIds = peers.map(p => p.id.toString());
 		expect(emittedIds).to.include(ids[0]!);
 		expect(emittedIds).to.not.include(ids[1]!);
+	});
+
+	it('emits only member peers, never foreign ones', async () => {
+		const nodes = await Promise.all([createMemNode(), createMemNode()]);
+		await Promise.all(nodes.map(n => n.start()));
+
+		const ids = nodes.map(n => n.peerId.toString());
+		const coords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)));
+		const store = new DigitreeStore();
+		store.upsert(ids[0]!, coords[0]!); store.setMembership(ids[0]!, 'member');
+		store.upsert(ids[1]!, coords[1]!); store.setMembership(ids[1]!, 'foreign');
+
+		const disc = new FretPeerDiscovery(store, {
+			emissionIntervalMs: 200,
+			batchSize: 10,
+			debounceMs: 60_000,
+		});
+
+		const peers = await startAndCollect(disc, 500);
+		await disc.stop();
+		await stopAll(nodes);
+
+		const emittedIds = peers.map(p => p.id.toString());
+		expect(emittedIds).to.include(ids[0]!, 'member peer should be emitted');
+		expect(emittedIds).to.not.include(ids[1]!, 'foreign peer must never be emitted');
 	});
 
 	it('debounces: does not re-emit within debounce window', async () => {

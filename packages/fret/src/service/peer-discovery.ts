@@ -70,6 +70,10 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		for (const entry of this.store.list()) {
 			if (count >= this.batchSize) break;
 			if (entry.state === 'dead') continue;
+			// Member-scoped: only same-network peers are surfaced to libp2p's discovery
+			// pipeline. Unlike the delta-based FretService.emitDiscovered, this re-scans the
+			// whole store each tick, so a peer is emitted as soon as it is classified `member`.
+			if (entry.membership !== 'member') continue;
 			const prev = this.emitted.get(entry.id);
 			if (prev !== undefined && prev > now) continue;
 			try {
