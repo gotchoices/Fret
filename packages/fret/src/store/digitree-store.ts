@@ -3,12 +3,30 @@ import { coordToBase64url, base64urlToCoord } from '../ring/hash.js';
 
 export type PeerState = 'connected' | 'disconnected' | 'dead';
 
+/**
+ * Whether a known peer belongs to *this* node's FRET network.
+ *
+ * The routing store is populated from network-agnostic libp2p signals (peerStore,
+ * peer:connect, bootstraps, neighbor snapshots), so it can hold peers that share the
+ * transport but participate in a *different* control network and never serve this
+ * network's namespaced FRET protocols. This tri-state labels each peer accordingly.
+ *
+ * - `unknown`: freshly discovered, not yet classified (default on insert).
+ * - `member`: confirmed to serve this network's FRET protocol.
+ * - `foreign`: confirmed NOT to serve it (belongs to another network).
+ *
+ * The store only stores and exposes the label; it never branches on it. Callers
+ * (e.g. ring gating) read it via their own predicate.
+ */
+export type MembershipState = 'unknown' | 'member' | 'foreign';
+
 export interface PeerEntry {
 	id: string;
 	coord: Uint8Array;
 	relevance: number;
 	lastAccess: number;
 	state: PeerState;
+	membership: MembershipState;
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -22,6 +40,7 @@ export interface SerializedPeerEntry {
 	relevance: number;
 	lastAccess: number;
 	state: PeerState;
+	membership?: MembershipState; // optional for back-compat with older snapshots
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -64,9 +83,18 @@ export class DigitreeStore {
 	upsert(id: string, coord: Uint8Array): PeerEntry {
 		const now = Date.now();
 		const prevKey = this.byId.get(id);
+		// Membership is durable across re-inserts: upsert runs network-agnostically
+		// on every peerStore/connect/snapshot signal, so resetting it would wipe a
+		// hard-won classification every stabilization tick. Carry the prior label
+		// forward; new entries default to 'unknown'.
+		let membership: MembershipState = 'unknown';
 		if (prevKey) {
 			const path = this.byKey.find(prevKey);
-			if (path.on) this.byKey.deleteAt(path);
+			if (path.on) {
+				const prev = this.byKey.at(path);
+				if (prev) membership = prev.membership;
+				this.byKey.deleteAt(path);
+			}
 			this.byId.delete(id);
 		}
 		const entry: PeerEntry = {
@@ -75,6 +103,7 @@ export class DigitreeStore {
 			relevance: 0,
 			lastAccess: now,
 			state: 'disconnected',
+			membership,
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
@@ -125,6 +154,10 @@ export class DigitreeStore {
 
 	setState(id: string, state: PeerState): void {
 		this.update(id, { state });
+	}
+
+	setMembership(id: string, membership: MembershipState): void {
+		this.update(id, { membership });
 	}
 
 	protectedIdsAround(coord: Uint8Array, breadth: number): Set<string> {
@@ -210,6 +243,7 @@ export class DigitreeStore {
 			relevance: e.relevance,
 			lastAccess: e.lastAccess,
 			state: e.state,
+			membership: e.membership,
 			accessCount: e.accessCount,
 			successCount: e.successCount,
 			failureCount: e.failureCount,
@@ -228,6 +262,9 @@ export class DigitreeStore {
 				relevance: s.relevance,
 				lastAccess: s.lastAccess,
 				state: 'disconnected',
+				// A persisted table is same-network by construction; default a missing
+				// field to 'unknown' for back-compat with snapshots predating membership.
+				membership: s.membership ?? 'unknown',
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,

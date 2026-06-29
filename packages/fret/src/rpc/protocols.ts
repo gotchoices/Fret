@@ -19,6 +19,28 @@ export const PROTOCOL_MAYBE_ACT = '/optimystic/default/fret/1.0.0/maybeAct';
 export const PROTOCOL_LEAVE = '/optimystic/default/fret/1.0.0/leave';
 export const PROTOCOL_PING = '/optimystic/default/fret/1.0.0/ping';
 
+/**
+ * True when `err` is libp2p's protocol-negotiation failure — i.e. the remote does
+ * not support the dialed protocol. Thrown by `dialProtocol`/`newStream` (via
+ * multistream-select) as `UnsupportedProtocolError`.
+ *
+ * This is the definitive "foreign network" signal for namespaced FRET RPCs: it must
+ * be distinguished from a generic timeout / transient failure (which leaves a peer
+ * unclassified). Matches by `name` (modern libp2p) and `code` (legacy
+ * `ERR_UNSUPPORTED_PROTOCOL`), with a message-substring fallback.
+ */
+export function isUnsupportedProtocolError(err: unknown): boolean {
+	if (err == null || typeof err !== 'object') return false;
+	const e = err as { name?: unknown; code?: unknown; message?: unknown };
+	if (e.name === 'UnsupportedProtocolError') return true;
+	if (e.code === 'ERR_UNSUPPORTED_PROTOCOL') return true;
+	if (typeof e.message === 'string') {
+		const m = e.message.toLowerCase();
+		if (m.includes('could not negotiate') || m.includes('protocol selection failed')) return true;
+	}
+	return false;
+}
+
 export async function encodeJson(obj: unknown): Promise<Uint8Array> {
 	const text = JSON.stringify(obj);
 	return new TextEncoder().encode(text);

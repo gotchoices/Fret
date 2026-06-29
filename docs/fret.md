@@ -142,6 +142,29 @@ Payload inclusion heuristic:
   - Multiplexing: reuse streams for multiple requests where possible
   - Snapshot caps: successors/predecessors/sample are profile-bounded (Edge ≤ 6/6/6, Core ≤ 12/12/8)
 
+### Ring membership (same-network vs foreign)
+Every FRET RPC is namespaced by network: the wire protocols are `/optimystic/${networkName}/fret/1.0.0/{neighbors,maybeAct,leave,ping,...}`, so two services with different `networkName`s cannot negotiate each other's protocols. The routing table, however, is populated by network-agnostic libp2p signals (peerStore, `peer:connect`, bootstraps, neighbor snapshots). In a deployment where one libp2p node hosts several control networks over a shared transport, a peer that participates only in *another* network is, at the libp2p level, a fully-connected peer — admitted to the table but unable to serve this network's protocols.
+
+To distinguish these, each routing-table entry carries a tri-state `membership` label:
+
+- **`unknown`** — freshly discovered, not yet classified (the default on insert).
+- **`member`** — confirmed to serve this network's FRET protocol.
+- **`foreign`** — confirmed NOT to serve it (belongs to another network).
+
+The tri-state (rather than a boolean) keeps a same-network peer whose `identify` hasn't completed (legitimately `unknown`) distinct from a confirmed-foreign peer, so the former is never starved.
+
+How labels are resolved:
+
+- **Self** is always `member` (seeded at the self-upsert site).
+- **Successful namespaced RPC → `member`.** Any completed ping / maybeAct over this network's protocols proves membership; normal traffic confirms members for free.
+- **Unsupported-protocol error → `foreign`.** libp2p throws `UnsupportedProtocolError` when the remote doesn't support the dialed protocol. This is distinguished from a timeout / transient failure (which leaves the peer `unknown` for a later retry) — only the explicit error demotes to `foreign`.
+- **peerStore protocols (when `identify` has run).** On `peer:identify` / `peer:update`, the peer's negotiated-protocol list is checked: contains one of ours → `member`; non-empty but contains none → `foreign`; empty → left `unknown`. This also delivers re-admission — a peer that later starts serving this network re-identifies and is re-evaluated `foreign → member`.
+- **Classification probe pass.** Because the gating work (see below) will exclude `unknown` peers from the ring, a bounded pass on each stabilization tick pings up to N `unknown` peers directly from the store (preferring connected / has-addresses ones) so an unclassified same-network peer is resolved within ~1 tick rather than starved. The pass runs only while unknowns exist; in single-network steady state every peer becomes `member` and it is a no-op.
+
+Labels are durable across the network-agnostic re-seeds (`upsert` preserves an existing entry's membership) and reversible in both directions (no state is permanent). Foreign peers are tagged and retained rather than evicted — an evicted foreign peer is just re-added by the next connect/seed and re-probed in a loop.
+
+The store only stores and exposes the label; **no read path consumes it for exclusion yet** — that gating (scoping ring/cohort/estimate to members) lands in a follow-on change, which will read membership via a caller-supplied predicate so direct store users (e.g. the simulator) stay unaffected.
+
 ### Active vs passive state (network manager)
 - Passive: background stabilization at a modest cadence; only gentle maintenance (no aggressive dialing).
 - Active (connection warm-up; refcount-based): when an operation starts, enter active mode to avoid serial dial chains:
@@ -424,6 +447,7 @@ interface SerializedPeerEntry {
   relevance: number;            // float score at time of export
   lastAccess: number;           // unix ms
   state: PeerState;             // 'connected' | 'disconnected' | 'dead'
+  membership?: MembershipState; // 'unknown' | 'member' | 'foreign'; absent in pre-membership snapshots → 'unknown'
   accessCount: number;
   successCount: number;
   failureCount: number;
@@ -443,7 +467,7 @@ interface SerializedTable {
 FRET's routing table (Digitree store) is in-memory by default. The `exportTable` / `importTable` API allows callers to snapshot and restore the full routing table across restarts, avoiding cold-start bootstrap latency.
 
 - **Export**: `exportTable()` returns a `SerializedTable` containing every peer entry in the Digitree, with `Uint8Array` coordinates encoded as base64url strings. The envelope includes the exporter's peer ID and a timestamp.
-- **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
+- **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Membership labels are preserved (a persisted table is same-network by construction); a missing `membership` field in an older snapshot defaults to `'unknown'`. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
 - **Persistence layer is external**: FRET only handles serialization/deserialization. The caller decides where and how to store the JSON (filesystem, IndexedDB, database, etc.).
 - **JSON-safe**: The `SerializedTable` structure is fully JSON-serializable and survives `JSON.stringify` / `JSON.parse` round-trips.
 

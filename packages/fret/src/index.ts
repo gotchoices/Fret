@@ -129,7 +129,7 @@ export { hashKey, hashPeerId } from './ring/hash.js';
 export type { RingCoord } from './ring/hash.js';
 export { xorDistance, clockwiseDistance, minDistance, lexLess } from './ring/distance.js';
 export { DigitreeStore } from './store/digitree-store.js';
-export type { PeerEntry, PeerState } from './store/digitree-store.js';
+export type { PeerEntry, PeerState, MembershipState } from './store/digitree-store.js';
 export { estimateSizeAndConfidence } from './estimate/size-estimator.js';
 export type { SizeEstimate } from './estimate/size-estimator.js';
 export { assembleCohort } from './service/cohort.js';

@@ -16,7 +16,7 @@ import type {
 import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
-import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
+import { makeProtocols, validateTimestamp, isUnsupportedProtocolError } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
@@ -225,11 +225,15 @@ export class FretService implements IFretService, Startable {
 		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
 		const x = normalizedLogDistance(await this.selfCoord(), coord);
 		const next = scoreSuccess(entry, latencyMs, x, this.sparsity);
+		// Every applySuccess call in this service follows a completed RPC over this
+		// network's namespaced protocol (ping or maybeAct), which proves the peer
+		// serves this network → confirm membership for free off normal traffic.
 		this.store.update(id, {
 			lastAccess: next.lastAccess,
 			relevance: next.relevance,
 			successCount: next.successCount,
-			avgLatencyMs: next.avgLatencyMs
+			avgLatencyMs: next.avgLatencyMs,
+			membership: 'member'
 		});
 	}
 
@@ -242,6 +246,48 @@ export class FretService implements IFretService, Startable {
 			relevance: next.relevance,
 			failureCount: next.failureCount
 		});
+	}
+
+	/** Confirm `id` serves this network (idempotent; no-op if absent or already member). */
+	private markMember(id: string): void {
+		const e = this.store.getById(id);
+		if (e && e.membership !== 'member') this.store.setMembership(id, 'member');
+	}
+
+	/**
+	 * Confirm `id` does NOT serve this network (idempotent). Foreign is reversible —
+	 * a later successful namespaced RPC or re-identify promotes it back to member.
+	 * We tag and retain rather than evict: an evicted foreign peer is just re-added by
+	 * the next peer:connect/peerStore seed and re-probed in a loop.
+	 */
+	private markForeign(id: string): void {
+		const e = this.store.getById(id);
+		if (e && e.membership !== 'foreign') this.store.setMembership(id, 'foreign');
+	}
+
+	/**
+	 * Classify `id` from a libp2p-reported protocol list (available once identify has
+	 * run). Member if any of our namespaced protocols appears; foreign if the list is
+	 * non-empty but contains none of them; left unknown if empty (identify pending).
+	 */
+	private classifyByProtocols(id: string, protocols: string[] | undefined): void {
+		if (!protocols || protocols.length === 0) return; // identify not complete → stay unknown
+		const mine = Object.values(this.protocols);
+		if (protocols.some((p) => mine.includes(p))) this.markMember(id);
+		else this.markForeign(id);
+	}
+
+	/** Opportunistic classification via the peerStore's negotiated-protocol list. */
+	private async classifyFromPeerStore(id: string): Promise<void> {
+		try {
+			const peerStore = (this.node as unknown as { peerStore?: { get?: (pid: PeerId) => Promise<{ protocols?: string[] }> } }).peerStore;
+			if (!peerStore?.get) return;
+			let record: { protocols?: string[] } | undefined;
+			try { record = await peerStore.get(peerIdFromString(id)); } catch { return; } // not in peerStore yet
+			this.classifyByProtocols(id, record?.protocols);
+		} catch (err) {
+			log.error('classifyFromPeerStore failed for %s - %e', id, err);
+		}
 	}
 
 	async start(): Promise<void> {
@@ -284,6 +330,33 @@ export class FretService implements IFretService, Startable {
 					void this.announceOnDeparture(id, coord);
 				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
+		});
+		// identify-driven membership: once libp2p learns a peer's negotiated protocols
+		// it can classify without an outbound probe. peer:update also delivers
+		// re-admission — a peer that later starts serving this network re-identifies
+		// and is re-evaluated foreign → member. (No-op on transports without identify,
+		// e.g. the in-memory test nodes; those rely on the probe pass.)
+		this.addNodeListener('peer:identify', async (evt: any) => {
+			try {
+				if (this.stopped) return;
+				const pid: PeerId | undefined = evt?.detail?.peerId;
+				const id = pid?.toString?.();
+				if (!id) return;
+				// Ensure an entry exists to label, but don't reset an existing one.
+				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
+				this.classifyByProtocols(id, evt?.detail?.protocols);
+			} catch (err) { log.error('peer:identify handler failed - %e', err) }
+		});
+		this.addNodeListener('peer:update', async (evt: any) => {
+			try {
+				if (this.stopped) return;
+				const peer = evt?.detail?.peer;
+				const pid: PeerId | undefined = peer?.id;
+				const id = pid?.toString?.();
+				if (!id) return;
+				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
+				this.classifyByProtocols(id, peer?.protocols);
+			} catch (err) { log.error('peer:update handler failed - %e', err) }
 		});
 	}
 
@@ -711,6 +784,11 @@ export class FretService implements IFretService, Startable {
 					const pidStr = p.id.toString();
 					if (!this.store.getById(pidStr)) discovered.push(pidStr);
 					this.store.upsert(pidStr, coord);
+					// If identify has populated the peerStore, classify off its protocol
+					// list now rather than waiting for an outbound probe.
+					if (this.store.getById(pidStr)?.membership === 'unknown') {
+						await this.classifyFromPeerStore(pidStr);
+					}
 				} catch (err) {
 					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
 				}
@@ -720,6 +798,8 @@ export class FretService implements IFretService, Startable {
 				const selfStr = this.node.peerId.toString();
 				if (!this.store.getById(selfStr)) discovered.push(selfStr);
 				this.store.upsert(selfStr, coord);
+				// Self always serves its own network.
+				this.store.setMembership(selfStr, 'member');
 			} catch (err) {
 				console.error('failed to add self to store', err);
 			}
@@ -790,6 +870,7 @@ export class FretService implements IFretService, Startable {
 		const near = nearAll.filter((id) => id !== selfStr && (this.isConnected(id) || this.hasAddresses(id)));
 		await this.probeNeighborsLatency(near.slice(0, 4));
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
+		await this.classifyUnknownPeers();
 	}
 
 	private async probeNeighborsLatency(ids: string[]): Promise<void> {
@@ -810,10 +891,71 @@ export class FretService implements IFretService, Startable {
 				// benign during churn - do not warn each tick
 				// console.warn('ping failed for', id, err);
 				try {
+					// An explicit unsupported-protocol error is definitive: the peer is
+					// reachable but does not serve this network → foreign. A timeout /
+					// transient error is NOT — leave the peer unclassified for a later tick.
+					if (isUnsupportedProtocolError(err)) this.markForeign(id);
 					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 					await this.applyFailure(id, coord);
 					this.diag.pingsFail++;
 				} catch {}
+			}
+		}
+	}
+
+	/**
+	 * Bounded classification probe pass over `unknown` peers.
+	 *
+	 * Normal traffic only touches peers the ring already selects, but the follow-on
+	 * gating work will exclude `unknown` peers from the ring — so without a dedicated
+	 * pass an unknown same-network peer would never be selected, never probed, and be
+	 * permanently starved. This iterates unknowns directly from the store (not through
+	 * ring views), prefers connected / has-addresses ones, and sends a namespaced ping
+	 * to at most N per tick. It runs only while unknowns exist; in single-network
+	 * steady state every peer becomes member and this is a no-op (no extra traffic).
+	 */
+	private async classifyUnknownPeers(): Promise<void> {
+		const selfStr = this.node.peerId.toString();
+		const budget = this.cfg.profile === 'core' ? 8 : 4;
+		const unknown = this.store.list().filter(
+			(e) => e.id !== selfStr && e.membership === 'unknown' && this.getBackoffPenalty(e.id) === 0
+		);
+		if (unknown.length === 0) return;
+		// Only peers we can actually reach are probeable; prefer connected over has-addresses.
+		const connected = unknown.filter((e) => this.isConnected(e.id));
+		const reachable = unknown.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id));
+		const targets = [...connected, ...reachable].slice(0, budget);
+		for (const e of targets) {
+			if (this.stopped) break;
+			await this.probeMembership(e.id);
+		}
+	}
+
+	/**
+	 * Probe a single peer's membership with a namespaced ping. Success → member;
+	 * unsupported-protocol → foreign; timeout / transient → stay unknown but back off
+	 * so we don't hammer an unreachable-but-connected peer every tick.
+	 */
+	private async probeMembership(id: string): Promise<void> {
+		try {
+			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
+			this.diag.pingsSent++;
+			if (res.ok) {
+				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+				await this.applySuccess(id, coord, res.rttMs); // marks member
+				this.diag.pingsOk++;
+				this.clearBackoff(id);
+			} else {
+				// empty/busy reply — ambiguous; leave unknown and back off briefly.
+				this.diag.pingsFail++;
+				this.recordBackoff(id);
+			}
+		} catch (err) {
+			this.diag.pingsFail++;
+			if (isUnsupportedProtocolError(err)) {
+				this.markForeign(id); // resolved — no backoff, no further probing needed
+			} else {
+				this.recordBackoff(id); // timeout / transient — retry a later tick
 			}
 		}
 	}
@@ -1044,6 +1186,8 @@ export class FretService implements IFretService, Startable {
 					}
 				} catch (err) {
 					log.error('forward maybeAct failed to %s - %e', next, err);
+					// Unsupported-protocol means this hop belongs to another network.
+					if (isUnsupportedProtocolError(err)) this.markForeign(next);
 					this.recordBackoff(next);
 				}
 			}

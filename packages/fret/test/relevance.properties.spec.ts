@@ -22,6 +22,7 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		relevance: 0,
 		lastAccess: Date.now(),
 		state: 'connected',
+		membership: 'unknown',
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,
