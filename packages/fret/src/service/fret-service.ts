@@ -1015,9 +1015,13 @@ export class FretService implements IFretService, Startable {
 		} catch (err) {
 			this.diag.pingsFail++;
 			if (isUnsupportedProtocolError(err)) {
-				// Confirmed foreign. Back off (growing) so the occasional foreign re-probe
-				// below — which exists to recover a *mislabeled* same-network peer — does not
-				// hammer a genuinely-foreign peer that keeps returning this error.
+				// Confirmed foreign. Back off so the occasional foreign re-probe (which exists
+				// to recover a *mislabeled* same-network peer) does not hammer a genuinely-
+				// foreign peer that keeps returning this error.
+				// NOTE: this backoff does NOT currently grow across windows — reprobeForeignPeers
+				// only picks peers whose backoff has expired, and getBackoffPenalty deletes the
+				// record on expiry, so recordBackoff always re-seeds factor=1. Net throttle is a
+				// fixed ~1s window, not a taper. Tracked by debt-foreign-reprobe-backoff-growth.
 				this.markForeign(id);
 				this.recordBackoff(id);
 			} else {
