@@ -4,6 +4,7 @@ import { yamux } from '@chainsafe/libp2p-yamux'
 import { tcp } from '@libp2p/tcp'
 import { memory } from '@libp2p/memory'
 import { plaintext } from '@libp2p/plaintext'
+import { identify, identifyPush } from '@libp2p/identify'
 
 let memAddrCounter = 0
 
@@ -24,6 +25,30 @@ export async function createMemNode(addr?: string): Promise<Libp2p> {
 		transports: [memory()],
 		connectionEncrypters: [plaintext()],
 		streamMuxers: [yamux()]
+	})
+	return node
+}
+
+/**
+ * TCP node with libp2p's `identify` + `identifyPush` services enabled.
+ *
+ * Unlike {@link createMemNode} (memory transport, no identify), connecting two of these
+ * exchanges each peer's negotiated-protocol list and populates the peerStore — and
+ * `identifyPush` propagates later protocol changes. Those are exactly the libp2p signals
+ * FRET's membership classification reads on `peer:identify` / `peer:update` and in
+ * `classifyFromPeerStore`, so this factory is required to exercise the identify-driven
+ * classification path end-to-end (the in-memory nodes never fire it).
+ */
+export async function createIdentifyNode(): Promise<Libp2p> {
+	const node = await createLibp2p({
+		addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
+		transports: [tcp()],
+		connectionEncrypters: [noise()],
+		streamMuxers: [yamux()],
+		services: {
+			identify: identify(),
+			identifyPush: identifyPush()
+		}
 	})
 	return node
 }

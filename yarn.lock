@@ -147,6 +147,28 @@ __metadata:
   languageName: node
   linkType: hard
 
+"@libp2p/identify@npm:4.0.10":
+  version: 4.0.10
+  resolution: "@libp2p/identify@npm:4.0.10"
+  dependencies:
+    "@libp2p/crypto": "npm:^5.1.13"
+    "@libp2p/interface": "npm:^3.1.0"
+    "@libp2p/interface-internal": "npm:^3.0.10"
+    "@libp2p/peer-id": "npm:^6.0.4"
+    "@libp2p/peer-record": "npm:^9.0.5"
+    "@libp2p/utils": "npm:^7.0.10"
+    "@multiformats/multiaddr": "npm:^13.0.1"
+    "@multiformats/multiaddr-matcher": "npm:^3.0.1"
+    it-drain: "npm:^3.0.10"
+    it-parallel: "npm:^3.0.13"
+    main-event: "npm:^1.0.1"
+    protons-runtime: "npm:^5.6.0"
+    uint8arraylist: "npm:^2.4.8"
+    uint8arrays: "npm:^5.1.0"
+  checksum: 10c0/6a504eea499911a425c909c30713fd0ecd77117ed161c6f36740b0cbbb216af40a8e4c4f37a28fa845f56e79ee876ecb9c92a5606dbba47d4661c84e8ef7d695
+  languageName: node
+  linkType: hard
+
 "@libp2p/interface-internal@npm:^3.0.10":
   version: 3.0.10
   resolution: "@libp2p/interface-internal@npm:3.0.10"
@@ -1153,6 +1175,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"it-drain@npm:^3.0.10":
+  version: 3.0.12
+  resolution: "it-drain@npm:3.0.12"
+  checksum: 10c0/203dba91fa359ca78e3e9b00880081ef0d550e3340de4925165ee508dc9cc095619a1f3c5f57be2c30f6f06fdf0440200307cbbc318e7c443e3b8d81fed4a348
+  languageName: node
+  linkType: hard
+
 "it-drain@npm:^3.0.9":
   version: 3.0.10
   resolution: "it-drain@npm:3.0.10"
@@ -1613,6 +1642,7 @@ __metadata:
   dependencies:
     "@chainsafe/libp2p-noise": "npm:^17.0.0"
     "@chainsafe/libp2p-yamux": "npm:^8.0.1"
+    "@libp2p/identify": "npm:4.0.10"
     "@libp2p/interface": "npm:^3.1.0"
     "@libp2p/logger": "npm:^6.2.2"
     "@libp2p/memory": "npm:^2.0.10"
