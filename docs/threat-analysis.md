@@ -274,7 +274,7 @@ If the attacker's leave notices include `replacements` pointing to slow/unrespon
 
 Several internal maps have no hard capacity limits:
 
-- `backoffMap: Map<string, {until, factor}>` — grows with every peer that returns busy or fails. Never pruned except by `clearBackoff` on success or `getBackoffPenalty` on expiry (lazy pruning). An attacker sending messages from many peer IDs creates entries that persist until their backoff expires.
+- `backoffMap: Map<string, {until, factor}>` — grows with every peer that returns busy or fails, but is bounded by the routing-table capacity (C=2048): `pruneBackoffMap` runs each stabilization tick and drops any entry whose peer is no longer in the store, and `clearBackoff` removes an entry on first success. Entries are deliberately retained past expiry (`getBackoffPenalty` no longer deletes on expiry, so the per-peer factor can grow across windows), but the per-entry payload is fixed-size, so the map cannot exceed the store's eviction-bounded size. An attacker spamming from many peer IDs therefore cannot grow it past that bound.
 - `announcedIds: Map<string, number>` — pruned at 4096 entries, but only when emitting new discoveries. Between prunes, can grow unbounded.
 - `departureDebounce: Map<string, number>` — pruned at 256, but only on departure events.
 - `networkObservations: Array` — capped at 100 entries. Adequately bounded.
