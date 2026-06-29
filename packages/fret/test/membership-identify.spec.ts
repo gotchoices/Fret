@@ -121,4 +121,58 @@ describe('Ring membership classification (identify-driven)', function () {
 		expect(store.getById(idC)?.membership).to.equal('member', 'mislabeled/late peer must be re-admitted via peer:update')
 		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 're-admission must not have sent any outbound probe')
 	})
+
+	// Isolates the peerStore *poll* path — classifyFromPeerStore, called from seedFromPeerStore
+	// — from the peer:identify / peer:update event handlers (which the two tests above leave
+	// racing). start() awaits seedFromPeerStore BEFORE it attaches any node event listener, so if
+	// A's peerStore is already populated when start() runs, the poll is the only thing that can
+	// have classified. We let libp2p identify populate A's peerStore while A has no FretService,
+	// then start A and assert membership SYNCHRONOUSLY right after start() resolves — before the
+	// event loop can deliver a single peer:identify/peer:update — which pins the poll path alone.
+	//
+	// SKIPPED: this currently fails because seedFromPeerStore enumerates peers via
+	// `node.peerStore.getPeers()`, which does not exist (getPeers lives on the libp2p *node*, not
+	// the peerStore; the peerStore enumerator is `all()`). The loop therefore always sees [] and
+	// the poll path is dead code with real libp2p — classification still works via the event
+	// listeners + the probe pass, which is why it went unnoticed. Tracked by
+	// tickets/backlog/bug-seedfrompeerstore-getpeers-noop. Un-skip once that lands; the test is
+	// written to pass against the fixed enumeration.
+	it.skip('classifies from the peerStore poll path at start, before any event listener fires (no probe)', async () => {
+		const nodeA = await createIdentifyNode(); await nodeA.start()
+		const nodeC = await createIdentifyNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		// C serves net-a, so its identify-advertised protocol list includes ours.
+		const svcC = new CoreFretService(nodeC, { profile: 'core', networkName: 'net-a' })
+		services = [svcC]
+		await svcC.start()
+
+		// Connect and wait for libp2p identify to populate A's peerStore with C's protocols —
+		// all while A has no FretService at all, so no FRET listener or probe is in play yet.
+		const netAPing = makeProtocols('net-a').PROTOCOL_PING
+		await nodeA.dial(nodeC.getMultiaddrs()[0]!)
+		const deadline = Date.now() + 10000
+		let peerStoreReady = false
+		while (Date.now() < deadline) {
+			try {
+				const rec = await nodeA.peerStore.get(nodeC.peerId)
+				if (rec.protocols?.includes(netAPing)) { peerStoreReady = true; break }
+			} catch { /* not in peerStore yet */ }
+			await new Promise((r) => setTimeout(r, 25))
+		}
+		expect(peerStoreReady).to.equal(true, "A's peerStore should learn C's net-a protocols via identify")
+
+		// Now start A. seedFromPeerStore is awaited inside start() before listeners attach, so the
+		// poll path classifies C synchronously — asserted with no waitFor, leaving the event
+		// handlers no opportunity to have run.
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		services = [svcC, svcA]
+		disableProbing(svcA)
+		await svcA.start()
+
+		const store = svcA.getStore()
+		expect(store.getById(nodeC.peerId.toString())?.membership).to.equal('member',
+			'classifyFromPeerStore poll path should classify C member at start, before listeners fire')
+		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 'poll-path classification must not have sent any outbound probe')
+	})
 })
