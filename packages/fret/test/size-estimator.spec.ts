@@ -134,6 +134,12 @@ describe('Size estimator', () => {
 
 	// --- Phase 2: Partial-knowledge (subsampling) tests ---
 
+	// NOTE: these subsample a *uniform* ring, so a contiguous window's median gap
+	// exactly equals the global inter-peer step and the estimator returns ~N
+	// exactly (the "within 2x" bound is therefore slack). This is the easy case;
+	// partial knowledge of a *non-uniform* ring (where local density != global
+	// density) is the realistic hard case and is not yet exercised — add it if/when
+	// the estimator gains topology-aware logic worth stress-testing.
 	describe('Phase 2: Partial-knowledge subsampling', () => {
 		const M = 8
 		const N = 1000
@@ -183,6 +189,11 @@ describe('Size estimator', () => {
 		it('monotonicity with incremental insertion (N=200, starting from 2 peers)', () => {
 			const coords = uniformCoords(200)
 			const store = new DigitreeStore()
+			// NOTE: monotonicity holds here only because peers are inserted in ring
+			// order — each insert grows count and shrinks the single wrap gap, so both
+			// confidence factors (sizeFactor, minGap/maxGap) rise monotonically.
+			// Confidence is NOT monotonic for arbitrary insertion order; this test
+			// asserts the ordered-insertion case, not a general property.
 			// Insert first two peers before tracking — the single-peer sentinel
 			// confidence (0.2) is a special case, not part of the monotonic curve
 			store.upsert('p0', coords[0]!)
