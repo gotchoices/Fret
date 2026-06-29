@@ -917,6 +917,15 @@ export class FretService implements IFretService, Startable {
 	private async classifyUnknownPeers(): Promise<void> {
 		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
+		// NOTE: scans the whole store (O(table size)) every tick to find unknowns, even
+		// once steady state has none. Fine at C=2048; if capacity or tick rate grows a lot,
+		// track an unknown-count or unknown-id set so a no-op tick costs O(1).
+		// NOTE: this pass only re-probes `unknown` peers — never `foreign`. A same-network
+		// peer mislabeled foreign (e.g. identify completed before it registered our handlers)
+		// is re-admitted only via peer:update re-identify or a successful namespaced RPC.
+		// Self-heals today (probeNeighborsLatency still pings near peers regardless of label);
+		// once the gating follow-on excludes foreign from the ring, that RPC path closes —
+		// gating must add an occasional foreign re-probe or guarantee the peer:update path.
 		const unknown = this.store.list().filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && this.getBackoffPenalty(e.id) === 0
 		);
