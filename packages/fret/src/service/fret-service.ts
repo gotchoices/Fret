@@ -88,6 +88,8 @@ export class FretService implements IFretService, Startable {
 	private readonly cfg: FretConfig;
 	private readonly node: Libp2p;
 	private stabilizing = false;
+	private stopped = false;
+	private readonly nodeListeners: Array<{ type: string; handler: (evt: any) => void }> = [];
 	private inflightAct = 0;
 	private readonly bucketNeighbors: TokenBucket;
 	private readonly bucketMaybeAct: TokenBucket;
@@ -243,19 +245,21 @@ export class FretService implements IFretService, Startable {
 	}
 
 	async start(): Promise<void> {
+		this.stopped = false;
 		await this.seedFromPeerStore();
 		this.registerRpcHandlers();
 		// Defer proactive announce to after first stabilization tick (table is richer)
 		this.startStabilizationLoop();
 		if (this.mode === 'active') void this.preconnectNeighbors();
 		// One-time post-bootstrap announce when first remote connects
-		this.node.addEventListener('peer:connect', async (evt: any) => {
-			if (this.postBootstrapAnnounced) return;
+		this.addNodeListener('peer:connect', async () => {
+			if (this.stopped || this.postBootstrapAnnounced) return;
 			this.postBootstrapAnnounced = true;
 			try { await this.announceNeighborsBounded(8); } catch (err) { log.error('postBootstrap announce failed - %e', err) }
 		});
-		this.node.addEventListener('peer:connect', async (evt: any) => {
+		this.addNodeListener('peer:connect', async (evt: any) => {
 			try {
+				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt?.detail?.toString?.();
 				if (!id) return;
@@ -265,8 +269,9 @@ export class FretService implements IFretService, Startable {
 				await this.applyTouch(id, coord);
 			} catch (err) { log.error('peer:connect handler failed - %e', err) }
 		});
-		this.node.addEventListener('peer:disconnect', async (evt: any) => {
+		this.addNodeListener('peer:disconnect', async (evt: any) => {
 			try {
+				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt?.detail?.toString?.();
 				if (!id) return;
@@ -275,7 +280,7 @@ export class FretService implements IFretService, Startable {
 				this.store.setState(id, 'disconnected');
 				await this.applyFailure(id, coord);
 				// Proactive: announce to neighbors around departed peer if it was a near neighbor
-				if (wasNear) {
+				if (wasNear && !this.stopped) {
 					void this.announceOnDeparture(id, coord);
 				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
@@ -283,8 +288,29 @@ export class FretService implements IFretService, Startable {
 	}
 
 	async stop(): Promise<void> {
+		// Mark stopped first so in-flight event handlers and announce loops quiesce
+		// before we tear down: opening a stream on a connection that is concurrently
+		// closing triggers an uncaught StreamStateError from yamux's window-update
+		// microtask, which we cannot catch.
+		this.stopped = true;
 		this.stabilizing = false;
+		this.preconnectRunning = false;
+		this.removeNodeListeners();
 		try { await this.sendLeaveToNeighbors(); } catch (err) { console.warn('sendLeaveToNeighbors failed', err); }
+	}
+
+	/** Register a node event listener and track it so stop() can detach it. */
+	private addNodeListener(type: string, handler: (evt: any) => void): void {
+		this.nodeListeners.push({ type, handler });
+		this.node.addEventListener(type as any, handler);
+	}
+
+	/** Detach all node event listeners registered via addNodeListener. */
+	private removeNodeListeners(): void {
+		for (const { type, handler } of this.nodeListeners) {
+			this.node.removeEventListener(type as any, handler);
+		}
+		this.nodeListeners.length = 0;
 	}
 
 	setMode(mode: FretMode): void {
@@ -400,6 +426,7 @@ export class FretService implements IFretService, Startable {
 
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		for (const id of ids) {
+			if (this.stopped) break;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
 				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
