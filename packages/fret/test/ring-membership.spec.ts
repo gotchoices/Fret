@@ -128,6 +128,29 @@ describe('DigitreeStore membership field', () => {
 		expect(e.membership).to.equal('unknown')
 	})
 
+	// Defensive branch: coord is hash-derived from the id and never changes in practice,
+	// but if a re-upsert ever supplied a different coord the BTree key must be rebuilt
+	// (delete + re-insert) so the byId→key mapping and ordered index stay consistent —
+	// while still preserving the entry's accumulated stats.
+	it('re-keys without orphaning when a re-upsert changes the coord', () => {
+		const s = new DigitreeStore()
+		s.upsert('id1', new Uint8Array(32))
+		s.update('id1', { relevance: 0.5, successCount: 3, membership: 'member' })
+		const newCoord = new Uint8Array(32).fill(7)
+		s.upsert('id1', newCoord)
+		const e = s.getById('id1')!
+		// stats survived the re-key
+		expect(e.relevance).to.equal(0.5)
+		expect(e.successCount).to.equal(3)
+		expect(e.membership).to.equal('member')
+		// coord was updated and no stale duplicate remains in the ordered index
+		expect(Array.from(e.coord)).to.deep.equal(Array.from(newCoord))
+		expect(s.size()).to.equal(1)
+		expect(s.list()).to.have.lengthOf(1)
+		// the entry is reachable at the new coord, not the old one
+		expect(s.successorOfCoord(newCoord)?.id).to.equal('id1')
+	})
+
 	it('round-trips membership through export/import', () => {
 		const s = new DigitreeStore()
 		s.upsert('m', new Uint8Array(32)); s.setMembership('m', 'member')
