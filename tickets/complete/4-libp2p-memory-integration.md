@@ -1,5 +1,5 @@
 description: libp2p in-memory integration tests using @libp2p/memory transport
-dependencies: @libp2p/memory, @libp2p/plaintext (devDeps), FRET core service
+prereq: @libp2p/memory, @libp2p/plaintext (devDeps), FRET core service
 ----
 
 ### Summary

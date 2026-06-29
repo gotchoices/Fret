@@ -1,5 +1,5 @@
 description: Review SimMessageBus, placement distributions, and capacity enforcement in the simulation harness
-dependencies: none (self-contained in test/simulation/)
+prereq: none (self-contained in test/simulation/)
 files:
   - packages/fret/test/simulation/message-bus.ts
   - packages/fret/test/simulation/fret-sim.ts

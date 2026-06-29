@@ -1,5 +1,5 @@
 description: Property-based tests (fast-check) for FRET ring, cohort, and relevance invariants
-dependencies: fast-check ^4.5.3, Digitree, ring/distance, store/relevance
+prereq: fast-check ^4.5.3, Digitree, ring/distance, store/relevance
 files: packages/fret/test/ring.properties.spec.ts, packages/fret/test/cohort.properties.spec.ts, packages/fret/test/relevance.properties.spec.ts
 ----
 

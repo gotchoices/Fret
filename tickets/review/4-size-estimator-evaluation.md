@@ -1,5 +1,5 @@
 description: Comprehensive size estimator accuracy evaluation on synthetic rings
-dependencies: size-estimator.ts, digitree-store.ts, DeterministicRNG
+prereq: size-estimator.ts, digitree-store.ts, DeterministicRNG
 files:
   - packages/fret/src/estimate/size-estimator.ts
   - packages/fret/src/store/digitree-store.ts

@@ -1,5 +1,5 @@
 description: libp2p PeerDiscovery module backed by FRET's Digitree
-dependencies: @libp2p/interface (PeerDiscovery, TypedEventTarget), main-event (TypedEventEmitter), FRET core (DigitreeStore)
+prereq: @libp2p/interface (PeerDiscovery, TypedEventTarget), main-event (TypedEventEmitter), FRET core (DigitreeStore)
 ----
 
 ### Summary

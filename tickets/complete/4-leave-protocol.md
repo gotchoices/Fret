@@ -1,5 +1,5 @@
 description: Graceful leave protocol with replacement suggestions
-dependencies: FRET core (S/P sets, Digitree, neighbor management)
+prereq: FRET core (S/P sets, Digitree, neighbor management)
 ----
 
 Graceful departure protocol: peers leave cleanly with replacement suggestions and bounded fan-out.

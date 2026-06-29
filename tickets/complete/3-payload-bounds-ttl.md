@@ -1,5 +1,5 @@
 description: Payload bounds, TTL/timestamp validation, and busy responses in all RPC handlers
-dependencies: none
+prereq: none
 ----
 
 ### Summary

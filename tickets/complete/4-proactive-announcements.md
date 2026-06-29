@@ -1,5 +1,5 @@
 description: Proactive neighbor announcements on topology change with profile-aware rate limiting
-dependencies: FRET core (fret-service.ts, neighbors.ts, token-bucket.ts, digitree-store.ts)
+prereq: FRET core (fret-service.ts, neighbors.ts, token-bucket.ts, digitree-store.ts)
 files: packages/fret/src/service/fret-service.ts, packages/fret/test/proactive-announce.spec.ts
 ----
 

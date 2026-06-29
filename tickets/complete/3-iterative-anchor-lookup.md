@@ -1,5 +1,5 @@
 description: Iterative anchor lookup and forwarding (maybeAct pipeline) — A5
-dependencies: FRET core (routing table, cohort assembly, size estimation)
+prereq: FRET core (routing table, cohort assembly, size estimation)
 ----
 
 ### Summary

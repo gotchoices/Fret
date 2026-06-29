@@ -1,5 +1,5 @@
 description: Churn scenario simulation tests validating FRET resilience
-dependencies: simulation harness (packages/fret/test/simulation/*)
+prereq: simulation harness (packages/fret/test/simulation/*)
 ----
 
 ### Summary

@@ -1,5 +1,5 @@
 description: Profile enforcement tests — Edge vs Core rate limits, caps, and backpressure
-dependencies: packages/fret (FretService, TokenBucket)
+prereq: packages/fret (FretService, TokenBucket)
 files: packages/fret/test/profile.behavior.spec.ts, packages/fret/src/service/fret-service.ts, packages/fret/src/utils/token-bucket.ts
 ----
 

@@ -1,5 +1,5 @@
 description: Sparsity-aware sample selection and estimator calibration from snapshots
-dependencies: FRET core (DigitreeStore, SparsityModel, size-estimator, neighbor snapshots)
+prereq: FRET core (DigitreeStore, SparsityModel, size-estimator, neighbor snapshots)
 files:
   - packages/fret/src/service/fret-service.ts (selectDiverseSample helper ~L53, snapshot ~L817, mergeAnnounceSnapshot ~L627, mergeNeighborSnapshots ~L812)
   - packages/fret/src/store/relevance.ts (sparsityBonus, normalizedLogDistance)
