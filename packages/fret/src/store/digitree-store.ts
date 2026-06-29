@@ -83,17 +83,25 @@ export class DigitreeStore {
 	upsert(id: string, coord: Uint8Array): PeerEntry {
 		const now = Date.now();
 		const prevKey = this.byId.get(id);
-		// Membership is durable across re-inserts: upsert runs network-agnostically
-		// on every peerStore/connect/snapshot signal, so resetting it would wipe a
-		// hard-won classification every stabilization tick. Carry the prior label
-		// forward; new entries default to 'unknown'.
-		let membership: MembershipState = 'unknown';
+		// upsert's contract is "ensure an entry exists", not "reset to defaults".
+		// On a hit, preserve all mutable stats (relevance, health counters, state,
+		// membership, metadata) and only refresh coord/lastAccess. New ids get defaults.
+		// If coord changed (shouldn't happen in practice — coord is hash-derived from
+		// peer id), re-key via delete+insert to keep the BTree key consistent.
 		if (prevKey) {
 			const path = this.byKey.find(prevKey);
 			if (path.on) {
-				const prev = this.byKey.at(path);
-				if (prev) membership = prev.membership;
-				this.byKey.deleteAt(path);
+				const prev = this.byKey.at(path)!;
+				const next: PeerEntry = { ...prev, coord, lastAccess: now };
+				const newKey = makeKey(next);
+				if (prevKey !== newKey) {
+					this.byKey.deleteAt(path);
+					this.byId.delete(id);
+					this.insert(next);
+				} else {
+					this.byKey.updateAt(path, next);
+				}
+				return next;
 			}
 			this.byId.delete(id);
 		}
@@ -103,7 +111,7 @@ export class DigitreeStore {
 			relevance: 0,
 			lastAccess: now,
 			state: 'disconnected',
-			membership,
+			membership: 'unknown',
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,

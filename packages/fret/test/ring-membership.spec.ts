@@ -90,6 +90,44 @@ describe('DigitreeStore membership field', () => {
 		expect(s.getById('id1')?.membership).to.equal('foreign')
 	})
 
+	// upsert's contract is "ensure an entry exists", not "reset to defaults".
+	// All mutable stats must survive a re-upsert (simulating a per-tick re-seed).
+	it('preserves relevance and health counters across a re-upsert', () => {
+		const s = new DigitreeStore()
+		s.upsert('id1', new Uint8Array(32))
+		s.update('id1', {
+			relevance: 0.9,
+			successCount: 5,
+			failureCount: 1,
+			accessCount: 7,
+			avgLatencyMs: 42,
+			state: 'connected',
+			membership: 'member',
+		})
+		s.upsert('id1', new Uint8Array(32)) // simulate a per-tick re-seed
+		const e = s.getById('id1')!
+		expect(e.relevance).to.equal(0.9)
+		expect(e.successCount).to.equal(5)
+		expect(e.failureCount).to.equal(1)
+		expect(e.accessCount).to.equal(7)
+		expect(e.avgLatencyMs).to.equal(42)
+		expect(e.state).to.equal('connected')
+		expect(e.membership).to.equal('member')
+	})
+
+	// A brand-new id must still build from defaults — only existing entries are preserved.
+	it('initializes a new id to zero counters and disconnected state', () => {
+		const s = new DigitreeStore()
+		const e = s.upsert('brand-new', new Uint8Array(32))
+		expect(e.relevance).to.equal(0)
+		expect(e.successCount).to.equal(0)
+		expect(e.failureCount).to.equal(0)
+		expect(e.accessCount).to.equal(0)
+		expect(e.avgLatencyMs).to.equal(0)
+		expect(e.state).to.equal('disconnected')
+		expect(e.membership).to.equal('unknown')
+	})
+
 	it('round-trips membership through export/import', () => {
 		const s = new DigitreeStore()
 		s.upsert('m', new Uint8Array(32)); s.setMembership('m', 'member')
