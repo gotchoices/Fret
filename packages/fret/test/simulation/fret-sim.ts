@@ -6,6 +6,10 @@ import { DigitreeStore } from '../../src/store/digitree-store.js'
 
 export interface SimPeerConfig {
 	profile: 'edge' | 'core'
+	// NOTE: only successors/predecessors caps are enforced in the harness — the sim does
+	// not yet emit the sparsity-weighted `sample` portion of a snapshot, so `sample` is
+	// carried for parity with the real profiles but is otherwise inert here. If the sim
+	// starts seeding via samples, enforce this cap in collectSnapshotEntries.
 	snapshotCap: { successors: number; predecessors: number; sample: number }
 	stabilizationIntervalMs: number
 	maxConnections: number
@@ -194,7 +198,10 @@ export class FretSimulation {
 	}
 
 	private scheduleStabilization(): void {
-		// Use the fastest cadence among all profiles so no peer misses its window
+		// Use the fastest cadence among all profiles so no peer misses its window.
+		// NOTE: when profileMix is set, config.stabilizationIntervalMs is intentionally
+		// ignored — per-peer cadence comes from each profile's stabilizationIntervalMs,
+		// gated in handleStabilize(). The global tick just sets the polling granularity.
 		const interval = this.config.profileMix
 			? Math.min(EDGE_PROFILE.stabilizationIntervalMs, CORE_PROFILE.stabilizationIntervalMs)
 			: this.config.stabilizationIntervalMs
@@ -669,10 +676,6 @@ export class FretSimulation {
 
 	getBus(): SimMessageBus | undefined {
 		return this.bus
-	}
-
-	getConfig(): Readonly<SimConfig> {
-		return this.config
 	}
 }
 
