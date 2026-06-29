@@ -150,7 +150,13 @@ describe('SimMessageBus', () => {
 	})
 })
 
-describe('Deterministic replay', () => {
+describe('Deterministic replay', function () {
+	// Each test runs two full FretSimulations back-to-back (CPU-bound, ~1.4s in
+	// isolation). Like the other simulation-heavy blocks in this file, lift the
+	// per-test timeout off the 2000ms default so full-suite CPU contention can't
+	// trip a spurious timeout.
+	this.timeout(60000)
+
 	it('two runs with same seed produce identical metrics', () => {
 		const config = {
 			seed: 42,
