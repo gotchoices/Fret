@@ -40,7 +40,7 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 
 ### Join and bootstrap
 1. New node chooses any reachable bootstrap peer(s).
-2. Bootstrap queried for nearest to destination (new node's ID). Flag also requests a sampling of cached and proximal nodes (to seed the new node's cache).
+2. Bootstrap queried for nearest to destination (new node's ID). Flag also requests a sampling of cached nodes (to seed the new node's cache). The sample is sparsity-weighted (`selectDiverseSample`): candidates are scored by the sender's sparsity bonus over ring distance and the top entries returned, biasing toward under-represented ring regions rather than peers clustered near the sender. Successor/predecessor members are excluded from the sample since they are already carried in their own snapshot fields.
 3. New node incorporates cache (evicting if needed by relevance), dials nearest peer(s) to ID, and repeats until neighborhood reached.
 4. Neighborhood detection: when self appears in the two-sided cohort of size m for its own ID
 5. Once in neighborhood, performs stabilization (see below) and announces presence to S/P sets
@@ -118,6 +118,7 @@ Payload inclusion heuristic:
   - Arc length method: average gap between consecutive S/P members; n_est = 2^B / avg_gap
   - Finger sampling: probe random points, measure hop counts; use exponential decay model
   - Weighted average of both methods; weight by method confidence
+  - Peer-reported estimates: when a received `NeighborSnapshotV1` carries `size_estimate` and `confidence` (both positive), the receiver feeds them into its local estimator as an external observation (`reportNetworkSize`, source `snapshot:<peerId>`). This happens on both the announce path (`mergeAnnounceSnapshot`) and the fetched-neighbor path (`mergeNeighborSnapshots`). Snapshots advertise the sender's *raw* FRET-local estimate (not its blended `getNetworkSizeEstimate`), so blending received estimates does not re-amplify already-blended values. Observations are bounded by a sliding time window and a max count. NOTE: these reports are unauthenticated — see the planned size-consensus / bounded-gossip work in `tickets/` for Sybil-resistant aggregation.
 - Confidence calculation:
   - Base confidence from sample count and recency
   - Zero if disconnected from bootstrap or |S∪P| < m/2

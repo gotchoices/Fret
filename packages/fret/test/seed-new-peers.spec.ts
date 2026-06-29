@@ -1,7 +1,8 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { DigitreeStore } from '../src/store/digitree-store.js'
-import { createSparsityModel, normalizedLogDistance, observeDistance } from '../src/store/relevance.js'
+import { createSparsityModel, normalizedLogDistance, observeDistance, sparsityBonus } from '../src/store/relevance.js'
+import { base64urlToCoord } from '../src/ring/hash.js'
 import { selectDiverseSample } from '../src/service/fret-service.js'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
@@ -39,10 +40,20 @@ describe('Seed new peers — selectDiverseSample', function () {
 		const sample = selectDiverseSample(store, selfCoord, sparsity, new Set(), 6)
 
 		expect(sample).to.have.length(6)
-		// All entries should have valid coords and non-zero relevance (or at least coord is non-empty)
+		// All entries should have valid coords and ids
 		for (const s of sample) {
 			expect(s.coord).to.be.a('string').and.not.be.empty
 			expect(s.id).to.be.a('string').and.not.be.empty
+		}
+		// Result must be ordered by sparsity bonus descending — recompute the bonus
+		// for each returned entry from its coord and assert monotonic non-increase.
+		const bonuses = sample.map((s) => {
+			const coord = base64urlToCoord(s.coord)
+			return sparsityBonus(sparsity, normalizedLogDistance(selfCoord, coord))
+		})
+		for (let i = 1; i < bonuses.length; i++) {
+			expect(bonuses[i]!).to.be.at.most(bonuses[i - 1]!,
+				'sample entries must be sorted by sparsity bonus descending')
 		}
 	})
 

@@ -63,6 +63,9 @@ export function selectDiverseSample(
 	excludeIds: Set<string>,
 	cap: number,
 ): Array<{ id: string; coord: string; relevance: number }> {
+	// NOTE: scans + scores + sorts the entire store (bounded by capacity C, default 2048) on every
+	// snapshot build. Fine at current scale; if C grows or snapshots become hot, switch to a
+	// bounded top-k heap (partial selection, no full sort) keyed on sparsity bonus.
 	const entries = store.list();
 	const candidates: Array<{ entry: PeerEntry; bonus: number }> = [];
 	for (const entry of entries) {
@@ -616,6 +619,16 @@ export class FretService implements IFretService, Startable {
 		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
 	}
 
+	/**
+	 * Feed a received snapshot's network-size estimate into the local estimator.
+	 * No-op unless both estimate and confidence are present and positive.
+	 */
+	private calibrateSizeFromSnapshot(snap: NeighborSnapshotV1, sourceId: string): void {
+		if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
+			this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + sourceId);
+		}
+	}
+
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
 		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		try {
@@ -651,9 +664,7 @@ export class FretService implements IFretService, Startable {
 				} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
 			}
 			// Calibrate local size estimator from snapshot's estimate
-			if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
-				this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + from);
-			}
+			this.calibrateSizeFromSnapshot(snap, from);
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
 			if (discovered.length > 0) void this.announceToNewPeers(discovered);
@@ -810,9 +821,7 @@ export class FretService implements IFretService, Startable {
 					} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
 				}
 				// Calibrate local size estimator from snapshot's estimate
-				if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
-					this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + id);
-				}
+				this.calibrateSizeFromSnapshot(snap, id);
 			} catch (err) {
 				console.warn('fetchNeighbors failed for', id, err);
 			}
