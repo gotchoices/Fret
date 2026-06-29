@@ -166,6 +166,9 @@ export class FretSimulation {
 		const centers = this.clusterCenters!
 		const center = centers[this.rng.nextInt(0, centers.length)]!
 		const spreadBits = this.config.clusterConfig?.spreadBits ?? 32
+		// NOTE: spread is scaled through a JS float, so it stays exact up to ~52 bits.
+		// Beyond that the offset loses low-bit precision (still wraps correctly); if a
+		// caller ever needs spreadBits > 52, do the scaling in BigInt instead.
 		const offset = BigInt(Math.round(this.rng.nextGaussian() * Number(1n << BigInt(spreadBits))))
 		const ringSize = 1n << 256n
 		// Wrap around ring
@@ -176,12 +179,15 @@ export class FretSimulation {
 
 	/** Power-law distribution — some ring regions are dense, most are sparse. */
 	private skewedCoord(): Uint8Array {
-		// Generate power-law via inverse transform: x = u^(1/(1-alpha)) mapped to ring
-		const u = this.rng.next()
-		const alpha = 2.0 // Pareto exponent
-		const pareto = Math.pow(u, 1 / (1 - alpha)) // values in [1, inf) concentrated near 1
-		// Normalize to [0, 1) and map to ring
-		const normalized = (pareto - 1) / pareto // concentrated near 0
+		// Raising a uniform sample to a power > 1 concentrates mass near 0, leaving
+		// most of the ring sparse — a crude model of organically dense/sparse regions.
+		// (The earlier inverse-Pareto form (pareto-1)/pareto algebraically reduces to
+		// 1-u, i.e. uniform, so it produced no skew at all.)
+		const u = this.rng.next() // [0,1); u=0 maps cleanly to coordinate 0 (no NaN)
+		const exponent = 3 // higher → denser near the low end of the ring
+		const normalized = Math.pow(u, exponent) // [0,1), concentrated near 0
+		// Only the top 128 bits carry entropy here (Number can't represent the full
+		// 256-bit range); the low 128 bits stay zero, which is fine for placement.
 		const ringSize = 1n << 256n
 		const val = BigInt(Math.floor(normalized * Number(ringSize >> 128n))) << 128n
 		return bigintToCoord(val % ringSize)
@@ -263,12 +269,13 @@ export class FretSimulation {
 			case 'route':
 				if (evt.peerId && evt.targetCoord) this.handleRoute(evt.peerId, evt.targetCoord)
 				break
-			case 'message-deliver':
-				this.handleMessageDeliver()
-				break
 		}
 
-		// After any event, deliver pending bus messages
+		// After any event, flush bus messages that have come due. The sim has no
+		// standalone timer event for the bus; delivery piggybacks on the periodic
+		// stabilization cadence, which always provides a future event to drain the
+		// queue. NOTE: messages still in flight when the run hits durationMs are
+		// simply never delivered (acceptable — they model in-transit traffic at EOL).
 		if (this.bus) {
 			this.deliverPendingMessages()
 		}
@@ -518,17 +525,20 @@ export class FretSimulation {
 		}
 	}
 
-	/** Enforce store capacity by evicting lowest-relevance entries. */
+	/** Enforce store capacity by evicting lowest-relevance entries (never self). */
 	private enforceCapacity(peerId: string, store: DigitreeStore): void {
 		const cap = this.config.capacity!
-		while (store.size() > cap) {
-			const entries = store.list()
-			// Never evict self
-			const evictable = entries.filter((e) => e.id !== peerId)
-			if (evictable.length === 0) break
-			// Sort by relevance ascending; evict lowest
-			evictable.sort((a, b) => a.relevance - b.relevance)
-			store.remove(evictable[0]!.id)
+		const overBy = store.size() - cap
+		if (overBy <= 0) return
+		// Sort by relevance ascending and drop the lowest `overBy` in one pass.
+		// NOTE: the sim populates stores exclusively via DigitreeStore.upsert, which
+		// fixes relevance at 0, so today every entry ties and eviction degenerates to
+		// ring order (list() is key-ordered). If the harness ever starts scoring peers,
+		// this becomes true relevance-based eviction with no code change.
+		const evictable = store.list().filter((e) => e.id !== peerId)
+		evictable.sort((a, b) => a.relevance - b.relevance)
+		for (const e of evictable.slice(0, overBy)) {
+			store.remove(e.id)
 		}
 	}
 
@@ -583,10 +593,6 @@ export class FretSimulation {
 		}
 
 		this.metrics.recordRoute(false, hops)
-	}
-
-	private handleMessageDeliver(): void {
-		this.deliverPendingMessages()
 	}
 
 	snapshotCoverage(): number {

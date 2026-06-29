@@ -127,6 +127,9 @@ export class SimMessageBus {
 	 * Returns messages in delivery-time order.
 	 */
 	deliver(upToTime: number): SimMessage[] {
+		// NOTE: O(pending) scan plus an indexOf/splice per delivered message into its
+		// link queue. Fine at simulation scale; if in-flight counts ever grow large,
+		// switch `pending` to a time-ordered heap and store queue indices.
 		const ready: SimMessage[] = []
 		const remaining: SimMessage[] = []
 

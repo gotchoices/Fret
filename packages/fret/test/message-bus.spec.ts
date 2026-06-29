@@ -397,10 +397,11 @@ describe('Placement distributions', function () {
 		const lowerHalf = coords.filter((c) => c < halfRing).length
 		const upperHalf = coords.filter((c) => c >= halfRing).length
 
-		// Skewed distribution should be uneven
-		// (one half should have more peers than the other)
-		// Skewed: at least one half should have more peers
-		expect(lowerHalf).to.not.equal(upperHalf)
+		// The power-law concentrates mass at the low end of the ring, so the lower
+		// half must hold substantially more peers than the upper half. A mere
+		// `lowerHalf !== upperHalf` check would also pass for a *uniform* layout
+		// (which almost never splits exactly evenly), so assert a real imbalance.
+		expect(lowerHalf).to.be.greaterThan(Math.floor(upperHalf * 1.5))
 	})
 
 	it('uniform placement still works as default', () => {
