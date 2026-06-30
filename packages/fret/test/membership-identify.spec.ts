@@ -8,15 +8,15 @@ import type { Libp2p } from 'libp2p'
 // The probe-based classification path (a namespaced ping → member, UnsupportedProtocolError
 // → foreign) is covered by ring-membership.spec.ts using in-memory nodes. Those nodes run no
 // identify service, so the peerStore protocol list never populates and the identify-driven
-// path — the `peer:identify` / `peer:update` listeners and the opportunistic
-// classifyFromPeerStore in seedFromPeerStore — never fires there. This spec covers that gap
-// with real TCP + identify nodes.
+// path — the `peer:identify` / `peer:update` listeners and the opportunistic peerStore poll in
+// seedFromPeerStore (which classifies `peerStore.all()` entries off their protocol list) —
+// never fires there. This spec covers that gap with real TCP + identify nodes.
 //
 // To prove classification rides identify and NOT an outbound probe, we neutralize the
 // observer's stabilization pass. Every probe-based classification (probeNeighborsLatency,
 // classifyUnknownPeers, reprobeForeignPeers) lives inside stabilizeOnce and is the ONLY code
 // that calls applySuccess/markForeign off an RPC — so a no-op stabilizeOnce leaves identify
-// (the event listeners + the peerStore-backed classifyFromPeerStore in seedFromPeerStore) as
+// (the event listeners + the peerStore-backed poll in seedFromPeerStore) as
 // the sole classification source. seedFromPeerStore still runs each tick, but it is itself the
 // identify path (it reads the identify-populated peerStore) and never sends a probe. We also
 // assert getDiagnostics().pingsSent === 0 as a public-API witness that no probe was sent.
@@ -122,22 +122,15 @@ describe('Ring membership classification (identify-driven)', function () {
 		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 're-admission must not have sent any outbound probe')
 	})
 
-	// Isolates the peerStore *poll* path — classifyFromPeerStore, called from seedFromPeerStore
-	// — from the peer:identify / peer:update event handlers (which the two tests above leave
-	// racing). start() awaits seedFromPeerStore BEFORE it attaches any node event listener, so if
-	// A's peerStore is already populated when start() runs, the poll is the only thing that can
-	// have classified. We let libp2p identify populate A's peerStore while A has no FretService,
-	// then start A and assert membership SYNCHRONOUSLY right after start() resolves — before the
-	// event loop can deliver a single peer:identify/peer:update — which pins the poll path alone.
-	//
-	// SKIPPED: this currently fails because seedFromPeerStore enumerates peers via
-	// `node.peerStore.getPeers()`, which does not exist (getPeers lives on the libp2p *node*, not
-	// the peerStore; the peerStore enumerator is `all()`). The loop therefore always sees [] and
-	// the poll path is dead code with real libp2p — classification still works via the event
-	// listeners + the probe pass, which is why it went unnoticed. Tracked by
-	// tickets/backlog/bug-seedfrompeerstore-getpeers-noop. Un-skip once that lands; the test is
-	// written to pass against the fixed enumeration.
-	it.skip('classifies from the peerStore poll path at start, before any event listener fires (no probe)', async () => {
+	// Isolates the peerStore *poll* path — seedFromPeerStore enumerates `node.peerStore.all()` and
+	// classifies each entry off its identify-advertised protocol list — from the peer:identify /
+	// peer:update event handlers (which the two tests above leave racing). start() awaits
+	// seedFromPeerStore BEFORE it attaches any node event listener, so if A's peerStore is already
+	// populated when start() runs, the poll is the only thing that can have classified. We let
+	// libp2p identify populate A's peerStore while A has no FretService, then start A and assert
+	// membership SYNCHRONOUSLY right after start() resolves — before the event loop can deliver a
+	// single peer:identify/peer:update — which pins the poll path alone.
+	it('classifies from the peerStore poll path at start, before any event listener fires (no probe)', async () => {
 		const nodeA = await createIdentifyNode(); await nodeA.start()
 		const nodeC = await createIdentifyNode(); await nodeC.start()
 		nodes = [nodeA, nodeC]
@@ -172,7 +165,7 @@ describe('Ring membership classification (identify-driven)', function () {
 
 		const store = svcA.getStore()
 		expect(store.getById(nodeC.peerId.toString())?.membership).to.equal('member',
-			'classifyFromPeerStore poll path should classify C member at start, before listeners fire')
+			'peerStore poll path should classify C member at start, before listeners fire')
 		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 'poll-path classification must not have sent any outbound probe')
 	})
 })

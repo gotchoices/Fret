@@ -36,8 +36,8 @@ export async function createMemNode(addr?: string): Promise<Libp2p> {
  * exchanges each peer's negotiated-protocol list and populates the peerStore — and
  * `identifyPush` propagates later protocol changes. Those are exactly the libp2p signals
  * FRET's membership classification reads on `peer:identify` / `peer:update` and in
- * `classifyFromPeerStore`, so this factory is required to exercise the identify-driven
- * classification path end-to-end (the in-memory nodes never fire it).
+ * `seedFromPeerStore`'s `peerStore.all()` poll, so this factory is required to exercise the
+ * identify-driven classification path end-to-end (the in-memory nodes never fire it).
  */
 export async function createIdentifyNode(): Promise<Libp2p> {
 	const node = await createLibp2p({

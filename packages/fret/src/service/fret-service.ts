@@ -48,10 +48,6 @@ function isBusy(res: unknown): res is BusyResponseV1 {
 	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
 }
 
-interface WithPeerStore {
-	peerStore?: { getPeers?: () => Array<{ id: PeerId }> };
-}
-
 /**
  * Ring views are scoped to this network: a peer participates in the ring (neighbor set,
  * cohort, size estimate, sample, discovery) only once confirmed to serve this network's
@@ -293,19 +289,6 @@ export class FretService implements IFretService, Startable {
 		const mine = Object.values(this.protocols);
 		if (protocols.some((p) => mine.includes(p))) this.markMember(id);
 		else this.markForeign(id);
-	}
-
-	/** Opportunistic classification via the peerStore's negotiated-protocol list. */
-	private async classifyFromPeerStore(id: string): Promise<void> {
-		try {
-			const peerStore = (this.node as unknown as { peerStore?: { get?: (pid: PeerId) => Promise<{ protocols?: string[] }> } }).peerStore;
-			if (!peerStore?.get) return;
-			let record: { protocols?: string[] } | undefined;
-			try { record = await peerStore.get(peerIdFromString(id)); } catch { return; } // not in peerStore yet
-			this.classifyByProtocols(id, record?.protocols);
-		} catch (err) {
-			log.error('classifyFromPeerStore failed for %s - %e', id, err);
-		}
 	}
 
 	async start(): Promise<void> {
@@ -803,7 +786,12 @@ export class FretService implements IFretService, Startable {
 	// Seeding and stabilization
 	private async seedFromPeerStore(): Promise<void> {
 		try {
-			const peers = (this.node as unknown as WithPeerStore).peerStore?.getPeers?.() ?? [];
+			// NOTE: runs at start() and on every stabilization tick. This re-enumerates the whole
+			// peerStore and SHA-256-hashes each peer's id per tick (upsert preserves existing stats,
+			// so it is correct, just not free). Fine at current capacity (C=2048); if the peerStore
+			// grows large or the tick cadence tightens, gate re-seed on a peerStore change/epoch or
+			// skip hashing for ids already in the store (reuse the stored coord).
+			const peers = await this.node.peerStore.all();
 			const discovered: string[] = [];
 			for (const p of peers) {
 				try {
@@ -814,7 +802,7 @@ export class FretService implements IFretService, Startable {
 					// If identify has populated the peerStore, classify off its protocol
 					// list now rather than waiting for an outbound probe.
 					if (this.store.getById(pidStr)?.membership === 'unknown') {
-						await this.classifyFromPeerStore(pidStr);
+						this.classifyByProtocols(pidStr, p.protocols);
 					}
 				} catch (err) {
 					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
