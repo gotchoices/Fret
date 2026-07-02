@@ -118,7 +118,7 @@ export function validateTimestamp(ts: number, maxDriftMs = 300_000): boolean {
  * sniff the multiaddr for `/p2p-circuit` as a fallback for transports/versions
  * that don't populate `limits`.
  */
-function isLimitedConnection(c: Connection): boolean {
+export function isLimitedConnection(c: Connection): boolean {
 	if ((c as { limits?: unknown }).limits != null) return true;
 	const addr = c.remoteAddr?.toString?.();
 	return addr != null && addr.includes('/p2p-circuit');
