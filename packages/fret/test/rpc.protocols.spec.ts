@@ -73,7 +73,7 @@ function expectRunsOnLimited(opts: StreamOpts, ctx: string): void {
 describe('openRpcStream', () => {
 	it('opens on a limited-only connection with runOnLimitedConnection (headline regression guard)', async () => {
 		const limited = makeConnection({ limited: true })
-		const { node } = makeNode([limited])
+		const { node, dialCalls } = makeNode([limited])
 
 		const stream = await openRpcStream(node, PID, PROTOCOLS)
 
@@ -81,6 +81,8 @@ describe('openRpcStream', () => {
 		expect(limited.calls.length, 'limited newStream calls').to.equal(1)
 		expect(limited.calls[0].protocols).to.deep.equal(PROTOCOLS)
 		expectRunsOnLimited(limited.calls[0].opts, 'limited-only')
+		// the limited connection must be REUSED, not re-dialed
+		expect(dialCalls.length, 'dialProtocol calls').to.equal(0)
 	})
 
 	it('prefers the direct connection when both direct and limited are open', async () => {
