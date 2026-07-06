@@ -26,7 +26,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 
 ## Development quickstart
 
-**All commands run from `packages/fret/`** (or use `yarn <script>` from root which proxies there).
+**All commands run from `packages/fret/`** (or `yarn <script>` from root proxies there).
 
 | Action | Command |
 |---|---|
@@ -38,35 +38,35 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 | Cut a release | `yarn release` (from root) |
 
 - **Workspace name**: `p2p-fret` (not `fret`, not `@nichetech/fret`)
-- **Test framework**: Mocha + Chai; tests are `*.spec.ts` (not `*.test.ts`)
-- **TS execution**: uses `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
+- **Test framework**: Mocha + Chai; tests `*.spec.ts` (not `*.test.ts`)
+- **TS execution**: `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
 - **No root tsconfig** — always run `tsc` from `packages/fret/`
-- **Formatting**: tabs for indentation (see tsconfig and existing code)
+- **Formatting**: tabs for indent (see tsconfig + existing code)
 
 ### Releasing
 
-`yarn release` (from root) runs the full flow: 5s abort window → `yarn check`
+`yarn release` (from root) runs full flow: 5s abort window → `yarn check`
 (typecheck + build + test) → `yarn bump` (bumpp: pick version, commit, tag
 `v<version>`, push) → `yarn pub` (clean, build, `yarn npm publish`) →
-`yarn gh-release` (GitHub release for the new tag).
+`yarn gh-release` (GitHub release for new tag).
 
-- **Release notes**: drop an untracked `.release-notes.pending.md` at the repo
-  root to use as the release body; otherwise GitHub auto-generates notes. The
-  pending file is consumed (deleted) on success.
-- **Publish only** (no version bump / GitHub release): `yarn pub`.
-- **Prereqs**: authenticated `gh` CLI and npm publish rights for `p2p-fret`.
+- **Release notes**: drop untracked `.release-notes.pending.md` at repo
+  root for release body; else GitHub auto-generates. Pending file
+  consumed (deleted) on success.
+- **Publish only** (no bump / GitHub release): `yarn pub`.
+- **Prereqs**: authenticated `gh` CLI + npm publish rights for `p2p-fret`.
 
 ## Agent efficiency
 
-- **Read this file first** — the project layout and quickstart above answer most structural questions. Don't explore to discover what's already documented here.
-- When spawning sub-agents, pass them the relevant file paths from the tree above rather than letting them `find`/`ls`/`Glob` their way to discovery.
-- `fret-service.ts` is large (~1400 lines). Read targeted line ranges rather than the full file multiple times. Key regions:
+- **Read this file first** — layout + quickstart above answer most structural questions. Don't explore to find what already documented here.
+- Spawning sub-agents: pass them relevant file paths from tree above, not let them `find`/`ls`/`Glob` to discovery.
+- `fret-service.ts` large (~1400 lines). Read targeted line ranges, not full file repeatedly. Key regions:
   - Constructor + profile config: lines ~1–150
   - RPC handlers: lines ~300–600
   - Stabilization: lines ~680–790
   - Neighbor snapshot: lines ~790–950
   - Iterative lookup: lines ~1200+
-- Run tests directly — don't guess at invocations. See the quickstart table above.
+- Run tests directly — don't guess invocations. See quickstart table above.
 
 ## General
 
@@ -84,18 +84,36 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - Don't be type lazy - avoid `any`
 - Don't eat exceptions w/o at least logging; exceptions should be exceptional - not control flow
 - Small, single-purpose functions/methods.  Decomposed sub-functions over grouped code sections
-- No half-baked janky parsers; use a full-fledged parser or better, brainstorm with the dev for another way
+- No half-baked janky parsers; use full-fledged parser or better, brainstorm with dev for another way
 - Think cross-platform (browser, node, RN, etc.)
-- Tabs for indentation; follow existing code style
+- Tabs for indent; follow existing code style
 
 ## Tasks
 
-- If the user mentions tasks (e.g. work task...), read @tasks/AGENTS.md to know what to do
+- If user mentions tasks (e.g. work task...), read @tasks/AGENTS.md to know what to do
 
-This is an important system; write production-grade, maintainable, and expressive code that we don't have to revisit later.  Read @docs/fret.md to come up to speed — also maintain this document.
+Important system; write production-grade, maintainable, expressive code we don't revisit later.  Read @docs/fret.md to come up to speed — also maintain this document.
 
 ## Tickets (tess)
 
-This project uses [tess](tess/) for AI-driven ticket management.
-Read and follow the ticket workflow rules in tess/agent-rules/tickets.md.
-Tickets are in the [tickets/](tickets/) directory.
+Project uses [tess](tess/) for AI-driven ticket management.
+Read + follow ticket workflow rules in tess/agent-rules/tickets.md.
+Tickets in [tickets/](tickets/) directory.
+
+## Caveman
+
+Respond terse like smart caveman. All technical substance stay. Only fluff die.
+
+Rules:
+- Drop: articles (a/an/the), filler (just/really/basically), pleasantries, hedging
+- Fragments OK. Short synonyms. Technical terms exact. Code unchanged.
+- Pattern: [thing] [action] [reason]. [next step].
+- Not: "Sure! I'd be happy to help you with that."
+- Yes: "Bug in auth middleware. Fix:"
+
+Switch level: /caveman lite|full|ultra|wenyan
+Stop: "stop caveman" or "normal mode"
+
+Auto-Clarity: drop caveman for security warnings, irreversible actions, user confused. Resume after.
+
+Boundaries: code/commits/PRs written normal.
