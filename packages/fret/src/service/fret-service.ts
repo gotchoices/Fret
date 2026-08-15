@@ -716,9 +716,21 @@ export class FretService implements IFretService, Startable {
 	 * open connection if there is one, and otherwise dials the *bare peer id* — which only
 	 * resolves if libp2p holds an address for it. A peer that is neither is undialable, and
 	 * every FRET RPC to it fails with `NoValidAddressesError`.
+	 *
+	 * The address-set lookup comes first because it is a `Set.has` while `isConnected` parses
+	 * the id and walks the connection list; a connected peer almost always has an address, so
+	 * the cheap arm short-circuits nearly every call. This predicate runs once per entry
+	 * inside the routing ring walk (see {@link dialableCohort}), so the order matters.
+	 *
+	 * NOTE: "no address" implies "undialable" only while the node has no peer-routing module.
+	 * libp2p's dialer falls back to `peerRouting.findPeer` for a bare-id dial with no known
+	 * addresses, so a deployment that configures delegated routing (or keeps a DHT alongside
+	 * FRET) would find this guard over-restrictive on the routing paths. FRET exists to
+	 * replace that lookup, so today there is nothing to fall back to; revisit if FRET is ever
+	 * run beside a peer-routing implementation.
 	 */
 	private isDialable(id: string): boolean {
-		return this.isConnected(id) || this.hasAddresses(id);
+		return this.hasAddresses(id) || this.isConnected(id);
 	}
 
 	/** Record whether libp2p holds an address for `id`, keeping {@link addressKnown} in sync. */
@@ -757,11 +769,17 @@ export class FretService implements IFretService, Startable {
 	 * *prefer* non-connected peers (a connected peer learns via normal exchange), so this
 	 * dials — and therefore has to be the place the dialability guard is applied. Checked
 	 * before the token bucket so an undialable target does not burn an announce token.
+	 *
+	 * Confirmed-foreign peers are skipped for the same reason: announce target lists walk the
+	 * store unfiltered (so a freshly-connected `unknown` peer is not stalled), but a peer we
+	 * already proved does not serve this network can only answer the dial with
+	 * `UnsupportedProtocolError`. `unknown` is still announced to — it may yet be a member.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		for (const id of ids) {
 			if (this.stopped) break;
 			if (!this.isDialable(id)) continue;
+			if (this.store.getById(id)?.membership === 'foreign') continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
 				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
@@ -932,12 +950,11 @@ export class FretService implements IFretService, Startable {
 			for (const id of warm) {
 				try {
 					await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
-					if (!this.isConnected(id) && this.bucketAnnounce.tryTake()) {
-						const snap = await this.snapshot();
-						// `warm` is dialability-filtered above, so dialing here is warranted:
-						// the target is address-known and we are deliberately not connected to it.
-						await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
-						this.diag.announcementsSent++;
+					// The ping usually opens the connection; announce only when it did not, and
+					// through the shared choke point so the dial flag, token accounting and
+					// counters stay in one place rather than being restated here.
+					if (!this.isConnected(id)) {
+						await this.sendAnnouncementsRateLimited([id], await this.snapshot());
 					}
 				} catch (err) {
 					log.error('warm/announce failed for %s - %e', id, err);
@@ -1123,6 +1140,11 @@ export class FretService implements IFretService, Startable {
 					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
 				}
 			}
+			// NOTE: wholesale replacement clobbers any `setAddressKnown` an identify handler ran
+			// while this walk was awaiting its per-peer hashes, so an address learned inside that
+			// window is missed until the next tick (~1.5s passive). Harmless today — a connected
+			// peer is dialable via `isConnected` regardless — but if the window ever matters,
+			// apply the walk's result as a diff instead of a swap.
 			this.addressKnown = addressKnown;
 			try {
 				const coord = await hashPeerId(this.node.peerId);
@@ -1449,6 +1471,27 @@ export class FretService implements IFretService, Startable {
 		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude, isMember);
 	}
 
+	/**
+	 * Routing-candidate cohort: member-scoped **and** dialability-scoped, both applied as the
+	 * ring walk's own predicate.
+	 *
+	 * Composing the predicate is the whole point — `.filter()`ing the assembled cohort would
+	 * shrink it below `wants` (to empty, when the peers nearest the key are all unreachable)
+	 * and dead-end a route while the ring still held reachable hops further out. Same rule as
+	 * the breadcrumb exclusions: filter into the walk, never out of the result.
+	 *
+	 * NOTE: the predicate now runs `isDialable` per visited entry, and a walk that finds no
+	 * match is capped at one full traversal of the store (C = 2048 today). Cheap because the
+	 * address-set arm short-circuits; if the table capacity grows a lot, keep a connected-id
+	 * set so the predicate is two `Set.has` calls.
+	 */
+	private dialableCohort(hashedCoord: Uint8Array, wants: number, exclude: Set<string>): string[] {
+		return assembleCohortOverStore(
+			this.store, hashedCoord, wants, exclude,
+			(e) => isMember(e) && this.isDialable(e.id)
+		);
+	}
+
 	expandCohort(
 		current: string[],
 		hashedCoord: Uint8Array,
@@ -1552,13 +1595,11 @@ export class FretService implements IFretService, Startable {
 			// requested count, so a long breadcrumb trail would dead-end routing while the ring
 			// still held usable next hops.
 			const exclude = new Set([...(msg.breadcrumbs ?? []), selfId]);
-			// Dialability is a hard filter on the *candidate list*, not a post-hoc skip of the
-			// winner: the selector then picks the best reachable hop instead of dead-ending a
-			// route that still had usable hops behind it. Same rule as the breadcrumb exclusions
-			// above — filter into the walk, never out of the result. An empty set after this
-			// falls through to the NearAnchor reply below, exactly as no-next-hop already did.
-			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude)
-				.filter((id) => this.isDialable(id));
+			// Dialability joins membership as the walk's predicate (see `dialableCohort`), so the
+			// selector picks the best *reachable* hop rather than dead-ending a route that still
+			// had usable hops behind it. A genuinely empty set falls through to the NearAnchor
+			// reply below, exactly as no-next-hop already did.
+			const candidates = this.dialableCohort(coord, Math.max(4, this.cfg.m), exclude);
 
 			const hopOpts = this.buildNextHopOptions(n, confidence);
 			const linkQ = (id: string) => this.linkQuality(id);
@@ -1823,16 +1864,22 @@ export class FretService implements IFretService, Startable {
 				: false;
 
 			// Pick candidates: use anchors from prior hints if available, else local cohort.
-			// Both lists are hard-filtered for dialability before selection (see routeAct for
-			// why the filter goes into the walk). Remote-supplied anchors are the likeliest to
-			// be undialable — FRET's wire format carries no addresses — so when the filter
-			// empties them we fall back to the local cohort rather than declaring the lookup
-			// exhausted; only an empty set from *both* ends the walk.
+			// The anchor list is a remote-supplied set of ids, not a sized ring walk, so
+			// filtering it directly costs nothing; the local cohort filters inside the walk
+			// (see `dialableCohort`). Remote anchors are the likeliest to be undialable — FRET's
+			// wire format carries no addresses — so when the filter empties them we fall back to
+			// the local cohort rather than declaring the lookup exhausted; only an empty set
+			// from *both* ends the walk.
+			// NOTE: the walk keeps no visited set, so an unreachable anchor list can send the
+			// next iteration back to the same local hop until `maxAttempts` runs out. Bounded
+			// and cheap today (the repeat probe is a real RPC to a real peer, not a failed
+			// dial); if lookups ever need to cover more of the ring, thread the probed ids
+			// through as an exclusion the way `routeAct` threads breadcrumbs.
 			const exclude = new Set([selfId]);
 			const anchorCandidates = bestAnchors.filter((id) => !exclude.has(id) && this.isDialable(id));
 			const candidates = anchorCandidates.length > 0
 				? anchorCandidates
-				: this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude).filter((id) => this.isDialable(id));
+				: this.dialableCohort(coord, Math.max(4, this.cfg.m), exclude);
 
 			if (candidates.length === 0) {
 				yield { type: 'exhausted', hop };

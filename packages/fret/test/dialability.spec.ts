@@ -4,7 +4,7 @@ import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
-import { hashKey } from '../src/ring/hash.js'
+import { hashKey, hashPeerId } from '../src/ring/hash.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
@@ -226,6 +226,86 @@ describe('dialability guard on outbound RPC', function () {
 			expect(svcA.getStore().getById(ghostSucc)?.membership, 'still a member').to.equal('member')
 		} finally {
 			await svcB.stop()
+			await stopAll([nodeA, nodeB])
+		}
+	})
+
+	// The guard belongs to the ring walk's predicate, not to the assembled cohort: with the
+	// whole requested cohort width (max(4, m) = 4 here) filled by unreachable peers on both
+	// sides of the key, post-filtering the result empties it and the route dead-ends even
+	// though a reachable hop sits just past the ghosts.
+	it('routeAct still finds a hop when unreachable peers fill the whole cohort width', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeB = await createMemNode(); await nodeB.start()
+		const svcB = new CoreFretService(nodeB, { profile: 'core', k: 7 })
+		await svcB.start()
+		try {
+			await nodeA.dial(nodeB.getMultiaddrs()[0]!)
+			const svcA = new CoreFretService(nodeA, { profile: 'core', k: 7 })
+			const keyB64 = base64url('crowded-key')
+			const coord = await hashKey(u8FromString(keyB64, 'base64url'))
+			const idB = nodeB.peerId.toString()
+			// Two ghosts each side, so the alternating walk fills all four cohort slots.
+			for (const delta of [1, 2, -1, -2]) seedMember(svcA, await ghostPeerId(), offsetCoord(coord, delta))
+			seedMember(svcA, idB, offsetCoord(coord, 5))
+			seedMember(svcA, nodeA.peerId.toString(), oppositeCoord(coord))
+			const dials = countDials(nodeA)
+
+			await svcA.routeAct({
+				v: 1, key: keyB64, want_k: 2, ttl: 3, min_sigs: 1,
+				breadcrumbs: [], correlation_id: 'dialability-crowded', timestamp: Date.now(), signature: ''
+			})
+
+			expect(svcA.getStore().getById(idB)?.successCount ?? 0, 'forwarded past the ghosts').to.be.greaterThan(0)
+			expect(dials(), 'no dial attempted for the ghosts').to.equal(0)
+		} finally {
+			await svcB.stop()
+			await stopAll([nodeA, nodeB])
+		}
+	})
+
+	// Leave notices run inside stop(), where a stack of doomed dials also delays shutdown.
+	// nodeB is the positive control: address-known and not connected, so it must still be dialed.
+	it('sendLeaveToNeighbors dials only the reachable neighbors', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeB = await createMemNode(); await nodeB.start()
+		try {
+			const svcA = new CoreFretService(nodeA, { profile: 'core', k: 7 })
+			await nodeA.peerStore.merge(nodeB.peerId, { multiaddrs: nodeB.getMultiaddrs() })
+			await (svcA as any).seedFromPeerStore()
+			const selfCoord = await hashPeerId(nodeA.peerId)
+			seedMember(svcA, await ghostPeerId(), offsetCoord(selfCoord, 1))
+			seedMember(svcA, await ghostPeerId(), offsetCoord(selfCoord, -1))
+			seedMember(svcA, nodeB.peerId.toString(), offsetCoord(selfCoord, 2))
+			expect(nodeA.getConnections(nodeB.peerId).length, 'premise: not connected').to.equal(0)
+			const dials = countDials(nodeA)
+
+			await (svcA as any).sendLeaveToNeighbors()
+
+			expect(dials(), 'one dial — the address-known neighbor, none of the ghosts').to.equal(1)
+		} finally {
+			await stopAll([nodeA, nodeB])
+		}
+	})
+
+	// The announce choke point is the one place FRET dials on purpose, so it owns both skips.
+	it('the announce choke point skips undialable and confirmed-foreign targets', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeB = await createMemNode(); await nodeB.start()
+		try {
+			const svcA = new CoreFretService(nodeA, { profile: 'core', k: 7 })
+			const idB = nodeB.peerId.toString()
+			await nodeA.peerStore.merge(nodeB.peerId, { multiaddrs: nodeB.getMultiaddrs() })
+			await (svcA as any).seedFromPeerStore()
+			svcA.getStore().setMembership(idB, 'foreign')
+			const snap = await (svcA as any).snapshot()
+			const dials = countDials(nodeA)
+
+			await (svcA as any).sendAnnouncementsRateLimited([await ghostPeerId(), idB], snap)
+
+			expect(svcA.getDiagnostics().announcementsSent, 'neither target announced to').to.equal(0)
+			expect(dials(), 'no dials').to.equal(0)
+		} finally {
 			await stopAll([nodeA, nodeB])
 		}
 	})
