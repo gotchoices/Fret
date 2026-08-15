@@ -651,6 +651,32 @@ export class FretService implements IFretService, Startable {
 		return this.getNetworkSizeEstimate();
 	}
 
+	/**
+	 * Response-cache key: correlation id **plus phase**, where the phase is simply whether the
+	 * message carries an activity.
+	 *
+	 * A find-then-act flow is two requests, not two copies of one: a digest-only probe asks
+	 * "who is near this key?", and the resend that follows carries the actual work. They share a
+	 * correlation id because they belong to one lookup, so keying on the id alone lets the
+	 * probe's cheap `NearAnchor` be handed back as the answer to the message that carries the
+	 * work — and the activity handler never runs. That is not a rare race: a responder's anchor
+	 * list normally names itself (it is in-cluster, which is why it answered), so the resend
+	 * usually goes straight back to the peer that just cached the digest reply.
+	 *
+	 * Both arms keep their idempotency under this key. A replayed digest probe still returns the
+	 * cached anchors without re-walking the ring, and a genuine retry of the same work still
+	 * returns the stored commit certificate rather than performing the work twice.
+	 *
+	 * The phase is read off the message's own `activity` field rather than parsed out of the
+	 * sender's id, which is opaque to us. The activity payload is deliberately *not* hashed into
+	 * the key: a retry whose payload re-encodes to equivalent-but-different bytes would miss the
+	 * cache and re-perform the work, which is worse than the collision that would guard against
+	 * (each lookup mints its own activity id, so distinct payloads do not share a key).
+	 */
+	private dedupKey(msg: RouteAndMaybeActV1): string {
+		return `${msg.correlation_id}|${msg.activity ? 'act' : 'digest'}`;
+	}
+
 	private async handleMaybeAct(
 		msg: RouteAndMaybeActV1
 	): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }> {
@@ -660,7 +686,7 @@ export class FretService implements IFretService, Startable {
 
 		// Correlation-ID dedup: return cached result if seen before
 		if (msg.correlation_id) {
-			const cached = this.dedupCache.get(msg.correlation_id);
+			const cached = this.dedupCache.get(this.dedupKey(msg));
 			if (cached) return cached;
 		}
 
@@ -680,7 +706,7 @@ export class FretService implements IFretService, Startable {
 		try {
 			const result = await this.routeAct(msg);
 			// Cache result for dedup
-			if (msg.correlation_id) this.dedupCache.set(msg.correlation_id, result);
+			if (msg.correlation_id) this.dedupCache.set(this.dedupKey(msg), result);
 			return result;
 		} catch (err) {
 			log.error('routeAct failed - %e', err);
@@ -1842,17 +1868,49 @@ export class FretService implements IFretService, Startable {
 		this.activityHandler = handler;
 	}
 
+	/**
+	 * A correlation id for one *phase* of a lookup — see {@link dedupKey} for why a phase, and
+	 * not a whole lookup, is the unit a receiver deduplicates on.
+	 *
+	 * `phase` is appended so the two ids of a single lookup are distinct by construction rather
+	 * than by the randomness. A receiver never parses it; it reads the phase off the message's
+	 * own `activity` field, which is the part it can actually trust.
+	 *
+	 * NOTE: `Math.random` is not replay-resistant — an observer can predict subsequent ids and
+	 * pre-poison a peer's response cache. Replacing it with `crypto.randomUUID` is tracked as
+	 * planned replay hardening in `docs/fret.md`; the two-phase shape here is unaffected by that
+	 * swap.
+	 */
+	private newCorrelationId(phase: 'digest' | 'act'): string {
+		const rand = Math.random().toString(36).slice(2, 8);
+		return `${this.node.peerId.toString()}-${Date.now()}-${rand}-${phase}`;
+	}
+
 	async *iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {
 		const coord = await hashKey(key);
 		const selfId = this.node.peerId.toString();
 		const selfCoord = await this.selfCoord();
 		const ttl = options.ttl ?? 8;
 		const maxAttempts = options.maxAttempts ?? ttl + 2;
-		const correlationId = `${selfId}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+		// One id per phase, each minted once for the whole lookup and shared across every hop
+		// and attempt of that phase. Per-*call* is the load-bearing part: a peer that already
+		// performed the work recognises a repeated activity send and returns its stored
+		// certificate, and a digest probe that loops around the ring is recognised as a replay.
+		// Minting a fresh id per message would destroy both. Splitting the two phases is what
+		// stops the probe's reply from being served as the answer to the activity (see
+		// `dedupKey`).
+		const discoveryId = this.newCorrelationId('digest');
+		const activityId = this.newCorrelationId('act');
 
 		let hop = 0;
 		let currentActivity = options.activity;
 		let bestAnchors: string[] = [];
+		// Every peer this walk has already contacted, across attempts. An anchor list that keeps
+		// naming a peer we already probed would otherwise send the next attempt straight back to
+		// it: the reply is valid (so nothing throws, and nothing is dropped from the pool) but
+		// carries no new information, and the walk spins until `maxAttempts` runs out. Seeded
+		// with self, which is never a hop.
+		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
 			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
@@ -1870,16 +1928,13 @@ export class FretService implements IFretService, Startable {
 			// wire format carries no addresses — so when the filter empties them we fall back to
 			// the local cohort rather than declaring the lookup exhausted; only an empty set
 			// from *both* ends the walk.
-			// NOTE: the walk keeps no visited set, so an unreachable anchor list can send the
-			// next iteration back to the same local hop until `maxAttempts` runs out. Bounded
-			// and cheap today (the repeat probe is a real RPC to a real peer, not a failed
-			// dial); if lookups ever need to cover more of the ring, thread the probed ids
-			// through as an exclusion the way `routeAct` threads breadcrumbs.
-			const exclude = new Set([selfId]);
-			const anchorCandidates = bestAnchors.filter((id) => !exclude.has(id) && this.isDialable(id));
+			// `visited` goes *into* the local walk rather than filtering its result, for the same
+			// reason the breadcrumb trail does (see `dialableCohort`): post-filtering a sized
+			// cohort shrinks it below the requested count.
+			const anchorCandidates = bestAnchors.filter((id) => !visited.has(id) && this.isDialable(id));
 			const candidates = anchorCandidates.length > 0
 				? anchorCandidates
-				: this.dialableCohort(coord, Math.max(4, this.cfg.m), exclude);
+				: this.dialableCohort(coord, Math.max(4, this.cfg.m), visited);
 
 			if (candidates.length === 0) {
 				yield { type: 'exhausted', hop };
@@ -1898,6 +1953,7 @@ export class FretService implements IFretService, Startable {
 				return;
 			}
 
+			visited.add(target);
 			yield { type: 'probing', hop, peerId: target, ttlRemaining: ttl - hop };
 
 			const msg: RouteAndMaybeActV1 = {
@@ -1909,7 +1965,11 @@ export class FretService implements IFretService, Startable {
 				digest: options.digest,
 				activity: includePayload ? currentActivity : undefined,
 				breadcrumbs: [selfId],
-				correlation_id: correlationId,
+				// The heuristic may put the payload on this very message, which makes it an
+				// activity-bearing message and so part of the activity phase — it must carry the
+				// same id the resend below would, or the two paths disagree about which id names
+				// the work.
+				correlation_id: includePayload ? activityId : discoveryId,
 				timestamp: Date.now(),
 				signature: '',
 			};
@@ -1935,15 +1995,29 @@ export class FretService implements IFretService, Startable {
 				// The anchors are remote-supplied ids we may hold no address for, so take the
 				// first *dialable* one; when none is, fall through to the bestAnchors update
 				// below and let the next iteration route locally instead of failing a dial.
+				// Deliberately not filtered against `visited`: the anchor we resend to is normally
+				// the peer we just probed (it named itself, being in-cluster), and that resend is
+				// the point of the two-phase flow rather than a repeat of the probe.
+				// NOTE: so the same peer can be an activity target on more than one attempt. Free
+				// today — every activity send of a lookup shares one id, so a repeat is answered
+				// from that peer's cache without re-performing the work, and `visited` still
+				// bounds the probe phase. If activity delivery ever needs to try *successive*
+				// anchors rather than the first dialable one, give the resend its own attempted
+				// set rather than reusing `visited`.
 				const actTarget = currentActivity && !includePayload
 					? anchor.anchors.find((id) => this.isDialable(id))
 					: undefined;
 				if (actTarget) {
+					visited.add(actTarget);
 					yield { type: 'activity_sent', hop: hop + 1, peerId: actTarget };
 
 					const actMsg: RouteAndMaybeActV1 = {
 						...msg,
 						activity: currentActivity,
+						// `...msg` carries the probe's id; this message is the activity phase, so
+						// override it. Sharing the probe's id is what made the receiver answer
+						// this message from the probe's cache entry and never run the activity.
+						correlation_id: activityId,
 						ttl: 1,
 						breadcrumbs: [selfId, target],
 					};
@@ -1982,7 +2056,8 @@ export class FretService implements IFretService, Startable {
 			} catch (err) {
 				log.error('iterativeLookup hop %d to %s failed - %e', hop, target, err);
 				this.recordBackoff(target);
-				bestAnchors = bestAnchors.filter((id) => id !== target);
+				// No need to drop `target` from `bestAnchors` — it is in `visited`, which every
+				// candidate path filters against.
 				hop++;
 			}
 		}

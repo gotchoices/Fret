@@ -89,13 +89,13 @@ Single pipeline for discovery and action:
   - digest: lightweight summary (for non-in-cluster probes)
   - activity: optional payload (pend/commit). Included when near enough by size/distribution estimate
   - breadcrumbs: visited peers to prevent loops and provide traceability
-  - correlationId: unique request identifier for tracing and deduplication
+  - correlationId: identifies a request **phase**, not a whole lookup. A find-then-act lookup mints two: one shared by every digest-only probe it sends, one shared by every activity-bearing message. Each is minted once per lookup (not per message), which is what makes a retry idempotent — a peer that already performed the work recognises the repeat and returns its stored certificate rather than doing it twice.
 
 Routing rule:
 1. If local membership test says "in-cluster":
    - If activity included: perform activity (callback) given the two-sided cohort (expand/filter as needed to satisfy minSigs), then return commit certificate
    - If no activity: reply with NearAnchor { anchors: [succ, pred], cohortHint: PeerId[], estimatedClusterSize, confidence } inviting a resend with activity
-   - Cache result for correlationId to handle duplicate requests
+   - Cache result to handle duplicate requests, keyed on correlation ID **and phase** (digest-only vs activity-bearing). Keying on the ID alone is wrong: the probe and the resend that follows it share an ID, so the probe's NearAnchor would be served as the answer to the message carrying the work and the activity would never run. Since the responder's own anchor list normally names itself, that resend usually arrives right back at the peer holding the probe's cache entry. The phase is read off the message's `activity` field; the payload itself is not hashed into the key, so a re-encoded-but-equivalent retry still hits the cache instead of re-performing the work.
 2. Else (not in-cluster): forward towards h by choosing the next hop that minimizes absolute ring distance to h using S/P (and optional finger cache). Optionally attach redirect hints (local near-h successors/predessors) to speed convergence.
    - Next-hop selection heuristic (connected-first bias):
      - Define cost(peer) = w_d·normDist(h, peer) − w_conn·isConnected(peer) − w_q·linkQuality(peer) + w_b·backoffPenalty(peer).
@@ -260,7 +260,7 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
 
 #### Current state
 - Timestamp bounds (±5 min) for message freshness
-- Correlation ID dedup cache (30s TTL, 1024 entries) for maybeAct
+- Correlation ID + phase dedup cache (30s TTL, 1024 entries) for maybeAct — the key is the correlation ID paired with whether the message carries an activity, so a digest probe and the activity resend sharing that ID get separate cache slots (see the routing rule above)
 - Rate limiting via global token buckets (per-protocol, profile-tuned Edge/Core), including the inbound announce handler (gated before any merge work; on rejection the message is dropped and `diag.rejected.rateLimited` increments)
 - Inbound snapshot-merge caps: both the neighbor-fetch merge and the announce merge slice remote successors/predecessors/sample to the same per-profile bounds (Core 16/16/8, Edge 8/8/6) before iterating, so one crafted message cannot force thousands of parse+hash+upsert ops regardless of the 128 KB byte limit
 - Breadcrumb loop detection and TTL limits on routing
@@ -337,10 +337,10 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Two-sided alternating walk with wants ≤ k; filter/expand API.
   - Membership test helper; repo-capability tagging for members.
 - RouteAndMaybeAct pipeline (A5) ✓
-  - Async generator (`iterativeLookup`) for progressive results; breadcrumbs/TTL.
+  - Async generator (`iterativeLookup`) for progressive results; breadcrumbs/TTL. The walk keeps a `visited` set (seeded with self) of every peer it has contacted — probe target, activity target, busy responder — and passes it *into* the candidate walk as the exclusion, so a remote anchor list that keeps naming an already-probed peer cannot stall the lookup on repeat probes. On a ring too small to offer a fresh hop this reaches `exhausted` promptly instead of burning the attempt budget.
   - Next-hop selector: cost-function mode with near/far behavior, backoff penalty, confidence weighting; legacy connected-first fallback.
   - Payload inclusion heuristic: `shouldIncludePayload` based on distance to key vs cluster span and confidence.
-  - Correlation-ID dedup cache; breadcrumb loop rejection.
+  - Correlation-ID + phase dedup cache; breadcrumb loop rejection.
   - Activity callback interface (`setActivityHandler`) for threshold signature tracking (minSigs).
 - Stabilization & health (A6)
   - Periodic S/P verification, finger probes; jitter; skip if recent traffic.
