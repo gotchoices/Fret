@@ -5,6 +5,7 @@ export class TokenBucket {
 	private last: number;
 
 	constructor(capacity: number, refillPerSec: number) {
+		if (!(refillPerSec > 0)) throw new Error('refillPerSec must be positive');
 		this.capacity = capacity;
 		this.refillPerSec = refillPerSec;
 		this.tokens = capacity;
@@ -12,6 +13,7 @@ export class TokenBucket {
 	}
 
 	tryTake(cost = 1): boolean {
+		cost = Math.min(cost, this.capacity);
 		this.refill();
 		if (this.tokens >= cost) {
 			this.tokens -= cost;
@@ -21,6 +23,7 @@ export class TokenBucket {
 	}
 
 	retryAfterMs(cost = 1): number {
+		cost = Math.min(cost, this.capacity);
 		this.refill();
 		if (this.tokens >= cost) return 0;
 		const deficit = cost - this.tokens;
