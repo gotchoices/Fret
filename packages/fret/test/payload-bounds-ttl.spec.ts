@@ -258,6 +258,57 @@ describe('Payload bounds and TTL validation', function () {
 		})
 	})
 
+	describe('rate limit precedes the cheap validity guards', () => {
+		// The guards (loop / stale timestamp / expired TTL / oversized payload) used to answer
+		// *before* the bucket was consulted, so a flood of trivially-invalid messages was
+		// unmetered. These two tests are the regression guard for that ordering; without them a
+		// revert to guards-first passes every other test in the suite.
+		const invalidMsg = (correlationId: string) => ({
+			v: 1 as const,
+			key: 'aWQ',
+			want_k: 7,
+			ttl: 0, // cheapest guard to fail
+			min_sigs: 3,
+			breadcrumbs: [] as string[],
+			correlation_id: correlationId,
+			timestamp: Date.now(),
+			signature: ''
+		})
+
+		it('an invalid message still consumes a maybeAct token', async () => {
+			const node = await createMemoryNode(); await node.start()
+			const svc = new CoreFretService(node, { profile: 'edge', k: 7 })
+			await svc.start()
+			await new Promise(r => setTimeout(r, 300))
+
+			const bucket = (svc as any).bucketMaybeAct
+			const before = bucket.tokens as number
+			await (svc as any).handleMaybeAct(invalidMsg('dHRsLTE'))
+			// Refill runs on every tryTake, so compare against the ceiling rather than
+			// `before - 1`: what matters is that a token was spent, not the exact residue.
+			expect(bucket.tokens as number).to.be.lessThan(before)
+
+			await svc.stop(); await node.stop()
+		})
+
+		it('a flood of invalid messages is bounded by the bucket', async () => {
+			const node = await createMemoryNode(); await node.start()
+			const svc = new CoreFretService(node, { profile: 'edge', k: 7 })
+			await svc.start()
+			await new Promise(r => setTimeout(r, 300))
+
+			// Edge capacity is 8; well past it, so refill during the loop cannot mask the bound.
+			let busy = 0
+			for (let i = 0; i < 40; i++) {
+				const res = await (svc as any).handleMaybeAct(invalidMsg(`Zmxvb2Q${i}`))
+				if ((res as any).busy === true) busy++
+			}
+			expect(busy, 'invalid messages must be metered by the bucket').to.be.greaterThan(0)
+
+			await svc.stop(); await node.stop()
+		})
+	})
+
 	describe('rate limit busy response', () => {
 		it('returns BusyResponseV1 when maybeAct bucket exhausted', async () => {
 			const node = await createMemoryNode(); await node.start()

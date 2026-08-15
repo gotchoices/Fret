@@ -738,6 +738,11 @@ export class FretService implements IFretService, Startable {
 	 * *not* {@link nearAnchorOnly} — that call still hashes the key and walks the ring twice,
 	 * which is exactly the per-message cost the rate limit below exists to bound, so a flood of
 	 * trivially-invalid messages must not be able to force it.
+	 *
+	 * NOTE: `estimated_cluster_size` / `confidence` are 0 here — "no information given" — for the
+	 * same reason {@link nearAnchorOnly} uses placeholders: no consumer reads either field today.
+	 * If one starts to, both sites need revisiting together, and this one cannot report a real
+	 * estimate without giving back the per-message cost it exists to avoid.
 	 */
 	private staticReject(): NearAnchorV1 {
 		return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 };
@@ -749,6 +754,11 @@ export class FretService implements IFretService, Startable {
 		// Rate limit first, before any per-message computation: otherwise a flood of messages
 		// that all fail a cheap validity check below (loop/stale/expired-TTL/oversized) would
 		// never reach this check and the bucket would bound nothing.
+		// NOTE: this also puts the dedup lookup behind the bucket, so under an empty bucket a
+		// legitimate retry gets `busy` instead of its cached certificate. Correct, not a
+		// regression of idempotency — the work is still never performed twice, and the sender
+		// has `retry_after_ms` — but if retry latency under load ever matters, the fix is a
+		// cheaper dedup-only pre-check, not moving the bucket back behind the guards.
 		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
 
 		// Breadcrumb loop detection: reject if self already visited
