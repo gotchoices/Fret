@@ -116,7 +116,7 @@ export interface FretService {
 
 	// Routing table persistence
 	exportTable(): SerializedTable;
-	importTable(table: SerializedTable): number;
+	importTable(table: SerializedTable): Promise<number>;
 }
 
 export type { SerializedPeerEntry, SerializedTable };

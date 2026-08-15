@@ -68,8 +68,8 @@ describe('FretService routing-table import', function () {
 		try { await peerNode.stop() } catch { /* already stopped */ }
 	})
 
-	it('restores the snapshot peers and reports how many ids it stored', () => {
-		const stored = svc.importTable(tableOf([serializedPeer(otherId, 40)]))
+	it('restores the snapshot peers and reports how many ids it stored', async () => {
+		const stored = await svc.importTable(tableOf([serializedPeer(otherId, 40)]))
 
 		expect(stored).to.equal(1)
 		const restored = entryFor(svc, otherId)
@@ -78,7 +78,7 @@ describe('FretService routing-table import', function () {
 		expect(restored.state).to.equal('disconnected')
 	})
 
-	it('ignores a snapshot record for self rather than letting it overwrite the live entry', () => {
+	it('ignores a snapshot record for self rather than letting it overwrite the live entry', async () => {
 		const before = entryFor(svc, selfId)
 		expect(before.membership, 'self is seeded as a member of its own network').to.equal('member')
 
@@ -86,7 +86,7 @@ describe('FretService routing-table import', function () {
 		// up labelled `unknown` and — if the file was corrupted or hand-edited — at a
 		// coordinate that is not the hash of self's peer id.
 		const bogusCoord = coordToBase64url(new Uint8Array(32).fill(7))
-		const stored = svc.importTable(
+		const stored = await svc.importTable(
 			tableOf([
 				serializedPeer(selfId, 0, { membership: 'unknown', coord: bogusCoord }),
 				serializedPeer(otherId, 40),
@@ -103,15 +103,15 @@ describe('FretService routing-table import', function () {
 		expect(after.coord, 'self still at its own ring coordinate').to.equal(before.coord)
 	})
 
-	it('round-trips its own export without duplicating or demoting self', () => {
-		svc.importTable(tableOf([serializedPeer(otherId, 40)]))
+	it('round-trips its own export without duplicating or demoting self', async () => {
+		await svc.importTable(tableOf([serializedPeer(otherId, 40)]))
 
 		const exported = svc.exportTable()
 		expect(exported.entries.map((e) => e.id).sort()).to.deep.equal([selfId, otherId].sort())
 
 		// Re-importing an export of this very table must be a no-op on the population: import
 		// replaces by id, and self's record is dropped, so nothing is added and nothing moves.
-		const stored = svc.importTable(exported)
+		const stored = await svc.importTable(exported)
 
 		expect(stored, 'every id but self re-stored').to.equal(exported.entries.length - 1)
 		const after = svc.exportTable()

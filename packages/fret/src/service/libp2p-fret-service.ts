@@ -130,7 +130,7 @@ export class Libp2pFretService implements Startable {
 		return this.ensure().exportTable();
 	}
 
-	importTable(table: SerializedTable): number {
+	importTable(table: SerializedTable): Promise<number> {
 		return this.ensure().importTable(table);
 	}
 }

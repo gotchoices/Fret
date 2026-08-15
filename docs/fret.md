@@ -593,7 +593,7 @@ interface SerializedTable {
 FRET's routing table (Digitree store) is in-memory by default. The `exportTable` / `importTable` API allows callers to snapshot and restore the full routing table across restarts, avoiding cold-start bootstrap latency.
 
 - **Export**: `exportTable()` returns a `SerializedTable` containing every peer entry in the Digitree, with `Uint8Array` coordinates encoded as base64url strings. The envelope includes the exporter's peer ID and a timestamp.
-- **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Membership labels are preserved (a persisted table is same-network by construction); a missing `membership` field in an older snapshot defaults to `'unknown'`. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
+- **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Membership labels are preserved (a persisted table is same-network by construction); a missing `membership` field in an older snapshot defaults to `'unknown'`. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual. `importTable` is `async` — capacity enforcement needs the self ring coordinate (a SHA-256 hash of the peer id), and import is commonly called before `start()` has cached it, so enforcement awaits the hash rather than skipping it. Callers must `await` the call; a fire-and-forget `importTable(...)` races enforcement against whatever runs next.
   - **A malformed coordinate rejects the whole snapshot, and nothing is written.** A corrupted persisted table is better refused loudly than admitted as ring state, so `importEntries` decodes every record's coordinate before it writes any of them — a mid-loop throw would otherwise leave a half-imported table behind *and* skip the capacity enforcement that runs after the call. Callers restoring an untrusted file should wrap `importTable` and fall back to a cold bootstrap. (Snapshot *sample* entries arriving over the wire are handled differently: those merge loops already skip-and-log per entry, so one bad sample drops that entry, not the message.)
   - **Replace by id.** Import is public and nothing stops a caller invoking it after `start()`, at which point self and any peer-store-seeded peers are already in the table. A snapshot record for an id already present therefore *replaces* that entry outright, including a coordinate move — the snapshot is the more recent view of that peer, and the alternative (leaving the existing entry in place) both discards the restored data and, on a coordinate move, strands the old entry in the tree unreachable by id.
   - **Returns the number of distinct ids stored**, not the number of input records, so a snapshot carrying an id twice reports 1.
@@ -609,7 +609,7 @@ await fs.writeFile('fret-table.json', JSON.stringify(table));
 
 // On startup
 const saved = JSON.parse(await fs.readFile('fret-table.json', 'utf-8'));
-const count = fret.importTable(saved);
+const count = await fret.importTable(saved);
 // count entries restored; stabilization loop re-validates liveness
 ```
 

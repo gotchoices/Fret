@@ -310,12 +310,14 @@ export class FretService implements IFretService, Startable {
 		return this.cachedSelfCoord;
 	}
 
-	private enforceCapacity(): void {
+	private async enforceCapacity(): Promise<void> {
 		const cap = Math.max(1, this.cfg.capacity);
 		if (this.store.size() <= cap) return;
-		// Protect immediate neighbors around self
-		const self = this.cachedSelfCoord;
-		if (!self) return;
+		// Protect immediate neighbors around self. Awaits (rather than reads the nullable
+		// cache) so enforcement still runs during startup seeding and table import, when
+		// `cachedSelfCoord` has not been hashed yet — the two bulk-insert paths most likely
+		// to overflow the table in the first place.
+		const self = await this.selfCoord();
 		// Protect only *member* neighbors around self (member-scoped walk). A foreign peer
 		// can no longer squat in a protected slot, so with relevance ~0 it becomes a
 		// preferred eviction victim — exactly what we want.
@@ -1228,7 +1230,7 @@ export class FretService implements IFretService, Startable {
 			}
 			// Calibrate local size estimator from snapshot's estimate
 			this.calibrateSizeFromSnapshot(snap, from);
-			this.enforceCapacity();
+			await this.enforceCapacity();
 			this.emitDiscovered(discovered);
 			if (discovered.length > 0) this.detach(this.announceToNewPeers(discovered), 'announceToNewPeers');
 		} catch (err) {
@@ -1282,7 +1284,7 @@ export class FretService implements IFretService, Startable {
 			} catch (err) {
 				console.error('failed to add self to store', err);
 			}
-			this.enforceCapacity();
+			await this.enforceCapacity();
 			this.emitDiscovered(discovered);
 		} catch (err) {
 			console.error('seedFromPeerStore failed:', err);
@@ -1341,7 +1343,7 @@ export class FretService implements IFretService, Startable {
 				console.warn('seedFromBootstraps failed for', bootstrapEntry, err);
 			}
 		}
-		this.enforceCapacity();
+		await this.enforceCapacity();
 		this.emitDiscovered(discovered);
 	}
 
@@ -1532,7 +1534,7 @@ export class FretService implements IFretService, Startable {
 				console.warn('fetchNeighbors failed for', id, err);
 			}
 		}
-		this.enforceCapacity();
+		await this.enforceCapacity();
 		this.emitDiscovered(announced);
 		if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 	}
@@ -2251,7 +2253,7 @@ export class FretService implements IFretService, Startable {
 		};
 	}
 
-	importTable(table: SerializedTable): number {
+	async importTable(table: SerializedTable): Promise<number> {
 		// A snapshot never speaks for *self*. Import replaces by id, and both fields that make
 		// self's entry authoritative are supplied by the snapshot: `membership` (absent in a
 		// pre-membership snapshot, and `unknown` in one taken by another peer, which would drop
@@ -2262,7 +2264,7 @@ export class FretService implements IFretService, Startable {
 		// The count therefore reports ids actually stored, self excluded.
 		const selfStr = this.node.peerId.toString();
 		const count = this.store.importEntries(table.entries.filter((e) => e.id !== selfStr));
-		this.enforceCapacity();
+		await this.enforceCapacity();
 		return count;
 	}
 }

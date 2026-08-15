@@ -104,7 +104,7 @@ interface FretService {
   exportTable(): SerializedTable;
 
   // Import a previously exported snapshot; returns number of entries loaded
-  importTable(table: SerializedTable): number;
+  importTable(table: SerializedTable): Promise<number>;
 }
 
 interface SerializedTable {
@@ -144,7 +144,7 @@ await fs.writeFile('fret-table.json', JSON.stringify(table));
 const saved: SerializedTable = JSON.parse(
   await fs.readFile('fret-table.json', 'utf-8')
 );
-const count = fret.importTable(saved);
+const count = await fret.importTable(saved);
 console.log(`Restored ${count} routing entries`);
 
 await fret.start();
@@ -153,7 +153,7 @@ await fret.start();
 ### Behavior
 
 - **State reset**: All imported entries get `state: 'disconnected'` regardless of their exported state — connection liveness must be re-established through pings and stabilization.
-- **Capacity enforcement**: `importTable` enforces the configured capacity after loading. A table exported from a node with a larger capacity won't exceed the importer's limit.
+- **Capacity enforcement**: `importTable` enforces the configured capacity after loading. A table exported from a node with a larger capacity won't exceed the importer's limit. `importTable` is `async` — enforcement needs the self ring coordinate, which is commonly not yet cached when import runs before `start()` — so always `await` it.
 - **Stale data safety**: After import, the normal stabilization loop probes peers to update connection states and relevance scores. Unreachable peers are decayed and eventually evicted.
 - **JSON round-trip safe**: `SerializedTable` survives `JSON.stringify` / `JSON.parse`.
 
