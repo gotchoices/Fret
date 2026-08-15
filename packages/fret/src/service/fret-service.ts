@@ -27,7 +27,7 @@ import { TokenBucket } from '../utils/token-bucket.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
-import { DedupCache } from './dedup-cache.js';
+import { DedupCache, DEDUP_TTL_MS } from './dedup-cache.js';
 import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js';
 import { xorDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
@@ -46,6 +46,28 @@ const log = createLogger('service:fret');
 
 function isBusy(res: unknown): res is BusyResponseV1 {
 	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
+}
+
+/**
+ * An unpredictable token, used for the random part of a correlation id.
+ *
+ * `Math.random` is a plain PRNG: an observer of a few of our ids can recover its state and
+ * compute the ids we have not sent yet, then pre-fill the target's dedup cache with fabricated
+ * answers so our real request is served the attacker's reply instead of being performed. A
+ * WebCrypto RNG is not predictable from its outputs, which closes that.
+ *
+ * `randomUUID` is absent on some runtimes we target (React Native, older browsers, non-secure
+ * browser contexts), so fall back to `getRandomValues`, which is far more widely present. If
+ * neither exists we throw rather than silently degrading to a guessable id.
+ */
+function randomToken(): string {
+	const c = globalThis.crypto;
+	if (typeof c?.randomUUID === 'function') return c.randomUUID();
+	if (typeof c?.getRandomValues === 'function') {
+		const bytes = c.getRandomValues(new Uint8Array(16));
+		return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+	}
+	throw new Error('no WebCrypto RNG available (globalThis.crypto): cannot mint a correlation id');
 }
 
 /**
@@ -144,7 +166,8 @@ export class FretService implements IFretService, Startable {
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
 	private metadata?: Record<string, any>;
 	private activityHandler?: ActivityHandler;
-	private readonly dedupCache = new DedupCache<NearAnchorV1 | { commitCertificate: string }>();
+	/** Sized in the constructor — capacity is profile-derived (see {@link dedupCapacity}). */
+	private readonly dedupCache: DedupCache<NearAnchorV1 | { commitCertificate: string }>;
 	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
@@ -263,6 +286,11 @@ export class FretService implements IFretService, Startable {
 			this.cfg.profile === 'core' ? 10 : 2
 		);
 		this.announceFanout = this.cfg.profile === 'core' ? 8 : 4;
+		// Sized by role: a flood that evicts live entries before their TTL expires turns the
+		// dedup cache back into a replay hole, so Core — which carries the higher inbound rate
+		// and is the harder node to flush — gets 4× Edge's slots. Edge's inbound maybeAct rate
+		// limit caps how fast the cache can be churned in the first place, so it needs fewer.
+		this.dedupCache = new DedupCache(DEDUP_TTL_MS, this.cfg.profile === 'core' ? 2048 : 512);
 	}
 
 	public getDiagnostics(): Readonly<typeof this.diag> {
@@ -714,7 +742,8 @@ export class FretService implements IFretService, Startable {
 			if (cached) return cached;
 		}
 
-		// Timestamp freshness: reject messages outside ±5 min window
+		// Timestamp freshness: reject messages outside the ±30s window (= the dedup TTL, so a
+		// message can never outlive the cache entry that recognises it as a replay)
 		if (!validateTimestamp(msg.timestamp)) {
 			this.diag.rejected.timestampBounds++;
 			return await this.nearAnchorOnly(msg);
@@ -1899,14 +1928,13 @@ export class FretService implements IFretService, Startable {
 	 * than by the randomness. A receiver never parses it; it reads the phase off the message's
 	 * own `activity` field, which is the part it can actually trust.
 	 *
-	 * NOTE: `Math.random` is not replay-resistant — an observer can predict subsequent ids and
-	 * pre-poison a peer's response cache. Replacing it with `crypto.randomUUID` is tracked as
-	 * planned replay hardening in `docs/fret.md`; the two-phase shape here is unaffected by that
-	 * swap.
+	 * The random part comes from {@link randomToken}, not `Math.random`, so an observer of our
+	 * ids cannot compute the next one and pre-poison a peer's dedup cache with an answer for a
+	 * request we have not sent yet. The self-id and timestamp prefixes are traceability only and
+	 * need not be secret.
 	 */
 	private newCorrelationId(phase: 'digest' | 'act'): string {
-		const rand = Math.random().toString(36).slice(2, 8);
-		return `${this.node.peerId.toString()}-${Date.now()}-${rand}-${phase}`;
+		return `${this.node.peerId.toString()}-${Date.now()}-${randomToken()}-${phase}`;
 	}
 
 	async *iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {

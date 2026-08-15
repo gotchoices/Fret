@@ -6,27 +6,34 @@ import { registerMaybeAct } from '../src/rpc/maybe-act.js'
 import { registerPing, sendPing } from '../src/rpc/ping.js'
 import { PROTOCOL_MAYBE_ACT, PROTOCOL_PING } from '../src/rpc/protocols.js'
 import { validateTimestamp, readAllBounded } from '../src/rpc/protocols.js'
+import { DEDUP_TTL_MS } from '../src/service/dedup-cache.js'
 
 describe('Payload bounds and TTL validation', function () {
 	this.timeout(15000)
 
 	describe('validateTimestamp', () => {
-		it('accepts timestamps within ±5 min', () => {
+		it('accepts timestamps within ±30 s', () => {
 			expect(validateTimestamp(Date.now())).to.equal(true)
-			expect(validateTimestamp(Date.now() - 60_000)).to.equal(true)
-			expect(validateTimestamp(Date.now() + 60_000)).to.equal(true)
-			expect(validateTimestamp(Date.now() - 299_000)).to.equal(true)
+			expect(validateTimestamp(Date.now() - 10_000)).to.equal(true)
+			expect(validateTimestamp(Date.now() + 10_000)).to.equal(true)
+			expect(validateTimestamp(Date.now() - 29_000)).to.equal(true)
 		})
 
-		it('rejects timestamps outside ±5 min', () => {
-			expect(validateTimestamp(Date.now() - 301_000)).to.equal(false)
-			expect(validateTimestamp(Date.now() + 301_000)).to.equal(false)
+		it('rejects timestamps outside ±30 s', () => {
+			expect(validateTimestamp(Date.now() - 31_000)).to.equal(false)
+			expect(validateTimestamp(Date.now() + 31_000)).to.equal(false)
 			expect(validateTimestamp(Date.now() - 600_000)).to.equal(false)
+		})
+
+		it('defaults to the dedup TTL, so no message outlives its dedup entry', () => {
+			expect(validateTimestamp(Date.now() - DEDUP_TTL_MS + 1_000)).to.equal(true)
+			expect(validateTimestamp(Date.now() - DEDUP_TTL_MS - 1_000)).to.equal(false)
 		})
 
 		it('supports custom drift window', () => {
 			expect(validateTimestamp(Date.now() - 50_000, 30_000)).to.equal(false)
 			expect(validateTimestamp(Date.now() - 10_000, 30_000)).to.equal(true)
+			expect(validateTimestamp(Date.now() - 50_000, 300_000)).to.equal(true)
 		})
 	})
 

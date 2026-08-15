@@ -1,10 +1,19 @@
+/**
+ * How long a deduplicated answer is remembered.
+ *
+ * Kept in lockstep with the default message-freshness window (`validateTimestamp`): a message
+ * that is still fresh enough to accept must still be recognised as a repeat, or the gap between
+ * the two is a window in which a captured message can be replayed and re-performed.
+ */
+export const DEDUP_TTL_MS = 30_000;
+
 /** Bounded TTL cache for correlation-ID deduplication. */
 export class DedupCache<T> {
 	private readonly entries = new Map<string, { result: T; expires: number }>();
 	private readonly ttlMs: number;
 	private readonly maxSize: number;
 
-	constructor(ttlMs = 30_000, maxSize = 1024) {
+	constructor(ttlMs = DEDUP_TTL_MS, maxSize = 1024) {
 		this.ttlMs = ttlMs;
 		this.maxSize = maxSize;
 	}

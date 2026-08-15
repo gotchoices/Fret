@@ -260,8 +260,9 @@ Notes:
 See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling and [threat-rir-mitigated.md](threat-rir-mitigated.md) for residual posture with Right-is-Right.
 
 #### Current state
-- Timestamp bounds (±5 min) for message freshness
-- Correlation ID + phase dedup cache (30s TTL, 1024 entries) for maybeAct — the key is the correlation ID paired with whether the message carries an activity, so a digest probe and the activity resend sharing that ID get separate cache slots, and only a terminal answer is stored (see the routing rule above)
+- Timestamp bounds (±30s) for message freshness, deliberately equal to the dedup TTL below. Any slack between the two is a replay window — a captured message whose dedup entry has expired but whose timestamp still passes is accepted and re-performed — so the two constants move together (`DEDUP_TTL_MS`). A deployment with poor clock sync can pass a wider window per call, at the cost of re-opening that gap.
+- Correlation ID + phase dedup cache (30s TTL; capacity 2048 Core / 512 Edge) for maybeAct — the key is the correlation ID paired with whether the message carries an activity, so a digest probe and the activity resend sharing that ID get separate cache slots, and only a terminal answer is stored (see the routing rule above). Capacity is profile-derived because an entry evicted before its TTL is a replay hole: Core carries the higher inbound rate and so is given 4× the slots, while Edge's tighter inbound maybeAct rate limit already caps how fast its cache can be churned.
+- Correlation IDs are minted from the WebCrypto RNG (`crypto.randomUUID`, falling back to `crypto.getRandomValues` where `randomUUID` is unavailable — React Native, older browsers). `Math.random` was predictable from observed outputs, which let an attacker pre-fill a peer's dedup cache with answers for requests not yet sent. The self-id and timestamp prefixes are traceability only and need not be secret.
 - Rate limiting via global token buckets (per-protocol, profile-tuned Edge/Core), including the inbound announce handler (gated before any merge work; on rejection the message is dropped and `diag.rejected.rateLimited` increments)
 - Inbound snapshot-merge caps: both the neighbor-fetch merge and the announce merge slice remote successors/predecessors/sample to the same per-profile bounds (Core 16/16/8, Edge 8/8/6) before iterating, so one crafted message cannot force thousands of parse+hash+upsert ops regardless of the 128 KB byte limit
 - Breadcrumb loop detection and TTL limits on routing
@@ -273,9 +274,7 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Sign all messages with sender's private key; verify on receipt
   - Verify ring coordinates in sample entries (re-hash rather than trust provided coords)
 - Replay hardening:
-  - Align dedup TTL with timestamp window (tighten to ±30s)
-  - Cryptographically strong correlation IDs (`crypto.randomUUID`)
-  - Dedup protection for leave notices
+  - Dedup protection for leave notices (the TTL/timestamp alignment, strong correlation IDs, and profile-tuned dedup capacity are done — see Current state above)
 - Leave authentication:
   - Require signature from departing peer
   - Liveness ping before removal

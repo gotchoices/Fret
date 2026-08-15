@@ -181,9 +181,9 @@ Unchanged. RiR operates above the transport layer and does not modify FRET's RPC
 Unchanged. Ring coordinate integrity is a FRET-layer concern with no application-layer visibility.
 
 #### 5.4 Weak Correlation ID Generation
-**Original: Medium | Residual: Medium**
+**Original: Medium | Residual: None (fixed in FRET)**
 
-Unchanged. Dispute messages use their own identifiers but FRET's `Math.random()` correlation IDs remain predictable.
+Resolved in FRET itself: correlation IDs are now minted from the WebCrypto RNG (`crypto.randomUUID`, `crypto.getRandomValues` fallback) rather than `Math.random`, so they are no longer predictable from observed IDs. Right-is-Right is not what closes this.
 
 #### 5.5 Serialized Routing Table Tampering
 **Original: Medium | Residual: Medium**

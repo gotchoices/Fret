@@ -65,7 +65,7 @@ Bootstrap peer ID extraction now uses proper `@multiformats/multiaddr` parsing i
   - Confirms graceful error handling without crashes
 
 - **Payload bounds & TTL validation** (`test/payload-bounds-ttl.spec.ts`)
-  - `validateTimestamp`: accepts within ±5 min, rejects outside, supports custom drift
+  - `validateTimestamp`: accepts within ±30 s (default equals the dedup TTL), rejects outside, supports custom drift
   - `readAllBounded`: reads within limit, rejects single-chunk and multi-chunk overflow
   - Oversized maybeAct payload at RPC layer rejected without crash
   - Stale/future timestamp rejection with diagnostic counters
@@ -73,6 +73,12 @@ Bootstrap peer ID extraction now uses proper `@multiformats/multiaddr` parsing i
   - `BusyResponseV1` when maybeAct/neighbors buckets exhausted
   - Valid message passes through normally
   - Multiple rejection types tracked independently
+
+- **Replay hardening** (`test/replay-hardening.spec.ts`)
+  - Correlation ids: self-id prefix + phase suffix, distinct per phase
+  - Ids stay unique with `Math.random` pinned (proves the WebCrypto RNG is the source)
+  - ≥128 bits of randomness; `getRandomValues` fallback when `randomUUID` is absent
+  - Dedup cache capacity is profile-derived (Core 2048 / Edge 512; Core is the default)
 
 - **Network isolation** (`test/network.isolation.spec.ts`)
   - Different networkNames cannot exchange snapshots (protocol mismatch)

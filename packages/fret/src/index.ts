@@ -134,7 +134,7 @@ export { estimateSizeAndConfidence } from './estimate/size-estimator.js';
 export type { SizeEstimate } from './estimate/size-estimator.js';
 export { assembleCohort } from './service/cohort.js';
 export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
-export { DedupCache } from './service/dedup-cache.js';
+export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
 export { validateTimestamp, readAllBounded } from './rpc/protocols.js';
 
 export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {

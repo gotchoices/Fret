@@ -157,7 +157,7 @@ The `replacements` field in the spoofed notice can point to attacker-controlled 
 
 - **Preconditions**: Knowledge of target peer's ID and its neighbors.
 - **Impact**: Targeted peer removal from the network. Replacement poisoning. Amplified resource consumption (each recipient does 6 pings + 4 snapshot fetches).
-- **Current mitigations**: Rate limiting via `bucketLeave` (20 tokens, 10/s refill for core). Timestamp validation (±5 min). `sanitizeReplacements` validates peer ID format. But no authentication of the sender.
+- **Current mitigations**: Rate limiting via `bucketLeave` (20 tokens, 10/s refill for core). Timestamp validation (±30s since the replay-hardening work; ±5 min when this was written). `sanitizeReplacements` validates peer ID format. But no authentication of the sender.
 
 #### 3.3 Replay Attacks with Future Timestamps
 **Severity: High**
@@ -174,6 +174,7 @@ Leave notices are particularly vulnerable: `LeaveNoticeV1` has no correlation ID
 - **Impact**: Duplicate activity execution (double pend/commit). Repeated leave-forced removal of honest peers. Stale routing decisions.
 - **Current mitigations**: 30s dedup window (maybeAct only). Timestamp freshness check. Breadcrumb loop detection.
 - **Gap**: 30s dedup is too short for the 5-minute (or 10-minute with future timestamps) validity. Leave notices have no dedup at all.
+- **Status — partly mitigated**: the freshness window is now ±30s, equal to the dedup TTL, so the multi-minute maybeAct gap described above is closed (a replay outside 30s fails the timestamp check; one inside it hits a live dedup entry). Correlation IDs are now WebCrypto-random, so they cannot be predicted and pre-filled. Dedup capacity is profile-derived (Core 2048 / Edge 512) rather than a flat 1024, so the cache is harder to flush by flooding. **Leave notices still have no dedup** — that arm is open, tracked with the leave-authentication work.
 
 #### 3.4 Announcement Flooding — No Inbound Rate Limit
 **Severity: High**
@@ -390,6 +391,7 @@ Predictable correlation IDs enable:
 - **Preconditions**: Observation of several correlation IDs from a target.
 - **Impact**: Dedup cache manipulation. Potential result hijacking.
 - **Remediation**: Use `crypto.randomUUID()` or `crypto.getRandomValues()`.
+- **Status — mitigated**: ids are minted from `crypto.randomUUID()`, falling back to `crypto.getRandomValues()` where it is unavailable. The self-id and timestamp prefixes remain, for traceability only.
 
 #### 5.5 Serialized Routing Table Tampering
 **Severity: Medium**
@@ -414,6 +416,7 @@ The design doc notes "The caller decides where and how to store the JSON" but pr
 
 - **Impact**: Activity replay. Stale routing information injection.
 - **Remediation**: Align dedup TTL with timestamp window, or use monotonic sequence numbers per-peer.
+- **Status — mitigated**: `validateTimestamp` now defaults to ±30s, equal to `DEDUP_TTL_MS`, so no accepted message outlives the dedup entry that recognises its replay. A caller may still pass a wider window explicitly for poor clock sync, which re-opens the gap by that amount.
 
 ---
 

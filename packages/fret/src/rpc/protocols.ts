@@ -184,7 +184,17 @@ export async function readAllBounded(
 	return out;
 }
 
-export function validateTimestamp(ts: number, maxDriftMs = 300_000): boolean {
+/**
+ * Freshness check for an inbound message: is its timestamp within `maxDriftMs` of now?
+ *
+ * The default is deliberately the same 30s as the dedup cache's TTL (`DedupCache`). Any slack
+ * between the two is a replay window: a captured message whose dedup entry has already expired
+ * but whose timestamp still passes is accepted and re-performed. The old 5-minute default left
+ * 4.5 minutes of that. 30s is generous for NTP-synced clocks; a deployment with poor time sync
+ * should widen it explicitly — and understand that it widens the replay window by the same
+ * amount unless the dedup TTL is widened with it.
+ */
+export function validateTimestamp(ts: number, maxDriftMs = 30_000): boolean {
 	return Math.abs(Date.now() - ts) <= maxDriftMs;
 }
 
