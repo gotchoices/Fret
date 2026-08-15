@@ -3,6 +3,7 @@ import { expect } from 'chai'
 import fc from 'fast-check'
 import { DigitreeStore } from '../src/store/digitree-store.js'
 import { COORD_BYTES } from '../src/ring/hash.js'
+import { assembleCohort } from '../src/service/cohort.js'
 
 const arbCoord = fc.uint8Array({ minLength: COORD_BYTES, maxLength: COORD_BYTES })
 
@@ -21,37 +22,6 @@ function seedStore(peers: FakePeer[]): DigitreeStore {
 	const store = new DigitreeStore()
 	for (const p of peers) store.upsert(p.id, p.coord)
 	return store
-}
-
-/**
- * Mirrors the assembleCohort logic from fret-service.ts but operates
- * directly on a DigitreeStore, avoiding the need for a full FretService.
- */
-function assembleCohort(
-	store: DigitreeStore,
-	coord: Uint8Array,
-	wants: number,
-	exclude?: Set<string>
-): string[] {
-	const out: string[] = []
-	const ex = exclude ?? new Set<string>()
-	const succIds = store.neighborsRight(coord, wants * 2)
-	const predIds = store.neighborsLeft(coord, wants * 2)
-	let si = 0
-	let pi = 0
-	while (out.length < wants && (si < succIds.length || pi < predIds.length)) {
-		if (out.length % 2 === 0 && si < succIds.length) {
-			const id = succIds[si++]
-			if (id && !ex.has(id)) out.push(id)
-		} else if (pi < predIds.length) {
-			const id = predIds[pi++]
-			if (id && !ex.has(id)) out.push(id)
-		} else if (si < succIds.length) {
-			const id = succIds[si++]
-			if (id && !ex.has(id)) out.push(id)
-		}
-	}
-	return Array.from(new Set(out)).slice(0, wants)
 }
 
 describe('Cohort assembly properties', function () {
@@ -203,6 +173,25 @@ describe('Cohort assembly properties', function () {
 					return cohort.length === Math.min(wants, ids.length)
 				}
 			), opts)
+		})
+
+		it('small ring (n ≈ wants): full distinct count returned despite cross-walk overlap', () => {
+			// Regression for cohort under-fill: when the ring is small, the clockwise and
+			// counterclockwise walks (each over-fetching wants*2) both wrap and return
+			// overlapping ids in different orders. The alternating merge must dedup against
+			// what it has already collected this pass, not just the caller's exclude set.
+			const store = new DigitreeStore()
+			const n = 3
+			for (let i = 0; i < n; i++) {
+				const coord = new Uint8Array(COORD_BYTES)
+				coord[31] = (i * 97) % 256
+				coord[30] = (i * 53) % 256
+				store.upsert(`p${i}`, coord)
+			}
+			const query = new Uint8Array(COORD_BYTES)
+			const cohort = assembleCohort(store, query, n)
+			expect(cohort.length).to.equal(n)
+			expect(new Set(cohort).size).to.equal(n)
 		})
 	})
 })

@@ -23,21 +23,25 @@ export function assembleCohort(
 ): string[] {
 	const out: string[] = [];
 	const ex = exclude ?? new Set<string>();
+	const seen = new Set<string>();
 	const succIds = store.neighborsRight(hashedCoord, wants * 2, filter);
 	const predIds = store.neighborsLeft(hashedCoord, wants * 2, filter);
 	let si = 0,
 		pi = 0;
+	const take = (id: string | undefined) => {
+		if (id && !ex.has(id) && !seen.has(id)) {
+			seen.add(id);
+			out.push(id);
+		}
+	};
 	while (out.length < wants && (si < succIds.length || pi < predIds.length)) {
 		if (out.length % 2 === 0 && si < succIds.length) {
-			const id = succIds[si++];
-			if (id && !ex.has(id)) out.push(id);
+			take(succIds[si++]);
 		} else if (pi < predIds.length) {
-			const id = predIds[pi++];
-			if (id && !ex.has(id)) out.push(id);
+			take(predIds[pi++]);
 		} else if (si < succIds.length) {
-			const id = succIds[si++];
-			if (id && !ex.has(id)) out.push(id);
+			take(succIds[si++]);
 		}
 	}
-	return Array.from(new Set(out)).slice(0, wants);
+	return out.slice(0, wants);
 }
