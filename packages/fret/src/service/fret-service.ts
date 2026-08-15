@@ -118,6 +118,7 @@ export class FretService implements IFretService, Startable {
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
 	private readonly bucketAnnounce: TokenBucket;
+	private readonly bucketAnnounceInbound: TokenBucket;
 	private readonly announceFanout: number;
 	private readonly departureDebounce = new Map<string, number>();
 	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
@@ -187,6 +188,15 @@ export class FretService implements IFretService, Startable {
 		this.bucketAnnounce = new TokenBucket(
 			this.cfg.profile === 'core' ? 16 : 6,
 			this.cfg.profile === 'core' ? 8 : 2
+		);
+		// Inbound-announce gate: guards *processing* of received announces (bucketAnnounce
+		// guards our *outbound* sends). Profile-tuned Edge < Core; checked before any merge.
+		// NOTE: capacity/refill are first-cut. On a large Core ring, churn can trigger many
+		// legit announces from distinct neighbors at once; if diag.rejected.rateLimited climbs
+		// in normal operation, raise these before assuming an attack.
+		this.bucketAnnounceInbound = new TokenBucket(
+			this.cfg.profile === 'core' ? 20 : 6,
+			this.cfg.profile === 'core' ? 10 : 2
 		);
 		this.announceFanout = this.cfg.profile === 'core' ? 8 : 4;
 	}
@@ -403,9 +413,7 @@ export class FretService implements IFretService, Startable {
 		registerNeighbors(
 			this.node,
 			async () => this.handleNeighborsRequest(),
-			(from, snap) => {
-				void this.mergeAnnounceSnapshot(from, snap);
-			},
+			(from, snap) => this.handleAnnounce(from, snap),
 			this.protocols,
 			this.maxBytesNeighbors(),
 			() => { this.diag.rejected.identityMismatch++; }
@@ -748,6 +756,32 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	/**
+	 * Per-message caps for merging a received neighbor/announce snapshot — single source of
+	 * truth shared by the neighbor-fetch merge (`mergeNeighborSnapshots`) and the inbound-announce
+	 * merge (`mergeAnnounceSnapshot`). Bounds how many remote-supplied ids one message can force
+	 * us to parse + SHA-256 hash + upsert, independent of the RPC byte limit.
+	 */
+	private mergeSnapshotCaps(): { successors: number; predecessors: number; sample: number } {
+		return this.cfg.profile === 'core'
+			? { successors: 16, predecessors: 16, sample: 8 }
+			: { successors: 8, predecessors: 8, sample: 6 };
+	}
+
+	/**
+	 * Inbound-announce entry point: gate on the per-profile token bucket before any merge work.
+	 * A crafted announce can carry many ids (the RPC accepts up to a 128 KB message), each
+	 * costing a parse + hash + upsert; without this gate one peer could force thousands of ops.
+	 * On rejection we drop the message and count it — never throw, so no inflight state desyncs.
+	 */
+	private handleAnnounce(from: string, snap: NeighborSnapshotV1): void {
+		if (!this.bucketAnnounceInbound.tryTake()) {
+			this.diag.rejected.rateLimited++;
+			return;
+		}
+		void this.mergeAnnounceSnapshot(from, snap);
+	}
+
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
 		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		try {
@@ -763,7 +797,12 @@ export class FretService implements IFretService, Startable {
 				this.store.update(from, { metadata: snap.metadata });
 			}
 
-			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
+			// Cap remote-supplied lists to the same per-profile bounds as the neighbor-fetch
+			// merge — a single crafted announce must not force thousands of parse+hash+upserts.
+			const caps = this.mergeSnapshotCaps();
+			const succList = (snap.successors ?? []).slice(0, caps.successors);
+			const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
+			for (const pid of [...succList, ...predList]) {
 				try {
 					const coord = await hashPeerId(peerIdFromString(pid));
 					if (!this.store.getById(pid)) discovered.push(pid);
@@ -774,7 +813,7 @@ export class FretService implements IFretService, Startable {
 				}
 			}
 			// merge bounded sample if present
-			for (const s of snap.sample ?? []) {
+			for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
 				try {
 					const coord = u8FromString(s.coord, 'base64url');
 					if (!this.store.getById(s.id)) discovered.push(s.id);
@@ -1031,10 +1070,9 @@ export class FretService implements IFretService, Startable {
 			try {
 				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS);
 				this.diag.snapshotsFetched++;
-				const capSucc = this.cfg.profile === 'core' ? 16 : 8;
-				const capPred = this.cfg.profile === 'core' ? 16 : 8;
-				const succList = (snap.successors ?? []).slice(0, capSucc);
-				const predList = (snap.predecessors ?? []).slice(0, capPred);
+				const caps = this.mergeSnapshotCaps();
+				const succList = (snap.successors ?? []).slice(0, caps.successors);
+				const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
 				for (const pid of [...succList, ...predList]) {
 					try {
 						const coord = await hashPeerId(peerIdFromString(pid));
@@ -1045,8 +1083,7 @@ export class FretService implements IFretService, Startable {
 						console.warn('failed to merge neighbor', pid, err);
 					}
 				}
-				const capSample = this.cfg.profile === 'core' ? 8 : 6;
-				for (const s of (snap.sample ?? []).slice(0, capSample)) {
+				for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
 					try {
 						const coord = u8FromString(s.coord, 'base64url');
 						if (!this.store.getById(s.id)) announced.push(s.id);
