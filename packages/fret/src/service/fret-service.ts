@@ -1589,6 +1589,18 @@ export class FretService implements IFretService, Startable {
 	}
 
 	// Routing
+	/**
+	 * The reject-path reply (breadcrumb loop, TTL expired, oversized payload, routeAct threw):
+	 * deliberately the cheaper twin of `buildNearAnchor` — narrower cohort hint, and no size
+	 * estimate computed — because these guards answer *before* the maybeAct token bucket, so
+	 * their cost is what an abusive sender gets for free. Anchors are still measured against
+	 * the key coordinate; both twins must stay that way (see `test/pick-anchors.spec.ts`).
+	 *
+	 * NOTE: `estimated_cluster_size` / `confidence` are placeholders here — no consumer reads
+	 * either field today. If one starts to, this must report the real estimate
+	 * (`estimateSizeAndConfidence`) rather than the configured k and a flat 0.5, and the extra
+	 * per-message cost on the pre-bucket path has to be weighed at that point.
+	 */
 	private async nearAnchorOnly(msg: RouteAndMaybeActV1): Promise<NearAnchorV1> {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 		const coord = await hashKey(keyBytes);
@@ -1637,6 +1649,12 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	/**
+	 * Up to two anchors for a NearAnchor reply: the candidates closest to `targetCoord`, which
+	 * is always the *key's* hashed coordinate. Anchors invite the sender to resend its activity,
+	 * so measuring from anything else (self, or the all-zero vector this once used) returns peers
+	 * near an unrelated point and the resend lands outside the key's cluster.
+	 */
 	private pickAnchors(candidates: string[], targetCoord: Uint8Array): string[] {
 		const unique = Array.from(new Set(candidates));
 		if (unique.length === 0) return [];

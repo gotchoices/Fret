@@ -94,7 +94,8 @@ Single pipeline for discovery and action:
 Routing rule:
 1. If local membership test says "in-cluster":
    - If activity included: perform activity (callback) given the two-sided cohort (expand/filter as needed to satisfy minSigs), then return commit certificate
-   - If no activity: reply with NearAnchor { anchors: [succ, pred], cohortHint: PeerId[], estimatedClusterSize, confidence } inviting a resend with activity
+   - If no activity: reply with NearAnchor { anchors, cohortHint: PeerId[], estimatedClusterSize, confidence } inviting a resend with activity
+   - **Anchors are measured against the key's own coordinate.** The candidate pool is the key's successor and predecessor windows, and the two anchors are the pool's *closest* members to the key (connected peers preferred when distances are within a byte, per the next-hop heuristic) — not one from each side. Both anchors may therefore sit on the same side of the key; anchors are routing hints, and being nearest the key is what makes the resend land in-cluster. Measuring from any fixed point instead (self, or the all-zero coordinate) silently returns whichever peers happen to have numerically small coordinates, which is a correctness bug, not a bias — see `test/pick-anchors.spec.ts`.
    - Cache result to handle duplicate requests, keyed on correlation ID **and phase** (digest-only vs activity-bearing). Keying on the ID alone is wrong: the probe and the resend that follows it share an ID, so the probe's NearAnchor would be served as the answer to the message carrying the work and the activity would never run. Since the responder's own anchor list normally names itself, that resend usually arrives right back at the peer holding the probe's cache entry. The phase is read off the message's `activity` field; the payload itself is not hashed into the key, so a re-encoded-but-equivalent retry still hits the cache instead of re-performing the work.
    - **Only a terminal answer is cached.** For a digest probe the NearAnchor *is* the answer. For an activity-bearing message a NearAnchor is a refusal — "I did not perform the work; the ring says try over there" — returned when no activity handler is installed, or when the peer is not in-cluster and its forward found no hop or failed. Storing a refusal would answer every retry of that work for the cache TTL with the same refusal and lose the activity silently, which is the phase-collision failure one level in. So an activity-bearing message caches only a commit certificate. The cost is that a replayed activity can re-drive a forward attempt; that is correct, because the work was never performed, and TTL decrement, breadcrumbs and the rate-limit bucket already bound it.
 2. Else (not in-cluster): forward towards h by choosing the next hop that minimizes absolute ring distance to h using S/P (and optional finger cache). Optionally attach redirect hints (local near-h successors/predessors) to speed convergence.
@@ -488,7 +489,7 @@ interface RouteAndMaybeActV1 {
 ```
 interface NearAnchorV1 {
   v: 1;
-  anchors: string[];            // [succ, pred]
+  anchors: string[];            // ≤2 peers nearest the key coordinate (see Routing rule)
   cohort_hint: string[];        // small peer id set
   estimated_cluster_size: number;
   confidence: number;           // [0, 1]
