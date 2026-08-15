@@ -36,6 +36,15 @@ export interface PeerEntry {
 	 * the store only stores and exposes the count; it never branches on it.
 	 */
 	negotiateFailures: number;
+	/**
+	 * Unix ms of the last handshake failure that was *counted* toward `negotiateFailures`.
+	 *
+	 * A run of failures only means "persistently absent" if the observations are separated in
+	 * time; concurrent RPCs to one restarting peer all fail in the same instant and are one
+	 * observation, not a run. Callers use this to space counted failures apart. Not serialized —
+	 * unlike the count it carries no diagnostic value across a restart. 0 = never counted.
+	 */
+	lastNegotiateFailureAt: number;
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -123,6 +132,7 @@ export class DigitreeStore {
 			state: 'disconnected',
 			membership: 'unknown',
 			negotiateFailures: 0,
+			lastNegotiateFailureAt: 0,
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
@@ -337,6 +347,7 @@ export class DigitreeStore {
 				// Handshake history cannot survive a restart — the remote may have restarted
 				// too. Reset for the same reason `state` is forced to 'disconnected'.
 				negotiateFailures: 0,
+				lastNegotiateFailureAt: 0,
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,

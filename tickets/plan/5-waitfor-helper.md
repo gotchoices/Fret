@@ -10,3 +10,13 @@ Approach:
 - Replace the fixed sleeps across the affected specs with predicate waits keyed on the actual observable state.
 
 References: review.html:437-441 "Fixed multi-second sleeps"; ring-membership.spec.ts:431/459/540, libp2p-memory.integration.spec.ts:104/132; existing pattern at membership-identify.spec.ts:29.
+
+Additional arm (found during the `membership-classification-strength` review): `ring-membership.spec.ts`
+now carries its own private copy of the same predicate-wait (`waitFor`, around line 425), a near-duplicate
+of the one in `membership-identify.spec.ts`. The fixed sleeps that spec used to have are already gone —
+converted to predicate waits by that ticket — so the remaining work there is purely the de-duplication:
+fold both copies into the shared helper this ticket creates. One behavioural detail worth carrying into
+the shared version: neither copy throws when the predicate never holds, so a spec chaining three waits
+can silently consume its whole mocha budget and report an opaque timeout instead of the assertion that
+follows the wait. The shared helper should either throw with the caller's label or keep a default timeout
+small enough that several chained waits still fit inside a test's budget.

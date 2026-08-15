@@ -422,7 +422,10 @@ describe('Foreign re-probe backoff growth', function () {
 	})
 })
 
-async function waitFor(predicate: () => boolean, timeoutMs = 20000, stepMs = 25): Promise<void> {
+// Default timeout is deliberately well under the suite's per-test budget: several tests chain
+// three waits, and a wait that silently runs to the full budget would surface as an opaque mocha
+// timeout instead of the precise assertion that follows each call.
+async function waitFor(predicate: () => boolean, timeoutMs = 12000, stepMs = 25): Promise<void> {
 	const deadline = Date.now() + timeoutMs
 	while (Date.now() < deadline) {
 		if (predicate()) return
@@ -666,6 +669,37 @@ describe('Ring membership classification (probe-based, no identify)', function (
 
 		const selfCoord = await hashPeerId(nodeA.peerId)
 		expect(svcA.getNeighbors(selfCoord, 'both', 8)).to.include(idC)
+	})
+
+	// A "run" of failures only means *persistently* absent if the observations are spread over
+	// time. Several concurrent inbound maybeActs forwarding to the same restarting hop all fail
+	// in the same instant; counting each would let one blip reach the threshold immediately and
+	// demote a confirmed member — the exact failure the threshold exists to prevent. Driven
+	// through the guard directly because provoking three genuinely-concurrent forwards to one
+	// peer over real transports is timing-fragile, and the guard is where the rule lives.
+	it('counts a burst of simultaneous negotiation failures as one observation', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		nodes = [nodeA]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		services = [svcA]
+		const signal = (svcA as unknown as { applyMembershipSignal: (id: string, s: string) => void })
+
+		const store = svcA.getStore()
+		store.upsert('burst-peer', new Uint8Array(32))
+		store.setMembership('burst-peer', 'member')
+
+		for (let i = 0; i < 5; i++) signal.applyMembershipSignal('burst-peer', 'negotiate-failure')
+		expect(negotiateFailures(svcA, 'burst-peer')).to.equal(1, 'a burst is one observation, not five')
+		expect(store.getById('burst-peer')?.membership).to.equal('member', 'a burst must not demote a member')
+
+		// Spaced-out failures still accumulate and still demote — the run is delayed, not disabled.
+		for (let i = 0; i < 2; i++) {
+			await new Promise((r) => setTimeout(r, 600))
+			signal.applyMembershipSignal('burst-peer', 'negotiate-failure')
+		}
+		expect(negotiateFailures(svcA, 'burst-peer')).to.equal(3)
+		expect(store.getById('burst-peer')?.membership).to.equal('foreign', 'a genuine run must still demote')
 	})
 
 	// Arm 3: an inbound namespaced RPC is the strongest membership proof there is — the remote

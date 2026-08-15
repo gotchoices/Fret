@@ -163,6 +163,16 @@ export class FretService implements IFretService, Startable {
 	 * its protocol list, so the common case is unchanged.
 	 */
 	private static readonly NEGOTIATE_FAILURE_THRESHOLD = 3;
+	/**
+	 * Minimum spacing between two failures that both count toward the run above.
+	 *
+	 * Failures that arrive closer together than this are the *same* observation seen by
+	 * concurrent callers, not independent evidence. Comfortably below the shortest interval
+	 * at which the probe passes can legitimately re-observe a peer (the 1 s first backoff
+	 * window), so genuine sequential failures are never swallowed and the ~7 s time-to-label
+	 * for a genuinely foreign peer is unchanged.
+	 */
+	private static readonly NEGOTIATE_FAILURE_MIN_SPACING_MS = 500;
 	private firstStabilizeDone = false;
 	private readonly diag = {
 		peersDiscovered: 0,
@@ -338,9 +348,8 @@ export class FretService implements IFretService, Startable {
 			case 'rpc-inbound':
 			case 'identify-member': {
 				// Positive proof outranks whatever label the peer currently carries.
-				const patch: Partial<PeerEntry> = { negotiateFailures: 0 };
-				if (e.membership !== 'member') patch.membership = 'member';
-				if (e.membership !== 'member' || e.negotiateFailures !== 0) this.store.update(id, patch);
+				if (e.membership === 'member' && e.negotiateFailures === 0) return; // already settled
+				this.store.update(id, { membership: 'member', negotiateFailures: 0 });
 				return;
 			}
 			case 'identify-foreign': {
@@ -350,10 +359,17 @@ export class FretService implements IFretService, Startable {
 				return;
 			}
 			case 'negotiate-failure': {
+				// A *run* means observations separated in time. Concurrent RPCs to one peer all
+				// fail in the same instant — several inbound maybeActs forwarding to the same
+				// restarting hop, say — and that is one observation, not three. Counting each
+				// would let a burst reach the threshold immediately and demote a confirmed member
+				// on a single blip, which is the whole failure this guard exists to prevent.
+				const now = Date.now();
+				if (now - e.lastNegotiateFailureAt < FretService.NEGOTIATE_FAILURE_MIN_SPACING_MS) return;
 				// Clamped at the threshold so the counter stays bounded for a peer we keep
 				// re-probing; a peer already at the threshold simply stays foreign.
 				const failures = Math.min(e.negotiateFailures + 1, FretService.NEGOTIATE_FAILURE_THRESHOLD);
-				const patch: Partial<PeerEntry> = { negotiateFailures: failures };
+				const patch: Partial<PeerEntry> = { negotiateFailures: failures, lastNegotiateFailureAt: now };
 				if (failures >= FretService.NEGOTIATE_FAILURE_THRESHOLD && e.membership !== 'foreign') {
 					patch.membership = 'foreign';
 				}
@@ -368,6 +384,14 @@ export class FretService implements IFretService, Startable {
 	 * proof available, since only this network's peers speak them and the sender identity is
 	 * transport-authenticated. Upserts first so a peer we have never seen is promoted rather
 	 * than dropped, which is what re-admits a NAT'd peer we struggle to dial but that reaches us.
+	 *
+	 * NOTE: this is the one admission path driven by the *remote* rather than by proof we
+	 * gathered ourselves — anyone who knows the network name can dial our ping protocol and
+	 * self-admit as `member` (only as themselves; the id is transport-authenticated). Harmless
+	 * under the current trust model, where speaking the namespaced protocol *is* membership,
+	 * and self-limiting: such a peer answers nothing, so outbound probes demote it again. If
+	 * admission control (see the security section of docs/fret.md) ever lands, this site must
+	 * consult it rather than promoting unconditionally.
 	 */
 	private async noteInboundRpc(id: string): Promise<void> {
 		if (this.stopped) return;
@@ -1210,8 +1234,10 @@ export class FretService implements IFretService, Startable {
 
 	/**
 	 * Probe a single peer's membership with a namespaced ping. Success → member;
-	 * unsupported-protocol → foreign; timeout / transient → stay unknown but back off
-	 * so we don't hammer an unreachable-but-connected peer every tick.
+	 * unsupported-protocol → one more strike toward the failure threshold (see
+	 * `applyMembershipSignal`), demoting to foreign only once the run completes;
+	 * timeout / transient → label untouched. Every failure backs off either way so we
+	 * don't hammer an unreachable-but-connected peer every tick.
 	 */
 	private async probeMembership(id: string): Promise<void> {
 		try {
