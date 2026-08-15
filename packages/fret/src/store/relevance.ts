@@ -71,10 +71,18 @@ function frequencyScore(entry: PeerEntry): number {
 	return Math.log1p(entry.accessCount) / 5; // saturates slowly
 }
 
-function healthScore(entry: PeerEntry): number {
+/**
+ * Health ∈ [0,1] from the success/failure ratio and measured latency.
+ *
+ * An *unmeasured* peer (`avgLatencyMs === null`) takes the neutral 0.5 penalty, so it scores
+ * strictly between a peer measured at 0 ms and one measured at 1000 ms. The test is on `null`
+ * and not on `> 0`: a genuine 0 ms measurement is the best possible link and must score as
+ * such, not be mistaken for the absence of a measurement.
+ */
+export function healthScore(entry: PeerEntry): number {
 	const total = entry.successCount + entry.failureCount;
 	const successRate = total > 0 ? entry.successCount / total : 0.5;
-	const latencyPenalty = entry.avgLatencyMs > 0 ? Math.min(1, entry.avgLatencyMs / 1000) : 0.5;
+	const latencyPenalty = entry.avgLatencyMs === null ? 0.5 : Math.min(1, entry.avgLatencyMs / 1000);
 	const health = 0.5 * successRate + 0.5 * (1 - latencyPenalty);
 	return Math.max(0, health);
 }
@@ -106,10 +114,34 @@ export function touch(entry: PeerEntry, x: number, model: SparsityModel, now = D
 	});
 }
 
-export function recordSuccess(entry: PeerEntry, latencyMs: number, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
-	observeDistance(model, x);
+/**
+ * Blend a new latency sample into a peer's running average.
+ *
+ * `null` means never measured, so the first sample seeds the average outright instead of being
+ * dragged toward a value that was never observed. A real 0 ms sample blends like any other.
+ * `undefined` means the caller has no sample at all — the average is returned untouched rather
+ * than fabricating one (see {@link recordSuccess}).
+ */
+function blendLatency(avg: number | null, sample: number | undefined): number | null {
+	if (sample === undefined) return avg;
+	if (avg === null) return sample;
 	const alpha = 0.2; // EMA for latency
-	const avgLatencyMs = entry.avgLatencyMs > 0 ? (1 - alpha) * entry.avgLatencyMs + alpha * latencyMs : latencyMs;
+	return (1 - alpha) * avg + alpha * sample;
+}
+
+/**
+ * Record a completed RPC against `entry`.
+ *
+ * `latencyMs` is **optional** because not every success carries a usable measurement. Timing a
+ * forwarded route, for instance, measures the whole downstream subtree rather than the link to
+ * the next hop, so recording it would penalize a healthy adjacent peer for a long path behind
+ * it. Such callers omit the argument and the peer's `avgLatencyMs` is left exactly as it was —
+ * still `null` if it has never been pinged. Callers must likewise omit `avgLatencyMs` from any
+ * patch they derive from the result when they supplied no sample.
+ */
+export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
+	observeDistance(model, x);
+	const avgLatencyMs = blendLatency(entry.avgLatencyMs, latencyMs);
 	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1 }, now);
 	const bonus = sparsityBonus(model, x);
 	const relevance = base * bonus;

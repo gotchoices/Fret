@@ -125,7 +125,7 @@ describe('DigitreeStore membership field', () => {
 		expect(e.successCount).to.equal(0)
 		expect(e.failureCount).to.equal(0)
 		expect(e.accessCount).to.equal(0)
-		expect(e.avgLatencyMs).to.equal(0)
+		expect(e.avgLatencyMs).to.equal(null) // never measured — not "measured at 0 ms"
 		expect(e.state).to.equal('disconnected')
 		expect(e.membership).to.equal('unknown')
 	})

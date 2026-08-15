@@ -28,7 +28,7 @@ function serializedPeer(id: string, coordByte: number, over: Partial<SerializedP
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,
-		avgLatencyMs: 0,
+		avgLatencyMs: null,
 		...over,
 	}
 }

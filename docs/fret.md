@@ -469,6 +469,8 @@ Notes:
 - `normalized_log_distance` is derived from **ring distance** (`min(cw, ccw)`), not XOR — the same `normalizedLogMagnitude` helper the next-hop cost function uses, so "near" means the same thing to routing and to the KDE. Since ring distance maxes at 2^255, x reaches 1 only for a pair sitting exactly antipodal; every other pair lands at 1 − 1/256 ≈ 0.996 or below. The KDE centers span 0.042–0.958 and x is only ever used as a relative position, so nothing is rescaled to compensate.
 - No explicit buckets or finger tables; a single ordered Digitree plus sparsity-aware scoring yields an emergent, distance-balanced cache well-suited to routing.
 - During a routing walk, temporary (ephemeral) multipliers may bias candidates near the desired step distance, but long-term scores remain governed by S(x).
+- **Unmeasured latency is `null`, not `0`, and scores neutrally.** `avgLatencyMs` is `number | null`; `null` means no round trip to that peer has ever been timed, and it takes the midpoint latency penalty (0.5) — so an unmeasured peer sits strictly between one measured at 0 ms (penalty 0, the best possible link) and one measured at 1000 ms or worse (penalty 1). The distinction is load-bearing rather than cosmetic: pings are timed with `Date.now()`, whose granularity is ~15 ms on Windows, so a localhost or same-process peer routinely measures 0 ms. While `0` doubled as the "no data" sentinel, such a peer scored *below* one measured at 300 ms (relevance 1.389 vs 1.461 on otherwise identical entries) — and relevance drives both next-hop preference and capacity eviction, so the faster peer was preferred less and evicted sooner. The nullable also makes "I have no measurement" unwritable as a number, which is what stops a caller with nothing to report from fabricating a 0 ms sample.
+- **Only a measured round trip to *that peer alone* is a latency sample.** `recordSuccess` takes an optional `latencyMs`; a caller that completed an RPC but timed nothing one-hop omits it, and the peer's average is left exactly as it was. The forwarded-`maybeAct` path is the case in point — it returns only once the entire remaining route has completed downstream, so its wall time is the cost of the whole subtree, not of the link to the next hop, and recording it would penalize a healthy adjacent peer for a long path behind it. Latency belongs to the ping paths (`probeNeighborsLatency`, `reprobeForeignPeers`), which measure one hop.
 
 #### Cohort assembly algorithm
 ```
@@ -574,7 +576,8 @@ interface SerializedPeerEntry {
   accessCount: number;
   successCount: number;
   failureCount: number;
-  avgLatencyMs: number;
+  avgLatencyMs: number | null;  // EMA of measured RTT; null = never measured. A field absent
+                                // in a pre-nullable snapshot reads back as null.
   metadata?: Record<string, any>;
 }
 

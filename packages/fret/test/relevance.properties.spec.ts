@@ -1,4 +1,5 @@
 import { describe, it } from 'mocha'
+import { expect } from 'chai'
 import fc from 'fast-check'
 import {
 	createSparsityModel,
@@ -8,6 +9,7 @@ import {
 	touch,
 	recordSuccess,
 	recordFailure,
+	healthScore,
 } from '../src/store/relevance.js'
 import type { PeerEntry } from '../src/store/digitree-store.js'
 import { COORD_BYTES } from '../src/ring/hash.js'
@@ -28,7 +30,7 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,
-		avgLatencyMs: 0,
+		avgLatencyMs: null, // never measured, matching the store's default for a fresh peer
 		...overrides,
 	}
 }
@@ -91,6 +93,35 @@ describe('Relevance scoring properties', function () {
 		})
 	})
 
+	// `avgLatencyMs` used to overload `0` to mean "never measured", so a peer genuinely measured
+	// at 0 ms took the neutral no-data penalty and scored *below* a peer measured at 300 ms.
+	// These pin the general rule rather than that one point, so the whole sentinel class stays
+	// caught: health is monotone in measured latency everywhere, and "unmeasured" is its own
+	// value sitting at the neutral midpoint.
+	describe('healthScore', () => {
+		const arbLatency = fc.double({ min: 0, max: 5000, noNaN: true })
+
+		it('is non-increasing in measured latency, across the full range including 0', () => {
+			fc.assert(fc.property(arbLatency, arbLatency, (a, b) => {
+				const faster = healthScore(makeEntry({ avgLatencyMs: Math.min(a, b) }))
+				const slower = healthScore(makeEntry({ avgLatencyMs: Math.max(a, b) }))
+				return faster >= slower
+			}), opts)
+		})
+
+		it('scores a 0 ms peer strictly above any slower measured peer', () => {
+			fc.assert(fc.property(fc.double({ min: 1e-6, max: 1000, noNaN: true }), (slower) => {
+				return healthScore(makeEntry({ avgLatencyMs: 0 })) > healthScore(makeEntry({ avgLatencyMs: slower }))
+			}), opts)
+		})
+
+		it('places an unmeasured peer strictly between a 0 ms and a 1000 ms peer', () => {
+			const unmeasured = healthScore(makeEntry({ avgLatencyMs: null }))
+			expect(unmeasured).to.be.lessThan(healthScore(makeEntry({ avgLatencyMs: 0 })))
+			expect(unmeasured).to.be.greaterThan(healthScore(makeEntry({ avgLatencyMs: 1000 })))
+		})
+	})
+
 	describe('touch', () => {
 		it('increments accessCount by 1', () => {
 			fc.assert(fc.property(
@@ -141,6 +172,48 @@ describe('Relevance scoring properties', function () {
 					return updated.relevance >= 0
 				}
 			), opts)
+		})
+
+		it('seeds the average with the first sample rather than blending against a phantom 0', () => {
+			const model = createSparsityModel()
+			expect(recordSuccess(makeEntry(), 400, 0.5, model).avgLatencyMs).to.equal(400)
+		})
+
+		// A measured 0 ms average is a real average, so the next sample must blend into it by
+		// EMA (α = 0.2) like any other — not hard-reset the peer to the new sample.
+		it('blends a later sample into a measured 0 ms average by EMA', () => {
+			const model = createSparsityModel()
+			const entry = makeEntry({ avgLatencyMs: 0 })
+			expect(recordSuccess(entry, 400, 0.5, model).avgLatencyMs).to.equal(80)
+		})
+
+		// The forward path in FretService.routeAct records success with no latency argument,
+		// because a forwarded maybeAct returns only once the whole downstream route has
+		// finished — its wall time is the subtree's cost, not the link's. Asserted here at the
+		// scoring seam rather than by driving routeAct end-to-end.
+		it('leaves avgLatencyMs untouched when no sample is supplied (the forward path)', () => {
+			const model = createSparsityModel()
+			const measured = recordSuccess(makeEntry({ avgLatencyMs: 200 }), undefined, 0.5, model)
+			expect(measured.avgLatencyMs).to.equal(200)
+
+			const neverMeasured = recordSuccess(makeEntry(), undefined, 0.5, model)
+			expect(neverMeasured.avgLatencyMs).to.equal(null)
+		})
+
+		it('still counts a latency-less success', () => {
+			const model = createSparsityModel()
+			const updated = recordSuccess(makeEntry({ successCount: 3 }), undefined, 0.5, model)
+			expect(updated.successCount).to.equal(4)
+			expect(updated.relevance).to.be.greaterThan(0)
+		})
+
+		// Twenty forwards used to erase a real 200 ms measurement (200 → 2.3) by feeding a
+		// fabricated 0 ms into the EMA on every hop.
+		it('does not decay a measured average over repeated latency-less successes', () => {
+			const model = createSparsityModel()
+			let entry = makeEntry({ avgLatencyMs: 200 })
+			for (let i = 0; i < 20; i++) entry = recordSuccess(entry, undefined, 0.5, model)
+			expect(entry.avgLatencyMs).to.equal(200)
 		})
 	})
 

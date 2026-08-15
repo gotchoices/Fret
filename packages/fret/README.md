@@ -123,7 +123,7 @@ interface SerializedPeerEntry {
   accessCount: number;
   successCount: number;
   failureCount: number;
-  avgLatencyMs: number;
+  avgLatencyMs: number | null; // null = never measured (absent field reads back as null)
   metadata?: Record<string, any>;
 }
 ```

@@ -48,7 +48,18 @@ export interface PeerEntry {
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
-	avgLatencyMs: number;
+	/**
+	 * EMA of measured round-trip latency in ms, or `null` when this peer has never been
+	 * measured.
+	 *
+	 * `null` rather than `0` because a genuine 0 ms sample is ordinary, not exotic: pings are
+	 * timed with `Date.now()`, whose granularity is ~15 ms on Windows, so a localhost or
+	 * same-process peer routinely rounds to 0. Overloading `0` to mean "unmeasured" made a
+	 * fast peer score *worse* than a mediocre one, and made "I have no measurement" writable
+	 * as a number — so callers with nothing to report wrote a fabricated 0 that decayed real
+	 * measurements away. Neither mistake is expressible now.
+	 */
+	avgLatencyMs: number | null;
 	metadata?: Record<string, any>;
 }
 
@@ -72,7 +83,7 @@ export interface SerializedPeerEntry {
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
-	avgLatencyMs: number;
+	avgLatencyMs: number | null; // null = never measured; absent in pre-nullable snapshots → null
 	metadata?: Record<string, any>;
 }
 
@@ -168,7 +179,7 @@ export class DigitreeStore {
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
-			avgLatencyMs: 0
+			avgLatencyMs: null
 		});
 	}
 
@@ -388,7 +399,11 @@ export class DigitreeStore {
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,
-				avgLatencyMs: s.avgLatencyMs,
+				// A snapshot predating the nullable field has no latency to restore.
+				// Pre-nullable snapshots wrote 0 for "never measured", which is ambiguous and
+				// reads back as a genuine 0 ms — accepted, since the next ping overwrites it and
+				// a coercion would instead discard real 0 ms measurements.
+				avgLatencyMs: s.avgLatencyMs ?? null,
 				...(s.metadata ? { metadata: s.metadata } : {}),
 			};
 			this.put(entry);

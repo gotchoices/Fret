@@ -76,7 +76,7 @@ function serialized(id: string, coord: Uint8Array, over: Partial<SerializedPeerE
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,
-		avgLatencyMs: 0,
+		avgLatencyMs: null,
 		...over,
 	}
 }
@@ -93,7 +93,7 @@ interface ModelEntry {
 	accessCount: number
 	successCount: number
 	failureCount: number
-	avgLatencyMs: number
+	avgLatencyMs: number | null
 	negotiateFailures: number
 }
 
@@ -106,7 +106,7 @@ const DEFAULTS: Omit<ModelEntry, 'coord'> = {
 	accessCount: 0,
 	successCount: 0,
 	failureCount: 0,
-	avgLatencyMs: 0,
+	avgLatencyMs: null, // never measured — the store's default for a fresh entry
 	negotiateFailures: 0,
 }
 

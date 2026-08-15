@@ -185,4 +185,38 @@ describe('DigitreeStore persistence', () => {
 		expect(store.size()).to.equal(0)
 		expect(store.getById('good')).to.equal(undefined)
 	})
+
+	// `avgLatencyMs: null` means "never measured". Round-tripping it as 0 would hand the
+	// restored peer a fabricated perfect-link measurement it never earned.
+	it('round-trips an unmeasured latency as null, and a measured 0 ms as 0', () => {
+		const store = new DigitreeStore()
+		store.upsert('never-pinged', randomCoord())
+		store.upsert('instant', randomCoord())
+		store.update('instant', { avgLatencyMs: 0 })
+
+		const restored = new DigitreeStore()
+		restored.importEntries(store.exportEntries())
+
+		expect(restored.getById('never-pinged')?.avgLatencyMs).to.equal(null)
+		expect(restored.getById('instant')?.avgLatencyMs).to.equal(0)
+	})
+
+	// A snapshot taken before the field was nullable simply omits it on entries it never
+	// measured; there is nothing to restore, so it reads back as unmeasured.
+	it('reads a missing avgLatencyMs as unmeasured', () => {
+		const record = {
+			id: 'legacy',
+			coord: coordToBase64url(randomCoord()),
+			relevance: 1,
+			lastAccess: 1,
+			state: 'disconnected',
+			accessCount: 0,
+			successCount: 0,
+			failureCount: 0,
+		} as unknown as SerializedPeerEntry
+
+		const store = new DigitreeStore()
+		store.importEntries([record])
+		expect(store.getById('legacy')?.avgLatencyMs).to.equal(null)
+	})
 })

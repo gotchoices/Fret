@@ -341,7 +341,15 @@ export class FretService implements IFretService, Startable {
 		});
 	}
 
-	private async applySuccess(id: string, coord: Uint8Array, latencyMs: number): Promise<void> {
+	/**
+	 * Record a completed namespaced RPC against `id`.
+	 *
+	 * `latencyMs` is optional and must be supplied **only** when the caller timed a round trip
+	 * to this peer alone — today that is the ping paths. A caller with no such measurement omits
+	 * it and the peer's `avgLatencyMs` is left untouched, rather than writing a placeholder that
+	 * would decay a real measurement away over successive calls.
+	 */
+	private async applySuccess(id: string, coord: Uint8Array, latencyMs?: number): Promise<void> {
 		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
 		const x = normalizedLogDistance(await this.selfCoord(), coord);
 		const next = scoreSuccess(entry, latencyMs, x, this.sparsity);
@@ -349,7 +357,9 @@ export class FretService implements IFretService, Startable {
 			lastAccess: next.lastAccess,
 			relevance: next.relevance,
 			successCount: next.successCount,
-			avgLatencyMs: next.avgLatencyMs,
+			// Omitted entirely with no sample, so the patch never speaks for a field this call
+			// has nothing to say about.
+			...(latencyMs === undefined ? {} : { avgLatencyMs: next.avgLatencyMs }),
 		});
 		// Every applySuccess call in this service follows a completed RPC over this
 		// network's namespaced protocol (ping or maybeAct), which proves the peer
@@ -1748,7 +1758,12 @@ export class FretService implements IFretService, Startable {
 						this.recordBackoff(next);
 					} else {
 						const nextCoord = this.store.getById(next)?.coord ?? (await hashPeerId(peerIdFromString(next)));
-						await this.applySuccess(next, nextCoord, 0);
+						// No latency sample: `sendMaybeAct` on the forward path returns only once
+						// the *entire remaining route* has completed downstream, so its wall time
+						// is the cost of the whole subtree, not of the link to `next`. Recording
+						// it would penalize a perfectly healthy adjacent hop for a long path
+						// behind it. Latency belongs to the ping paths, which measure one hop.
+						await this.applySuccess(next, nextCoord);
 						this.clearBackoff(next);
 						return result;
 					}
