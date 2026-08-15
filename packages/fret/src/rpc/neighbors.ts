@@ -46,6 +46,8 @@ export function registerNeighbors(
 				const actual = connection.remotePeer.toString();
 				if (snap.from !== actual) {
 					onIdentityMismatch?.(snap.from, actual);
+					// NOTE: debug-gated (@libp2p/logger emits only under DEBUG). If mismatch logging
+					// is ever routed to an always-on sink, a hostile peer can spam it — rate-limit then.
 					log.error('announce identity mismatch: claimed %s actual %s - dropping', snap.from, actual);
 					await stream.close();
 					return;
