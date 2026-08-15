@@ -63,7 +63,7 @@ describe('Payload bounds and TTL validation', function () {
 	describe('oversized payload at RPC layer', () => {
 		it('rejects oversized maybeAct payload without crashing', async () => {
 			const a = await createMemoryNode(); await a.start()
-			registerMaybeAct(
+			await registerMaybeAct(
 				a,
 				async () => ({ v: 1 as const, anchors: [], cohort_hint: [], estimated_cluster_size: 1, confidence: 0 }),
 				PROTOCOL_MAYBE_ACT,

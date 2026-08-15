@@ -46,7 +46,7 @@ describe('transport identity verification', function () {
 		it('drops a spoofed leave (from != authenticated sender); onLeave not called, mismatch fired', async () => {
 			const onLeave: LeaveNoticeV1[] = []
 			const mismatches: Array<{ claimed: string; actual: string }> = []
-			registerLeave(recv, (n) => { onLeave.push(n) }, undefined, (claimed, actual) => mismatches.push({ claimed, actual }))
+			await registerLeave(recv, (n) => { onLeave.push(n) }, undefined, (claimed, actual) => mismatches.push({ claimed, actual }))
 
 			// claim to be `other` while actually connected as `sender`
 			const spoofed: LeaveNoticeV1 = { v: 1, from: other.peerId.toString(), timestamp: Date.now() }
@@ -62,7 +62,7 @@ describe('transport identity verification', function () {
 		it('processes a valid leave (from == authenticated sender); onLeave called, no mismatch', async () => {
 			const onLeave: LeaveNoticeV1[] = []
 			const mismatches: Array<{ claimed: string; actual: string }> = []
-			registerLeave(recv, (n) => { onLeave.push(n) }, undefined, (claimed, actual) => mismatches.push({ claimed, actual }))
+			await registerLeave(recv, (n) => { onLeave.push(n) }, undefined, (claimed, actual) => mismatches.push({ claimed, actual }))
 
 			const valid: LeaveNoticeV1 = { v: 1, from: sender.peerId.toString(), timestamp: Date.now() }
 			await sendLeave(sender, recv.peerId.toString(), valid)
@@ -78,7 +78,7 @@ describe('transport identity verification', function () {
 		it('drops a spoofed announce (from != authenticated sender); onAnnounce not called, mismatch fired', async () => {
 			const announced: string[] = []
 			const mismatches: Array<{ claimed: string; actual: string }> = []
-			registerNeighbors(
+			await registerNeighbors(
 				recv,
 				() => snapshot(recv.peerId.toString()),
 				(from) => { announced.push(from) },
@@ -99,7 +99,7 @@ describe('transport identity verification', function () {
 		it('processes a valid announce (from == authenticated sender); onAnnounce called, no mismatch', async () => {
 			const announced: string[] = []
 			const mismatches: Array<{ claimed: string; actual: string }> = []
-			registerNeighbors(
+			await registerNeighbors(
 				recv,
 				() => snapshot(recv.peerId.toString()),
 				(from) => { announced.push(from) },
@@ -120,7 +120,7 @@ describe('transport identity verification', function () {
 	describe('route-and-maybe-act', () => {
 		it('threads the authenticated sender id to the handle callback', async () => {
 			const seen: string[] = []
-			registerMaybeAct(recv, async (_msg, from) => { seen.push(from); return nearAnchor() })
+			await registerMaybeAct(recv, async (_msg, from) => { seen.push(from); return nearAnchor() })
 
 			const msg: RouteAndMaybeActV1 = {
 				v: 1,

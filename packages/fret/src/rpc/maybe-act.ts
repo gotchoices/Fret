@@ -7,15 +7,15 @@ import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:maybeAct');
 
-export function registerMaybeAct(
+export async function registerMaybeAct(
 	node: Libp2p,
 	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
 	protocol = PROTOCOL_MAYBE_ACT,
 	maxBytes = 512 * 1024
-): void {
+): Promise<void> {
 	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
-	void node.handle(protocol, async (stream: Stream, connection: Connection) => {
+	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
 		try {
 			const bytes = await readAllBounded(stream, maxBytes);
 			const msg = await decodeJson<RouteAndMaybeActV1>(bytes);

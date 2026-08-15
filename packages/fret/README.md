@@ -79,7 +79,7 @@ FRET detects potential partitions using multiple signals:
 
 ```typescript
 // FRET automatically includes size estimates in ping responses
-registerPing(node, PROTOCOL_PING, () => {
+await registerPing(node, PROTOCOL_PING, () => {
   return fretService.getNetworkSizeEstimate();
 });
 

@@ -278,6 +278,19 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
 ### Aspect-oriented implementation plan
 - Service shell & lifecycle (A1)
   - Startable service; registrar handle/unhandle; capabilities/dependencies.
+  - `stop()` is a strict mirror of `start()`: it bumps the run generation, clears the loop
+    timers, detaches node listeners, `unhandle`s all five protocols, then sends leave notices
+    (unhandle only removes *inbound* handlers, so outbound leaves still go out). `start()` is
+    guarded against re-entry and resets run-scoped flags, so start→stop→start is safe.
+  - **Run generation.** Background loops (stabilization, active preconnect) capture the run
+    generation when armed and exit — rather than rescheduling — once it no longer matches.
+    A boolean "am I running" flag cannot do this: `stop()` clears it but cannot cancel a timer
+    already pending, and the next `start()` sets it back to true, so the stale tick resurrects
+    itself and the service ends up with two live loops. Both loops also store their timer handle
+    so `stop()` can cancel them outright.
+  - Intentionally-detached async work goes through `FretService.detach(promise, label)`, which
+    attaches a logging catch. Under Node's default `--unhandled-rejections=throw`, a bare
+    `void somePromise()` whose body can throw is a process-fatal rejection.
   - Modes: Edge/Core profiles; client/server toggle analogous to kad-dht.
   - Ready gate for early queries; allow zero-peers override for single-node dev.
 - Routing store (Digitree) & indices (A2)

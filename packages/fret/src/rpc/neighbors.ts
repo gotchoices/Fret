@@ -14,18 +14,18 @@ import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:neighbors');
 
-export function registerNeighbors(
+export async function registerNeighbors(
 	node: Libp2p,
 	getSnapshot: () => NeighborSnapshotV1 | BusyResponseV1 | Promise<NeighborSnapshotV1 | BusyResponseV1>,
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
 	maxBytes = 128 * 1024,
 	onIdentityMismatch?: (claimed: string, actual: string) => void
-): void {
+): Promise<void> {
 	// Request handler carries no inbound `from`; it only replies with our own
 	// snapshot. Adopt the (stream, connection) shape so the authenticated identity
 	// is available and new handlers copy the correct signature.
-	void node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, _connection: Connection) => {
+	await node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, _connection: Connection) => {
 		try {
 			const snap = await getSnapshot();
 			stream.send(await encodeJson(snap));
@@ -36,7 +36,7 @@ export function registerNeighbors(
 	});
 
 	if (onAnnounce) {
-		void node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream, connection: Connection) => {
+		await node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream, connection: Connection) => {
 			try {
 				const bytes = await readAllBounded(stream, maxBytes);
 				const snap = await decodeJson<NeighborSnapshotV1>(bytes);

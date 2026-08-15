@@ -20,14 +20,14 @@ function isBusy(res: unknown): res is BusyResponseV1 {
 	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
 }
 
-export function registerPing(
+export async function registerPing(
 	node: Libp2p,
 	protocol = PROTOCOL_PING,
 	getSizeEstimate?: SizeEstimateProvider
-): void {
+): Promise<void> {
 	// Ping carries no `from`; adopt the (stream, connection) shape for consistency
 	// so the authenticated identity is available and new handlers copy it correctly.
-	void node.handle(protocol, async (stream: Stream, _connection: Connection) => {
+	await node.handle(protocol, async (stream: Stream, _connection: Connection) => {
 		if (getSizeEstimate) {
 			try {
 				const sizeInfo = await getSizeEstimate();

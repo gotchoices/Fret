@@ -24,13 +24,13 @@ function sanitizeReplacements(ids: string[] | undefined): string[] | undefined {
 	return valid.length > 0 ? valid : undefined;
 }
 
-export function registerLeave(
+export async function registerLeave(
 	node: Libp2p,
 	onLeave: (notice: LeaveNoticeV1) => Promise<void> | void,
 	protocol = PROTOCOL_LEAVE,
 	onIdentityMismatch?: (claimed: string, actual: string) => void
-): void {
-	void node.handle(protocol, async (stream: Stream, connection: Connection) => {
+): Promise<void> {
+	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
 		try {
 			const bytes = await readAllBounded(stream, 4096);
 			const msg = await decodeJson<LeaveNoticeV1>(bytes);

@@ -98,8 +98,18 @@ export class FretService implements IFretService, Startable {
 	private readonly store = new DigitreeStore();
 	private readonly cfg: FretConfig;
 	private readonly node: Libp2p;
-	private stabilizing = false;
 	private stopped = false;
+	private started = false;
+	/**
+	 * Run generation: bumped by both start() and stop(). Each background loop captures the
+	 * generation it was armed for and exits when it no longer matches, so a timer left pending
+	 * by a stop() cannot be resurrected by the next start() (which would leave two live loops).
+	 */
+	private runGen = 0;
+	private stabilizeTimer: ReturnType<typeof setTimeout> | null = null;
+	private preconnectTimer: ReturnType<typeof setTimeout> | null = null;
+	/** runGen the active-preconnect loop is armed for; -1 when no loop is armed. */
+	private preconnectGen = -1;
 	private readonly nodeListeners: Array<{ type: string; handler: (evt: any) => void }> = [];
 	private inflightAct = 0;
 	private readonly bucketNeighbors: TokenBucket;
@@ -109,7 +119,6 @@ export class FretService implements IFretService, Startable {
 	private postBootstrapAnnounced = false;
 	private readonly sparsity: SparsityModel = createSparsityModel();
 	private cachedSelfCoord: Uint8Array | null = null;
-	private preconnectRunning = false;
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
 	private metadata?: Record<string, any>;
 	private activityHandler?: ActivityHandler;
@@ -303,12 +312,26 @@ export class FretService implements IFretService, Startable {
 	}
 
 	async start(): Promise<void> {
+		// Re-entrancy guard: a second start() would double every node listener and
+		// re-register every protocol (which the registrar rejects as a duplicate).
+		if (this.started) return;
+		this.started = true;
+		this.runGen++;
 		this.stopped = false;
+		// Run-scoped flags: a restarted service must announce again, not inherit the
+		// "already announced" state of the previous run.
+		this.postBootstrapAnnounced = false;
+		this.firstStabilizeDone = false;
 		await this.seedFromPeerStore();
-		this.registerRpcHandlers();
+		await this.registerRpcHandlers();
 		// Defer proactive announce to after first stabilization tick (table is richer)
 		this.startStabilizationLoop();
-		if (this.mode === 'active') void this.preconnectNeighbors();
+		if (this.mode === 'active') {
+			this.detach(this.preconnectNeighbors(), 'preconnectNeighbors');
+			// stop() disarms the loop, so a restart while still in active mode must re-arm it;
+			// otherwise setMode('active') would have to be called again to get warm-up back.
+			this.startActivePreconnectLoop();
+		}
 		// One-time post-bootstrap announce when first remote connects
 		this.addNodeListener('peer:connect', async () => {
 			if (this.stopped || this.postBootstrapAnnounced) return;
@@ -339,7 +362,7 @@ export class FretService implements IFretService, Startable {
 				await this.applyFailure(id, coord);
 				// Proactive: announce to neighbors around departed peer if it was a near neighbor
 				if (wasNear && !this.stopped) {
-					void this.announceOnDeparture(id, coord);
+					this.detach(this.announceOnDeparture(id, coord), 'announceOnDeparture');
 				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
 		});
@@ -377,11 +400,27 @@ export class FretService implements IFretService, Startable {
 		// before we tear down: opening a stream on a connection that is concurrently
 		// closing triggers an uncaught StreamStateError from yamux's window-update
 		// microtask, which we cannot catch.
+		this.started = false;
+		this.runGen++;
 		this.stopped = true;
-		this.stabilizing = false;
-		this.preconnectRunning = false;
+		this.clearLoopTimers();
 		this.removeNodeListeners();
+		// Unhandle before the leave notices: unhandle only removes *inbound* handlers,
+		// while the leave notices go out over our own outbound streams.
+		await this.unregisterRpcHandlers();
 		try { await this.sendLeaveToNeighbors(); } catch (err) { console.warn('sendLeaveToNeighbors failed', err); }
+	}
+
+	/** Cancel any pending loop timers. Ticks already in flight exit on the generation check. */
+	private clearLoopTimers(): void {
+		if (this.stabilizeTimer != null) { clearTimeout(this.stabilizeTimer); this.stabilizeTimer = null; }
+		if (this.preconnectTimer != null) { clearTimeout(this.preconnectTimer); this.preconnectTimer = null; }
+		this.preconnectGen = -1;
+	}
+
+	/** Attach a logging catch to an intentionally-detached promise so a rejection can never escape. */
+	private detach(promise: Promise<unknown>, label: string): void {
+		void promise.catch((err) => log.error('%s failed - %e', label, err));
 	}
 
 	/** Register a node event listener and track it so stop() can detach it. */
@@ -400,7 +439,7 @@ export class FretService implements IFretService, Startable {
 
 	setMode(mode: FretMode): void {
 		this.mode = mode;
-		if (mode === 'active' && !this.preconnectRunning) this.startActivePreconnectLoop();
+		if (mode === 'active') this.startActivePreconnectLoop();
 	}
 
 	async ready(): Promise<void> {}
@@ -409,29 +448,47 @@ export class FretService implements IFretService, Startable {
 	private maxBytesMaybeAct(): number { return this.cfg.profile === 'core' ? 512 * 1024 : 256 * 1024; }
 
 	// RPC registration
-	private registerRpcHandlers(): void {
-		registerNeighbors(
-			this.node,
-			async () => this.handleNeighborsRequest(),
-			(from, snap) => this.handleAnnounce(from, snap),
-			this.protocols,
-			this.maxBytesNeighbors(),
-			() => { this.diag.rejected.identityMismatch++; }
-		);
-		// `_from` is the transport-authenticated sender; unused for now but reserved
-		// for future per-peer rate limiting / diagnostics.
-		registerMaybeAct(this.node, async (msg, _from) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct());
-		registerLeave(
-			this.node,
-			async (notice) => this.handleLeave(notice),
-			this.protocols.PROTOCOL_LEAVE,
-			() => { this.diag.rejected.identityMismatch++; }
-		);
-		registerPing(
-			this.node,
-			this.protocols.PROTOCOL_PING,
-			() => this.handlePingRequest()
-		);
+	private async registerRpcHandlers(): Promise<void> {
+		try {
+			await Promise.all([
+				registerNeighbors(
+					this.node,
+					async () => this.handleNeighborsRequest(),
+					(from, snap) => this.handleAnnounce(from, snap),
+					this.protocols,
+					this.maxBytesNeighbors(),
+					() => { this.diag.rejected.identityMismatch++; }
+				),
+				// `_from` is the transport-authenticated sender; unused for now but reserved
+				// for future per-peer rate limiting / diagnostics.
+				registerMaybeAct(this.node, async (msg, _from) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct()),
+				registerLeave(
+					this.node,
+					async (notice) => this.handleLeave(notice),
+					this.protocols.PROTOCOL_LEAVE,
+					() => { this.diag.rejected.identityMismatch++; }
+				),
+				registerPing(
+					this.node,
+					this.protocols.PROTOCOL_PING,
+					() => this.handlePingRequest()
+				),
+			]);
+		} catch (err) {
+			// A failed registration leaves the service degraded but running; it must not
+			// escape as an unhandled rejection (which is process-fatal under Node's default).
+			log.error('registerRpcHandlers failed - %e', err);
+		}
+	}
+
+	/** Mirror of registerRpcHandlers so a stopped service stops serving this network's protocols. */
+	private async unregisterRpcHandlers(): Promise<void> {
+		try {
+			await this.node.unhandle(Object.values(this.protocols));
+		} catch (err) {
+			// The node itself may already be stopping; a failed unhandle is not fatal to shutdown.
+			log.error('unregisterRpcHandlers failed - %e', err);
+		}
 	}
 
 	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1 | BusyResponseV1> {
@@ -564,10 +621,14 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private startActivePreconnectLoop(): void {
-		if (this.preconnectRunning) return;
-		this.preconnectRunning = true;
+		// Re-entered from setMode(); one loop per run generation.
+		if (this.preconnectGen === this.runGen) return;
+		const gen = this.runGen;
+		this.preconnectGen = gen;
+		/** Exit the loop, releasing the arm slot only if this tick still owns the current run. */
+		const release = (): void => { if (gen === this.runGen) this.preconnectGen = -1; };
 		const tick = async () => {
-			if (!this.preconnectRunning || this.mode !== 'active') { this.preconnectRunning = false; return; }
+			if (this.stopped || gen !== this.runGen || this.mode !== 'active') { release(); return; }
 			try {
 				const selfCoord = await this.selfCoord();
 				const selfStr = this.node.peerId.toString();
@@ -583,7 +644,9 @@ export class FretService implements IFretService, Startable {
 				}
 			}
 			} catch (err) { log.error('active preconnect tick failed - %e', err) }
-			setTimeout(tick, 1000);
+			// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
+			if (this.stopped || gen !== this.runGen) { release(); return; }
+			this.preconnectTimer = setTimeout(tick, 1000);
 		};
 		void tick();
 	}
@@ -686,7 +749,7 @@ export class FretService implements IFretService, Startable {
 			}
 			await this.mergeNeighborSnapshots(warm.slice(0, 4));
 			// Announce replacement info to immediate neighbors
-			void this.announceReplacementsToNeighbors(coord);
+			this.detach(this.announceReplacementsToNeighbors(coord), 'announceReplacementsToNeighbors');
 		} catch (err) {
 			log.error('handleLeave failed for %s - %e', peerId, err);
 		}
@@ -779,7 +842,7 @@ export class FretService implements IFretService, Startable {
 			this.diag.rejected.rateLimited++;
 			return;
 		}
-		void this.mergeAnnounceSnapshot(from, snap);
+		this.detach(this.mergeAnnounceSnapshot(from, snap), 'mergeAnnounceSnapshot');
 	}
 
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
@@ -825,7 +888,7 @@ export class FretService implements IFretService, Startable {
 			this.calibrateSizeFromSnapshot(snap, from);
 			this.enforceCapacity();
 			this.emitDiscovered(discovered);
-			if (discovered.length > 0) void this.announceToNewPeers(discovered);
+			if (discovered.length > 0) this.detach(this.announceToNewPeers(discovered), 'announceToNewPeers');
 		} catch (err) {
 			log.error('mergeAnnounceSnapshot failed for %s - %e', from, err);
 		}
@@ -874,10 +937,10 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private startStabilizationLoop(): void {
-		if (this.stabilizing) return;
-		this.stabilizing = true;
+		// One loop per run; start() guards re-entry, so no "already running" check is needed.
+		const gen = this.runGen;
 		const tick = async () => {
-			if (!this.stabilizing) return;
+			if (this.stopped || gen !== this.runGen) return;
 			try {
 				await this.seedFromPeerStore();
 				await this.seedFromBootstraps();
@@ -885,16 +948,19 @@ export class FretService implements IFretService, Startable {
 				// Proactive announce after first stabilization (table populated)
 				if (!this.firstStabilizeDone) {
 					this.firstStabilizeDone = true;
-					void this.proactiveAnnounceOnStart();
+					this.detach(this.proactiveAnnounceOnStart(), 'proactiveAnnounceOnStart');
 				}
 			} catch (err) {
 				console.error('stabilize tick failed:', err);
 			} finally {
-				const delay = this.mode === 'active' ? 300 : 1500;
-				setTimeout(tick, delay);
+				// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
+				if (!this.stopped && gen === this.runGen) {
+					const delay = this.mode === 'active' ? 300 : 1500;
+					this.stabilizeTimer = setTimeout(tick, delay);
+				}
 			}
 		};
-		tick();
+		void tick();
 	}
 
 	private async seedFromBootstraps(): Promise<void> {
@@ -1099,7 +1165,7 @@ export class FretService implements IFretService, Startable {
 		}
 		this.enforceCapacity();
 		this.emitDiscovered(announced);
-		if (announced.length > 0) void this.announceToNewPeers(announced);
+		if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 	}
 
 	// Snapshots

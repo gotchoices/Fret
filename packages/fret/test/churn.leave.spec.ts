@@ -186,7 +186,7 @@ describe('Churn leave handling', function () {
 		try { await nodes[0].unhandle(protocols.PROTOCOL_LEAVE) } catch {}
 
 		const { registerLeave: regLeave } = await import('../src/rpc/leave.js')
-		regLeave(nodes[0], async (notice: LeaveNoticeV1) => {
+		await regLeave(nodes[0], async (notice: LeaveNoticeV1) => {
 			capturedReplacements = notice.replacements
 		}, protocols.PROTOCOL_LEAVE)
 
