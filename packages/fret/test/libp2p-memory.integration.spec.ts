@@ -9,8 +9,8 @@ import type { NearAnchorV1, RouteAndMaybeActV1 } from '../src/index.js'
 
 // Uses @libp2p/memory transport with plaintext encryption for fast,
 // deterministic in-process testing (no TCP ports or TLS overhead).
-// readAllBounded includes an idle-timeout to work around yamux
-// failing to propagate remote-close EOF to the dialer's async iterator.
+// yamux + libp2p v3 propagate remote-close EOF to the dialer's async iterator,
+// so readAllBounded relies on a single overall deadline with no idle timer.
 
 // --- helpers ---
 

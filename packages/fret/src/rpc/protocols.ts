@@ -64,8 +64,77 @@ export function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Ar
 	return chunk.subarray();
 }
 
+type StreamChunk = Uint8Array | { subarray(): Uint8Array };
+
+/** Race sentinel — distinct from a real `IteratorResult`, so a poll tick is never read as EOF. */
+const POLL_TICK = Symbol('readAllBounded.poll');
+
+/**
+ * How often to re-check the stream's own end-of-read state; see {@link remoteFinishedWriting}.
+ *
+ * NOTE: this adds up to one poll interval to every RPC that hits the lost-event case,
+ * which is a floor under the measured ping RTT that feeds peer health scoring. The
+ * durable fix is to subscribe before writing so the event is never missed at all (see
+ * the framing/iterator-priming arm on `tickets/plan/8-rpc-shared-helper`); revisit this
+ * constant if RTT-derived scoring ever needs finer resolution than this floor allows.
+ */
+const EOF_POLL_MS = 20;
+
+/**
+ * The subset of libp2p's `MessageStream`/`Stream` state we consult to recognise an
+ * end-of-stream whose event we never received. Optional because `readAllBounded`
+ * also accepts plain async iterables (tests, non-libp2p sources).
+ */
+interface ReadEndState {
+	readBufferLength?: number;
+	remoteWriteStatus?: string;
+	readStatus?: string;
+}
+
+/**
+ * True when the remote has closed its writing end AND everything it sent has been
+ * drained — i.e. no further chunk can arrive, so the read is complete.
+ *
+ * libp2p's async-iterator adaptor ends the iteration off the one-shot
+ * `remoteCloseWrite` / `close` events, which it subscribes to when iteration
+ * *starts*. Every FRET RPC opens a stream, writes, and only then begins reading, so
+ * a fast responder routinely closes before that subscription exists and the event is
+ * lost — the iterator then never yields `done` and the read runs to its deadline.
+ * Polling the stream's state recovers that case without ever guessing: a stream that
+ * is merely slow reports neither a closed remote nor an empty-and-final buffer, so it
+ * keeps being read.
+ *
+ * Returns false for a plain async iterable (no state to consult), leaving those
+ * callers on ordinary iterator EOF.
+ */
+function remoteFinishedWriting(stream: unknown): boolean {
+	const s = stream as ReadEndState | null;
+	if (typeof s?.readBufferLength !== 'number') return false;
+	if (s.readBufferLength > 0) return false;
+	return s.remoteWriteStatus === 'closed' || s.readStatus === 'closed';
+}
+
+/**
+ * Read a whole stream into one buffer, bounded by `maxBytes` and a single overall
+ * `timeoutMs` deadline.
+ *
+ * There is deliberately no *idle* timer — a gap between chunks means a slow link, not
+ * end-of-stream, and treating it as EOF truncated healthy transfers into malformed
+ * JSON and failure-scored the (healthy) sender. Reads end on iterator EOF, or on the
+ * stream itself reporting the remote finished writing; only the overall deadline
+ * bounds a peer that genuinely stalls mid-payload.
+ *
+ * NOTE: an inbound handler holds a stalled stream for the full `timeoutMs` (5s
+ * default) rather than failing fast, bounded by the per-profile inbound stream caps.
+ * If slow-loris pressure ever shows up, give handlers a shorter read deadline — do
+ * not reintroduce an idle timer.
+ *
+ * @throws if the deadline expires or `maxBytes` is exceeded — a partial read is an
+ * error, never a short-but-valid result, so callers report a timeout instead of the
+ * malformed-JSON error a truncated buffer would produce downstream.
+ */
 export async function readAllBounded(
-	stream: AsyncIterable<Uint8Array | { subarray(): Uint8Array }>,
+	stream: AsyncIterable<StreamChunk>,
 	maxBytes: number,
 	timeoutMs = 5000
 ): Promise<Uint8Array> {
@@ -73,20 +142,31 @@ export async function readAllBounded(
 	let len = 0;
 	const iter = stream[Symbol.asyncIterator]();
 	const deadline = Date.now() + timeoutMs;
+	const timedOut = () => new Error(`read timed out after ${timeoutMs}ms (${len} bytes read)`);
+	// Held across poll ticks: re-calling `iter.next()` would queue a second read and
+	// silently drop whichever chunk the abandoned one consumes.
+	let pending: Promise<IteratorResult<StreamChunk>> | undefined;
 
 	while (true) {
 		const remaining = deadline - Date.now();
-		if (remaining <= 0) break;
+		if (remaining <= 0) throw timedOut();
 
 		let timer: ReturnType<typeof setTimeout> | undefined;
-		const timeout = new Promise<IteratorResult<any>>(r => {
-			timer = setTimeout(() => r({ done: true, value: undefined }), remaining);
+		const poll = new Promise<typeof POLL_TICK>(r => {
+			timer = setTimeout(() => r(POLL_TICK), Math.min(remaining, EOF_POLL_MS));
 		});
-		const next = iter.next();
-		next.catch(() => {}); // Prevent unhandled rejection if timeout wins
-		const result = await Promise.race([next, timeout]);
+		if (pending == null) {
+			pending = iter.next();
+			pending.catch(() => {}); // Prevent unhandled rejection if the poll wins
+		}
+		const result = await Promise.race<IteratorResult<StreamChunk> | typeof POLL_TICK>([pending, poll]);
 		clearTimeout(timer);
 
+		if (result === POLL_TICK) {
+			if (remoteFinishedWriting(stream)) break;
+			continue; // still open — keep waiting on `pending`, bounded only by the deadline
+		}
+		pending = undefined;
 		if (result.done) break;
 
 		const bytes = toBytes(result.value);

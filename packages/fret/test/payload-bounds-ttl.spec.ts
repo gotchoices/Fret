@@ -3,7 +3,8 @@ import { expect } from 'chai'
 import { createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
-import { PROTOCOL_MAYBE_ACT, PROTOCOL_LEAVE } from '../src/rpc/protocols.js'
+import { registerPing, sendPing } from '../src/rpc/ping.js'
+import { PROTOCOL_MAYBE_ACT, PROTOCOL_PING } from '../src/rpc/protocols.js'
 import { validateTimestamp, readAllBounded } from '../src/rpc/protocols.js'
 
 describe('Payload bounds and TTL validation', function () {
@@ -69,6 +70,63 @@ describe('Payload bounds and TTL validation', function () {
 			}
 			const result = await readAllBounded(gen(), 100)
 			expect(result).to.deep.equal(new Uint8Array([1, 2, 3, 4, 5, 6]))
+		})
+
+		it('throws when a stalled peer exhausts the overall deadline', async () => {
+			async function* gen() {
+				yield new Uint8Array([1, 2, 3])
+				await new Promise(() => {}) // never yields again, never closes
+			}
+			const start = Date.now()
+			try {
+				await readAllBounded(gen(), 100, 200)
+				throw new Error('should have thrown')
+			} catch (err: any) {
+				expect(err.message).to.include('read timed out')
+				// A timeout must not masquerade as EOF: the partial buffer is never returned.
+				expect(err.message).to.include('3 bytes read')
+			}
+			expect(Date.now() - start).to.be.lessThan(2000)
+		})
+
+		it('throws rather than truncating when the deadline expires mid-stream', async () => {
+			async function* gen() {
+				yield new Uint8Array([1, 2, 3])
+				await new Promise(r => setTimeout(r, 300))
+				yield new Uint8Array([4, 5, 6])
+			}
+			try {
+				await readAllBounded(gen(), 100, 150)
+				throw new Error('should have thrown')
+			} catch (err: any) {
+				expect(err.message).to.include('read timed out')
+			}
+		})
+
+		it('returns an empty buffer when the peer closes without sending', async () => {
+			async function* gen(): AsyncGenerator<Uint8Array> { /* immediate EOF */ }
+			const result = await readAllBounded(gen(), 100)
+			expect(result).to.deep.equal(new Uint8Array(0))
+		})
+
+		it('ends a real libp2p read promptly when the responder closes before we subscribe', async () => {
+			// libp2p's async-iterator adaptor subscribes to the one-shot remoteCloseWrite
+			// event when iteration STARTS, so a responder that closes first (the norm for a
+			// small reply) leaves the iterator with no EOF to yield. Without the state poll
+			// this read runs to the full deadline; assert it does not.
+			const a = await createMemoryNode(); await a.start()
+			const b = await createMemoryNode(); await b.start()
+			try {
+				await registerPing(a, PROTOCOL_PING)
+				await b.dial(a.getMultiaddrs()[0]!)
+				const start = Date.now()
+				const res = await sendPing(b, a.peerId.toString(), PROTOCOL_PING)
+				const elapsed = Date.now() - start
+				expect(res.ok, 'ping answered').to.equal(true)
+				expect(elapsed, `round-trip took ${elapsed}ms — read is stalling to its deadline`).to.be.lessThan(1000)
+			} finally {
+				await b.stop(); await a.stop()
+			}
 		})
 	})
 

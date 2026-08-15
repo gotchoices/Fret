@@ -12,6 +12,14 @@ Consequences to fix as part of this work:
 - No shape validation of decoded messages. The decoder blindly casts to the target type; the `from` field is never parsed as a peer id, snapshot arrays are unbounded within the byte cap (thousands of ids), and breadcrumbs are unbounded and grow every hop. Only the leave-notice replacement sanitizer does this correctly.
 - Backpressure and cancellation are ignored. Stream sends that return false or throw when the buffer fills at 128-512 KiB are not handled, no AbortSignal is threaded anywhere, and ping starts its round-trip clock before dialing, inflating first-contact latency. The maybe-act RPC also accepts 512 KiB at the wire layer while the service rejects payloads over 128 KiB only after fully buffering.
 
+Additional arm (added by the `idle-read-timeout` review): **the requester subscribes to the reply stream too late, so end-of-stream is routinely missed.** libp2p's async-iterator adaptor subscribes to the one-shot remote-close event only when iteration *starts*. Every sender here opens the stream, writes, closes, and only *then* begins reading — so a responder that replies quickly (the norm for a small reply) closes before the subscription exists, the event is lost, and the read has no end-of-stream to observe. Measured on both this repo's transports (memory+plaintext and TCP+noise+yamux): a ping reply arrives in under a millisecond and the read then never ends on its own.
+
+Two durable fixes, either of which retires the whole class rather than this one instance:
+- **Begin reading before writing.** The shared request helper owns the whole open/write/read sequence, so it can start iterating the reply stream before it sends the request; the subscription then always predates the response and no event can be missed.
+- **Frame the messages.** `docs/fret.md` already specifies "length-prefixed UTF-8 JSON" for all four protocols, but the implementation ships bare JSON and infers message end from stream close. A length prefix makes the reader authoritative about where a message ends, so neither a missed close event nor a timeout guess can truncate or stall it.
+
+Until then `readAllBounded` polls the stream's own read state (`readBufferLength` / `remoteWriteStatus`) every 20ms as a backstop — correct, but it consults properties the shared helper should not need to know about, and it puts a ~20ms floor under every measured RPC round-trip time (which feeds peer health scoring).
+
 Expected behavior: one request helper and one handler-registration helper own the transport boilerplate; a single discriminated result type reports success, unreachable, busy, decode-error, and foreign-protocol distinctly so callers can record failure and drive foreign classification; every decoded message passes a per-message validator; streams are always drained and closed or aborted; an AbortSignal bounds every RPC; and the round-trip clock starts after the stream opens.
 
 Requirements:
@@ -19,6 +27,7 @@ Requirements:
 - Adopt a single non-throwing, non-fabricating discriminated error contract across all RPC families.
 - Add per-message shape validators (field types, peer-id parseability, array caps) in the style of the existing replacement sanitizer.
 - Handle stream drain/backpressure; thread an AbortSignal through send and read.
+- Subscribe to the reply stream before writing the request (and/or add length-prefix framing per `docs/fret.md`), then drop `readAllBounded`'s stream-state poll.
 - Start the ping round-trip clock after the stream opens.
 - Tighten each RPC's max-bytes to the real ceiling so oversized payloads are rejected before full buffering.
 

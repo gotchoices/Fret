@@ -140,7 +140,7 @@ Payload inclusion heuristic:
 - Stream management:
   - Max inbound: 32 (Edge) / 128 (Core)
   - Max outbound: 64 (Edge) / 256 (Core)
-  - Stream timeout: 30s default, 10s for ping
+  - Stream read deadline: one overall budget per read (`readAllBounded`, 5s default, uniform across the four RPCs today). There is deliberately **no** per-chunk idle timer — a gap between chunks is a slow link, not end-of-stream, and an idle timer truncated healthy transfers into malformed JSON and failure-scored the (healthy) sender. libp2p v3's `close()` half-closes, so `iter.next()` resolves `{ done: true }` on genuine EOF; the overall deadline is what bounds a peer that stalls mid-payload. Exceeding it throws a read-timeout error rather than returning the partial buffer, so a timeout is never mistaken for a short-but-valid message.
   - Multiplexing: reuse streams for multiple requests where possible
   - Snapshot caps: successors/predecessors/sample are profile-bounded (Edge ≤ 6/6/6, Core ≤ 12/12/8)
 
