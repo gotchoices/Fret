@@ -214,6 +214,7 @@ The dedup cache (`DedupCache`) has max 1024 entries. An attacker can pre-fill th
 - **Preconditions**: Ability to send maybeAct messages (rate limited to 32/16 for core).
 - **Impact**: Dedup protection bypassed for legitimate requests. Potential double-execution of activities.
 - **Current mitigations**: Rate limiting on maybeAct. Cache size of 1024 provides some buffer.
+- **Status — mitigated**: capacity is now profile-derived (Core 2048 / Edge 512) and deliberately sized above what the maybeAct rate limit can force into one TTL window. Only a rate-limited request reaches the cache, so the ceiling on attacker-inserted entries per 30 s TTL is burst + refill × TTL: Core 32 + 16/s × 30 s = 512, Edge 8 + 4/s × 30 s = 128 — a quarter of the respective capacity. A flood can therefore no longer evict a live entry, provided the two constants stay in step (noted at the sizing site in `fret-service.ts`). Separately, `correlation_id` is still unbounded in length and is used verbatim as the cache key, so the *memory* held by a full cache is attacker-influenced up to the 512 KB message cap; field-length validation is tracked with the RPC shared-helper work.
 
 #### 3.7 Stream Resource Exhaustion
 **Severity: Medium**
@@ -688,7 +689,7 @@ The 100ms idle timeout after first data (`protocols.ts:53`) is fragile:
 | 9 | **Routing table pollution via snapshots** | High | Identity (1.3) |
 | 10 | **Global (not per-peer) rate limiting** | High | DoS (4.1) |
 | 11 | **No rate limit on inbound announcements** | High | Protocol (3.4) |
-| 12 | **Replay attacks with 9.5-minute window** | High | Protocol (3.3) |
+| 12 | ~~**Replay attacks with 9.5-minute window**~~ — window closed; leave-notice dedup still open | High | Protocol (3.3) |
 | 13 | **Leave storm amplification** | High | DoS (4.2) |
 | 14 | **Network size estimate manipulation** | High | Eclipse (2.4) |
 | 15 | **Bootstrap poisoning** | High | Partition (7.5) |

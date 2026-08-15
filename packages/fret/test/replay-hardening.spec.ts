@@ -56,13 +56,14 @@ describe('replay hardening', function () {
 			}
 		})
 
-		it('carries at least 128 bits of randomness', async () => {
+		it('carries at least 122 bits of randomness', async () => {
 			const node = await createMemNode()
 			try {
 				const svc = new CoreFretService(node, { profile: 'edge', k: 7 })
 				const id = (svc as any).newCorrelationId('act') as string
 				const random = id.split('-').slice(2, -1).join('-')
-				// randomUUID: 36 chars, 122 random bits; getRandomValues fallback: 32 hex chars.
+				// 32 hex digits either way: randomUUID spends 6 of those bits on its version and
+				// variant fields (122 random), the getRandomValues fallback all 128.
 				const hex = random.replace(/-/g, '')
 				expect(hex.length, `unexpected random segment: ${random}`).to.be.at.least(32)
 				expect(/^[0-9a-f]+$/.test(hex)).to.equal(true)

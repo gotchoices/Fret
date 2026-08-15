@@ -166,7 +166,7 @@ export class FretService implements IFretService, Startable {
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
 	private metadata?: Record<string, any>;
 	private activityHandler?: ActivityHandler;
-	/** Sized in the constructor — capacity is profile-derived (see {@link dedupCapacity}). */
+	/** Sized in the constructor, where the profile is known — see the sizing note there. */
 	private readonly dedupCache: DedupCache<NearAnchorV1 | { commitCertificate: string }>;
 	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
 	private readonly bucketPing: TokenBucket;
@@ -286,10 +286,13 @@ export class FretService implements IFretService, Startable {
 			this.cfg.profile === 'core' ? 10 : 2
 		);
 		this.announceFanout = this.cfg.profile === 'core' ? 8 : 4;
-		// Sized by role: a flood that evicts live entries before their TTL expires turns the
-		// dedup cache back into a replay hole, so Core — which carries the higher inbound rate
-		// and is the harder node to flush — gets 4× Edge's slots. Edge's inbound maybeAct rate
-		// limit caps how fast the cache can be churned in the first place, so it needs fewer.
+		// Sized by role: an entry evicted before its TTL expires is a replay hole, so capacity
+		// must exceed the most entries an attacker can force into one TTL window. Only a
+		// rate-limited request reaches `cacheResponse`, so that ceiling is the maybeAct bucket:
+		// burst + refill × TTL — Core 32 + 16/s × 30s = 512, Edge 8 + 4/s × 30s = 128. Both
+		// capacities below are 4× that, leaving room for legitimate concurrent lookups.
+		// NOTE: these track the `bucketMaybeAct` rates above; raising those without raising
+		// these re-opens the eviction hole.
 		this.dedupCache = new DedupCache(DEDUP_TTL_MS, this.cfg.profile === 'core' ? 2048 : 512);
 	}
 
@@ -744,6 +747,9 @@ export class FretService implements IFretService, Startable {
 
 		// Timestamp freshness: reject messages outside the ±30s window (= the dedup TTL, so a
 		// message can never outlive the cache entry that recognises it as a replay)
+		// NOTE: ±30s also makes this the tightest clock-sync requirement in the system, and a
+		// badly-skewed peer presents only as a rising `timestampBounds` count. If skew ever
+		// needs diagnosing in the field, record the observed offset here rather than a bare tally.
 		if (!validateTimestamp(msg.timestamp)) {
 			this.diag.rejected.timestampBounds++;
 			return await this.nearAnchorOnly(msg);

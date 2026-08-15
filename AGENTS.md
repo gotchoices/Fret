@@ -42,6 +42,11 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - **TS execution**: `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
 - **No root tsconfig** — always run `tsc` from `packages/fret/`
 - **Formatting**: tabs for indent (see tsconfig + existing code)
+- **NOTE: don't run `yarn format`.** There is no prettier config, so it applies prettier's
+  space-indent defaults and rewrites every source file against the house style above.
+  `yarn format:check` fails on all 21 source files for the same reason — known and not a
+  regression. There is no lint step; `yarn check` (typecheck + build + test) is the gate.
+  Revisit if a prettier config is ever added that matches the tab style.
 
 ### Releasing
 

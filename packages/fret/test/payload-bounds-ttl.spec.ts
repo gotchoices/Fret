@@ -190,7 +190,15 @@ describe('Payload bounds and TTL validation', function () {
 			expect(result).to.have.property('anchors')
 
 			const diag = svc.getDiagnostics()
-			expect((diag as any).rejected.timestampBounds).to.be.greaterThan(0)
+			const afterStale = (diag as any).rejected.timestampBounds as number
+			expect(afterStale).to.be.greaterThan(0)
+
+			// Regression guard for the window tightening: 60s stale passed the old ±5 min
+			// default, so it outlived its dedup entry and could be replayed. Distinct
+			// correlation id, or the cache would answer before the timestamp check runs.
+			const recent = { ...msg, correlation_id: 'cmVjZW50', timestamp: Date.now() - 60_000 }
+			expect(await (svc as any).handleMaybeAct(recent)).to.have.property('anchors')
+			expect((svc.getDiagnostics() as any).rejected.timestampBounds).to.equal(afterStale + 1)
 
 			await svc.stop()
 			await stopAll(nodes)
