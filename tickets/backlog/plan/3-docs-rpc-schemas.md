@@ -1,5 +1,6 @@
 description: Document JSON schemas for RPCs with examples
 dependencies: FRET RPC layer
+tradeoffs: Hand-written schema documents drift from the TypeScript wire types the moment either changes; a maintainer may prefer generating them from the types, or judge the exported types to be sufficient documentation already.
 ----
 
 Document the wire protocol with:

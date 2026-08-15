@@ -1,6 +1,7 @@
 description: End-to-end encryption of activity payloads so only the target cluster can decrypt
 dependencies: 5-message-signatures (signatures needed alongside encryption for full protection)
 files: src/service/fret-service.ts (iterativeLookup, routeAct), src/service/payload-heuristic.ts, docs/fret.md
+tradeoffs: No approach is settled — cluster key agreement, onion layering, and coordinator-targeted re-encryption each conflict with progressive routing in a different way — so this is an open design question rather than schedulable work; a maintainer may reasonably decide payload confidentiality belongs to the embedding application, not the routing overlay.
 ----
 
 ### Problem

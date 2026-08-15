@@ -1,6 +1,7 @@
 description: Re-hash peer IDs for sample entries instead of trusting provided coords
 dependencies: none
 files: src/service/fret-service.ts (lines 644-651, 803-810), src/ring/hash.ts
+tradeoffs: Replaces a cheap base64 decode with a SHA-256 per sample entry on the snapshot-merge path, and once coordinates are distrusted the wire field becomes dead weight — a maintainer may prefer to remove the field from the wire format outright rather than pay to re-derive it.
 ----
 
 ### Context

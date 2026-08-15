@@ -1,5 +1,6 @@
 description: Diagnostics counters, hop counts, and convergence metrics
 dependencies: FRET core (all modules)
+tradeoffs: Counters spread across every module are easy to add and hard to remove, and the service already exposes a diagnostics structure that partially covers this; a maintainer may want the existing counters extended in place rather than a new metrics layer introduced.
 ----
 
 Add operational diagnostics for monitoring and debugging FRET in production.

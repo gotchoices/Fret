@@ -1,6 +1,7 @@
 description: Add diversity requirements to cohort assembly (IP range, AS number diversity)
 dependencies: none — design needed for what diversity signals are available in a libp2p context
 files: src/service/fret-service.ts (assembleCohort ~line 850-870), src/store/digitree-store.ts
+tradeoffs: The diversity signals it depends on (address range, autonomous system number) are unavailable or meaningless in browser and relay-heavy deployments, and skipping ring-adjacent peers to satisfy a quota weakens the ring-order property cohort assembly rests on; a maintainer may want this only as an optional application-supplied policy hook.
 ----
 
 ### Problem

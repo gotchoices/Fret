@@ -1,6 +1,7 @@
 description: Implement cryptographic signatures on all FRET protocol messages
 dependencies: none (parallel with 5-transport-identity-verification; complementary defense-in-depth)
 files: src/rpc/sign.ts (new), src/rpc/protocols.ts, src/rpc/neighbors.ts, src/rpc/maybe-act.ts, src/rpc/leave.ts, src/service/fret-service.ts, src/service/libp2p-fret-service.ts, src/index.ts, docs/fret.md, test/sign.spec.ts (new), test/signature-integration.spec.ts (new)
+tradeoffs: Adds an asymmetric signature operation per message on both ends plus a canonical-JSON pass, which is real cost on mobile/Edge profiles, and the backward-compatible empty-signature path leaves the protection advisory until a later flag makes it mandatory; a maintainer may argue the transport identity verification already shipped covers the realistic attacker and defer this.
 ----
 
 ### Overview

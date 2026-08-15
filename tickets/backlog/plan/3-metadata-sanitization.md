@@ -1,6 +1,7 @@
 description: Sanitize metadata keys and bound metadata size to prevent prototype pollution and storage bloat
 dependencies: none
 files: src/service/fret-service.ts (mergeAnnounceSnapshot ~line 600-603), src/store/digitree-store.ts (update ~line 93-98)
+tradeoffs: The prototype-pollution half is weaker than it reads — object spread defines own properties rather than invoking a setter, so the merge site named here does not actually pollute a prototype — which leaves storage bloat, already partly bounded by the table capacity limit; and capping metadata constrains a field deliberately left open for embedding applications.
 ----
 
 ### Problem

@@ -1,6 +1,7 @@
 description: Sign or HMAC serialized routing table exports and verify coordinates on import
 dependencies: 5-message-signatures (same key infrastructure)
 files: src/service/fret-service.ts (exportTable/importTable ~line 1347-1360), docs/fret.md
+tradeoffs: The exported table is written and read by the local application, so the threat needs an attacker who can already write that application's own storage — arguably outside FRET's trust boundary and better handled by the storage layer. The coordinate re-verification half is cheap and defensible independently of the signing half.
 ----
 
 ### Problem

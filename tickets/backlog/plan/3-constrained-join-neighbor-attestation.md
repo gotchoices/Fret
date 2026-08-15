@@ -1,6 +1,8 @@
 description: Dual-path admission control — density-constrained open path and credential-verified fast path
 dependencies: 3-size-consensus-bounded-gossip (open path needs agreed size estimate for density checks)
 files: src/service/fret-service.ts (mergeAnnounceSnapshot, mergeNeighborSnapshots, stabilizeOnce), src/store/digitree-store.ts, docs/fret.md
+prereq: size-consensus-bounded-gossip
+tradeoffs: Large ticket with a hard prerequisite (an agreed network size) and a real false-positive risk — density friction mis-tuned against a legitimate mass join is indistinguishable from the attack it targets and would lock out honest peers; a maintainer may ship only the application admission hook and leave the open-path density math unbuilt.
 ----
 
 ### Problem

@@ -1,6 +1,7 @@
 description: Add liveness verification before peer removal, treat suggested replacements as untrusted, and add leave dedup
 dependencies: 5-message-signatures (sig field + verification), 5-transport-identity-verification (from-field check) — but all work below is independent and ships first
 files: src/service/fret-service.ts (handleLeave ~501-562), src/rpc/leave.ts, src/rpc/ping.ts, test/churn.leave.spec.ts, docs/fret.md
+tradeoffs: A liveness ping before every removal delays a legitimate departure by up to five seconds and adds an outbound request per leave notice — which is itself the amplification the leave-amplification-cap ticket is trying to shrink; a maintainer may prefer to wait for signed leave notices and drop the ping entirely. The dedup arm is cheap and defensible on its own.
 ----
 
 ### Overview

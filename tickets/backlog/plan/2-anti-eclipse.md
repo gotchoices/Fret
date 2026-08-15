@@ -1,6 +1,7 @@
 description: Anti-eclipse measures: random walk discovery, multi-path bootstrap verification, S/P change alerts
 dependencies: none — design exploration ticket
 files: src/service/fret-service.ts (stabilizeOnce ~line 715-722, seedFromBootstraps ~line 686-713), docs/fret.md
+tradeoffs: Three loosely-related mechanisms bundled into one ticket, each adding steady background traffic (random walks) or new alerting surface (neighbor-set churn) with no way to confirm they help absent a real eclipse; a maintainer may want them split and justified individually, or judge eclipse theoretical at the deployment sizes currently in view.
 ----
 
 ### Problem

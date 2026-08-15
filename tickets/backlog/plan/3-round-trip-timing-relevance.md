@@ -1,5 +1,6 @@
 description: Incorporate round-trip timing into peer relevance scoring
 dependencies: FRET core (peer cache, relevance scoring)
+tradeoffs: Biasing relevance toward low-latency peers pulls the routing table toward topologically near ones, working directly against the sparsity model whose purpose is a distance-balanced spine; it also depends on latency measurements that are known to be wrong today (see fix/13-zero-latency-health-skew), which must land first for any timing input to be trustworthy.
 ----
 
 Add RTT measurement into the peer cache and use it to bias toward "nearer" (lower latency) peers.

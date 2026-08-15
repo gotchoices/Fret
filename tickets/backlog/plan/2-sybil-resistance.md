@@ -1,6 +1,7 @@
 description: Identity cost mechanism (proof-of-work, stake, or similar) for Sybil resistance
 dependencies: none — design exploration ticket
 files: docs/fret.md
+tradeoffs: Every candidate mechanism (proof-of-work, stake, progressive trust) taxes honest mobile peers hardest, and none has been chosen — this is an open design question, not schedulable work. Deployments that have an admission authority already get equivalent protection from the credentialed path in the constrained-join ticket.
 ----
 
 ### Problem

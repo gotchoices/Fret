@@ -1,6 +1,7 @@
 description: Per-peer token buckets on all inbound RPC handlers with violation tracking and temporary blocking
 dependencies: 5-transport-identity-verification (need remotePeer from connection), 4-announce-inbound-rate-limiting (array caps)
 files: src/utils/peer-rate-limiter.ts (new), src/service/fret-service.ts, docs/fret.md, test/per-peer-rate-limit.spec.ts (new)
+tradeoffs: Trades memory and per-request overhead for denial-of-service isolation — a bucket per peer per protocol (five limiters, up to 512 tracked peers on Core) plus a prune pass every stabilization tick; with global buckets already in place a maintainer may judge single-peer exhaustion an acceptable risk until it is actually observed. Both named dependencies have already landed.
 ----
 
 ### Overview

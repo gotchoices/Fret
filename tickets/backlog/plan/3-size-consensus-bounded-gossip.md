@@ -1,6 +1,8 @@
 description: Converge on a bounded network size consensus via signed observations exchanged in neighbor snapshots
 dependencies: 5-transport-identity-verification (observations must come from verified identities), 4-replay-dedup-hardening (timestamp tightening)
 files: src/estimate/size-estimator.ts, src/service/fret-service.ts (reportNetworkSize ~line 1061-1078, getNetworkSizeEstimate, snapshot ~line 814), src/rpc/neighbors.ts, docs/fret.md
+prereq: message-signatures
+tradeoffs: Adds a signed observation array to every snapshot — more bytes, more verification — to defend an input whose current failure mode is a mis-sized cluster span rather than a breach; a maintainer may prefer to first land the estimator accuracy fixes already queued (fix/12-size-estimator-fixes) and see whether purely local estimates are then good enough.
 ----
 
 ### Problem

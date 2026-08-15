@@ -1,5 +1,6 @@
 description: Active preconnect mode for pre-dialing anchor/neighbor peers
 dependencies: FRET core (active/passive state, connection management)
+tradeoffs: Pre-dialing spends connections and battery on peers that may never be used, which is precisely wrong for Edge profiles; a maintainer should want the serial-dial latency it claims to remove actually measured before a second dialing loop is added.
 ----
 
 Pre-dial a small set of anchor and neighbor peers during active mode to avoid serial dial chains during routing.

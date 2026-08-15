@@ -1,5 +1,6 @@
 description: Document simulator design, invariants, and test methodology in fret.md
 dependencies: simulation harness, property-based tests
+tradeoffs: Documenting the simulator before the sim-router-realism ticket fixes its known shortcuts would enshrine behavior that is about to change; low value until the simulator is trustworthy.
 ----
 
 Expand docs/fret.md with:

@@ -1,6 +1,7 @@
 description: Path obfuscation for breadcrumbs and routing metadata to reduce traffic analysis and surveillance
 dependencies: 2-e2e-payload-encryption (related privacy concern), 5-message-signatures
 files: src/service/fret-service.ts (iterativeLookup, routeAct), docs/fret.md
+tradeoffs: Obfuscating the path costs exactly the routing diagnostics and traceability the design deliberately built in, and a token that every hop can test for self-visitation but not read is not obviously constructible without per-hop crypto; a maintainer may accept path visibility as the price of debuggable routing.
 ----
 
 ### Problem
