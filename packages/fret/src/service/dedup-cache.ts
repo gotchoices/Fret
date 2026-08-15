@@ -42,8 +42,13 @@ export class DedupCache<T> {
 	}
 
 	private evictOldest(): void {
-		// Insertion order and expiry order agree (constant ttlMs), so the first (oldest-inserted)
-		// entry is also the one nearest to expiry — evicting it needs no O(n) scan of the map.
+		// Insertion order and expiry order agree (constant ttlMs, and `set` re-inserts a refreshed
+		// key at the newest slot with a fresh expiry), so the first (oldest-inserted) entry is also
+		// the one nearest to expiry — evicting it needs no O(n) scan of the map.
+		// NOTE: that agreement assumes `Date.now()` is non-decreasing. A backwards clock step can
+		// leave a live entry ahead of an expired one, so one eviction picks the wrong victim; it
+		// self-corrects on the next insert. If wall-clock steps ever matter here, take the expiry
+		// from a monotonic source rather than reintroducing a scan.
 		const first = this.entries.keys().next();
 		if (!first.done) this.entries.delete(first.value);
 	}
