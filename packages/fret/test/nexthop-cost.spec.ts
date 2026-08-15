@@ -104,3 +104,88 @@ describe('Next-hop cost-function mode', () => {
 		}
 	})
 })
+
+describe('Next-hop near-mode strict improvement (selfCoord)', () => {
+	// Near radius large enough that both self and every candidate below count as "near".
+	const nearRadius = computeNearRadius(10, 5)
+
+	it('returns undefined when every near candidate is behind the node', () => {
+		const store = new DigitreeStore()
+		const target = coordByte(200)
+
+		store.upsert('behind-a', coordByte(210)) // dist 10
+		store.upsert('behind-b', coordByte(220)) // dist 20
+
+		const result = chooseNextHop(
+			store, target,
+			['behind-a', 'behind-b'],
+			() => false,
+			() => 0.5,
+			{ nearRadius, confidence: 0.9, selfCoord: coordByte(201) } // self dist 1
+		)
+
+		if (result !== undefined) {
+			throw new Error(`expected no hop when all candidates are farther than self, got ${result}`)
+		}
+	})
+
+	it('picks the strictly-closer candidate and never one behind the node', () => {
+		const store = new DigitreeStore()
+		const target = coordByte(200)
+
+		store.upsert('behind', coordByte(215))  // dist 15
+		store.upsert('ahead', coordByte(205))   // dist 5
+
+		const result = chooseNextHop(
+			store, target,
+			['behind', 'ahead'],
+			(id) => id === 'behind', // connectedness must not rescue a backwards hop
+			() => 0.5,
+			{ nearRadius, confidence: 0.9, selfCoord: coordByte(190) } // self dist 10
+		)
+
+		if (result !== 'ahead') {
+			throw new Error(`expected the strictly-closer candidate, got ${result}`)
+		}
+	})
+
+	it('does not filter when the node itself is far from the key', () => {
+		const store = new DigitreeStore()
+		const target = coordByte(200)
+
+		store.upsert('near-candidate', coordByte(202)) // dist 2, inside the near radius
+
+		// Tiny near radius: the candidate is near, self (dist 60) is not.
+		const result = chooseNextHop(
+			store, target,
+			['near-candidate'],
+			() => false,
+			() => 0.5,
+			{ nearRadius: coordByte(5), confidence: 0.9, selfCoord: coordByte(140) }
+		)
+
+		if (result !== 'near-candidate') {
+			throw new Error(`far node should still take a near hop, got ${result}`)
+		}
+	})
+
+	it('leaves near-mode selection unchanged when no selfCoord is supplied', () => {
+		const store = new DigitreeStore()
+		const target = coordByte(200)
+
+		store.upsert('behind-a', coordByte(210))
+		store.upsert('behind-b', coordByte(220))
+
+		const result = chooseNextHop(
+			store, target,
+			['behind-a', 'behind-b'],
+			() => false,
+			() => 0.5,
+			{ nearRadius, confidence: 0.9 }
+		)
+
+		if (result !== 'behind-a') {
+			throw new Error(`without selfCoord the closest candidate still wins, got ${result}`)
+		}
+	})
+})

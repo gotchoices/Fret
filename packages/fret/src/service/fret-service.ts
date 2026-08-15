@@ -1725,7 +1725,7 @@ export class FretService implements IFretService, Startable {
 			// reply below, exactly as no-next-hop already did.
 			const candidates = this.dialableCohort(coord, Math.max(4, this.cfg.m), exclude);
 
-			const hopOpts = this.buildNextHopOptions(n, confidence);
+			const hopOpts = this.buildNextHopOptions(n, confidence, await this.selfCoord());
 			const linkQ = (id: string) => this.linkQuality(id);
 			const next = chooseNextHop(
 				this.store, coord, candidates,
@@ -1777,9 +1777,24 @@ export class FretService implements IFretService, Startable {
 		};
 	}
 
-	private buildNextHopOptions(sizeEstimate: number, confidence: number): NextHopOptions {
+	/**
+	 * `selfCoord` is supplied only when we are *forwarding* someone else's message, which is
+	 * where near-mode strict improvement belongs: a forwarded message handed to a peer farther
+	 * from the key than we are drifts backwards, and only breadcrumbs plus TTL stop it looping.
+	 *
+	 * It is deliberately omitted when we *originate* a lookup. A lookup seeks the key's cluster
+	 * — the k peers nearest the key, spanning both sides — not the key point itself, so an
+	 * originator that happens to be the closest peer to the key still has to contact a cluster
+	 * member, and every one of them is farther from the key than it is. Filtering there does not
+	 * prevent a loop (the walk's `visited` set already does that); it just refuses to send at
+	 * all, and the activity is never performed. `pickAnchors` omits it for a different reason:
+	 * it ranks peers by closeness to a key as a hint for another peer's resend, so our own
+	 * distance is irrelevant to the ordering.
+	 */
+	private buildNextHopOptions(sizeEstimate: number, confidence: number, selfCoord?: Uint8Array): NextHopOptions {
 		return {
 			nearRadius: computeNearRadius(sizeEstimate, this.cfg.k),
+			selfCoord,
 			confidence,
 			backoffPenalty: (id) => this.getBackoffPenalty(id),
 		};
@@ -2038,6 +2053,9 @@ export class FretService implements IFretService, Startable {
 				return;
 			}
 
+			// No self coordinate here: we are originating, not forwarding. See
+			// `buildNextHopOptions` — an originator nearest the key must still reach out to the
+			// cluster around it, and every member of that cluster is farther from the key.
 			const hopOpts = this.buildNextHopOptions(n, confidence);
 			const linkQ = (id: string) => this.linkQuality(id);
 			const target = chooseNextHop(

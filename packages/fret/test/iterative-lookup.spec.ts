@@ -1,6 +1,8 @@
 import { describe, it } from 'mocha'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
+import { hashKey, hashPeerId } from '../src/ring/hash.js'
+import { lexLess, minDistance } from '../src/ring/distance.js'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
 
 async function makeMesh(n: number) {
@@ -89,6 +91,55 @@ describe('Iterative lookup', function () {
 		if (!hasActivity) {
 			throw new Error(`expected activity-related events, got: ${types.join(', ')}`)
 		}
+
+		await Promise.all(services.map(s => s.stop()))
+		await stopAll(nodes)
+	})
+
+	// Near-mode routing requires a hop to be strictly closer to the key than the sender, so a
+	// forwarded message can never drift backwards. That rule is for *forwarding*: a lookup we
+	// originate is aiming at the key's cluster, and when we are the peer nearest the key every
+	// cluster member is farther from it than we are. Applying the rule here refuses to send at
+	// all and the activity is silently never performed.
+	it('still delivers activity when the initiator is the peer nearest the key', async () => {
+		const { nodes, services } = await makeMesh(2)
+		await new Promise(r => setTimeout(r, 2000))
+
+		const selfCoord = await hashPeerId(nodes[0]!.peerId)
+		const peerCoord = await hashPeerId(nodes[1]!.peerId)
+		// Peer ids are random per run, so search for a key the initiator is strictly nearest to
+		// rather than hoping the coin lands that way.
+		let key: Uint8Array | undefined
+		for (let i = 0; i < 256 && !key; i++) {
+			const candidate = u8FromString(`nearest-initiator-${i}`)
+			const coord = await hashKey(candidate)
+			if (lexLess(minDistance(selfCoord, coord), minDistance(peerCoord, coord))) key = candidate
+		}
+		if (!key) throw new Error('no key found that the initiator is nearest to')
+
+		let fired = 0
+		services[1]!.setActivityHandler(async () => {
+			fired++
+			return { commitCertificate: 'cert-initiator-nearest' }
+		})
+
+		const events: string[] = []
+		let completed: { commitCertificate: string } | undefined
+		for await (const evt of services[0]!.iterativeLookup(key, {
+			wantK: 7,
+			minSigs: 1,
+			digest: 'Zg',
+			activity: 'payload-data',
+			ttl: 3,
+		})) {
+			events.push(evt.type)
+			if (evt.type === 'complete') completed = evt.result
+		}
+
+		if (completed?.commitCertificate !== 'cert-initiator-nearest') {
+			throw new Error(`lookup did not complete; events: ${events.join(' -> ')}`)
+		}
+		if (fired !== 1) throw new Error(`expected the activity to run once, ran ${fired} times`)
 
 		await Promise.all(services.map(s => s.stop()))
 		await stopAll(nodes)

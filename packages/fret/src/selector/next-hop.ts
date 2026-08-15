@@ -8,6 +8,17 @@ export type BackoffPenalty = (id: string) => number; // [0..1]
 export interface NextHopOptions {
 	/** Near-radius threshold; distances ≤ this trigger strict mode. */
 	nearRadius?: Uint8Array;
+	/**
+	 * The caller's own ring coordinate. Supplied, near mode measures strict improvement
+	 * against *our* distance to the target instead of only ordering candidates among
+	 * themselves, so a hop can never be farther from the key than we already are.
+	 *
+	 * Optional because not every caller is choosing a hop *for itself*: `pickAnchors`
+	 * ranks peers by closeness to a key as a hint for someone else's resend, and the
+	 * exported standalone / simulator usage has no node identity at all. Omitted, the
+	 * selector behaves exactly as it did before this option existed.
+	 */
+	selfCoord?: Uint8Array;
 	/** Confidence in network size estimate [0,1]; adjusts weight balance. */
 	confidence?: number;
 	/** Per-peer backoff penalty [0,1]; penalizes recently-failed peers. */
@@ -131,6 +142,16 @@ function chooseNextHopCost(
 	const backoff = opts.backoffPenalty ?? (() => 0);
 	const nearRadius = opts.nearRadius!;
 
+	// Depends only on (near, confidence), so there are two possible results for the whole
+	// call; computing it per candidate re-derived the same two values N times. In near mode
+	// the resulting cost is only ever a tertiary tie-break, so most of that work was discarded.
+	const nearW = weightsForContext(true, confidence);
+	const farW = weightsForContext(false, confidence);
+
+	// Our own distance to the target, when the caller told us where it sits.
+	const selfDist = opts.selfCoord ? minDistance(opts.selfCoord, targetCoord) : undefined;
+	const selfIsNear = selfDist !== undefined && isNear(selfDist, nearRadius);
+
 	type Scored = { id: string; dist: Uint8Array; near: boolean; connected: boolean; costVal: number };
 	const scored: Scored[] = [];
 
@@ -140,7 +161,7 @@ function chooseNextHopCost(
 		const dist = minDistance(entry.coord, targetCoord);
 		const near = isNear(dist, nearRadius);
 		const connected = isConnected(id);
-		const w = weightsForContext(near, confidence);
+		const w = near ? nearW : farW;
 		const costVal = cost(normalizedLogMagnitude(dist), connected, linkQ(id), backoff(id), w);
 		scored.push({ id, dist, near, connected, costVal });
 	}
@@ -149,8 +170,19 @@ function chooseNextHopCost(
 
 	// Partition: near-mode candidates use strict distance ordering;
 	// far-mode candidates use cost function.
-	const nearCandidates = scored.filter(s => s.near);
+	let nearCandidates = scored.filter(s => s.near);
 	const farCandidates = scored.filter(s => !s.near);
+
+	if (selfIsNear) {
+		// Strict improvement is measured against *our own* distance to the target: a candidate
+		// no closer than we already are moves the message backwards, and only breadcrumbs plus
+		// TTL would stop it looping. Ordering candidates among themselves cannot see that.
+		nearCandidates = nearCandidates.filter(s => lexLess(s.dist, selfDist!));
+		// No fall-through to far mode. Every far candidate sits beyond nearRadius ≥ selfDist,
+		// so it is guaranteed worse than staying put — the exact hop this filter exists to
+		// reject. Callers already handle `undefined`: it yields a NearAnchor / exhausted.
+		if (nearCandidates.length === 0) return undefined;
+	}
 
 	// Near mode: strict distance improvement (ε ≈ 0); connection only breaks ties
 	if (nearCandidates.length > 0) {
