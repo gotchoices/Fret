@@ -341,6 +341,19 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Ready gate for early queries; allow zero-peers override for single-node dev.
 - Routing store (Digitree) & indices (A2)
   - Ordered B+Tree keyed by ring coordinate; secondary relevance index.
+  - **One entry per peer id, and the id index points at its current key.** The store keeps two
+    views of the same population: the ordered tree (every ring walk, `list`, `exportEntries`)
+    and a map from peer id to that entry's tree key (`getById`, `remove`, `update`, `size`).
+    The tree key embeds the coordinate (`hex(coord)|id`), so **changing a peer's coordinate is a
+    re-key, not an in-place edit** — the old entry must be dropped as the new one is placed.
+    All mutation therefore funnels through a single private write seam inside `DigitreeStore`
+    (plus its delete half, `remove`); no write path re-derives the bookkeeping for itself.
+    Breaking the invariant in either direction is silently corrupting rather than loud: an extra
+    tree entry is walked by the ring but unreachable by id (so `remove` cannot delete it, and it
+    consumes a slot in every ring walk, shrinking cohorts below the requested count), while a
+    stale id mapping hides a live entry from every id-keyed reader. `test/digitree.invariants.spec.ts`
+    pins it — a model-based property test over arbitrary write sequences, so a future write path
+    that bypasses the seam fails there rather than shipping.
   - Bounded capacity with victim selection; infinite relevance for S/P.
   - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
   - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
@@ -550,6 +563,9 @@ FRET's routing table (Digitree store) is in-memory by default. The `exportTable`
 
 - **Export**: `exportTable()` returns a `SerializedTable` containing every peer entry in the Digitree, with `Uint8Array` coordinates encoded as base64url strings. The envelope includes the exporter's peer ID and a timestamp.
 - **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Membership labels are preserved (a persisted table is same-network by construction); a missing `membership` field in an older snapshot defaults to `'unknown'`. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
+  - **Replace by id.** Import is public and nothing stops a caller invoking it after `start()`, at which point self and any peer-store-seeded peers are already in the table. A snapshot record for an id already present therefore *replaces* that entry outright, including a coordinate move — the snapshot is the more recent view of that peer, and the alternative (leaving the existing entry in place) both discards the restored data and, on a coordinate move, strands the old entry in the tree unreachable by id.
+  - **Returns the number of distinct ids stored**, not the number of input records, so a snapshot carrying an id twice reports 1.
+  - Because replacement is unconditional, `importTable` re-asserts self's `member` label afterwards: a record for self (another peer's snapshot, or one predating the membership field, which decodes as `unknown`) would otherwise demote self out of every member-only ring view until the next stabilization tick re-seeded it.
 - **Persistence layer is external**: FRET only handles serialization/deserialization. The caller decides where and how to store the JSON (filesystem, IndexedDB, database, etc.).
 - **JSON-safe**: The `SerializedTable` structure is fully JSON-serializable and survives `JSON.stringify` / `JSON.parse` round-trips.
 

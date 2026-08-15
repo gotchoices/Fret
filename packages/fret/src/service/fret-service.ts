@@ -13,7 +13,7 @@ import type {
 	RouteProgress,
 	LookupOptions,
 } from '../index.js';
-import { DigitreeStore, type PeerEntry } from '../store/digitree-store.js';
+import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp, isUnsupportedProtocolError } from '../rpc/protocols.js';
@@ -413,7 +413,7 @@ export class FretService implements IFretService, Startable {
 				// Clamped at the threshold so the counter stays bounded for a peer we keep
 				// re-probing; a peer already at the threshold simply stays foreign.
 				const failures = Math.min(e.negotiateFailures + 1, FretService.NEGOTIATE_FAILURE_THRESHOLD);
-				const patch: Partial<PeerEntry> = { negotiateFailures: failures, lastNegotiateFailureAt: now };
+				const patch: PeerPatch = { negotiateFailures: failures, lastNegotiateFailureAt: now };
 				if (failures >= FretService.NEGOTIATE_FAILURE_THRESHOLD && e.membership !== 'foreign') {
 					patch.membership = 'foreign';
 				}
@@ -2216,6 +2216,13 @@ export class FretService implements IFretService, Startable {
 
 	importTable(table: SerializedTable): number {
 		const count = this.store.importEntries(table.entries);
+		// Import replaces by id, so a record for *self* — a snapshot taken by another peer, or
+		// one predating the membership field, which decodes as `unknown` — would overwrite the
+		// `member` label self is seeded with. An `unknown` self is excluded from every
+		// member-only ring view, so re-assert it here rather than waiting for the next
+		// stabilization tick's peer-store re-seed to heal it.
+		const selfStr = this.node.peerId.toString();
+		if (this.store.getById(selfStr)) this.store.setMembership(selfStr, 'member');
 		this.enforceCapacity();
 		return count;
 	}

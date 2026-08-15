@@ -52,6 +52,15 @@ export interface PeerEntry {
 	metadata?: Record<string, any>;
 }
 
+/**
+ * A patch applied to an existing entry by {@link DigitreeStore.update}.
+ *
+ * `id` is excluded deliberately: it is the identity the store's id index is keyed on, so
+ * re-writing it through a patch could only ever leave the two structures disagreeing. The
+ * coordinate *is* patchable — that is a re-key, which the store handles (see `put`).
+ */
+export type PeerPatch = Partial<Omit<PeerEntry, 'id'>>;
+
 export interface SerializedPeerEntry {
 	id: string;
 	coord: string; // base64url
@@ -84,6 +93,23 @@ function makeKey(entry: PeerEntry): string {
 	return `${coordToHex(entry.coord)}|${entry.id}`;
 }
 
+/**
+ * The routing table: an ordered B+Tree of peer entries plus an index from peer id to that
+ * entry's tree key.
+ *
+ * The tree key embeds the ring coordinate (`hex(coord)|id`), so **changing a peer's
+ * coordinate changes its tree key** — an update is a re-key, not an in-place edit. Every
+ * read above this class rests on one invariant:
+ *
+ * > Exactly one tree entry exists per peer id, and `byId` maps that id to that entry's
+ * > current key.
+ *
+ * Nothing outside this class may write to either structure. All mutation funnels through
+ * the private {@link DigitreeStore.put} seam (and its delete half, {@link
+ * DigitreeStore.remove}), which is what makes the invariant hold by construction rather
+ * than by each write path re-deriving the bookkeeping — and getting it wrong differently.
+ * `test/digitree.invariants.spec.ts` fails for any write path that bypasses the seam.
+ */
 export class DigitreeStore {
 	private readonly byKey: BTree<string, PeerEntry>;
 	private readonly byId: Map<string, string>; // id -> key
@@ -93,38 +119,37 @@ export class DigitreeStore {
 		this.byId = new Map();
 	}
 
-	insert(entry: PeerEntry): void {
+	/**
+	 * The single write seam over both structures: places `entry` as the one and only tree
+	 * entry for its id, and points `byId` at it.
+	 *
+	 * If the id already has an entry under a *different* key, its coordinate changed and the
+	 * old entry must be dropped first — otherwise the tree keeps both under different keys
+	 * and the id is duplicated in every ring walk while `byId` can only see one of them.
+	 */
+	private put(entry: PeerEntry): PeerEntry {
 		const key = makeKey(entry);
-		this.byKey.insert(entry);
+		const prevKey = this.byId.get(entry.id);
+		if (prevKey !== undefined && prevKey !== key) {
+			const prev = this.byKey.find(prevKey);
+			if (prev.on) this.byKey.deleteAt(prev);
+		}
+		// insert-or-replace at `key`: unlike `insert` it has no conflict outcome to discard,
+		// and unlike `updateAt` it needs no caller-held path — it takes its own `find` after
+		// the delete above, so nothing here can act on a path the tree already invalidated.
+		this.byKey.upsert(entry);
 		this.byId.set(entry.id, key);
+		return entry;
 	}
 
 	upsert(id: string, coord: Uint8Array): PeerEntry {
 		const now = Date.now();
-		const prevKey = this.byId.get(id);
 		// upsert's contract is "ensure an entry exists", not "reset to defaults".
 		// On a hit, preserve all mutable stats (relevance, health counters, state,
 		// membership, metadata) and only refresh coord/lastAccess. New ids get defaults.
-		// If coord changed (shouldn't happen in practice — coord is hash-derived from
-		// peer id), re-key via delete+insert to keep the BTree key consistent.
-		if (prevKey) {
-			const path = this.byKey.find(prevKey);
-			if (path.on) {
-				const prev = this.byKey.at(path)!;
-				const next: PeerEntry = { ...prev, coord, lastAccess: now };
-				const newKey = makeKey(next);
-				if (prevKey !== newKey) {
-					this.byKey.deleteAt(path);
-					this.byId.delete(id);
-					this.insert(next);
-				} else {
-					this.byKey.updateAt(path, next);
-				}
-				return next;
-			}
-			this.byId.delete(id);
-		}
-		const entry: PeerEntry = {
+		const prev = this.getById(id);
+		if (prev) return this.put({ ...prev, coord, lastAccess: now });
+		return this.put({
 			id,
 			coord,
 			relevance: 0,
@@ -137,23 +162,15 @@ export class DigitreeStore {
 			successCount: 0,
 			failureCount: 0,
 			avgLatencyMs: 0
-		};
-		this.insert(entry);
-		return entry;
+		});
 	}
 
-	update(id: string, patch: Partial<PeerEntry>): void {
-		const key = this.byId.get(id);
-		if (!key) return;
-		const path = this.byKey.find(key);
-		const cur = this.byKey.at(path);
+	update(id: string, patch: PeerPatch): void {
+		const cur = this.getById(id);
 		if (!cur) return;
-		const next: PeerEntry = { ...cur, ...patch };
-		this.byKey.updateAt(path, next);
-		if (makeKey(cur) !== makeKey(next)) {
-			this.byKey.deleteAt(path);
-			this.insert(next);
-		}
+		// A coord in the patch re-keys the entry; `put` owns that, so there is nothing to
+		// special-case here.
+		this.put({ ...cur, ...patch });
 	}
 
 	getById(id: string): PeerEntry | undefined {
@@ -331,8 +348,16 @@ export class DigitreeStore {
 		}));
 	}
 
+	/**
+	 * Restores serialized entries, replacing by id: a snapshot record for an id already in the
+	 * store wins, including a coordinate move (the snapshot is the more recent view of that
+	 * peer, and a stale duplicate would otherwise linger in the tree unreachable by id).
+	 *
+	 * @returns the number of *distinct ids stored* — not the number of input records, so a
+	 * snapshot carrying an id twice reports 1.
+	 */
 	importEntries(entries: SerializedPeerEntry[]): number {
-		let count = 0;
+		const stored = new Set<string>();
 		for (const s of entries) {
 			const coord = base64urlToCoord(s.coord);
 			const entry: PeerEntry = {
@@ -354,9 +379,9 @@ export class DigitreeStore {
 				avgLatencyMs: s.avgLatencyMs,
 				...(s.metadata ? { metadata: s.metadata } : {}),
 			};
-			this.insert(entry);
-			count++;
+			this.put(entry);
+			stored.add(entry.id);
 		}
-		return count;
+		return stored.size;
 	}
 }
