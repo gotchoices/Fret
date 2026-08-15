@@ -205,10 +205,10 @@ describe('Size estimator', () => {
 			const coords = uniformCoords(200)
 			const store = new DigitreeStore()
 			// NOTE: monotonicity holds here only because peers are inserted in ring
-			// order — each insert grows count and shrinks the single wrap gap, so both
-			// confidence factors (sizeFactor, minGap/maxGap) rise monotonically.
-			// Confidence is NOT monotonic for arbitrary insertion order; this test
-			// asserts the ordered-insertion case, not a general property.
+			// order into an evenly-spaced ring — every gap stays equal, so the dispersion
+			// factor is 1 - 1/sqrt(G) and both confidence factors (sizeFactor, dispersion)
+			// rise with each insert. Confidence is NOT monotonic for arbitrary insertion
+			// order; this test asserts the ordered-insertion case, not a general property.
 			// Insert first two peers before tracking — the single-peer sentinel
 			// confidence (0.2) is a special case, not part of the monotonic curve
 			store.upsert('p0', coords[0]!)
@@ -335,6 +335,55 @@ describe('Size estimator', () => {
 				})
 			}
 		}
+
+		// The cases above use one seed per (N, far) pair, which pins one draw rather than the
+		// estimator. This sweeps 20 seeds at a fixed shape so a change that happens to suit
+		// seed 7000+N+far but degrades the estimator in general still fails here.
+		it('N=2000, 32 far peers known: within 2x across 20 seeds', () => {
+			const N = 2000
+			let worst = 0
+			for (let seed = 0; seed < 20; seed++) {
+				const rng = new DeterministicRNG(8000 + seed)
+				const values = sortedRing(N, rng)
+				const selfIdx = rng.nextInt(0, N)
+				const store = partialKnowledgeStore(values, selfIdx, 32, rng)
+
+				const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(values[selfIdx]!) })
+				worst = Math.max(worst, relativeError(est.n, N))
+				expect(est.n).to.be.greaterThan(N / 2, `undercount at seed ${seed}: n_est=${est.n}`)
+				expect(est.n).to.be.lessThan(N * 2, `overcount at seed ${seed}: n_est=${est.n}`)
+			}
+			// Guards the 2x bound against silently becoming the actual accuracy. Measured worst
+			// across these 20 seeds is 0.545; the mean of 2m exponential gaps has a coefficient
+			// of variation of 1/sqrt(2m) ~ 25%, so a bound much below this would pin the draw.
+			expect(worst).to.be.lessThan(0.75, `worst relative error across 20 seeds: ${worst}`)
+		})
+
+		// Pins a *known blind spot*, not desired behaviour — see the NOTE on `dispersionFactor`
+		// and the "Known blind spot" bullet in docs/fret.md. Dispersion measures spacing
+		// regularity within the sampled arc and cannot see the arc that was never sampled, so a
+		// node whose entire neighbourhood is packed into a tiny evenly-spaced band reports a
+		// confidently wrong n. If a future change gives the estimator a defence against this
+		// (corroboration from peer-reported estimates is the stated one), this test should fail
+		// and be rewritten to assert the defence — it must not be loosened to keep it green.
+		it('KNOWN BLIND SPOT: an eclipsed neighbourhood scores high confidence on a wrong n', () => {
+			// Self plus 2m neighbours evenly spaced across 1/1000th of the ring: the shape an
+			// eclipse (or a very young ring) produces.
+			const band = RING_SIZE / 1000n
+			const points = 2 * M + 1
+			const step = band / BigInt(points)
+			const store = new DigitreeStore()
+			for (let i = 0; i < points; i++) store.upsert(`e${i}`, bigIntToCoord(BigInt(i) * step))
+
+			const selfIdx = Math.floor(points / 2)
+			const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(BigInt(selfIdx) * step) })
+
+			// n is inflated by ~1000x: local spacing is 1000x tighter than the true spacing of
+			// any plausible ring this node could belong to.
+			expect(est.n).to.be.greaterThan(10_000)
+			// ...and confidence does not notice, because the sampled arc is perfectly regular.
+			expect(est.confidence).to.be.greaterThan(0.8)
+		})
 
 		it('S/P window is used even when self sits at the wrap-around point', () => {
 			// Self near coordinate 0 puts half its predecessor window at the top of the ring.

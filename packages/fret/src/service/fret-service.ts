@@ -1920,6 +1920,8 @@ export class FretService implements IFretService, Startable {
 		return {
 			size_estimate: estimate,
 			confidence: Math.min(1, avgConfidence),
+			// Observations contributing, not distinct observers: repeated snapshots from one
+			// peer each add an entry. Diagnostic only — nothing branches on it.
 			sources: allObservations.length
 		};
 	}

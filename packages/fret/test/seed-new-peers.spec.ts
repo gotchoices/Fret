@@ -312,4 +312,38 @@ describe('Seed new peers — estimator calibration from snapshots', function () 
 			await node.stop()
 		}
 	})
+
+	// `getNetworkSizeEstimate` is public and synchronous while the self ring coordinate is only
+	// hashed during `start()`, so a caller can reach the estimator before it exists. The service
+	// passes `cachedSelfCoord ?? undefined`, which selects the estimator's whole-store fallback
+	// rather than passing a bogus coordinate or throwing.
+	it('getNetworkSizeEstimate works before start() via the whole-store fallback', async () => {
+		const node = await createMemNode()
+		await node.start()
+		const svc = new CoreFretService(node, { profile: 'edge', k: 7, m: 4 })
+		try {
+			expect((svc as any).cachedSelfCoord, 'self coordinate must be unset before start()').to.equal(null)
+
+			// Populate the store directly — nothing has run that would do it yet.
+			const store = (svc as any).store as DigitreeStore
+			const step = (1n << 256n) / 64n
+			for (let i = 0; i < 64; i++) {
+				const v = BigInt(i) * step
+				const coord = new Uint8Array(COORD_BYTES)
+				let rem = v
+				for (let b = 31; b >= 0; b--) { coord[b] = Number(rem & 0xffn); rem >>= 8n }
+				store.upsert(`pre${i}`, coord)
+				store.setMembership(`pre${i}`, 'member')
+			}
+
+			const est = svc.getNetworkSizeEstimate()
+			expect(est.size_estimate).to.be.greaterThan(0)
+			expect(est.confidence).to.be.greaterThan(0)
+			// Evenly spaced ring, so the fallback's median gap is the true gap and n is exact.
+			expect(est.size_estimate).to.equal(64)
+		} finally {
+			await svc.stop()
+			await node.stop()
+		}
+	})
 })

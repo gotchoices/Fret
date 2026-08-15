@@ -11,6 +11,31 @@ Network size estimation is currently local-only with lightweight sharing. Each p
 
 Without agreement on network size, peers cannot independently assess whether a ring region is over- or under-populated. This is a prerequisite for density anomaly detection and constrained join (see `3-constrained-join-neighbor-attestation`).
 
+### Added evidence — the local estimate got cheaper to manipulate (from review of `size-estimator-fixes`)
+
+The estimator accuracy fix this ticket's `tradeoffs:` line hoped might make local estimates
+"good enough" has landed, and it moves the manipulation cost the wrong way. Two changes:
+
+- The gap population is no longer every entry in the store (capacity 2048). It is the
+  successor/predecessor window: `2m + 1` coordinates immediately around the node's own ring
+  position, 17 at the default `m = 8`. Entries outside that window contribute nothing to
+  `n_est`, so an attacker no longer needs to out-number the store — they need coordinates
+  nearer the victim than the victim's own neighbours.
+- The statistic is the arithmetic mean of those gaps, not the median. The mean has a breakdown
+  point of zero, so each admitted Sybil moves it by roughly `1/2m` (~6%), and on the order of
+  `m` of them move `n_est` by a factor of two. The median needed roughly half the population.
+
+This is the same precondition as an eclipse, so it is not an independent attack — but it does
+mean the local statistic has no outlier resistance left to fall back on, which strengthens the
+case for this ticket rather than weakening it. `docs/threat-analysis.md` §2.4 has been corrected
+to say so. A related blind spot is recorded as a `NOTE:` at `dispersionFactor` in
+`src/estimate/size-estimator.ts` and pinned by the test
+`KNOWN BLIND SPOT: an eclipsed neighbourhood scores high confidence on a wrong n`
+(`test/size-estimator.spec.ts`): confidence is computed from spacing regularity *within* the
+sampled arc, so an evenly-spaced attacker band scores ~0.875 while `n_est` is off by ~1000x.
+Whatever consensus this ticket lands should therefore also feed the reported **confidence**, not
+only the size.
+
 ### Approach
 
 Evolve the existing estimate sharing into a lightweight bounded gossip protocol:

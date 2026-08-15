@@ -102,18 +102,24 @@ An attacker node accepts forwarded `RouteAndMaybeAct` messages but silently drop
 #### 2.4 Network Size Estimate Manipulation
 **Severity: High**
 
-`estimateSizeAndConfidence` (`size-estimator.ts:18-48`) computes `n_est = 2^256 / median_gap` from known peers. An attacker who controls entries in the store can skew the estimate:
+`estimateSizeAndConfidence` (`size-estimator.ts`) computes `n_est = 2^256 / representative_gap` from known peers. An attacker who controls entries in the store can skew the estimate:
 
 - **Inflate**: Insert entries with small gaps (clustered coordinates) to make the network appear larger.
 - **Deflate**: Remove entries (via leave notices) or insert with large gaps to make the network appear smaller.
 
-This is amplified by `reportNetworkSize` (`fret-service.ts:1061-1078`) which accepts external estimates with no authentication. Any code path calling `reportNetworkSize` can inject arbitrary estimates that influence `getNetworkSizeEstimate`.
+**The gap population is now the successor/predecessor window, and the statistic is the mean, not the median.** Both changes cut the attacker's cost:
+
+- The population is `2m + 1` coordinates around the victim's own ring position — 17 at the default `m = 8` — rather than every entry in a store of capacity 2048. Entries outside that window no longer contribute to `n_est` at all, so an attacker no longer needs a majority of the store; they need coordinates that land *nearer the victim than the victim's true neighbors*, reachable by grinding peer IDs into an arc of roughly `2m / n` of the ring.
+- The mean has a breakdown point of zero: any single window member moves it. Each Sybil admitted into the window displaces one true neighbor and shifts the mean by roughly `1/2m` (~6% at `m = 8`), so on the order of `m` grinded Sybils suffice to move `n_est` by a factor of two. The median previously required controlling about half the population to move at all.
+- This is the same precondition as an eclipse (§1.3), so a successful size-estimate attack of this shape is a *symptom* of neighborhood capture rather than an independent one. The corresponding blind spot in the **confidence** value is recorded at `size-estimator.ts` (`dispersionFactor`) and in `docs/fret.md`: dispersion is a purely local statistic and scores a tightly-packed, evenly-spaced attacker arc as healthy.
+
+This is amplified by `reportNetworkSize` (`fret-service.ts`) which accepts external estimates with no authentication. Any code path calling `reportNetworkSize` can inject arbitrary estimates that influence `getNetworkSizeEstimate`.
 
 A deflated estimate increases `nearRadius` (from `computeNearRadius`), causing the routing cost function to stay in "far mode" (preferring connected peers over distance), reducing routing accuracy. An inflated estimate shrinks `nearRadius`, potentially causing premature "near mode" switching.
 
 - **Preconditions**: Ability to influence the target's Digitree entries (via snapshot injection) or access to `reportNetworkSize`.
 - **Impact**: Routing performance degradation, incorrect payload inclusion decisions, false partition detection.
-- **Current mitigations**: Median gap (not mean) provides some resistance to outliers. Confidence weighting in `getNetworkSizeEstimate`. But the median is still easily manipulable if the attacker controls enough entries.
+- **Current mitigations**: Confidence weighting in `getNetworkSizeEstimate`. The median-gap outlier resistance noted here previously applies only to the degraded whole-store fallback (no `selfCoord`), which no in-service call site takes. On the live path there is no outlier resistance — the defence has to be corroboration from independent observers, i.e. the signed size-consensus work tracked in `tickets/` (`3-size-consensus-bounded-gossip`), not a better local statistic.
 
 #### 2.5 Backoff Exploitation
 **Severity: Medium**

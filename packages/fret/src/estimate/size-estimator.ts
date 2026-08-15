@@ -61,9 +61,12 @@ function consecutiveGaps(ascendingValues: bigint[]): bigint[] {
  * would split such a window in two and manufacture an interior gap the size of the rest of the
  * ring — precisely the outlier this method exists to avoid.
  *
- * Self is normally present in the store, so a walk anchored exactly at `selfCoord` can return
- * self; offsets are collected in a `Set` so that (and any coincident coordinate) contributes
- * once.
+ * Self is normally present in the store, and a walk anchored exactly at `selfCoord` returns it
+ * as its own first result on *both* sides — so each side is asked for `m + 1` to still yield the
+ * m successors and m predecessors the S/P window is defined as, and offsets are collected in a
+ * `Set` so self (and any coincident coordinate) contributes once. Asking for plain `m` instead
+ * costs two of the 2m gaps. When self is absent from the store the extra slot simply widens the
+ * window by one peer per side, which is harmless.
  */
 function windowGaps(store: DigitreeStore, m: number, selfCoord: Uint8Array, filter?: (e: PeerEntry) => boolean): bigint[] {
 	const selfBig = bytesToBigInt(selfCoord);
@@ -75,8 +78,9 @@ function windowGaps(store: DigitreeStore, m: number, selfCoord: Uint8Array, filt
 		if (d < 0n) d += RING_SIZE;
 		offsets.add(d > HALF_RING ? d - RING_SIZE : d);
 	};
-	for (const id of store.neighborsRight(selfCoord, m, filter)) addById(id);
-	for (const id of store.neighborsLeft(selfCoord, m, filter)) addById(id);
+	const reach = m + 1;
+	for (const id of store.neighborsRight(selfCoord, reach, filter)) addById(id);
+	for (const id of store.neighborsLeft(selfCoord, reach, filter)) addById(id);
 	return consecutiveGaps([...offsets].sort(ascending));
 }
 
@@ -87,7 +91,7 @@ function windowGaps(store: DigitreeStore, m: number, selfCoord: Uint8Array, filt
  * near 1 is the *healthy* value rather than a defect. Flooring cv at 1 encodes that prior: a
  * synthetically perfect (evenly spaced) sample cannot claim zero sampling error from a handful
  * of gaps. The factor is then monotone in window size, capping confidence at 0.5 + 0.5·(1 −
- * 1/√G) — 0.875 at G = 16, ~0.57 at G = 2.
+ * 1/√G) — 0.875 at G = 16 (a full S/P window at the default m = 8), ~0.65 at G = 2.
  *
  * NOTE: this measures *local* spacing regularity only. A node whose neighbors are all packed
  * into a tiny, evenly-spaced arc — an eclipse, or a very young ring — scores high here while
@@ -152,6 +156,11 @@ function collectGaps(
  * Confidence blends sample count against 2m with the dispersion factor above.
  */
 export function estimateSizeAndConfidence(store: DigitreeStore, m: number, options?: SizeEstimateOptions): SizeEstimate {
+	// NOTE: `list()` walks and materializes every entry, but on the `selfCoord` path only its
+	// length is used (for `sizeFactor`) — the gap population comes from the S/P window instead.
+	// That is an O(store) allocation per call, and the estimator is called once per inbound
+	// maybeAct. Fine at today's capacity (2048) and message rates; if either grows, give the
+	// store a `countWhere(filter)` and build the list only for the whole-store fallback.
 	const peers = options?.filter ? store.list().filter(options.filter) : store.list();
 	const count = peers.length;
 	if (count === 0) return { n: 0, confidence: 0 };
