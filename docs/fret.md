@@ -234,10 +234,10 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
 - Rate limiting via global token buckets (per-protocol, profile-tuned Edge/Core)
 - Breadcrumb loop detection and TTL limits on routing
 - Capacity-bounded routing table (C=2048) with relevance-based eviction
+- Transport identity verification: every RPC handler receives `(stream, connection)`; any message carrying a `from` field (leave notice, announce snapshot) is dropped unless `from` equals the transport-authenticated `connection.remotePeer`, and mismatches are counted (`diag.rejected.identityMismatch`). Handlers without a `from` (neighbors request, maybeAct, ping) still adopt the two-argument signature so the authenticated sender is available (threaded to the maybeAct handler for future per-peer rate limiting).
 
 #### Not yet implemented (planned — see tickets/)
 - Message authentication:
-  - Verify `from` field against transport-authenticated `connection.remotePeer` on all RPC handlers
   - Sign all messages with sender's private key; verify on receipt
   - Verify ring coordinates in sample entries (re-hash rather than trust provided coords)
 - Replay hardening:

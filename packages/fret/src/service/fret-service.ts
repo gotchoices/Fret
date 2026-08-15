@@ -137,6 +137,7 @@ export class FretService implements IFretService, Startable {
 			timestampBounds: 0,
 			ttlExpired: 0,
 			rateLimited: 0,
+			identityMismatch: 0,
 		},
 	};
 
@@ -406,10 +407,18 @@ export class FretService implements IFretService, Startable {
 				void this.mergeAnnounceSnapshot(from, snap);
 			},
 			this.protocols,
-			this.maxBytesNeighbors()
+			this.maxBytesNeighbors(),
+			() => { this.diag.rejected.identityMismatch++; }
 		);
-		registerMaybeAct(this.node, async (msg) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct());
-		registerLeave(this.node, async (notice) => this.handleLeave(notice), this.protocols.PROTOCOL_LEAVE);
+		// `_from` is the transport-authenticated sender; unused for now but reserved
+		// for future per-peer rate limiting / diagnostics.
+		registerMaybeAct(this.node, async (msg, _from) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct());
+		registerLeave(
+			this.node,
+			async (notice) => this.handleLeave(notice),
+			this.protocols.PROTOCOL_LEAVE,
+			() => { this.diag.rejected.identityMismatch++; }
+		);
 		registerPing(
 			this.node,
 			this.protocols.PROTOCOL_PING,

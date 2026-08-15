@@ -196,9 +196,12 @@ describe('Churn leave handling', function () {
 		const fakeReplacements = Array.from({ length: 20 }, () =>
 			nodes[1].peerId.toString()
 		)
+		// `from` must match the transport-authenticated sender (nodes[1]); the handler
+		// now drops leaves whose `from` is spoofed, so this exercises replacement
+		// truncation rather than the identity gate.
 		const notice: LeaveNoticeV1 = {
 			v: 1,
-			from: nodes[2].peerId.toString(),
+			from: nodes[1].peerId.toString(),
 			replacements: fakeReplacements,
 			timestamp: Date.now(),
 		}

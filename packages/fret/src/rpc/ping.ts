@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
+import type { Connection, Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { PROTOCOL_PING, encodeJson, decodeJson, readAllBounded, openRpcStream } from './protocols.js';
 import type { BusyResponseV1 } from '../index.js';
@@ -25,7 +25,9 @@ export function registerPing(
 	protocol = PROTOCOL_PING,
 	getSizeEstimate?: SizeEstimateProvider
 ): void {
-	void node.handle(protocol, async (stream: Stream) => {
+	// Ping carries no `from`; adopt the (stream, connection) shape for consistency
+	// so the authenticated identity is available and new handlers copy it correctly.
+	void node.handle(protocol, async (stream: Stream, _connection: Connection) => {
 		if (getSizeEstimate) {
 			try {
 				const sizeInfo = await getSizeEstimate();

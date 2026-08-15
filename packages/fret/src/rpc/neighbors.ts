@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
+import type { Connection, Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_NEIGHBORS,
@@ -19,9 +19,13 @@ export function registerNeighbors(
 	getSnapshot: () => NeighborSnapshotV1 | BusyResponseV1 | Promise<NeighborSnapshotV1 | BusyResponseV1>,
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
-	maxBytes = 128 * 1024
+	maxBytes = 128 * 1024,
+	onIdentityMismatch?: (claimed: string, actual: string) => void
 ): void {
-	void node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream) => {
+	// Request handler carries no inbound `from`; it only replies with our own
+	// snapshot. Adopt the (stream, connection) shape so the authenticated identity
+	// is available and new handlers copy the correct signature.
+	void node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, _connection: Connection) => {
 		try {
 			const snap = await getSnapshot();
 			stream.send(await encodeJson(snap));
@@ -32,10 +36,20 @@ export function registerNeighbors(
 	});
 
 	if (onAnnounce) {
-		void node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream) => {
+		void node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream, connection: Connection) => {
 			try {
 				const bytes = await readAllBounded(stream, maxBytes);
 				const snap = await decodeJson<NeighborSnapshotV1>(bytes);
+				// The snapshot's self-reported `from` must match the transport-authenticated
+				// remote peer — otherwise a connected peer can impersonate another and poison
+				// the routing table via a forged sample/successor set.
+				const actual = connection.remotePeer.toString();
+				if (snap.from !== actual) {
+					onIdentityMismatch?.(snap.from, actual);
+					log.error('announce identity mismatch: claimed %s actual %s - dropping', snap.from, actual);
+					await stream.close();
+					return;
+				}
 				onAnnounce(snap.from, snap);
 				stream.send(await encodeJson({ ok: true }));
 				await stream.close();

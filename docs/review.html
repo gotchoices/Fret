@@ -1,0 +1,475 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FRET Code Review — 2026-07-03</title>
+<style>
+	:root {
+		--bg: #ffffff;
+		--fg: #1a1d21;
+		--muted: #5c6470;
+		--border: #e3e6ea;
+		--surface: #f6f7f9;
+		--accent: #2456a6;
+		--critical: #b3261e;
+		--critical-bg: #fdeceb;
+		--major: #a05a00;
+		--major-bg: #fdf3e3;
+		--minor: #1f5f8b;
+		--minor-bg: #e9f2f9;
+		--nit: #5c6470;
+		--nit-bg: #eef0f3;
+		--good: #1e6f42;
+		--good-bg: #e8f4ec;
+		--mono: ui-monospace, "Cascadia Code", "SF Mono", Consolas, monospace;
+	}
+	@media (prefers-color-scheme: dark) {
+		:root {
+			--bg: #16181c;
+			--fg: #e6e8eb;
+			--muted: #9aa3ae;
+			--border: #2c3138;
+			--surface: #1e2126;
+			--accent: #7aa7e8;
+			--critical: #f2867e;
+			--critical-bg: #3a2220;
+			--major: #e8b464;
+			--major-bg: #362b18;
+			--minor: #85b8dd;
+			--minor-bg: #1c2c38;
+			--nit: #9aa3ae;
+			--nit-bg: #23262b;
+			--good: #7fcf9e;
+			--good-bg: #1a2f22;
+		}
+	}
+	* { box-sizing: border-box; }
+	body {
+		margin: 0;
+		background: var(--bg);
+		color: var(--fg);
+		font: 16px/1.6 system-ui, -apple-system, "Segoe UI", sans-serif;
+	}
+	main { max-width: 60rem; margin: 0 auto; padding: 2.5rem 1.5rem 5rem; }
+	header { border-bottom: 2px solid var(--border); padding-bottom: 1.25rem; margin-bottom: 2rem; }
+	h1 { font-size: 1.9rem; margin: 0 0 .4rem; letter-spacing: -.02em; }
+	.meta { color: var(--muted); font-size: .92rem; }
+	h2 {
+		font-size: 1.35rem; margin: 2.8rem 0 .9rem; letter-spacing: -.01em;
+		padding-top: 1.2rem; border-top: 1px solid var(--border);
+	}
+	h3 { font-size: 1.08rem; margin: 1.8rem 0 .6rem; }
+	p { margin: .6rem 0; }
+	code {
+		font-family: var(--mono); font-size: .84em;
+		background: var(--surface); border: 1px solid var(--border);
+		border-radius: 4px; padding: .1em .35em; white-space: nowrap;
+	}
+	.pill {
+		display: inline-block; font-size: .72rem; font-weight: 700;
+		text-transform: uppercase; letter-spacing: .05em;
+		border-radius: 999px; padding: .12rem .6rem; vertical-align: middle;
+	}
+	.critical { color: var(--critical); background: var(--critical-bg); }
+	.major    { color: var(--major);    background: var(--major-bg); }
+	.minor    { color: var(--minor);    background: var(--minor-bg); }
+	.nit      { color: var(--nit);      background: var(--nit-bg); }
+	.good     { color: var(--good);     background: var(--good-bg); }
+	.cat { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; font-weight: 600; }
+	.finding {
+		border: 1px solid var(--border); border-radius: 8px;
+		padding: .85rem 1rem; margin: .7rem 0; background: var(--bg);
+	}
+	.finding.critical-b { border-left: 4px solid var(--critical); }
+	.finding.major-b    { border-left: 4px solid var(--major); }
+	.finding.minor-b    { border-left: 4px solid var(--minor); }
+	.finding.nit-b      { border-left: 4px solid var(--nit); }
+	.finding .head { display: flex; flex-wrap: wrap; gap: .5rem .7rem; align-items: baseline; margin-bottom: .25rem; }
+	.finding .title { font-weight: 650; }
+	.finding p { margin: .35rem 0 0; font-size: .93rem; }
+	.finding .fix { color: var(--muted); }
+	.finding .fix b { color: var(--fg); }
+	ol.actions { padding-left: 1.4rem; }
+	ol.actions li { margin: .55rem 0; }
+	ol.actions li b { display: inline; }
+	.summary-box {
+		background: var(--surface); border: 1px solid var(--border);
+		border-radius: 10px; padding: 1.1rem 1.3rem; margin: 1.2rem 0;
+	}
+	table { border-collapse: collapse; width: 100%; font-size: .9rem; margin: .8rem 0; }
+	th, td { text-align: left; padding: .45rem .7rem; border-bottom: 1px solid var(--border); vertical-align: top; }
+	th { color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .04em; }
+	.tablewrap { overflow-x: auto; }
+	ul { margin: .5rem 0; padding-left: 1.3rem; }
+	li { margin: .3rem 0; }
+	.strengths li { margin: .45rem 0; }
+	.toc { font-size: .92rem; columns: 2; column-gap: 2rem; }
+	.toc a { color: var(--accent); text-decoration: none; }
+	.toc a:hover { text-decoration: underline; }
+	@media (max-width: 640px) { .toc { columns: 1; } }
+	footer { margin-top: 3rem; padding-top: 1rem; border-top: 1px solid var(--border); color: var(--muted); font-size: .85rem; }
+</style>
+</head>
+<body>
+<main>
+
+<header>
+	<h1>FRET Code Review</h1>
+	<div class="meta">
+		<code>p2p-fret</code> · reviewed 2026-07-03 · scope: full <code>packages/fret/src</code> + test suite + design doc alignment ·
+		method: five parallel deep reviews (core service, store/ring, RPC/selector/estimator, discovery/libp2p glue, tests/simulation), findings verified against code, deduplicated and synthesized here.
+	</div>
+</header>
+
+<nav class="toc">
+	<a href="#summary">Executive summary</a><br>
+	<a href="#actions">Top-priority actions</a><br>
+	<a href="#design">Design assessment</a><br>
+	<a href="#core">Core service</a><br>
+	<a href="#rpc">RPC layer, selector, estimator</a><br>
+	<a href="#store">Store &amp; ring</a><br>
+	<a href="#glue">Discovery &amp; libp2p glue</a><br>
+	<a href="#tests">Test suite &amp; simulation</a><br>
+	<a href="#strengths">What's working well</a>
+</nav>
+
+<h2 id="summary">Executive summary</h2>
+<div class="summary-box">
+	<p><b>Overall: solid mid-maturity code with a well-reasoned design, undermined by a handful of correctness bugs at the protocol seams and a lifecycle that cannot survive restart.</b> The hard algorithmic parts — ring walks, membership tri-state gating, digitree usage, sparsity/KDE scoring — are largely correct and unusually well-commented. The problems cluster in four places:</p>
+	<ul>
+		<li><b>Two protocol-correctness bugs</b>: the correlation-ID dedup cache defeats the designed "NearAnchor invites resend-with-activity" flow (the activity can silently never execute), and <code>pickAnchors</code> selects anchors by distance to the <em>zero</em> coordinate instead of the key.</li>
+		<li><b>A metric split</b>: routing, payload heuristic, and relevance KDE use XOR distance while cohort/membership use true ring order and the design doc specifies <code>min(cw,&nbsp;ccw)</code>. Behavior silently degrades at the ring wrap boundary. Three independent reviews converged on this.</li>
+		<li><b>Broken stop/start lifecycle</b>: protocol handlers are never unregistered, <code>handle()</code> rejections are unobserved (process-fatal unhandled rejection on restart), and untracked timers mean stop→start can leave two stabilization loops running forever.</li>
+		<li><b>Asymmetric input hardening</b>: RPC handlers discard <code>connection.remotePeer</code> (so a forged LeaveNotice evicts any peer), the announce path has no caps and no token bucket, and decoded messages get zero shape validation.</li>
+	</ul>
+	<p>Cleanliness debt is moderate and mechanical: one 9×-duplicated ring-walk idiom, 4–5× duplicated RPC stream boilerplate with three inconsistent error contracts, a god-class service, and scattered <code>any</code>/<code>console.*</code> violations of house rules. The test suite has genuine strengths (property tests, deterministic simulation with replay proof, exemplary membership specs) but the failure/recovery machinery — the code that matters most under churn — is essentially untested.</p>
+</div>
+
+<h2 id="actions">Top-priority actions</h2>
+<ol class="actions">
+	<li><b>Fix the dedup/resend interaction.</b> Key the dedup cache on <code>correlation_id + hasActivity</code> (or don't cache digest-only NearAnchor responses), and mint a fresh correlation ID for the activity resend in <code>iterativeLookup</code>. Without this the unified find+act pipeline's core flow is broken.</li>
+	<li><b>Plumb <code>connection.remotePeer</code> through every RPC handler and verify <code>from</code>.</b> Closes the spoofed-leave eviction hole with a small mechanical change; it is also prerequisite plumbing for the entire documented security roadmap. Stop proactively dialing leave-notice "replacements" (insert as <code>unknown</code>, let classification vet them).</li>
+	<li><b>Make stop()/start() symmetric.</b> <code>unhandle()</code> all five protocols in <code>stop()</code>, <code>.catch</code> every <code>handle()</code>, store and clear timer handles, replace the shared boolean loop flags with a per-run generation token, and guard <code>start()</code> against re-entry.</li>
+	<li><b>Resolve XOR vs ring distance — deliberately.</b> Recommended: implement true <code>min(cw, ccw)</code> and use it in <code>chooseNextHop</code>, <code>shouldIncludePayload</code>, and the relevance KDE. If XOR is kept as an approximation, rename <code>minDistance</code>, document why, and accept the wrap-seam inconsistency in the doc.</li>
+	<li><b>Harden the announce path.</b> Apply the same 16/16/8 caps as the fetch path to <code>mergeAnnounceSnapshot</code>, gate the inbound announce handler on a token bucket, and move the <code>bucketMaybeAct</code> check before the expensive NearAnchor computation.</li>
+	<li><b>Fix <code>pickAnchors</code></b> to use the actual key coordinate instead of <code>new Uint8Array(32)</code> — one-line, both callers have the key in scope.</li>
+	<li><b>Extract a shared RPC helper</b> (<code>rpcRequest</code> + <code>registerJsonHandler</code>). One refactor fixes stream leaks on handler errors, the fabricated-success snapshot fallback, missing backpressure handling, missing AbortSignals, unread acks, and the three divergent error contracts — and deletes roughly half of <code>rpc/</code>.</li>
+	<li><b>Validate at the decode boundary.</b> Assert <code>COORD_BYTES</code> in <code>base64urlToCoord</code>/<code>hexToCoord</code> (a wrong-length coord corrupts ring ordering), cap remote-supplied arrays, and add per-message shape validators in the <code>sanitizeReplacements</code> style.</li>
+	<li><b>Kill the per-tick hash storm and store traps.</b> Reuse <code>store.getById(id)?.coord</code> in <code>seedFromPeerStore</code>; route <code>importEntries</code> through upsert logic (current path can orphan tree entries); delete the broken re-key branch in <code>DigitreeStore.update</code>.</li>
+	<li><b>Pay the top test debt.</b> Real tests for failure decay / dead-marking / recovery, actual-concurrency inflight tests (not writing the private counter), assertions in the fuzz test, and replace fixed sleeps with the existing <code>waitFor</code> pattern suite-wide.</li>
+</ol>
+
+<h2 id="design">Design assessment</h2>
+
+<h3>The distance-metric split is the one design decision you must make</h3>
+<p>The design doc specifies ring distance <code>d(a,b) = min(cw, ccw)</code>. Cohort assembly and neighbor selection honor it (B-tree ring order); next-hop cost, the payload-inclusion heuristic, and the relevance KDE's normalized log-distance all use <b>XOR</b>. XOR is a fundamentally different metric: ring-adjacent coords across a high-bit boundary (<code>0x00ff…</code>/<code>0x0100…</code>) are XOR-maximally far. Consequences today: near/far classification compares XOR distance against a near-radius derived from ring arc length (incommensurable units); a hop ring-adjacent to the key can be classed "far" and payload withheld; the cohort walk and the routing cost disagree about which peers are "near the key" exactly at the wrap seam; and the sparsity model's distance balancing is skewed there too. This is not a bug to patch quietly — it's a fork: either implement ring distance everywhere (recommended; <code>clockwiseDistance</code> already exists, unused) or adopt XOR deliberately and rewrite the doc. Today the code lies about which metric it uses.</p>
+
+<h3>Correlation-ID semantics conflate idempotency with response caching</h3>
+<p>The dedup cache treats "same correlation ID" as "same request," but the protocol deliberately sends the <em>same logical request twice with different payloads</em> (digest-only probe, then resend-with-activity). Since <code>buildNearAnchor</code> can return the responder itself as an anchor, the resend very likely targets a node that already cached a digest-only answer — and gets it back, so the activity never runs. Combined with <code>iterativeLookup</code> keeping no visited set, this degrades into a no-progress retry spin. Design fix: give each phase its own correlation ID (dedup then protects each phase independently), or make the cache key <code>(correlationId, hasActivity)</code>. Also decide what dedup is <em>for</em>: at 30&nbsp;s TTL against a ±5&nbsp;min timestamp window it covers ~10% of the replay surface (already on the roadmap — trivially alignable now).</p>
+
+<h3>In-cluster test is narrower than the doc promises</h3>
+<p>The doc's membership test is "self within the first k (or wants) cohort entries"; the implementation acts only when self is one of the two key-adjacent anchors (<code>distIdx &lt;= 1</code>). A node at cohort index 3 that receives a payload-included message forwards it instead of acting — extra hops the payload heuristic didn't budget for, and a mismatch with the economics the doc describes (send payload once "near enough"). Either widen the acting condition toward <code>want_k</code> or amend the doc to say only anchors act; the cohort/threshold-signature story reads more naturally with the wider test.</p>
+
+<h3>Security roadmap: the ordering matters more than the timeline</h3>
+<p>Most missing security (signatures, replay hardening, per-peer buckets) is honestly documented as planned. Two items shouldn't wait, because they're either being made <em>harder</em> by current structure or are free: (1) every RPC handler declares <code>(stream)</code> and discards the <code>connection</code> parameter libp2p already hands it — all downstream authentication depends on that plumbing, and each new handler copies the wrong signature; (2) the leave handler is a ~10× amplification lever today (one unauthenticated inbound message → peer eviction + up to 6 dials + 4 snapshot fetches). Wire formats declare <code>sig</code>/<code>signature</code> fields that are populated with empty strings and never verified — fine as staging, but worth a loud comment so nobody assumes coverage.</p>
+
+<h3>Size estimation: two quiet deviations from the doc</h3>
+<p>The doc specifies average gap between <em>consecutive S/P members</em>; the implementation takes median gap over the whole filtered store, which systematically underestimates n (gaps between non-adjacent known peers are wider than true adjacent gaps). And the confidence formula's <code>varianceFactor = minGap/maxGap</code> is statistically dead weight — for uniform random coords it approaches 0 for any real network, so confidence is effectively <code>0.5 · sizeFactor</code> with a ~0.55 ceiling. Since near-radius, payload inclusion, and cluster-span all key off (n_est, confidence), this deserves a pass: use S/P-adjacent gaps as specified, and an IQR- or median/mean-dispersion confidence.</p>
+
+<h3>Decomposition: the service is a god class; the RPC layer is copy-paste</h3>
+<p><code>fret-service.ts</code> (~1600 lines) owns routing, stabilization, membership classification, size observation/blending/churn/partition detection, announce policy, discovery emission, and lifecycle. Two extractions are cheap and high-value: a <code>SizeObserver</code> (the ~135-line observation/blend/decay block has zero coupling to the store or libp2p and its math is currently untestable in isolation), and a <code>ringNeighborsBothSides()</code> helper replacing nine hand-rolled copies of the same two-sided-walk idiom. In <code>rpc/</code>, the client and handler boilerplate is duplicated 4–5× with three <em>different</em> error contracts (maybe-act throws; neighbors swallows and fabricates a fake empty snapshot; ping returns <code>{ok:false}</code>) — the fake-snapshot contract is the worst, since it makes foreign-network classification impossible on that path and books failures as successes. One shared helper forces a single contract.</p>
+
+<h3>The simulation validates the ring math, not the routing code</h3>
+<p>The harness is genuinely deterministic (seeded RNG, replay-proof) — a real asset. But its router filters candidates by global liveness knowledge no real node has and doesn't require distance progress, so the 85% routing-success regression threshold measures an oracle-assisted model, not production behavior. Meanwhile production routing (<code>iterativeLookup</code>, next-hop cost, payload heuristic) is only smoke-tested at 3 nodes. Worth a mid-scale in-memory-transport test tier driving real <code>FretService</code> instances, and restricting the sim router to local-store knowledge.</p>
+
+<h3>Discovery emission: three paths where one belongs</h3>
+<p><code>emitDiscovered</code>, <code>FretPeerDiscovery.scan</code>, and <code>seedDiscovery</code> all emit peer-discovery events, with two independent debounce maps and copy-pasted pruning. Only <code>scan</code> is the durable, correctly member-gated path — and <code>seedDiscovery</code> actively violates the member-only guarantee (it emits every store entry unfiltered, which matters exactly when <code>importTable</code> restores a table containing foreign-labeled peers). Consolidate on <code>scan</code>; delete the other two. All paths also emit empty multiaddrs, so events are only actionable for peers already in the peerStore — either enrich or document.</p>
+
+<h2 id="core">Core service — <code>fret-service.ts</code></h2>
+
+<div class="finding critical-b">
+	<div class="head"><span class="pill critical">critical</span><span class="cat">robust</span><span class="title">Dedup cache defeats the resend-with-activity flow</span><code>fret-service.ts:444-447, 1477, 1553</code></div>
+	<p>Dedup is checked before activity handling and <code>iterativeLookup</code> reuses one correlation ID across hops <em>and</em> the activity resend. When the resend targets a node that already answered digest-only (likely — <code>buildNearAnchor</code>'s anchors can include the responder), the cached NearAnchor is returned and the activity never executes.</p>
+	<p class="fix"><b>Fix:</b> key dedup on <code>correlation_id + hasActivity</code> or skip caching digest-only responses; mint a fresh correlation ID for the resend.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">stop()/start() lifecycle broken</span><code>fret-service.ts:364-374, 401-418, 828-850, 549-572</code></div>
+	<p><code>stop()</code> never calls <code>node.unhandle()</code> — a stopped service keeps serving RPCs, and restart re-registers handlers whose duplicate-handler rejection is discarded by <code>void node.handle(...)</code> (unhandled rejection, process-fatal by default). Stabilization/preconnect timers are untracked, so stop leaves pending ticks alive, and stop→start lets the old tick see re-set boolean flags and continue — two concurrent loops rescheduling forever. No re-entrancy guard on <code>start()</code> (double listeners).</p>
+	<p class="fix"><b>Fix:</b> unhandle in stop; <code>.catch</code> each handle; store/clear timer handles; per-run generation token instead of shared booleans; started-guard.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust · security</span><span class="title">Announce path unbounded and unbucketed</span><code>fret-service.ts:757-775</code></div>
+	<p><code>mergeAnnounceSnapshot</code> iterates all remote-supplied <code>successors</code>/<code>predecessors</code>/<code>sample</code> with no caps (fetch path caps at 16/16/8), and the inbound announce handler has no token bucket. A 128&nbsp;KB announce forces thousands of <code>peerIdFromString</code> + SHA-256 + upsert per message.</p>
+	<p class="fix"><b>Fix:</b> apply fetch-path caps; gate the handler on a bucket.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">Rate-limit check runs after the expensive work</span><code>fret-service.ts:441-458</code></div>
+	<p><code>handleMaybeAct</code> computes full <code>nearAnchorOnly()</code> (key hash, two filtered ring walks, two next-hop runs) for loop/stale/expired/oversized messages <em>before</em> <code>bucketMaybeAct.tryTake()</code> — flooding with expired-TTL messages bypasses rate limiting entirely.</p>
+	<p class="fix"><b>Fix:</b> take the token first; return a minimal static rejection for invalid messages.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title"><code>pickAnchors</code> measures distance to zero, not to the key</span><code>fret-service.ts:1195-1198</code></div>
+	<p>Passes <code>new Uint8Array(32)</code> as the target coordinate, so NearAnchor anchors are biased toward numerically small coords rather than being the key's succ/pred as the wire format promises.</p>
+	<p class="fix"><b>Fix:</b> pass the key coord — both callers have it in scope.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust · security</span><span class="title">Leave handler is an amplification lever</span><code>fret-service.ts:615-676</code></div>
+	<p>Unauthenticated <code>handleLeave</code> removes the named peer, then dials up to 6 attacker-supplied replacements (ping + snapshot-announce each) plus 4 <code>fetchNeighbors</code> — ~10 outbound RPCs plus a peer removal per inbound message. Also rebuilds the full snapshot inside the loop (up to 6×).</p>
+	<p class="fix"><b>Fix:</b> insert replacements as <code>unknown</code> for the classification pass to vet (matches the doc's "untrusted hints"); build the snapshot once. Authentication: see RPC finding on <code>remotePeer</code>.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">perf · robust</span><span class="title">Stabilization runs ~14 RPCs strictly serially with no abort</span><code>fret-service.ts:881-920</code></div>
+	<p>Pings and snapshot fetches run one at a time; <code>sendPing → openRpcStream → dialProtocol</code> carries no AbortSignal (only the read has a 5&nbsp;s cap), so one bad peer can stall a tick for tens of seconds.</p>
+	<p class="fix"><b>Fix:</b> bounded-concurrency <code>Promise.allSettled</code> pool; per-RPC timeout/AbortSignal.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">clean · design</span><span class="title">Nine copies of the two-sided walk idiom; god-class scope</span><code>fret-service.ts:520-719 (9 sites), 1331-1465</code></div>
+	<p><code>Array.from(new Set([...neighborsRight(c,m), ...neighborsLeft(c,m)])).filter(id =&gt; id !== selfStr)</code> appears nine times with small variations. Separately, ~135 lines of size observation/blending/churn/partition detection have zero coupling to the store or libp2p.</p>
+	<p class="fix"><b>Fix:</b> extract <code>ringNeighborsBothSides(coord, count, opts)</code>; extract a <code>SizeObserver</code> class (makes the decay math unit-testable).</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title"><code>iterativeLookup</code> keeps no visited set</span><code>fret-service.ts:1494-1496, 1577, 1594</code></div>
+	<p><code>exclude</code> is just self; anchors are only removed on <em>throw</em>, so an already-probed peer is re-selected every attempt. With the dedup bug above, this becomes a fast no-progress spin until <code>maxAttempts</code>.</p>
+	<p class="fix"><b>Fix:</b> maintain a visited set across attempts; filter candidates/anchors against it.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Capacity unenforced exactly when it matters</span><code>fret-service.ts:207-212</code></div>
+	<p><code>enforceCapacity</code> silently returns while <code>cachedSelfCoord</code> is null — which is the state during <code>start()</code>'s first peerStore seed and any pre-start <code>importTable()</code>, the two paths most likely to bulk-insert.</p>
+	<p class="fix"><b>Fix:</b> seed the self-coord cache at start entry (or make enforceCapacity await <code>selfCoord()</code>).</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">perf</span><span class="title">Per-tick hot-path waste</span><code>fret-service.ts:794-806, 514-1061 (5 sites), 216-224, 939, 971</code></div>
+	<p>(a) <code>seedFromPeerStore</code> SHA-256-hashes every peerStore ID every tick (300&nbsp;ms in active mode) even when the coord is already stored. (b) Five sites re-await <code>hashPeerId(self)</code> despite the <code>selfCoord()</code> cache. (c) <code>enforceCapacity</code> does a full list+sort up to 4–5× per tick. (d) Steady-state classification/re-probe passes materialize two full O(C) arrays per tick just to filter to empty.</p>
+	<p class="fix"><b>Fix:</b> <code>store.getById(id)?.coord ?? await hashPeerId(...)</code>; use <code>selfCoord()</code> everywhere; enforce capacity once per tick; maintain unknown/foreign counts for early-return.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Fake 0&nbsp;ms latency skews health EMA</span><code>fret-service.ts:1252</code></div>
+	<p>Successful forwards call <code>applySuccess(next, coord, 0)</code>, feeding a fabricated 0&nbsp;ms sample into <code>avgLatencyMs</code> and skewing relevance health scoring.</p>
+	<p class="fix"><b>Fix:</b> measure actual RPC duration or add a latency-less success variant.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Misc: unbounded announce debounce map; unguarded fire-and-forget; broken confidence average</span><code>fret-service.ts:1184-1186, 672, 331, 1370-1394</code></div>
+	<p><code>announcedIds</code> prunes only expired entries and only past 4096 — edge-profile 30-min TTLs let it grow unbounded. <code>void announceReplacementsToNeighbors(...)</code> / <code>void announceOnDeparture(...)</code> bodies can reject outside any try/catch. <code>getNetworkSizeEstimate</code> divides a recency-weighted confidence numerator by an unweighted count (systematic under-report) and carries a dead zero-observations branch.</p>
+	<p class="fix"><b>Fix:</b> hard-cap with oldest-expiry eviction; wrap the two bodies in try/log; divide by Σ recencyWeight, delete dead branch.</p>
+</div>
+
+<div class="finding nit-b">
+	<div class="head"><span class="pill nit">cleanup</span><span class="cat">clean</span><span class="title">Mechanical cleanups</span><code>fret-service.ts various</code></div>
+	<p>Dead private <code>nextSuccessor</code>/<code>nextPredecessor</code> (:1115-1122, zero callers, O(n) anyway). Ten <code>console.warn/error</code> sites bypassing the structured logger. <code>preconnectNeighbors</code> near-duplicates the active-loop tick body. Two separate <code>peer:connect</code> listeners. Type laziness: <code>(res as any).busy</code>, <code>(evt: any)</code> handlers (libp2p exports typed event maps), <code>Record&lt;string, any&gt;</code> metadata, inline <code>import()</code> type at :113. <code>ready()</code> is an empty stub while the doc promises a ready gate (<code>firstStabilizeDone</code> already exists — resolve on it). Broken indentation at :34-42 and :563-567.</p>
+</div>
+
+<h2 id="rpc">RPC layer, selector, estimator — <code>rpc/</code>, <code>selector/</code>, <code>estimate/</code>, <code>utils/</code></h2>
+
+<div class="finding critical-b">
+	<div class="head"><span class="pill critical">critical</span><span class="cat">security</span><span class="title">Handlers discard <code>connection.remotePeer</code> — forged LeaveNotice evicts any peer</span><code>leave.ts:32, neighbors.ts:24/35, maybe-act.ts:16, ping.ts:28</code></div>
+	<p>libp2p v3's <code>StreamHandler</code> is <code>(stream, connection)</code>; every handler declares only <code>(stream)</code>. <code>notice.from</code> is unverifiable, and <code>fret-service.ts:631</code> removes whatever peer it names — any connected peer can evict any other (rate-limited only by the global bucket). Announce snapshots can likewise impersonate via <code>snap.from</code>. The current signatures make the documented verification impossible to implement downstream.</p>
+	<p class="fix"><b>Fix:</b> accept <code>(stream, connection)</code>, pass <code>connection.remotePeer.toString()</code> to callbacks, reject on mismatch with <code>from</code>.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">XOR is not ring distance</span><code>distance.ts:44-47, next-hop.ts:156/205, relevance.ts:30</code></div>
+	<p>Confirmed independently by three reviews — see <a href="#design">Design assessment</a>. <code>minDistance</code>'s comment claims "absolute ring distance via XOR"; it is neither. Near/far classification compares XOR distance to a ring-arc-derived near-radius; next-hop can pick the ring-worse candidate; behavior degrades at the wrap seam.</p>
+	<p class="fix"><b>Fix:</b> implement <code>min(clockwiseDistance(a,b), clockwiseDistance(b,a))</code>, use consistently — or deliberately adopt XOR and fix doc + name.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">Handler error paths leak streams</span><code>neighbors.ts:29-44, maybe-act.ts:23-25, leave.ts:40-42, ping.ts:50-51</code></div>
+	<p>Every handler <code>catch</code> only logs — no <code>stream.abort()</code>/<code>close()</code>. A malformed request leaves the inbound stream open until muxer timeout while the remote burns its full 5&nbsp;s read window. Ping's fallback send/close sits outside any try/catch (rejects the handler promise on a reset stream).</p>
+	<p class="fix"><b>Fix:</b> <code>stream.abort(err)</code> in every catch (falls out of the shared-helper refactor below).</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">100&nbsp;ms idle-read timeout truncates slow multi-chunk messages</span><code>protocols.ts:78-83</code></div>
+	<p>After the first chunk, the next must arrive within 100&nbsp;ms or the read is treated as complete; the truncated buffer fails <code>JSON.parse</code> and the peer gets failure-scored. 128–512&nbsp;KiB snapshots over relayed/congested links will hit this. libp2p v3 <code>close()</code> is a proper half-close, so EOF propagation works without the hack.</p>
+	<p class="fix"><b>Fix:</b> drop the idle timeout or raise to ≥1&nbsp;s and make configurable.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust · clean</span><span class="title"><code>fetchNeighbors</code> fabricates success on every failure</span><code>neighbors.ts:60-70</code></div>
+	<p>Unreachable, busy, decode-error, and foreign-protocol all return a synthetic empty <code>NeighborSnapshotV1</code> indistinguishable from a real response — <code>snapshotsFetched++</code> counts garbage, failure/backoff never records, and swallowing <code>UnsupportedProtocolError</code> means foreign classification can never happen on this path. Also <code>'busy' in res</code> throws on <code>null</code> JSON (exception as control flow into the same fake snapshot).</p>
+	<p class="fix"><b>Fix:</b> return <code>undefined</code> or a discriminated result; let the caller record failure and classify foreign.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">security</span><span class="title">Zero shape validation of decoded messages</span><code>neighbors.ts:38, maybe-act.ts:19, protocols.ts:59</code></div>
+	<p><code>decodeJson</code> blindly <code>as T</code>-casts. <code>from</code> never parsed as a PeerId; snapshot arrays unbounded within the 128&nbsp;KiB cap (~4000 ids); <code>breadcrumbs</code> unbounded and grows per hop. Only <code>sanitizeReplacements</code> (leave.ts:18) does it right. Related: maybe-act accepts 512&nbsp;KiB at the RPC layer while the service rejects &gt;128&nbsp;KiB activity only after full buffering.</p>
+	<p class="fix"><b>Fix:</b> per-message validators (field types, PeerId parseability, array caps); tighten RPC <code>maxBytes</code> to the real ceiling.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">clean · design</span><span class="title">RPC boilerplate duplicated 4–5× with three error contracts</span><code>rpc/* cross-file</code></div>
+	<p>Every sender repeats open→send→close→read→decode→finally-double-close; every handler repeats read→decode→handle→send→close→catch-log. maybe-act throws, neighbors swallows-and-fabricates, ping returns <code>{ok:false}</code>. Magic numbers split across files (<code>128*1024</code> hard-coded in fetch vs param in register). Backpressure ignored (<code>stream.send()</code> returning false / throwing when the buffer fills — real risk at 128–512&nbsp;KiB). No AbortSignal anywhere; ping starts its RTT clock before dialing, inflating first-contact latency.</p>
+	<p class="fix"><b>Fix:</b> one <code>rpcRequest(node, peer, protocol, body, opts)</code> + <code>registerJsonHandler(node, protocol, fn, maxBytes)</code>; single discriminated error contract; drain handling; threaded AbortSignal; RTT clock after stream-open.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Selector: near mode never enforces strict improvement vs self</span><code>next-hop.ts:172-181, 55-74</code></div>
+	<p>Doc: near mode requires strict distance improvement (ε≈0). Code sorts candidates by distance but never compares against self's own distance to the key, so a hop farther than self can be chosen; loop safety rests entirely on breadcrumbs/TTL. Also near-mode cost weights are computed per candidate but effectively dead (cost is a tertiary tie-break there).</p>
+	<p class="fix"><b>Fix:</b> filter <code>dist &lt; selfDist</code> in near mode; hoist/remove the near weight computation.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Size estimator: dead confidence factor, wrong gap population</span><code>size-estimator.ts:51</code></div>
+	<p>See <a href="#design">Design assessment</a>: <code>varianceFactor = minGap/maxGap</code> ≈ 0 for any real network; median gap over the whole store underestimates n vs the doc's consecutive-S/P gaps.</p>
+	<p class="fix"><b>Fix:</b> S/P-adjacent gaps; IQR or median/mean dispersion for confidence.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Token bucket edge cases</span><code>token-bucket.ts:14-29</code></div>
+	<p><code>cost &gt; capacity</code> is permanently unsatisfiable yet <code>retryAfterMs</code> returns a finite wait; <code>refillPerSec ≤ 0</code> yields Infinity/negative waits. Core refill math is sound.</p>
+	<p class="fix"><b>Fix:</b> clamp cost to capacity (or throw); validate rates at construction.</p>
+</div>
+
+<div class="finding nit-b">
+	<div class="head"><span class="pill nit">cleanup</span><span class="cat">clean</span><span class="title">Mechanical cleanups</span><code>rpc/* various</code></div>
+	<p><code>encodeJson</code>/<code>decodeJson</code> needlessly async. Back-compat protocol constants hand-duplicate <code>makeProtocols('default')</code> — derive them. <code>stream!</code> non-null assertions (overload <code>openRpcStream</code> on <code>requireExisting</code>). Unread <code>{ok:true}</code> acks in leave/announce (wasted bytes; read or remove). NUL-byte stripping in <code>decodeJson</code> hides a framing bug — log when non-whitespace is stripped.</p>
+</div>
+
+<h2 id="store">Store &amp; ring — <code>store/</code>, <code>ring/</code></h2>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title"><code>update()</code> re-key branch throws and desyncs <code>byId</code></span><code>digitree-store.ts:132-135</code></div>
+	<p><code>BTree.updateAt</code> already delete+re-inserts on key change and bumps the tree version; the store then calls <code>deleteAt(path)</code> on the now-stale path — <code>validatePath</code> throws, and even if it didn't, it would delete the freshly re-inserted entry. <code>byId</code> is never re-mapped. Latent (no caller re-keys today) but a loaded trap.</p>
+	<p class="fix"><b>Fix:</b> delete the manual re-key block; use <code>updateAt</code>'s returned <code>[path, wasUpdate]</code> and refresh <code>byId</code> when the key changed.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title"><code>insert()</code> ignores conflicts; <code>importEntries</code> can orphan tree entries</span><code>digitree-store.ts:77-81, 312-335</code></div>
+	<p><code>BTree.insert</code> returns <code>on=false</code> on duplicate key; ignored. Importing an id at a different coord (coords are file/wire-controlled, never re-derived) creates a second tree entry for the same id — unreachable via <code>byId</code>, unremovable by eviction, but present in every ring walk — and skews the filtered-walk scan cap (<code>byId.size</code> vs actual tree size). Same-coord duplicates over-report the restored count.</p>
+	<p class="fix"><b>Fix:</b> route <code>importEntries</code> through upsert logic; check <code>insert</code>'s returned path.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">No coord length validation at the decode boundary</span><code>hash.ts:45-47, 33-39; fret-service.ts:770</code></div>
+	<p><code>base64urlToCoord</code> never asserts <code>COORD_BYTES</code>, and snapshot sample coords feed straight into <code>upsert</code>. Ring ordering depends on fixed-length 64-char hex keys — a wrong-length coord silently corrupts successor/predecessor order (lexicographic prefix rule). <code>hexToCoord</code> additionally coerces garbage hex to zeros via NaN. Full re-hash verification is planned security work, but length validation is store integrity and is one line.</p>
+	<p class="fix"><b>Fix:</b> <code>if (out.length !== COORD_BYTES) throw</code>; validate hex length/charset.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Cohort under-fills when n ≈ wants</span><code>service/cohort.ts:30-42</code></div>
+	<p>On small rings both directional walks return the same ids; the alternating merge checks only <code>exclude</code>, not what's already collected, so <code>out.length</code> reaches <code>wants</code> counting cross-list duplicates and the trailing dedup shrinks the cohort below <code>wants</code> even though enough distinct members exist.</p>
+	<p class="fix"><b>Fix:</b> dedup with a <code>seen</code> set inside the loop.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Relevance: 0&nbsp;ms sentinel and stale counter</span><code>relevance.ts:83/118, 103-113</code></div>
+	<p><code>avgLatencyMs === 0</code> conflates "unknown" with "measured 0&nbsp;ms" — a genuine 0&nbsp;ms sample (common on localhost given <code>Date.now()</code> granularity) keeps a peer permanently out of the EMA branch and scores it worse than a 300&nbsp;ms peer. <code>touch()</code> computes base relevance with the pre-increment <code>accessCount</code>, unlike record{Success,Failure}.</p>
+	<p class="fix"><b>Fix:</b> explicit known-ness (nullable field or <code>successCount &gt; 0</code>); fold <code>accessCount + 1</code> in.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">perf</span><span class="title">Hot-path allocation churn</span><code>digitree-store.ts:64-73, 253-293</code></div>
+	<p><code>makeKey</code> builds a 64-char hex string per binary-search probe (~12–20 per lookup; entries are frozen so the key is stable). Wrap walks push duplicates then dedup via <code>Array.from(new Set(...))</code> — a repeat insertion into a Set would prove full wrap and allow early exit; these run ~10+ times per stabilization tick.</p>
+	<p class="fix"><b>Fix:</b> cache the key on the entry (or WeakMap); collect into a Set with early exit.</p>
+</div>
+
+<div class="finding nit-b">
+	<div class="head"><span class="pill nit">cleanup</span><span class="cat">clean</span><span class="title">Mechanical cleanups</span><code>store/ring various</code></div>
+	<p>Four near-identical wrap walks in <code>digitree-store.ts:208-294</code> — extract one directional walker. Duplicated <code>coordToHex</code> (store re-implements hash.ts's export). <code>lexLess</code> pads left-aligned while xor/clockwise pad right-aligned — pick one convention. Dead exports <code>clockwiseDistance</code>/<code>minDistance</code> (wire into the ring-distance fix or delete). <code>metadata?: Record&lt;string, any&gt;</code> → <code>unknown</code>. <code>withCounters</code> is a misnamed bare spread; dead <code>Math.max(1, 60_000)</code> guard; mirrored-index xor loop is an obfuscated forward loop.</p>
+</div>
+
+<h2 id="glue">Discovery &amp; libp2p glue — <code>service/*.ts</code>, <code>index.ts</code></h2>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title"><code>seedDiscovery</code> violates the member-only emission guarantee</span><code>discovery.ts:8-16 (called at libp2p-fret-service.ts:55)</code></div>
+	<p>Dispatches <code>peer:discovery</code> for every store entry — no membership or dead-state filter — while both other emission paths enforce member-only. The store is non-empty at this call site exactly when <code>importTable</code> restored a table legitimately containing foreign entries, so the one path that runs against a populated store leaks foreign peers into libp2p's discovery pipeline; otherwise it's a no-op.</p>
+	<p class="fix"><b>Fix:</b> delete it (scan's first tick covers the need) or filter member + non-dead.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">robust</span><span class="title">Stale identify event demotes RPC-confirmed member to foreign</span><code>fret-service.ts:340-361, 287-292</code></div>
+	<p>The <code>peer:identify</code>/<code>peer:update</code> handlers call <code>classifyByProtocols</code> unconditionally; a queued event carrying a pre-handler-registration protocol list can demote a peer the probe pass just RPC-confirmed as member, stranding it on the slow foreign re-probe path. Inconsistent with <code>seedFromPeerStore</code>, which classifies only <code>unknown</code> entries.</p>
+	<p class="fix"><b>Fix:</b> never demote an existing member from an identify protocol list (RPC proof outranks identify); keep foreign→member promotion.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">clean</span><span class="title"><code>Libp2pFretService</code> dead wiring and duplicate surface</span><code>libp2p-fret-service.ts:8-16, 72-98, 84-86, 138-140</code></div>
+	<p><code>components</code> stored but never read — the <code>fretService()</code> factory produces a service that throws "libp2p node not injected" unless <code>setLibp2p()</code> is called out-of-band, and its parameter type requires the component itself. <code>getNeighborsForKey</code>/<code>assembleCohortForKey</code> duplicate <code>getNeighbors</code>/<code>assembleCohort</code>. <code>getDiagnostics(): unknown</code> via <code>as any</code> when the concrete class has a typed method — type <code>inner</code> as the concrete class and both casts disappear.</p>
+	<p class="fix"><b>Fix:</b> consume <code>components.libp2p</code> in the constructor; delete the ForKey pair; type the field concretely.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">robust</span><span class="title">Dedup cache eviction quirks; TTL misaligned with timestamp window</span><code>dedup-cache.ts:26-43, 7</code></div>
+	<p>Overwriting an existing key at capacity still evicts an unrelated live entry; Map insertion-order means a just-refreshed entry can be evicted as "oldest"; at capacity every set pays an O(n) expiry scan. Separately, 30&nbsp;s TTL vs ±5&nbsp;min timestamp window leaves ~90% of the replay window uncovered (doc-acknowledged; alignable today).</p>
+	<p class="fix"><b>Fix:</b> handle existing-key overwrite first (delete-then-set); align <code>DedupCache(300_000)</code> or tighten <code>validateTimestamp</code> to ±30&nbsp;s.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">clean</span><span class="title">Public API type laziness</span><code>index.ts:140, 20-24, 101-103, 123-124</code></div>
+	<p><code>createFret(node: any, ...)</code> on the package's headline factory — should be <code>Libp2p</code> (it's immediately passed to a class that requires it). Metadata <code>Record&lt;string, any&gt;</code> throughout. Double import/re-export of the same class.</p>
+	<p class="fix"><b>Fix:</b> type the factory; <code>unknown</code> metadata values; single aliased import.</p>
+</div>
+
+<h2 id="tests">Test suite &amp; simulation — <code>test/</code></h2>
+<p>29 spec files + deterministic simulation harness. Strengths: property-based coverage of ring arithmetic/cohort/relevance/persistence; the membership tri-state suites (<code>ring-membership</code>, <code>membership-identify</code>) are exemplary — isolated causal paths, regression comments, condition-based waiting; the sim harness proves determinism with same-seed byte-identical replay tests. Weaknesses cluster below.</p>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">coverage</span><span class="title">Failure machinery untested</span><code>missing (applyFailure et al.)</code></div>
+	<p>Nothing exercises the service's failure path: relevance decay on failed ping, soft-vs-hard failure, dead-marking after repeated timeouts, recovery reset — the doc's "Failure detection and recovery" contract. <code>recordFailure</code> is property-tested in isolation only. (If 3-strikes dead-marking isn't implemented at all, that's a doc/code divergence worth a ticket.)</p>
+	<p class="fix"><b>Fix:</b> stubbed failing-ping unit tests + a two-node test where a peer goes unreachable, asserting state/relevance transitions.</p>
+</div>
+
+<div class="finding major-b">
+	<div class="head"><span class="pill major">major</span><span class="cat">quality</span><span class="title">Concurrency tested by writing the private counter; fuzz test asserts nothing</span><code>profile.behavior.spec.ts:249-271, rpc.fuzz.spec.ts:9-22</code></div>
+	<p>Inflight limits are "tested" by assigning <code>inflightAct</code> directly — increment/decrement pairing (including exception paths) is unverified, the exact class of bug counters get. The lone fuzz test has zero assertions and one malformed shape.</p>
+	<p class="fix"><b>Fix:</b> N parallel <code>handleMaybeAct</code> with a slow stubbed activity (assert busy responses + counter returns to 0); post-fuzz valid request must succeed; loop malformed shapes.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">quality</span><span class="title">Weak assertions in networked tests</span><code>churn.leave.spec.ts:96-136, iterative-lookup.spec.ts:51-157, proactive-announce.spec.ts:134-174, profile.behavior.spec.ts:359-382, fret.mesh.spec.ts:47</code></div>
+	<p>A meaningful fraction assert monotone counters (<code>≥ before</code>, trivially true), property existence, "any of three outcomes," or compute values never asserted (<code>stillHasLeaving</code>, <code>totalSkipped</code>). The dedup integration test never proves the second call hit the cache. Preconnect-budget tests are tautological with an empty store.</p>
+	<p class="fix"><b>Fix:</b> assert effects (peer removed, handler invoked once, bucket-skip counter incremented, ping count saturates at seeded budget).</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">quality</span><span class="title">Fixed multi-second sleeps — main flake risk and wall-clock cost</span><code>ring-membership.spec.ts:431/459/540, libp2p-memory.integration.spec.ts:104/132, ~10 specs</code></div>
+	<p>Up to 6&nbsp;s real-timer sleeps followed by "should have resolved by now" asserts; under CI load a missed tick fails the test, and passing runs still burn the full sleep. <code>membership-identify.spec.ts:29</code> already has the right <code>waitFor</code> predicate pattern.</p>
+	<p class="fix"><b>Fix:</b> extract <code>waitFor</code> into <code>test/helpers</code>; replace fixed sleeps suite-wide.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">coverage</span><span class="title">Gaps: service-level persistence, token refill, partition/merge, stream errors, mirrored cohort</span><code>various</code></div>
+	<p><code>FretService.exportTable/importTable</code> untested (incl. the doc-promised over-capacity eviction on import). Token bucket refill-over-time never tested (only config echo) — needs an injectable clock. No partition/merge scenario despite the doc's testing strategy naming it (<code>SimMessageBus.setLink</code> could model it today). No client-side tests for mid-stream aborts / unresponsive peers. <code>cohort.properties.spec.ts</code> property-tests a local <em>reimplementation</em> of <code>assembleCohort</code> that can silently drift from production — point it at the real export.</p>
+</div>
+
+<div class="finding minor-b">
+	<div class="head"><span class="pill minor">minor</span><span class="cat">quality</span><span class="title">Sim routing is oracle-assisted; churn under-delivers</span><code>test/simulation/fret-sim.ts:586-594, 213-223</code></div>
+	<p>The sim router filters next hops by global <code>p.alive</code> knowledge no real node has and takes <code>candidates[0]</code> without requiring progress, so the 85% routing-success regression threshold validates ring-maintenance math, not routing behavior. Churn leavers are all picked from the initial population at init — late joiners never churn; duplicates no-op — so effective churn is below configured.</p>
+	<p class="fix"><b>Fix:</b> restrict routing to local-store knowledge; schedule churn lazily. Consider a mid-scale in-memory tier driving real <code>FretService</code> instances.</p>
+</div>
+
+<div class="finding nit-b">
+	<div class="head"><span class="pill nit">cleanup</span><span class="cat">clean</span><span class="title">Test housekeeping</span><code>various</code></div>
+	<p>Mesh/star setup boilerplate re-implemented in ≥6 specs — consolidate into helpers. <code>helpers/libp2p.ts:64</code> <code>stopAll</code> mutates the caller's array via <code>reverse()</code>. <code>cohort.assembly.spec.ts</code> and <code>selector.connected-first.spec.ts</code> are subsumed by stronger suites — fold/delete. <code>test/README.md</code> stale ("67 passing"; shipped features listed as next steps).</p>
+</div>
+
+<h2 id="strengths">What's working well</h2>
+<ul class="strengths">
+	<li><span class="pill good">strong</span> <b>Membership tri-state design and implementation</b> — the unknown/member/foreign model, member-gated ring views with skip-and-continue filtered walks, bounded classification/re-probe passes, and durable labels across re-seeds are carefully reasoned, correctly implemented, and exceptionally well-commented. The matching test suites are the best in the codebase.</li>
+	<li><span class="pill good">strong</span> <b>Digitree usage is idiomatic and correct</b> — crack semantics, sentinel seeks, path-invalidation discipline (one latent exception noted above), provably terminating filtered walks, correct upsert state preservation, and eviction protection matching the documented policy.</li>
+	<li><span class="pill good">strong</span> <b>Bounded-budget discipline</b> — token buckets per protocol, per-tick probe budgets, snapshot caps on the fetch path, breadcrumb/TTL loop guards, capacity-bounded table. The pattern is right; it just needs to be applied to the announce path too.</li>
+	<li><span class="pill good">strong</span> <b>Deterministic simulation harness</b> — seeded RNG, time-ordered scheduler, latency/loss/backpressure modeling, and explicit same-seed replay tests. A real asset for churn work once the oracle-routing issue is fixed.</li>
+	<li><span class="pill good">strong</span> <b>Honest self-documentation</b> — known perf tradeoffs carry NOTE comments naming the fix; the design doc's security section candidly separates current state from planned work.</li>
+	<li><span class="pill good">strong</span> <b>KDE/sparsity relevance math is safe</b> — epsilon guards, clamps handling cold-start blowup, sound EMA/refill math in the token bucket core.</li>
+</ul>
+
+<footer>
+	Generated 2026-07-03 by five parallel deep-review passes (core service · store/ring · RPC/selector/estimator · discovery/libp2p glue · tests/simulation), findings verified against source and the digitree 1.x library, then deduplicated and synthesized. Line numbers reference the tree as of commit <code>b25652b</code>.
+</footer>
+
+</main>
+</body>
+</html>
