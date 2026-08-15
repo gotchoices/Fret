@@ -249,5 +249,22 @@ describe('Ring arithmetic properties', function () {
 				return bytesEqual(base64urlToCoord(coordToBase64url(c)), c)
 			}), opts)
 		})
+
+		it('base64urlToCoord throws on wrong-length input', () => {
+			expect(() => base64urlToCoord('')).to.throw()
+			expect(() => base64urlToCoord(coordToBase64url(new Uint8Array(COORD_BYTES - 1)))).to.throw()
+			expect(() => base64urlToCoord(coordToBase64url(new Uint8Array(COORD_BYTES + 1)))).to.throw()
+		})
+
+		it('hexToCoord throws on wrong-length input', () => {
+			expect(() => hexToCoord('')).to.throw()
+			expect(() => hexToCoord('ab'.repeat(COORD_BYTES - 1))).to.throw()
+			expect(() => hexToCoord('ab'.repeat(COORD_BYTES + 1))).to.throw()
+		})
+
+		it('hexToCoord throws on non-hex charset instead of coercing to zero bytes', () => {
+			expect(() => hexToCoord('zz'.repeat(COORD_BYTES))).to.throw()
+			expect(() => hexToCoord('gg' + 'ab'.repeat(COORD_BYTES - 1))).to.throw()
+		})
 	})
 })

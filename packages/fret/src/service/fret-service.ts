@@ -14,7 +14,7 @@ import type {
 	LookupOptions,
 } from '../index.js';
 import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
-import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
+import { hashKey, hashPeerId, coordToBase64url, base64urlToCoord } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp, isUnsupportedProtocolError } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
@@ -1203,7 +1203,7 @@ export class FretService implements IFretService, Startable {
 			// merge bounded sample if present
 			for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
 				try {
-					const coord = u8FromString(s.coord, 'base64url');
+					const coord = base64urlToCoord(s.coord);
 					if (!this.store.getById(s.id)) discovered.push(s.id);
 					this.store.upsert(s.id, coord);
 					await this.applyTouch(s.id, coord);
@@ -1503,7 +1503,7 @@ export class FretService implements IFretService, Startable {
 				}
 				for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
 					try {
-						const coord = u8FromString(s.coord, 'base64url');
+						const coord = base64urlToCoord(s.coord);
 						if (!this.store.getById(s.id)) announced.push(s.id);
 						this.store.upsert(s.id, coord);
 						await this.applyTouch(s.id, coord);

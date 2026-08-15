@@ -30,7 +30,12 @@ export function coordToHex(coord: RingCoord): string {
 	return s;
 }
 
+const HEX_COORD_RE = new RegExp(`^[0-9a-fA-F]{${COORD_BYTES * 2}}$`);
+
 export function hexToCoord(hex: string): RingCoord {
+	if (!HEX_COORD_RE.test(hex)) {
+		throw new Error(`hexToCoord: expected ${COORD_BYTES * 2} hex chars, got ${JSON.stringify(hex)}`);
+	}
 	const out = new Uint8Array(COORD_BYTES);
 	for (let i = 0; i < COORD_BYTES; i++) {
 		out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
@@ -43,5 +48,9 @@ export function coordToBase64url(coord: RingCoord): string {
 }
 
 export function base64urlToCoord(s: string): RingCoord {
-	return u8FromString(s, 'base64url');
+	const coord = u8FromString(s, 'base64url');
+	if (coord.length !== COORD_BYTES) {
+		throw new Error(`base64urlToCoord: expected ${COORD_BYTES} bytes, got ${coord.length}`);
+	}
+	return coord;
 }
