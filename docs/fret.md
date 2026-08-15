@@ -130,16 +130,33 @@ Payload inclusion heuristic:
 - Cluster expansion compensates for excluded peers to maintain k where possible.
 
 ### Network size estimation
-- **Member-scoped.** The estimate counts only this network's members (`membership === 'member'`), so a co-resident foreign network sharing the transport cannot inflate `n_est` or the derived cluster span / near-radius. `estimateSizeAndConfidence` takes an optional member filter that `FretService` supplies; the exported standalone defaults to counting every entry, leaving the simulator unaffected.
+- **Member-scoped.** The estimate counts only this network's members (`membership === 'member'`), so a co-resident foreign network sharing the transport cannot inflate `n_est` or the derived cluster span / near-radius. `estimateSizeAndConfidence` takes an options bag (`SizeEstimateOptions`) whose `filter` is the member gate `FretService` supplies; the exported standalone defaults to counting every entry, leaving the simulator unaffected.
+- **The gap population is the S/P window, not the whole store.** The same options bag carries `selfCoord`, and supplying it is what selects the intended arc-length method: gaps are taken between adjacent members of the successor/predecessor window around self (self plus `neighborsRight`/`neighborsLeft` under the same filter, de-duplicated because a walk anchored at self normally returns self). Coordinates are re-centred on self as *signed* offsets so a window straddling coordinate 0 stays one contiguous run rather than splitting into two and manufacturing an interior gap the size of the ring.
+  - **Omitting `selfCoord` is a documented degradation, not an equivalent path.** It falls back to consecutive gaps over every known coordinate and takes their median. A node's knowledge is deliberately non-uniform — it knows *every* peer adjacent to itself but only a sparsity-weighted scattering of far ones (see `selectDiverseSample`) — so whole-store gaps mix ~2m near-true spacings with a long tail of huge far-peer gaps. Once far peers outnumber near ones, which is the normal steady state, even the median lands in that tail and `n_est` collapses by one to two orders of magnitude, inflating cluster span by the same factor until every node believes it is near-cluster. Measured on a uniform-random ring with a node knowing self + 8 successors + 8 predecessors + 32 far peers: whole-store median returned 97 for a 2000-peer ring (−95%) where the S/P window returned 2462 (+23%). The four in-service call sites all pass `selfCoord`; `getNetworkSizeEstimate` is public and synchronous, so it passes the cached coordinate and falls through to the whole-store path when called before `start()` has hashed it.
+  - **Neither population includes the wrap-around gap** (last coordinate back round to the first). A node's view of the ring is never complete, so that gap spans the arc it has *not* sampled: it is the single largest outlier in the population, and including it kept the dispersion factor below pinned near a constant on exactly the well-sampled windows it was meant to reward.
 - Maintain online estimate (n_est, confidence ∈ [0,1]):
-  - Arc length method: average gap between consecutive S/P members; n_est = 2^B / avg_gap
+  - Arc length method: mean gap between consecutive S/P members; n_est = 2^B / avg_gap
   - Finger sampling: probe random points, measure hop counts; use exponential decay model
   - Weighted average of both methods; weight by method confidence
   - Peer-reported estimates: when a received `NeighborSnapshotV1` carries `size_estimate` and `confidence` (both positive), the receiver feeds them into its local estimator as an external observation (`reportNetworkSize`, source `snapshot:<peerId>`). This happens on both the announce path (`mergeAnnounceSnapshot`) and the fetched-neighbor path (`mergeNeighborSnapshots`). Snapshots advertise the sender's *raw* FRET-local estimate (not its blended `getNetworkSizeEstimate`), so blending received estimates does not re-amplify already-blended values. Observations are bounded by a sliding time window and a max count. NOTE: these reports are unauthenticated — see the planned size-consensus / bounded-gossip work in `tickets/` for Sybil-resistant aggregation.
-- Confidence calculation:
-  - Base confidence from sample count and recency
+- Confidence calculation — an even blend of *how many* gaps were sampled and *how well* their mean is pinned down:
+
+```
+G     = number of gaps in the population above
+cv    = sd(gaps) / mean(gaps)          // coefficient of variation
+cvEff = max(cv, 1)                     // exponential-gap prior (see below)
+rse   = cvEff / sqrt(G)                // relative standard error of the mean gap
+dispersion = clamp(1 - rse, 0, 1)
+sizeFactor = min(1, count / 2m)        // count = peers passing the member filter
+confidence = clamp(0.5*sizeFactor + 0.5*dispersion, 0.05, 1)
+```
+
+  - Flooring `cv` at 1 encodes the prior that gaps on a uniform-random ring are exponentially distributed, so `cv ≈ 1` is the *healthy* value, not a defect: a synthetically perfect (evenly spaced) sample cannot claim zero sampling error from a handful of gaps. It also makes confidence monotone in window size and caps it at `0.5 + 0.5·(1 − 1/√G)` — 0.875 at G = 16, ~0.57 at G = 2.
+  - This replaced a `minGap / maxGap` variance factor that was ~0 on any random ring (measured 4.4e-5 at n = 1000), which pinned confidence at exactly 0.5 for every node knowing ≥ 2m peers. Every consumer — `shouldIncludePayload`, the confidence-weighted next-hop cost, the ≥ 0.3 operation gate — treated that constant as if it carried information about sample quality.
+  - **Known blind spot: dispersion is a purely local statistic.** A node whose neighbors are all packed into a tiny, evenly-spaced arc — an eclipse, or a very young ring — scores a high dispersion factor while `n_est` is wildly wrong, because no statistic over the sampled arc can see the arc that was never sampled. The defense is corroboration from peer-reported estimates (`reportNetworkSize` / `calibrateSizeFromSnapshot`), not a better local formula.
   - Zero if disconnected from bootstrap or |S∪P| < m/2
   - Decay by factor 0.95 per minute without updates
+- **Blending FRET's estimate with peer reports** (`getNetworkSizeEstimate`) uses two *different* weightings, and the distinction is load-bearing. The size is weighted by recency × confidence, so a recent, confident observation dominates. The reported confidence is weighted by recency **only** — dividing a recency-weighted numerator by an unweighted observation count instead makes every observation older than "now" drag the average toward zero even when all observations agree perfectly (four agreeing observations at 0.5, spread over the 5-minute window, reported 0.23). The local FRET estimate is always the first observation, so the observation list is never empty; the reachable degenerate case is every observation carrying confidence 0, and both denominators guard it.
 - Usage:
   - Operations require min confidence (e.g., 0.3) to proceed
   - Cluster span estimate = k * (2^B / n_est)

@@ -284,7 +284,7 @@ describe('Ring membership gating (member-scoped reads)', () => {
 			['m1', 40, 'member'], ['m2', 80, 'member'], ['m3', 120, 'member'], ['m4', 160, 'member'],
 		])
 
-		const scoped = estimateSizeAndConfidence(mixed, 4, member)
+		const scoped = estimateSizeAndConfidence(mixed, 4, { filter: member })
 		const expected = estimateSizeAndConfidence(memberOnly, 4)
 		expect(scoped.n).to.equal(expected.n, 'member-scoped estimate equals a members-only store')
 
@@ -323,7 +323,7 @@ describe('Ring membership gating (member-scoped reads)', () => {
 		expect(store.neighborsRight(key, 3, member)).to.deep.equal(store.neighborsRight(key, 3))
 		expect(store.neighborsLeft(key, 3, member)).to.deep.equal(store.neighborsLeft(key, 3))
 		expect(assembleCohort(store, key, 4, undefined, member)).to.deep.equal(assembleCohort(store, key, 4))
-		expect(estimateSizeAndConfidence(store, 4, member).n).to.equal(estimateSizeAndConfidence(store, 4).n)
+		expect(estimateSizeAndConfidence(store, 4, { filter: member }).n).to.equal(estimateSizeAndConfidence(store, 4).n)
 	})
 
 	// Simulator / standalone exports default to no filter and count every entry regardless of
@@ -338,7 +338,7 @@ describe('Ring membership gating (member-scoped reads)', () => {
 
 		// But a member-scoped read sees nothing while both are unclassified.
 		expect(assembleCohort(store, coordAt(80), 2, undefined, member)).to.have.length(0)
-		expect(estimateSizeAndConfidence(store, 2, member).n).to.equal(0)
+		expect(estimateSizeAndConfidence(store, 2, { filter: member }).n).to.equal(0)
 	})
 })
 
@@ -545,7 +545,7 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		memberOnly.upsert(idA, await hashPeerId(nodeA.peerId))
 		memberOnly.upsert(idC, await hashPeerId(nodeC.peerId))
 		const expectedN = estimateSizeAndConfidence(memberOnly, 4).n
-		const scopedN = estimateSizeAndConfidence(store, 4, (e) => e.membership === 'member').n
+		const scopedN = estimateSizeAndConfidence(store, 4, { filter: (e) => e.membership === 'member' }).n
 		expect(scopedN).to.equal(expectedN, 'foreign peer must not inflate n_est')
 
 		// Discovery emission: the scan surfaces C, never B.

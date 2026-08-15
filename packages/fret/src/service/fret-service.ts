@@ -1526,7 +1526,7 @@ export class FretService implements IFretService, Startable {
 		// Size estimate, neighbors, and sample are all member-scoped so the snapshot we
 		// advertise describes only this network — and never re-introduces a foreign peer to
 		// same-network neighbors via the sample (the transitive-propagation guard).
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isMember, selfCoord });
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -1694,7 +1694,10 @@ export class FretService implements IFretService, Startable {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 		const coord = await hashKey(keyBytes);
 		const selfId = this.node.peerId.toString();
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
+			filter: isMember,
+			selfCoord: await this.selfCoord()
+		});
 
 		// In-cluster test
 		const distIdx = this.neighborDistance(selfId, coord, Math.max(2, msg.want_k ?? this.cfg.k));
@@ -1864,7 +1867,12 @@ export class FretService implements IFretService, Startable {
 	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
 		// Get FRET's own estimate (member-scoped: a co-resident foreign network must not
 		// inflate this network's size estimate or the derived cluster span / near-radius).
-		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
+		// This method is public and callable before `start()` has hashed the self coordinate;
+		// when it is not yet populated the estimator falls through to its whole-store path.
+		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
+			filter: isMember,
+			selfCoord: this.cachedSelfCoord ?? undefined
+		});
 
 		// Add FRET estimate as an observation
 		const now = Date.now();
@@ -1878,14 +1886,16 @@ export class FretService implements IFretService, Startable {
 			...this.networkObservations
 		];
 
-		if (allObservations.length === 0) {
-			return { size_estimate: 0, confidence: 0, sources: 0 };
-		}
-
-		// Weight recent observations more heavily with exponential decay
+		// Weight recent observations more heavily with exponential decay. Two different
+		// denominators are in play and mixing them up is what made the reported confidence
+		// collapse: `size_estimate` is weighted by recency × confidence (a confident, recent
+		// observation should dominate the size), while the average confidence is weighted by
+		// recency *only* — dividing a recency-weighted numerator by an unweighted count drags
+		// the result toward zero as observations age even when every one of them agrees.
 		let totalWeight = 0;
 		let weightedSum = 0;
 		let confidenceSum = 0;
+		let recencySum = 0;
 
 		for (const obs of allObservations) {
 			const age = now - obs.timestamp;
@@ -1894,15 +1904,18 @@ export class FretService implements IFretService, Startable {
 
 			weightedSum += obs.estimate * weight;
 			confidenceSum += obs.confidence * recencyWeight;
+			recencySum += recencyWeight;
 			totalWeight += weight;
 		}
 
-		if (totalWeight === 0) {
+		// Reachable when every observation carries confidence 0 (the local FRET estimate is
+		// always present, so an *empty* observation set is not).
+		if (totalWeight === 0 || recencySum === 0) {
 			return { size_estimate: 0, confidence: 0, sources: 0 };
 		}
 
 		const estimate = Math.round(weightedSum / totalWeight);
-		const avgConfidence = confidenceSum / allObservations.length;
+		const avgConfidence = confidenceSum / recencySum;
 
 		return {
 			size_estimate: estimate,
@@ -2023,7 +2036,7 @@ export class FretService implements IFretService, Startable {
 		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isMember, selfCoord });
 
 			// Decide whether to include payload
 			const distToKey = minDistance(selfCoord, coord);

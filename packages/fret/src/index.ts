@@ -131,7 +131,7 @@ export { clockwiseDistance, minDistance, lexLess } from './ring/distance.js';
 export { DigitreeStore } from './store/digitree-store.js';
 export type { PeerEntry, PeerPatch, PeerState, MembershipState } from './store/digitree-store.js';
 export { estimateSizeAndConfidence } from './estimate/size-estimator.js';
-export type { SizeEstimate } from './estimate/size-estimator.js';
+export type { SizeEstimate, SizeEstimateOptions } from './estimate/size-estimator.js';
 export { assembleCohort } from './service/cohort.js';
 export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
 export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';

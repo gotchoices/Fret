@@ -280,4 +280,36 @@ describe('Seed new peers — estimator calibration from snapshots', function () 
 			await node.stop()
 		}
 	})
+
+	// The reported confidence is a recency-weighted average, so a set of observations that all
+	// agree must report exactly that agreed value no matter how they are spread in time.
+	// Dividing the recency-weighted numerator by an unweighted count instead made every
+	// observation older than "now" drag the result toward zero: four agreeing observations
+	// spread over the 5-minute window reported 0.23 instead of 0.50.
+	it('reported confidence is unaffected by the age spread of agreeing observations', async () => {
+		const { node, svc } = await createService()
+		try {
+			// Baseline: with no external observations the only observation is the local FRET
+			// estimate at age 0, so the reported confidence is exactly that estimate's own.
+			const baseline = svc.getNetworkSizeEstimate().confidence
+			expect(baseline).to.be.greaterThan(0)
+
+			// Add observations that agree on confidence but sit at increasing ages across the
+			// window. `reportNetworkSize` stamps `Date.now()`, so the ages are injected directly.
+			const now = Date.now()
+			const observations = (svc as any).networkObservations as Array<{
+				estimate: number; confidence: number; timestamp: number; source: string
+			}>
+			for (const ageMs of [60_000, 120_000, 240_000]) {
+				observations.push({ estimate: 200, confidence: baseline, timestamp: now - ageMs, source: 'aged' })
+			}
+
+			const aged = svc.getNetworkSizeEstimate().confidence
+			expect(aged).to.be.closeTo(baseline, 1e-9,
+				`agreeing observations must average to their common value, got ${aged} vs ${baseline}`)
+		} finally {
+			await svc.stop()
+			await node.stop()
+		}
+	})
 })
