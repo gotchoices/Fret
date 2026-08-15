@@ -73,18 +73,14 @@ export async function readAllBounded(
 	let len = 0;
 	const iter = stream[Symbol.asyncIterator]();
 	const deadline = Date.now() + timeoutMs;
-	// Short idle timeout after first data arrives — works around muxer
-	// implementations that fail to propagate remote-close EOF.
-	const idleMs = 100;
 
 	while (true) {
 		const remaining = deadline - Date.now();
 		if (remaining <= 0) break;
-		const chunkTimeout = len > 0 ? Math.min(remaining, idleMs) : remaining;
 
 		let timer: ReturnType<typeof setTimeout> | undefined;
 		const timeout = new Promise<IteratorResult<any>>(r => {
-			timer = setTimeout(() => r({ done: true, value: undefined }), chunkTimeout);
+			timer = setTimeout(() => r({ done: true, value: undefined }), remaining);
 		});
 		const next = iter.next();
 		next.catch(() => {}); // Prevent unhandled rejection if timeout wins

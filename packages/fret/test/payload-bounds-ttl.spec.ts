@@ -58,6 +58,18 @@ describe('Payload bounds and TTL validation', function () {
 				expect(err.message).to.include('payload too large')
 			}
 		})
+
+		it('reads to completion across a >100ms gap between chunks', async () => {
+			const first = new Uint8Array([1, 2, 3])
+			const second = new Uint8Array([4, 5, 6])
+			async function* gen() {
+				yield first
+				await new Promise(r => setTimeout(r, 150))
+				yield second
+			}
+			const result = await readAllBounded(gen(), 100)
+			expect(result).to.deep.equal(new Uint8Array([1, 2, 3, 4, 5, 6]))
+		})
 	})
 
 	describe('oversized payload at RPC layer', () => {
