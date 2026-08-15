@@ -1778,18 +1778,16 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * `selfCoord` is supplied only when we are *forwarding* someone else's message, which is
-	 * where near-mode strict improvement belongs: a forwarded message handed to a peer farther
-	 * from the key than we are drifts backwards, and only breadcrumbs plus TTL stop it looping.
+	 * `selfCoord` is supplied only when *forwarding* someone else's message, so near-mode
+	 * selection can require a hop strictly closer to the key than we are.
 	 *
-	 * It is deliberately omitted when we *originate* a lookup. A lookup seeks the key's cluster
-	 * — the k peers nearest the key, spanning both sides — not the key point itself, so an
-	 * originator that happens to be the closest peer to the key still has to contact a cluster
-	 * member, and every one of them is farther from the key than it is. Filtering there does not
-	 * prevent a loop (the walk's `visited` set already does that); it just refuses to send at
-	 * all, and the activity is never performed. `pickAnchors` omits it for a different reason:
-	 * it ranks peers by closeness to a key as a hint for another peer's resend, so our own
-	 * distance is irrelevant to the ordering.
+	 * It is deliberately omitted when we *originate* a lookup: an originating node aims at the
+	 * key's cluster — the k peers around the key, spanning both sides — not the key point, so
+	 * an originator that is itself the peer nearest the key must still contact a cluster member,
+	 * and every one of them is farther from the key than it is. Filtering there prevents no loop
+	 * (`iterativeLookup`'s `visited` set does that) and only refuses to send, silently dropping
+	 * the activity. `test/iterative-lookup.spec.ts` pins that down. See "Next-hop selection
+	 * heuristic" in `docs/fret.md` for the full argument.
 	 */
 	private buildNextHopOptions(sizeEstimate: number, confidence: number, selfCoord?: Uint8Array): NextHopOptions {
 		return {
@@ -2053,9 +2051,7 @@ export class FretService implements IFretService, Startable {
 				return;
 			}
 
-			// No self coordinate here: we are originating, not forwarding. See
-			// `buildNextHopOptions` — an originator nearest the key must still reach out to the
-			// cluster around it, and every member of that cluster is farther from the key.
+			// No self coordinate: we are originating, not forwarding. See `buildNextHopOptions`.
 			const hopOpts = this.buildNextHopOptions(n, confidence);
 			const linkQ = (id: string) => this.linkQuality(id);
 			const target = chooseNextHop(

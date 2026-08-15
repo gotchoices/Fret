@@ -10,13 +10,14 @@ export interface NextHopOptions {
 	nearRadius?: Uint8Array;
 	/**
 	 * The caller's own ring coordinate. Supplied, near mode measures strict improvement
-	 * against *our* distance to the target instead of only ordering candidates among
-	 * themselves, so a hop can never be farther from the key than we already are.
+	 * against *our* distance to the target rather than only ordering candidates among
+	 * themselves, so a near hop can never be farther from the key than we already are.
+	 * Omitted, the selector behaves as it did before this option existed.
 	 *
-	 * Optional because not every caller is choosing a hop *for itself*: `pickAnchors`
-	 * ranks peers by closeness to a key as a hint for someone else's resend, and the
-	 * exported standalone / simulator usage has no node identity at all. Omitted, the
-	 * selector behaves exactly as it did before this option existed.
+	 * Optional because not every caller is choosing a hop *for itself*, and one that is
+	 * may still want to reach past itself — see "Next-hop selection heuristic" in
+	 * `docs/fret.md` for which call sites supply it and why. Ignored on the legacy path
+	 * (no `nearRadius`), like `connectedToleranceBytes` is on the cost path.
 	 */
 	selfCoord?: Uint8Array;
 	/** Confidence in network size estimate [0,1]; adjusts weight balance. */
@@ -148,9 +149,10 @@ function chooseNextHopCost(
 	const nearW = weightsForContext(true, confidence);
 	const farW = weightsForContext(false, confidence);
 
-	// Our own distance to the target, when the caller told us where it sits.
+	// Our own distance to the target, when the caller told us where it sits. Only a *near*
+	// self constrains the choice; see the strict-improvement filter below.
 	const selfDist = opts.selfCoord ? minDistance(opts.selfCoord, targetCoord) : undefined;
-	const selfIsNear = selfDist !== undefined && isNear(selfDist, nearRadius);
+	const nearSelfDist = selfDist !== undefined && isNear(selfDist, nearRadius) ? selfDist : undefined;
 
 	type Scored = { id: string; dist: Uint8Array; near: boolean; connected: boolean; costVal: number };
 	const scored: Scored[] = [];
@@ -173,14 +175,13 @@ function chooseNextHopCost(
 	let nearCandidates = scored.filter(s => s.near);
 	const farCandidates = scored.filter(s => !s.near);
 
-	if (selfIsNear) {
-		// Strict improvement is measured against *our own* distance to the target: a candidate
-		// no closer than we already are moves the message backwards, and only breadcrumbs plus
-		// TTL would stop it looping. Ordering candidates among themselves cannot see that.
-		nearCandidates = nearCandidates.filter(s => lexLess(s.dist, selfDist!));
-		// No fall-through to far mode. Every far candidate sits beyond nearRadius ≥ selfDist,
-		// so it is guaranteed worse than staying put — the exact hop this filter exists to
-		// reject. Callers already handle `undefined`: it yields a NearAnchor / exhausted.
+	if (nearSelfDist !== undefined) {
+		// Strict improvement against *our own* distance: a candidate no closer than we already
+		// are moves the message backwards, which ordering candidates among themselves cannot see.
+		nearCandidates = nearCandidates.filter(s => lexLess(s.dist, nearSelfDist));
+		// Deliberately no fall-through to far mode: every far candidate sits beyond
+		// nearRadius ≥ nearSelfDist, so it is guaranteed worse than staying put. Both callers
+		// handle `undefined` — it becomes a NearAnchor reply or an `exhausted` lookup.
 		if (nearCandidates.length === 0) return undefined;
 	}
 
