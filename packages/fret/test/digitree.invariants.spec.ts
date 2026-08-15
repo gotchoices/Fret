@@ -43,6 +43,7 @@ type Op =
 	| { kind: 'recoord'; id: number; coord: number }
 	| { kind: 'touch'; id: number; relevance: number }
 	| { kind: 'import'; records: Array<{ id: number; coord: number }> }
+	| { kind: 'reimport' }
 	| { kind: 'remove'; id: number }
 	| { kind: 'state'; id: number; state: PeerState }
 	| { kind: 'membership'; id: number; membership: MembershipState }
@@ -58,6 +59,7 @@ const opArb: fc.Arbitrary<Op> = fc.oneof(
 		kind: fc.constant('import' as const),
 		records: fc.array(fc.record({ id: idArb, coord: coordArb }), { minLength: 1, maxLength: 4 }),
 	}),
+	fc.record({ kind: fc.constant('reimport' as const) }),
 	fc.record({ kind: fc.constant('remove' as const), id: idArb }),
 	fc.record({ kind: fc.constant('state' as const), id: idArb, state: fc.constantFrom(...STATES) }),
 	fc.record({ kind: fc.constant('membership' as const), id: idArb, membership: fc.constantFrom(...MEMBERSHIPS) })
@@ -144,6 +146,17 @@ function applyOp(store: DigitreeStore, model: Model, op: Op): void {
 			store.importEntries(op.records.map((r) => serialized(ids[r.id]!, coords[r.coord]!)))
 			// Replace-by-id: the snapshot wins outright, including a coordinate move.
 			for (const r of op.records) model.set(ids[r.id]!, { ...DEFAULTS, coord: coords[r.coord]! })
+			return
+		}
+		case 'reimport': {
+			// Feed the store its own export. Every record collides with a live id at the same
+			// key, so this is the replace-at-an-existing-key path applied to the whole
+			// population at once — the one shape a single-record import never reaches.
+			store.importEntries(store.exportEntries())
+			// Import forces liveness and handshake history back to their cold-start values;
+			// everything else round-trips unchanged.
+			for (const [id, prev] of model)
+				model.set(id, { ...prev, state: 'disconnected', negotiateFailures: 0 })
 			return
 		}
 		case 'remove': {

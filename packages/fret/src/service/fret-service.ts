@@ -2215,14 +2215,16 @@ export class FretService implements IFretService, Startable {
 	}
 
 	importTable(table: SerializedTable): number {
-		const count = this.store.importEntries(table.entries);
-		// Import replaces by id, so a record for *self* — a snapshot taken by another peer, or
-		// one predating the membership field, which decodes as `unknown` — would overwrite the
-		// `member` label self is seeded with. An `unknown` self is excluded from every
-		// member-only ring view, so re-assert it here rather than waiting for the next
-		// stabilization tick's peer-store re-seed to heal it.
+		// A snapshot never speaks for *self*. Import replaces by id, and both fields that make
+		// self's entry authoritative are supplied by the snapshot: `membership` (absent in a
+		// pre-membership snapshot, and `unknown` in one taken by another peer, which would drop
+		// self out of every member-only ring view) and `coord` (a wrong one moves self off its
+		// own ring position, so capacity enforcement no longer protects it). Both would heal on
+		// the next stabilization tick's peer-store re-seed, but dropping self's record is one
+		// rule instead of two repairs — and the local entry is better information regardless.
+		// The count therefore reports ids actually stored, self excluded.
 		const selfStr = this.node.peerId.toString();
-		if (this.store.getById(selfStr)) this.store.setMembership(selfStr, 'member');
+		const count = this.store.importEntries(table.entries.filter((e) => e.id !== selfStr));
 		this.enforceCapacity();
 		return count;
 	}
