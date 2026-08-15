@@ -1,5 +1,5 @@
 import { BTree } from 'digitree';
-import { coordToBase64url, base64urlToCoord } from '../ring/hash.js';
+import { COORD_BYTES, coordToBase64url, coordToHex, base64urlToCoord } from '../ring/hash.js';
 
 export type PeerState = 'connected' | 'disconnected' | 'dead';
 
@@ -83,10 +83,16 @@ export interface SerializedTable {
 	entries: SerializedPeerEntry[];
 }
 
-function coordToHex(coord: Uint8Array): string {
-	let s = '';
-	for (let i = 0; i < coord.length; i++) s += coord[i]!.toString(16).padStart(2, '0');
-	return s;
+/**
+ * The tree key embeds the coordinate as hex, so a coordinate of the wrong width produces a
+ * key of the wrong length and sorts into an arbitrary ring position — silently scrambling
+ * every ordered read that rests on it. Rejecting at the single write seam makes the bad
+ * state unrepresentable in the store regardless of which decode path produced the bytes.
+ */
+function assertCoordWidth(coord: Uint8Array): void {
+	if (coord.length !== COORD_BYTES) {
+		throw new Error(`DigitreeStore: ring coordinate must be ${COORD_BYTES} bytes, got ${coord.length}`);
+	}
 }
 
 function makeKey(entry: PeerEntry): string {
@@ -128,6 +134,7 @@ export class DigitreeStore {
 	 * and the id is duplicated in every ring walk while `byId` can only see one of them.
 	 */
 	private put(entry: PeerEntry): PeerEntry {
+		assertCoordWidth(entry.coord);
 		const key = makeKey(entry);
 		const prevKey = this.byId.get(entry.id);
 		if (prevKey !== undefined && prevKey !== key) {
@@ -353,13 +360,18 @@ export class DigitreeStore {
 	 * store wins, including a coordinate move (the snapshot is the more recent view of that
 	 * peer, and a stale duplicate would otherwise linger in the tree unreachable by id).
 	 *
+	 * A record whose coordinate is malformed rejects the whole snapshot, and does so *before*
+	 * any entry is written: a corrupted persisted table is better refused loudly than admitted
+	 * as ring state, but a mid-loop throw would leave a half-imported table behind (and skip
+	 * the caller's capacity enforcement, which runs after the call returns).
+	 *
 	 * @returns the number of *distinct ids stored* — not the number of input records, so a
 	 * snapshot carrying an id twice reports 1.
 	 */
 	importEntries(entries: SerializedPeerEntry[]): number {
+		const decoded = entries.map((s) => ({ s, coord: base64urlToCoord(s.coord) }));
 		const stored = new Set<string>();
-		for (const s of entries) {
-			const coord = base64urlToCoord(s.coord);
+		for (const { s, coord } of decoded) {
 			const entry: PeerEntry = {
 				id: s.id,
 				coord,

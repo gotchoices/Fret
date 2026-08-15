@@ -354,6 +354,17 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     stale id mapping hides a live entry from every id-keyed reader. `test/digitree.invariants.spec.ts`
     pins it — a model-based property test over arbitrary write sequences, so a future write path
     that bypasses the seam fails there rather than shipping.
+  - **Every stored coordinate is exactly `COORD_BYTES` (32) wide,** enforced at that same write
+    seam. Because the tree key is `hex(coord)|id`, a short or long coordinate yields a
+    wrong-length key that sorts into an arbitrary ring position — every ordered read then
+    silently returns the wrong peers, with no error anywhere. Checking once at the seam makes
+    the bad state unrepresentable in the store no matter which decode path produced the bytes,
+    rather than relying on each decoder to validate. The decoders validate too
+    (`base64urlToCoord` rejects a wrong decoded length, `hexToCoord` rejects anything that is
+    not exactly 64 hex characters — previously `parseInt` on a non-hex pair returned `NaN`,
+    which coerces to `0` when assigned into a `Uint8Array`, so garbage decoded to a plausible
+    near-zero coordinate), so a malformed wire value is rejected at the boundary it entered by
+    and the seam is the backstop.
   - Bounded capacity with victim selection; infinite relevance for S/P.
   - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
   - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
@@ -563,6 +574,7 @@ FRET's routing table (Digitree store) is in-memory by default. The `exportTable`
 
 - **Export**: `exportTable()` returns a `SerializedTable` containing every peer entry in the Digitree, with `Uint8Array` coordinates encoded as base64url strings. The envelope includes the exporter's peer ID and a timestamp.
 - **Import**: `importTable(table)` deserializes entries back into the Digitree. All imported entries have their state forced to `'disconnected'` since connection liveness cannot survive a restart. Membership labels are preserved (a persisted table is same-network by construction); a missing `membership` field in an older snapshot defaults to `'unknown'`. Capacity enforcement runs after import, so importing a table larger than the local capacity evicts lowest-relevance entries as usual.
+  - **A malformed coordinate rejects the whole snapshot, and nothing is written.** A corrupted persisted table is better refused loudly than admitted as ring state, so `importEntries` decodes every record's coordinate before it writes any of them — a mid-loop throw would otherwise leave a half-imported table behind *and* skip the capacity enforcement that runs after the call. Callers restoring an untrusted file should wrap `importTable` and fall back to a cold bootstrap. (Snapshot *sample* entries arriving over the wire are handled differently: those merge loops already skip-and-log per entry, so one bad sample drops that entry, not the message.)
   - **Replace by id.** Import is public and nothing stops a caller invoking it after `start()`, at which point self and any peer-store-seeded peers are already in the table. A snapshot record for an id already present therefore *replaces* that entry outright, including a coordinate move — the snapshot is the more recent view of that peer, and the alternative (leaving the existing entry in place) both discards the restored data and, on a coordinate move, strands the old entry in the tree unreachable by id.
   - **Returns the number of distinct ids stored**, not the number of input records, so a snapshot carrying an id twice reports 1.
   - **A snapshot never speaks for self.** Because replacement is unconditional, `importTable` drops the record whose id is the importing node's own before handing the rest to the store; the count therefore excludes self. Both fields that make self's entry authoritative come from the snapshot and both would be wrong: `membership` (absent in a pre-membership snapshot, `unknown` in one taken by another peer — either drops self out of every member-only ring view) and `coord` (a tampered one moves self off its own ring position, so capacity enforcement no longer protects it). Each would heal on the next stabilization tick's peer-store re-seed, but the local entry is better information than any snapshot's view of it, so there is nothing to import. Coordinate verification for *other* peers' records is a separate, still-open concern (see `tickets/`).

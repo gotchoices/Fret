@@ -1,6 +1,8 @@
 import { describe, it } from 'mocha'
 import fc from 'fast-check'
+import { expect } from 'chai'
 import { DigitreeStore, type SerializedPeerEntry, type PeerEntry } from '../src/store/digitree-store.js'
+import { coordToBase64url } from '../src/ring/hash.js'
 
 function randomCoord(len = 32): Uint8Array {
 	const u = new Uint8Array(len)
@@ -154,5 +156,33 @@ describe('DigitreeStore persistence', () => {
 			throw new Error('right neighbors differ after import')
 		if (JSON.stringify(origLeft) !== JSON.stringify(restoredLeft))
 			throw new Error('left neighbors differ after import')
+	})
+
+	it('rejects a wrong-width coordinate at the write seam', () => {
+		const store = new DigitreeStore()
+		expect(() => store.upsert('short', randomCoord(31))).to.throw(/32 bytes/)
+		expect(() => store.upsert('long', randomCoord(33))).to.throw(/32 bytes/)
+		expect(store.size()).to.equal(0)
+	})
+
+	it('a malformed coordinate rejects the whole snapshot without importing part of it', () => {
+		const good: SerializedPeerEntry = {
+			id: 'good',
+			coord: coordToBase64url(randomCoord()),
+			relevance: 1,
+			lastAccess: 1,
+			state: 'disconnected',
+			accessCount: 0,
+			successCount: 0,
+			failureCount: 0,
+			avgLatencyMs: 0,
+		}
+		const bad: SerializedPeerEntry = { ...good, id: 'bad', coord: coordToBase64url(randomCoord(31)) }
+
+		const store = new DigitreeStore()
+		// `good` sorts first, so a per-record throw would leave it behind.
+		expect(() => store.importEntries([good, bad])).to.throw()
+		expect(store.size()).to.equal(0)
+		expect(store.getById('good')).to.equal(undefined)
 	})
 })
