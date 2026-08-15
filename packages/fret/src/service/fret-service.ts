@@ -348,6 +348,13 @@ export class FretService implements IFretService, Startable {
 	 * to this peer alone — today that is the ping paths. A caller with no such measurement omits
 	 * it and the peer's `avgLatencyMs` is left untouched, rather than writing a placeholder that
 	 * would decay a real measurement away over successive calls.
+	 *
+	 * NOTE: this reads the entry, awaits `selfCoord()`, then writes — as do `applyTouch` /
+	 * `applyFailure`. Two chains scoring the same peer across that await both derive
+	 * `successCount + 1` from the same base, so one increment is lost. Harmless while the
+	 * counters only feed a relevance score that is recomputed on every call; if they ever
+	 * become load-bearing (quorum, fairness accounting), make the update read-modify-write
+	 * inside the store instead of patching a value derived outside it.
 	 */
 	private async applySuccess(id: string, coord: Uint8Array, latencyMs?: number): Promise<void> {
 		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);

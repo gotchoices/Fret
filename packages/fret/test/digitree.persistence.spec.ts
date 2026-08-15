@@ -37,13 +37,15 @@ describe('DigitreeStore persistence', () => {
 
 					const store = new DigitreeStore()
 					for (const id of uniq) {
-						const entry = store.upsert(id, randomCoord())
+						store.upsert(id, randomCoord())
 						store.update(id, {
 							relevance: Math.random() * 100,
 							accessCount: Math.floor(Math.random() * 50),
 							successCount: Math.floor(Math.random() * 30),
 							failureCount: Math.floor(Math.random() * 10),
-							avgLatencyMs: Math.random() * 500,
+							// Unmeasured is a value the round-trip must preserve, not an absence:
+							// restoring it as 0 would hand the peer a perfect-link measurement.
+							avgLatencyMs: Math.random() < 0.25 ? null : Math.random() * 500,
 						})
 					}
 
