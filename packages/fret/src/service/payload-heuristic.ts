@@ -19,7 +19,9 @@ const RING_SIZE = 1n << 256n;
  * Estimate the probability that the given distance falls within the cluster
  * span, scaled by confidence.
  *
- * @param distToKey  XOR distance from self (or candidate) to the target key.
+ * @param distToKey  Ring distance from self (or candidate) to the target key —
+ *   `minDistance`, the shorter of the two arcs.  It must be an arc length, since
+ *   the near-zone it is compared against is derived from the ring circumference.
  * @param sizeEstimate  Estimated number of peers in the network.
  * @param confidence  Confidence in the size estimate [0,1].
  * @param k  Cluster size target.
@@ -54,7 +56,7 @@ export function shouldIncludePayload(
  * nearRadius ≈ β × clusterSpan where clusterSpan = k × (2^256 / n_est).
  *
  * Returns a 32-byte Uint8Array representing the near radius as a big-endian
- * integer, suitable for comparison with XOR distances.
+ * integer, suitable for comparison with ring distances (`minDistance`).
  */
 export function computeNearRadius(
 	sizeEstimate: number,

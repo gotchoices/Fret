@@ -1,5 +1,5 @@
 import type { PeerEntry } from './digitree-store.js';
-import { xorDistance } from '../ring/distance.js';
+import { minDistance } from '../ring/distance.js';
 
 export interface SparsityModel {
 	centers: number[];
@@ -26,8 +26,14 @@ export function createSparsityModel(
 	return { centers, occupancy: new Float64Array(m), alpha, sigma, beta, sMin, sMax, eps };
 }
 
+/**
+ * Normalized log ring distance ∈ [0,1] — 0 = coincident, larger = farther.
+ * Derived from `minDistance`, which tops out at half the ring (2^255), so the
+ * practical maximum is 1 − 1/256 rather than 1.  The value only feeds the KDE
+ * as a relative position, so the unused top step needs no rescaling.
+ */
 export function normalizedLogDistance(selfCoord: Uint8Array, otherCoord: Uint8Array): number {
-	const d = xorDistance(selfCoord, otherCoord);
+	const d = minDistance(selfCoord, otherCoord);
 	let lz = 0;
 	for (let i = 0; i < d.length; i++) {
 		const v = d[i] ?? 0;

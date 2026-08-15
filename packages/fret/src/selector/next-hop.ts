@@ -1,5 +1,5 @@
 import type { DigitreeStore } from '../store/digitree-store.js'
-import { xorDistance, lexLess } from '../ring/distance.js'
+import { minDistance, lexLess } from '../ring/distance.js'
 
 export type LinkQuality = (id: string) => number; // [0..1]
 export type IsConnected = (id: string) => boolean;
@@ -75,7 +75,9 @@ function weightsForContext(near: boolean, confidence: number): CostWeights {
 
 function normalizeDistance(dist: Uint8Array): number {
 	// Count leading zero bits for fine-grained log-distance [0,1]
-	// 0 = identical (distance zero), 1 = maximally far
+	// 0 = identical (distance zero); larger = farther.  Ring distance tops out at
+	// half the ring (2^255), so the practical maximum here is 1 − 1/256, not 1.
+	// Only relative ordering matters, so the unused top step costs nothing.
 	let lzBits = 0;
 	for (let i = 0; i < dist.length; i++) {
 		const v = dist[i]!;
@@ -153,7 +155,7 @@ function chooseNextHopCost(
 	for (const id of candidates) {
 		const entry = store.getById(id);
 		if (!entry) continue;
-		const dist = xorDistance(entry.coord, targetCoord);
+		const dist = minDistance(entry.coord, targetCoord);
 		const near = isNear(dist, nearRadius);
 		const connected = isConnected(id);
 		const w = weightsForContext(near, confidence);
@@ -202,7 +204,7 @@ function chooseNextHopLegacy(
 	for (const id of candidates) {
 		const entry = store.getById(id);
 		if (!entry) continue;
-		const dist = xorDistance(entry.coord, targetCoord);
+		const dist = minDistance(entry.coord, targetCoord);
 		const connected = isConnected(id);
 		const score = (connected ? 1 : 0) + 0.25 * linkQ(id);
 		scored.push({ id, dist, connected, score });

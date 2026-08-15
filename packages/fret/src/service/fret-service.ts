@@ -29,7 +29,7 @@ import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
 import { DedupCache, DEDUP_TTL_MS } from './dedup-cache.js';
 import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js';
-import { xorDistance } from '../ring/distance.js';
+import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import {
     createSparsityModel,
@@ -2013,7 +2013,7 @@ export class FretService implements IFretService, Startable {
 			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 
 			// Decide whether to include payload
-			const distToKey = xorDistance(selfCoord, coord);
+			const distToKey = minDistance(selfCoord, coord);
 			const includePayload = currentActivity
 				? shouldIncludePayload(distToKey, n, confidence, options.wantK)
 				: false;

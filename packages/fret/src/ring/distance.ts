@@ -1,14 +1,3 @@
-export function xorDistance(a: Uint8Array, b: Uint8Array): Uint8Array {
-	const len = Math.max(a.length, b.length);
-	const out = new Uint8Array(len);
-	for (let i = 0; i < len; i++) {
-		const ai = a[a.length - 1 - i] ?? 0;
-		const bi = b[b.length - 1 - i] ?? 0;
-		out[len - 1 - i] = ai ^ bi;
-	}
-	return out;
-}
-
 export function lexLess(a: Uint8Array, b: Uint8Array): boolean {
 	const len = Math.max(a.length, b.length);
 	for (let i = 0; i < len; i++) {
@@ -41,7 +30,17 @@ export function clockwiseDistance(a: Uint8Array, b: Uint8Array): Uint8Array {
 	return out;
 }
 
+/**
+ * True ring distance: the shorter of the two arcs between a and b, on a ring of
+ * 2^(8·len).  This is the single distance metric FRET uses — routing, payload
+ * inclusion, and the relevance sparsity model all measure with it, so the
+ * wrap-around point behaves like every other point on the ring.  Maximum value
+ * is 2^(8·len − 1) (half the ring), not 2^(8·len) − 1.
+ */
 export function minDistance(a: Uint8Array, b: Uint8Array): Uint8Array {
-	// For routing we use absolute ring distance via XOR by default
-	return xorDistance(a, b);
+	const cw = clockwiseDistance(a, b);
+	const ccw = clockwiseDistance(b, a);
+	// Both arcs are max(a.length, b.length) bytes wide, so a big-endian byte
+	// compare is a magnitude compare here.
+	return lexLess(ccw, cw) ? ccw : cw;
 }

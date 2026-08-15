@@ -47,6 +47,17 @@ function oneBitFrom(coord: Uint8Array, byte = 31): Uint8Array {
 	return out
 }
 
+/** `coord` moved `delta` steps around the ring (negative = counter-clockwise), mod 2^256. */
+function shiftCoord(coord: Uint8Array, delta: bigint): Uint8Array {
+	const mod = 1n << 256n
+	let v = 0n
+	for (const b of coord) v = (v << 8n) | BigInt(b)
+	v = (((v + delta) % mod) + mod) % mod
+	const out = new Uint8Array(32)
+	for (let i = 31; i >= 0; i--) { out[i] = Number(v & 0xffn); v >>= 8n }
+	return out
+}
+
 /** A coordinate a few ticks off the all-zero vector the bug measured against. */
 function nearZero(value: number): Uint8Array {
 	const out = new Uint8Array(32)
@@ -117,9 +128,18 @@ describe('pickAnchors measures distance from the target coordinate', function ()
 		expect(priv.pickAnchors(['ghost-peer', 'known-peer'], keyCoord)).to.deep.equal(['known-peer'])
 	})
 
-	// NOTE: no equidistant-candidates test — XOR distance to a fixed target is injective, so two
-	// peers with distinct coordinates can never tie. `betterByDist`'s lexicographic id tie-break
-	// in selector/next-hop.ts is unreachable from here; it is exercised by the selector's own spec.
+	it('breaks an equidistant tie by peer id', async () => {
+		// Ring distance is not injective the way XOR was: a peer d clockwise of the key and a
+		// peer d counter-clockwise of it sit at the same arc length. `betterByDist` resolves
+		// that by lexicographic peer id, which is what fret.md prescribes.
+		const keyCoord = await hashKey(u8FromString('pick-anchors-tie', 'utf8'))
+		seedMember(priv, 'zzz-clockwise', shiftCoord(keyCoord, 4096n))
+		seedMember(priv, 'aaa-counter', shiftCoord(keyCoord, -4096n))
+		seedMember(priv, 'far-peer', shiftCoord(keyCoord, 1n << 200n))
+
+		const anchors = priv.pickAnchors(['zzz-clockwise', 'aaa-counter', 'far-peer'], keyCoord)
+		expect(anchors).to.deep.equal(['aaa-counter', 'zzz-clockwise'])
+	})
 })
 
 describe('NearAnchor replies anchor on the key coordinate', function () {

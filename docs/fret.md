@@ -17,7 +17,9 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 - Key coordinate: r(key) = SHA-256(keyBytes) using the same hash family as peers
 - Ring arithmetic: all comparisons are modulo 2^B where B = 256 bits
 - Distance metric: d(a,b) = min(clockwise_distance(a,b), counterclockwise_distance(a,b))
-- Tie-breaking: when equidistant, prefer lexicographic order of peer IDs
+- **One metric, everywhere.** `min(cw, ccw)` (`minDistance`) is the *only* distance function in FRET: neighbor/cohort walks, next-hop selection (both the cost path and the legacy connected-first path), the payload-inclusion heuristic, and the relevance sparsity model all measure with it. The wrap-around point therefore behaves like every other point on the ring — two coordinates straddling it are adjacent, as they should be. A bit-XOR metric is *not* interchangeable here: it treats the identifier space as a bit-tree, so it maximizes exactly where arc length minimizes, and its magnitudes are incommensurable with the ring-circumference-derived thresholds (cluster span, near-radius) they would be compared against. See `test/ring-wrap-distance.spec.ts` for the seam vectors that pin this down.
+- Because it is the *shorter* of the two arcs, ring distance maxes out at 2^(B−1) = 2^255, not 2^256 − 1.
+- Tie-breaking: when equidistant, prefer lexicographic order of peer IDs. Unlike XOR, ring distance is not unique per coordinate — one peer clockwise and one counter-clockwise can sit at the same arc length — so this tie-break is load-bearing, not decorative.
 
 ### Overlay model: Ring with symmetric neighbors and optional fingers
 - Successor set S(p): the next m peers clockwise after p (m = ceil(k/2) by default).
@@ -418,6 +420,7 @@ relevance = base · S(x)
 ```
 
 Notes:
+- `normalized_log_distance` is derived from **ring distance** (`min(cw, ccw)`), not XOR. Since ring distance maxes at 2^255 rather than 2^256 − 1, x tops out at 1 − 1/256 ≈ 0.996; the KDE centers span 0.042–0.958 and x is only ever used as a relative position, so nothing is rescaled to compensate.
 - No explicit buckets or finger tables; a single ordered Digitree plus sparsity-aware scoring yields an emergent, distance-balanced cache well-suited to routing.
 - During a routing walk, temporary (ephemeral) multipliers may bias candidates near the desired step distance, but long-term scores remain governed by S(x).
 

@@ -110,7 +110,7 @@ describe('Seed new peers — selectDiverseSample', function () {
 		// Create near-self peers: set a bit deep in the coordinate (high leading zeros = low x)
 		// normalizedLogDistance: x = 1 - leadingZeros/256, so more leading zeros = lower x
 		for (let i = 1; i <= 10; i++) {
-			// Byte 30 (near LSB) — XOR has ~240 leading zero bits → x ≈ 0.06
+			// Byte 30 (near LSB) — ring distance has ~240 leading zero bits → x ≈ 0.06
 			const coord = new Uint8Array(COORD_BYTES)
 			coord[30] = i
 			store.upsert(`near-${i}`, coord)

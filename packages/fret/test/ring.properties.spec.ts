@@ -1,7 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import fc from 'fast-check'
-import { xorDistance, clockwiseDistance, lexLess } from '../src/ring/distance.js'
+import { minDistance, clockwiseDistance, lexLess } from '../src/ring/distance.js'
 import {
 	coordToHex, hexToCoord,
 	coordToBase64url, base64urlToCoord,
@@ -21,6 +21,13 @@ function isAllZero(u: Uint8Array): boolean {
 	return true
 }
 
+/** 2^255 — half the ring; the largest value a min-arc distance can take. */
+const HALF_RING = (() => {
+	const u = new Uint8Array(COORD_BYTES)
+	u[0] = 0x80
+	return u
+})()
+
 /** Add two 256-bit big-endian unsigned integers mod 2^256 */
 function addMod(a: Uint8Array, b: Uint8Array): Uint8Array {
 	const out = new Uint8Array(COORD_BYTES)
@@ -38,24 +45,39 @@ describe('Ring arithmetic properties', function () {
 
 	const opts = { numRuns: 200 }
 
-	describe('xorDistance', () => {
+	describe('minDistance', () => {
 		it('is symmetric: d(a,b) = d(b,a)', () => {
 			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
-				return bytesEqual(xorDistance(a, b), xorDistance(b, a))
+				return bytesEqual(minDistance(a, b), minDistance(b, a))
 			}), opts)
 		})
 
 		it('self-distance is zero', () => {
 			fc.assert(fc.property(arbCoord, (a) => {
-				return isAllZero(xorDistance(a, a))
+				return isAllZero(minDistance(a, a))
 			}), opts)
 		})
 
 		it('identity of indiscernibles: d(a,b) = 0 iff a = b', () => {
 			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
-				const dist = xorDistance(a, b)
+				const dist = minDistance(a, b)
 				if (isAllZero(dist)) return bytesEqual(a, b)
 				return !bytesEqual(a, b)
+			}), opts)
+		})
+
+		it('never exceeds half the ring (2^255)', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				return !lexLess(HALF_RING, minDistance(a, b))
+			}), opts)
+		})
+
+		it('is the smaller of the two arcs', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				const cw = clockwiseDistance(a, b)
+				const ccw = clockwiseDistance(b, a)
+				const smaller = lexLess(ccw, cw) ? ccw : cw
+				return bytesEqual(minDistance(a, b), smaller)
 			}), opts)
 		})
 	})
