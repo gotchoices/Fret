@@ -33,20 +33,17 @@ export class DedupCache<T> {
 	}
 
 	set(key: string, result: T): void {
-		if (this.entries.size >= this.maxSize) this.evictExpired();
-		if (this.entries.size >= this.maxSize) this.evictOldest();
+		// Refreshing an existing key never grows the map, so it must never trigger eviction.
+		// Deleting first also moves the re-`set` key to the newest Map-iteration-order slot,
+		// so a just-refreshed entry is never mistaken for the oldest.
+		if (this.entries.has(key)) this.entries.delete(key);
+		else if (this.entries.size >= this.maxSize) this.evictOldest();
 		this.entries.set(key, { result, expires: Date.now() + this.ttlMs });
 	}
 
-	private evictExpired(): void {
-		const now = Date.now();
-		for (const [k, v] of this.entries) {
-			if (v.expires < now) this.entries.delete(k);
-		}
-	}
-
 	private evictOldest(): void {
-		// Delete the first (oldest-inserted) entry
+		// Insertion order and expiry order agree (constant ttlMs), so the first (oldest-inserted)
+		// entry is also the one nearest to expiry — evicting it needs no O(n) scan of the map.
 		const first = this.entries.keys().next();
 		if (!first.done) this.entries.delete(first.value);
 	}

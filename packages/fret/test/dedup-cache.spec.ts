@@ -39,4 +39,27 @@ describe('DedupCache', () => {
 		cache.set('k', 'v2')
 		if (cache.get('k') !== 'v2') throw new Error('expected updated value')
 	})
+
+	it('refreshing an existing key at capacity does not evict an unrelated entry', () => {
+		const cache = new DedupCache<number>(30_000, 3)
+		cache.set('a', 1)
+		cache.set('b', 2)
+		cache.set('c', 3)
+		cache.set('a', 11) // overwrite, cache stays "full" but must not evict b or c
+		if (cache.get('a') !== 11) throw new Error('expected refreshed value')
+		if (!cache.has('b')) throw new Error('expected "b" to survive refresh of "a"')
+		if (!cache.has('c')) throw new Error('expected "c" to survive refresh of "a"')
+	})
+
+	it('a refreshed entry is not treated as the oldest for eviction', () => {
+		const cache = new DedupCache<number>(30_000, 3)
+		cache.set('a', 1)
+		cache.set('b', 2)
+		cache.set('c', 3)
+		cache.set('a', 11) // refresh 'a' — it should no longer be "oldest"
+		cache.set('d', 4) // at capacity: must evict 'b' (now oldest), not 'a'
+		if (!cache.has('a')) throw new Error('expected refreshed "a" to survive')
+		if (cache.has('b')) throw new Error('expected "b" to be evicted as oldest')
+		if (!cache.has('d')) throw new Error('expected "d" to be present')
+	})
 })
