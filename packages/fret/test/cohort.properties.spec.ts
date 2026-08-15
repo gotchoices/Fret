@@ -135,6 +135,44 @@ describe('Cohort assembly properties', function () {
 			}), opts)
 		})
 
+		it('exclusion does not under-fill: size = min(wants, n − |exclude|)', () => {
+			// Generalized guard for the whole under-fill class: whatever the caller excludes,
+			// the walk must keep going until it has `wants` admissible ids or the ring is dry.
+			fc.assert(fc.property(
+				arbPeerSet, arbCoord,
+				fc.integer({ min: 1, max: 30 }),
+				fc.integer({ min: 0, max: 30 }),
+				(peers, coord, wants, excludeCount) => {
+					const store = seedStore(peers)
+					const exclude = new Set(peers.slice(0, excludeCount).map((p) => p.id))
+					const cohort = assembleCohort(store, coord, wants, exclude)
+					if (cohort.some((id) => exclude.has(id))) return false
+					return cohort.length === Math.min(wants, peers.length - exclude.size)
+				}
+			), opts)
+		})
+
+		it('exclusions wider than the over-fetch window still fill', () => {
+			// Regression: the walk over-fetches a fixed multiple of `wants`. If the caller's
+			// exclusions blanket that whole window, a fixed multiple returns nothing even
+			// though the ring is full — the over-fetch must widen by the exclusion count.
+			const store = new DigitreeStore()
+			for (let i = 0; i < 100; i++) {
+				const coord = new Uint8Array(COORD_BYTES)
+				coord[30] = i
+				store.upsert(`p${i}`, coord)
+			}
+			const query = new Uint8Array(COORD_BYTES)
+			const wants = 2
+			const exclude = new Set([
+				...store.neighborsRight(query, wants * 2),
+				...store.neighborsLeft(query, wants * 2),
+			])
+			const cohort = assembleCohort(store, query, wants, exclude)
+			expect(cohort).to.have.length(wants)
+			expect(cohort.some((id) => exclude.has(id))).to.equal(false)
+		})
+
 		it('is deterministic: same inputs → same result', () => {
 			fc.assert(fc.property(arbPeerSet, arbCoord, fc.integer({ min: 1, max: 20 }), (peers, coord, wants) => {
 				const store1 = seedStore(peers)

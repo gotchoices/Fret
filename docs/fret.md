@@ -372,24 +372,33 @@ Notes:
 #### Cohort assembly algorithm
 ```
 function assembleCohort(key, wants, excludeSet):
-  succ = findSuccessor(key)
-  pred = findPredecessor(key)
+  # Over-fetch both walks: `wants * 2` so the two walks overlapping on a small ring still
+  # yield `wants` distinct ids, `+ |excludeSet|` so exclusions blanketing one walk's window
+  # don't starve it. Each walk is capped at the ring size, so an over-large ask just
+  # returns every entry.
+  reach = wants * 2 + excludeSet.size
+  succs = neighborsRight(key, reach)   # distinct, ordered clockwise
+  preds = neighborsLeft(key, reach)    # distinct, ordered counterclockwise
   cohort = []
-  i = 0
-  while cohort.size < wants and (succ or pred):
-    if i % 2 == 0 and succ and succ not in excludeSet:
-      cohort.add(succ)
-      succ = successor(succ)
-    elif pred and pred not in excludeSet:
-      cohort.add(pred)
-      pred = predecessor(pred)
-    i++
-  return cohort
+  seen = {}
+  while cohort.size < wants and (succs or preds remain):
+    # Alternate sides on cohort size; a skipped candidate does not advance the alternation,
+    # so the same side is re-drawn until it yields an admissible id.
+    take = (cohort.size % 2 == 0 and succs remain) ? next(succs) : next(preds)
+    if take not in excludeSet and take not in seen:
+      seen.add(take); cohort.add(take)
+  return cohort   # distinct by construction — never dedup or truncate afterwards
 
 function isInCluster(self, key, k):
   cohort = assembleCohort(key, k, {})
   return self in cohort
 ```
+
+Exclusions must be passed **into** the assembly, never applied to its result: filtering the
+returned array shrinks the cohort below `wants` even when the ring holds enough admissible
+peers. The same rule covers the routing-candidate path, where the exclusion set is the
+breadcrumb trail plus self — a long trail would otherwise dead-end a route that still had
+usable next hops.
 
 ### Wire formats
 

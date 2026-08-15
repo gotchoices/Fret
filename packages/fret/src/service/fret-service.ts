@@ -1158,15 +1158,6 @@ export class FretService implements IFretService, Startable {
 		return Array.from(new Set(ids)).slice(0, wants);
 	}
 
-	private nextSuccessor(cur: PeerEntry, arr: PeerEntry[]): PeerEntry | undefined {
-		const idx = arr.findIndex((e) => e.id === cur.id);
-		return arr[(idx + 1) % arr.length];
-	}
-	private nextPredecessor(cur: PeerEntry, arr: PeerEntry[]): PeerEntry | undefined {
-		const idx = arr.findIndex((e) => e.id === cur.id);
-		return arr[(idx - 1 + arr.length) % arr.length];
-	}
-
 	assembleCohort(hashedCoord: Uint8Array, wants: number, exclude?: Set<string>): string[] {
 		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude, isMember);
 	}
@@ -1249,7 +1240,6 @@ export class FretService implements IFretService, Startable {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 		const coord = await hashKey(keyBytes);
 		const selfId = this.node.peerId.toString();
-		const selfCoord = await this.selfCoord();
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, isMember);
 
 		// In-cluster test
@@ -1271,9 +1261,11 @@ export class FretService implements IFretService, Startable {
 
 		// Not in-cluster: forward if TTL allows
 		if (msg.ttl > 0) {
+			// Exclusions go *into* the walk: post-filtering a sized cohort shrinks it below the
+			// requested count, so a long breadcrumb trail would dead-end routing while the ring
+			// still held usable next hops.
 			const exclude = new Set([...(msg.breadcrumbs ?? []), selfId]);
-			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m))
-				.filter((id) => !exclude.has(id));
+			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude);
 
 			const hopOpts = this.buildNextHopOptions(n, confidence);
 			const linkQ = (id: string) => this.linkQuality(id);
@@ -1539,7 +1531,7 @@ export class FretService implements IFretService, Startable {
 			const exclude = new Set([selfId]);
 			const candidates = bestAnchors.length > 0
 				? bestAnchors.filter((id) => !exclude.has(id))
-				: this.assembleCohort(coord, Math.max(4, this.cfg.m)).filter((id) => !exclude.has(id));
+				: this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude);
 
 			if (candidates.length === 0) {
 				yield { type: 'exhausted', hop };
