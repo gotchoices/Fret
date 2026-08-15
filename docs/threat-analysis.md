@@ -403,7 +403,7 @@ Predictable correlation IDs enable:
 #### 5.5 Serialized Routing Table Tampering
 **Severity: Medium**
 
-`exportTable`/`importTable` (`fret-service.ts:1347-1360`) produce/consume JSON with no integrity protection. If the serialized table is stored on disk or transmitted, it can be tampered with:
+`exportTable`/`importTable` (`fret-service.ts`, the routing-table persistence pair at the end of the class) produce/consume JSON with no integrity protection. If the serialized table is stored on disk or transmitted, it can be tampered with:
 
 - Modify relevance scores to promote attacker-controlled peers
 - Insert fabricated peer entries with chosen coordinates

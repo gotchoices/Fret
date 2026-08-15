@@ -322,7 +322,11 @@ export class FretService implements IFretService, Startable {
 		// can no longer squat in a protected slot, so with relevance ~0 it becomes a
 		// preferred eviction victim — exactly what we want.
 		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isMember);
-		// Evict the lowest relevance non-protected entries until under cap
+		// Evict the lowest relevance non-protected entries until under cap.
+		// NOTE: lists and fully sorts the store to drop a handful of entries. Only reachable once
+		// the table is at capacity, so it is a no-op in the common case; if a ring settles at cap
+		// under steady churn this runs on every merge/seed, and a bounded selection of the few
+		// lowest-relevance entries would replace the full sort.
 		const entries = this.store.list();
 		entries.sort((a, b) => a.relevance - b.relevance);
 		for (const e of entries) {

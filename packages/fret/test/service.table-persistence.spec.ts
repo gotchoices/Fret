@@ -119,3 +119,51 @@ describe('FretService routing-table import', function () {
 		expect(entryFor(svc, selfId).membership).to.equal('member')
 	})
 })
+
+describe('FretService routing-table import before start()', function () {
+	this.timeout(30000)
+
+	// `enforceCapacity` protects up to `m` member neighbors on each side of self, so CAPACITY
+	// must exceed 2m for eviction to be able to reach the cap at all.
+	const M = 8
+	const CAPACITY = 20
+	const OVERSIZED = 40
+
+	let node: Libp2p
+	let svc: FretService
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Deliberately *not* started: `start()` is what hashes and caches self's ring coordinate,
+		// and capacity enforcement needs that coordinate to know which neighbors to protect.
+		svc = new FretService(node, { networkName: NETWORK, capacity: CAPACITY, m: M })
+	})
+
+	afterEach(async () => {
+		try { await svc.stop() } catch { /* never started */ }
+		try { await node.stop() } catch { /* already stopped */ }
+	})
+
+	it('enforces capacity on a bulk import that runs before the self coordinate is cached', async () => {
+		// Relevance ascending with the coordinate so the survivors are identifiable: eviction
+		// takes the lowest-relevance non-protected entries first.
+		const oversized = Array.from({ length: OVERSIZED }, (_, i) =>
+			serializedPeer(`peer-${i}`, i, { relevance: i })
+		)
+
+		const stored = await svc.importTable(tableOf(oversized))
+
+		expect(stored, 'every record accepted by the store').to.equal(OVERSIZED)
+		// The regression this pins: enforcement used to read the not-yet-hashed self coordinate
+		// and return early, leaving all 40 entries in a table capped at 20.
+		expect(svc.getStore().size(), 'trimmed to the configured capacity').to.equal(CAPACITY)
+		// Trimming is by relevance, not arbitrary. Self's coordinate is a hash, so *which* peers
+		// land in the protected neighbor window is not predictable — but that window holds at
+		// most 2m ids, so the CAPACITY - 2m highest-relevance peers survive on relevance alone
+		// whatever it contains.
+		const survivors = svc.exportTable().entries.map((e) => e.id)
+		const alwaysKept = Array.from({ length: CAPACITY - 2 * M }, (_, i) => `peer-${OVERSIZED - 1 - i}`)
+		for (const id of alwaysKept) expect(survivors, `${id} kept on relevance`).to.include(id)
+	})
+})
