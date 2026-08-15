@@ -68,7 +68,14 @@ export function computeNearRadius(
 
 	const span = BigInt(k) * (RING_SIZE / BigInt(Math.max(1, Math.round(sizeEstimate))));
 	let val = span * BigInt(beta);
-	// Clamp to ring size
+	// Clamp to ring size.
+	// NOTE: ring distance never exceeds half the ring (2^255), so once n_est drops
+	// below ~2·β·k (≈60 at the defaults) the radius covers every possible distance
+	// and the selector's cost path treats all candidates as near — pure strict
+	// distance, no connected-first bias.  That is the right reading for a network
+	// that small (the cluster really is a quarter of the ring), and it is what the
+	// XOR metric did too, so it is not a regression.  If profiles ever want the
+	// connection bias back on small rings, cap at 2^255 and scale β instead.
 	if (val >= RING_SIZE) val = RING_SIZE - 1n;
 
 	for (let i = 31; i >= 0; i--) {

@@ -1,7 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import fc from 'fast-check'
-import { minDistance, clockwiseDistance, lexLess } from '../src/ring/distance.js'
+import { minDistance, clockwiseDistance, lexLess, normalizedLogMagnitude } from '../src/ring/distance.js'
 import {
 	coordToHex, hexToCoord,
 	coordToBase64url, base64urlToCoord,
@@ -38,6 +38,31 @@ function addMod(a: Uint8Array, b: Uint8Array): Uint8Array {
 		carry = s >> 8
 	}
 	return out
+}
+
+const RING = 1n << BigInt(COORD_BYTES * 8)
+
+function toBigInt(u: Uint8Array): bigint {
+	let v = 0n
+	for (const b of u) v = (v << 8n) | BigInt(b)
+	return v
+}
+
+function toCoord(v: bigint): Uint8Array {
+	let x = ((v % RING) + RING) % RING
+	const out = new Uint8Array(COORD_BYTES)
+	for (let i = COORD_BYTES - 1; i >= 0; i--) { out[i] = Number(x & 0xffn); x >>= 8n }
+	return out
+}
+
+/**
+ * Independent BigInt oracle for the ring metric — deliberately shares no code
+ * with `src/ring/distance.ts`, so a bug in `clockwiseDistance` or `lexLess`
+ * cannot hide behind a test that re-derives the answer from the same helpers.
+ */
+function refMinDistance(a: Uint8Array, b: Uint8Array): bigint {
+	const cw = (toBigInt(b) - toBigInt(a) + RING) % RING
+	return cw <= RING - cw ? cw : RING - cw
 }
 
 describe('Ring arithmetic properties', function () {
@@ -78,6 +103,27 @@ describe('Ring arithmetic properties', function () {
 				const ccw = clockwiseDistance(b, a)
 				const smaller = lexLess(ccw, cw) ? ccw : cw
 				return bytesEqual(minDistance(a, b), smaller)
+			}), opts)
+		})
+
+		it('matches an independent BigInt reference', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				return toBigInt(minDistance(a, b)) === refMinDistance(a, b)
+			}), opts)
+		})
+
+		it('satisfies the triangle inequality: d(a,c) ≤ d(a,b) + d(b,c)', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, arbCoord, (a, b, c) => {
+				return toBigInt(minDistance(a, c))
+					<= toBigInt(minDistance(a, b)) + toBigInt(minDistance(b, c))
+			}), opts)
+		})
+
+		it('is exactly half the ring at the antipode, from both directions', () => {
+			fc.assert(fc.property(arbCoord, (a) => {
+				const anti = toCoord(toBigInt(a) + (RING >> 1n))
+				return bytesEqual(minDistance(a, anti), HALF_RING)
+					&& bytesEqual(minDistance(anti, a), HALF_RING)
 			}), opts)
 		})
 	})
@@ -133,6 +179,60 @@ describe('Ring arithmetic properties', function () {
 			fc.assert(fc.property(arbCoord, arbCoord, arbCoord, (a, b, c) => {
 				if (lexLess(a, b) && lexLess(b, c)) return lexLess(a, c)
 				return true
+			}), opts)
+		})
+
+		// Right-alignment: a short operand is the smaller-width integer it looks
+		// like, not that integer scaled up by the missing bytes.  A left-aligned
+		// compare reads [0x01] as 2^248 and calls it larger than a full-width 2.
+		it('treats a shorter operand as zero-padded on the left', () => {
+			fc.assert(fc.property(
+				fc.uint8Array({ minLength: 1, maxLength: COORD_BYTES }),
+				fc.uint8Array({ minLength: 1, maxLength: COORD_BYTES }),
+				(a, b) => {
+					const pad = (u: Uint8Array) => {
+						const out = new Uint8Array(COORD_BYTES)
+						out.set(u, COORD_BYTES - u.length)
+						return out
+					}
+					return lexLess(a, b) === lexLess(pad(a), pad(b))
+				}
+			), opts)
+		})
+
+		it('orders a short operand against a wide one by magnitude', () => {
+			expect(lexLess(new Uint8Array([0x01]), toCoord(2n))).to.equal(true)
+			expect(lexLess(toCoord(2n), new Uint8Array([0x01]))).to.equal(false)
+		})
+	})
+
+	describe('normalizedLogMagnitude', () => {
+		it('is 0 for a zero distance and 1 at the antipode', () => {
+			expect(normalizedLogMagnitude(new Uint8Array(COORD_BYTES))).to.equal(0)
+			expect(normalizedLogMagnitude(HALF_RING)).to.equal(1)
+		})
+
+		it('stays within [0,1] for every ring distance', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				const x = normalizedLogMagnitude(minDistance(a, b))
+				return x >= 0 && x <= 1
+			}), opts)
+		})
+
+		// Only the antipode sets the top bit, so every other pair is capped a
+		// step below 1 — the claim docs/fret.md makes about the KDE's x axis.
+		it('caps below 1 for every non-antipodal pair', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				const d = minDistance(a, b)
+				if (bytesEqual(d, HALF_RING)) return true
+				return normalizedLogMagnitude(d) <= 1 - 1 / 256
+			}), opts)
+		})
+
+		it('is monotone non-decreasing in magnitude', () => {
+			fc.assert(fc.property(arbCoord, arbCoord, (a, b) => {
+				const [lo, hi] = lexLess(b, a) ? [b, a] : [a, b]
+				return normalizedLogMagnitude(lo!) <= normalizedLogMagnitude(hi!)
 			}), opts)
 		})
 	})

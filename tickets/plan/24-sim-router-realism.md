@@ -16,3 +16,11 @@ Design direction:
 The plan agent should decide how far to push the local-knowledge routing model versus standing up a real-instance tier, and set realistic churn/success thresholds for each.
 
 References: review.html:448-452 "Sim routing is oracle-assisted; churn under-delivers"; fret-sim.ts routing filter (~586-594) and churn init (~213-223).
+
+### Arm: the simulation cannot detect a change of distance metric
+
+Added by the review of `consolidate-ring-distance`, as evidence for the "oracle-assisted routing" point above rather than as a separate concern.
+
+That change replaced the distance function behind *every* next-hop decision, the payload-inclusion heuristic, and the relevance model. The full suite stayed green and the churn scenario still reported 90% routing success over 20 attempts — but neither result is evidence, because nothing under `packages/fret/test/simulation/` imports the production distance function or the production hop selector (`grep -L` for `minDistance|chooseNextHop|clockwiseDistance` over that directory returns every file). The simulator reimplements hop choice against its own global view, so it would have reported the same success rate had the metric been left broken.
+
+What this means for the direction already sketched above: the "restrict routing to local store knowledge" work should route through the *shipped* `chooseNextHop` rather than a sim-local equivalent, otherwise the harness can be made realistic and still not guard the code it exists to guard. Concretely, the property worth having is a routing-success and hop-count measurement over a seeded ring that a metric or selector regression would visibly move — today no such number exists at any scale.

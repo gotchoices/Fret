@@ -1,5 +1,5 @@
 import type { DigitreeStore } from '../store/digitree-store.js'
-import { minDistance, lexLess } from '../ring/distance.js'
+import { minDistance, lexLess, normalizedLogMagnitude } from '../ring/distance.js'
 
 export type LinkQuality = (id: string) => number; // [0..1]
 export type IsConnected = (id: string) => boolean;
@@ -24,10 +24,9 @@ function leadingByteIndex(u8: Uint8Array): number {
 	return Number.POSITIVE_INFINITY;
 }
 
+/** Magnitude equality, right-aligned to match `lexLess`. */
 function equalBytes(a: Uint8Array, b: Uint8Array): boolean {
-	if (a.length !== b.length) return false;
-	for (let i = 0; i < a.length; i++) if (a[i] !== b[i]) return false;
-	return true;
+	return !lexLess(a, b) && !lexLess(b, a);
 }
 
 function betterByDist(idA: string, distA: Uint8Array, idB: string, distB: Uint8Array): boolean {
@@ -71,23 +70,6 @@ function weightsForContext(near: boolean, confidence: number): CostWeights {
 	wConn = Math.max(0.05, wConn - cAdj);
 
 	return { wD, wConn, wQ, wB };
-}
-
-function normalizeDistance(dist: Uint8Array): number {
-	// Count leading zero bits for fine-grained log-distance [0,1]
-	// 0 = identical (distance zero); larger = farther.  Ring distance tops out at
-	// half the ring (2^255), so the practical maximum here is 1 − 1/256, not 1.
-	// Only relative ordering matters, so the unused top step costs nothing.
-	let lzBits = 0;
-	for (let i = 0; i < dist.length; i++) {
-		const v = dist[i]!;
-		if (v === 0) { lzBits += 8; continue; }
-		lzBits += Math.clz32(v) - 24; // clz32 counts for 32-bit; subtract 24 for byte
-		break;
-	}
-	const totalBits = dist.length * 8;
-	if (lzBits >= totalBits) return 0;
-	return Math.max(0, Math.min(1, 1 - lzBits / totalBits));
 }
 
 function cost(
@@ -159,7 +141,7 @@ function chooseNextHopCost(
 		const near = isNear(dist, nearRadius);
 		const connected = isConnected(id);
 		const w = weightsForContext(near, confidence);
-		const costVal = cost(normalizeDistance(dist), connected, linkQ(id), backoff(id), w);
+		const costVal = cost(normalizedLogMagnitude(dist), connected, linkQ(id), backoff(id), w);
 		scored.push({ id, dist, near, connected, costVal });
 	}
 

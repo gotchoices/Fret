@@ -420,7 +420,7 @@ relevance = base · S(x)
 ```
 
 Notes:
-- `normalized_log_distance` is derived from **ring distance** (`min(cw, ccw)`), not XOR. Since ring distance maxes at 2^255 rather than 2^256 − 1, x tops out at 1 − 1/256 ≈ 0.996; the KDE centers span 0.042–0.958 and x is only ever used as a relative position, so nothing is rescaled to compensate.
+- `normalized_log_distance` is derived from **ring distance** (`min(cw, ccw)`), not XOR — the same `normalizedLogMagnitude` helper the next-hop cost function uses, so "near" means the same thing to routing and to the KDE. Since ring distance maxes at 2^255, x reaches 1 only for a pair sitting exactly antipodal; every other pair lands at 1 − 1/256 ≈ 0.996 or below. The KDE centers span 0.042–0.958 and x is only ever used as a relative position, so nothing is rescaled to compensate.
 - No explicit buckets or finger tables; a single ordered Digitree plus sparsity-aware scoring yields an emergent, distance-balanced cache well-suited to routing.
 - During a routing walk, temporary (ephemeral) multipliers may bias candidates near the desired step distance, but long-term scores remain governed by S(x).
 

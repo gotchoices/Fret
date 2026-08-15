@@ -1,5 +1,5 @@
 import type { PeerEntry } from './digitree-store.js';
-import { minDistance } from '../ring/distance.js';
+import { minDistance, normalizedLogMagnitude } from '../ring/distance.js';
 
 export interface SparsityModel {
 	centers: number[];
@@ -27,24 +27,12 @@ export function createSparsityModel(
 }
 
 /**
- * Normalized log ring distance ∈ [0,1] — 0 = coincident, larger = farther.
- * Derived from `minDistance`, which tops out at half the ring (2^255), so the
- * practical maximum is 1 − 1/256 rather than 1.  The value only feeds the KDE
- * as a relative position, so the unused top step needs no rescaling.
+ * The KDE's x axis: normalized log ring distance ∈ [0,1] — 0 = coincident,
+ * larger = farther.  Measured with `minDistance`, the same metric routing uses,
+ * so a peer that routing calls near is near here too.
  */
 export function normalizedLogDistance(selfCoord: Uint8Array, otherCoord: Uint8Array): number {
-	const d = minDistance(selfCoord, otherCoord);
-	let lz = 0;
-	for (let i = 0; i < d.length; i++) {
-		const v = d[i] ?? 0;
-		if (v === 0) { lz += 8; continue; }
-		// leading zeros in a byte: 7 - floor(log2(v))
-		const leading = 7 - Math.floor(Math.log2(v));
-		lz += leading;
-		break;
-	}
-	const x = 1 - Math.min(256, lz) / 256;
-	return x;
+	return normalizedLogMagnitude(minDistance(selfCoord, otherCoord));
 }
 
 function gaussianKernel(dx: number, sigma: number): number {
