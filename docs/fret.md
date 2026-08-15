@@ -280,8 +280,10 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Startable service; registrar handle/unhandle; capabilities/dependencies.
   - `stop()` is a strict mirror of `start()`: it bumps the run generation, clears the loop
     timers, detaches node listeners, `unhandle`s all five protocols, then sends leave notices
-    (unhandle only removes *inbound* handlers, so outbound leaves still go out). `start()` is
-    guarded against re-entry and resets run-scoped flags, so start→stop→start is safe.
+    (unhandle only removes *inbound* handlers, so outbound leaves still go out). Both are
+    idempotent: `start()` is guarded against re-entry and resets run-scoped flags, and `stop()`
+    returns immediately unless a run is in progress, so start→stop→start is safe and a repeated
+    `stop()` does not re-send the leave fan-out to peers already told goodbye.
   - **Run generation.** Background loops (stabilization, active preconnect) capture the run
     generation when armed and exit — rather than rescheduling — once it no longer matches.
     A boolean "am I running" flag cannot do this: `stop()` clears it but cannot cancel a timer

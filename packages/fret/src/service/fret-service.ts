@@ -396,6 +396,10 @@ export class FretService implements IFretService, Startable {
 	}
 
 	async stop(): Promise<void> {
+		// Idempotent, mirroring start(): a second stop() — or one on a service that was
+		// never started — must not re-run the leave fan-out to peers we already said
+		// goodbye to. (Specs routinely stop a service and then stop it again in afterEach.)
+		if (!this.started) return;
 		// Mark stopped first so in-flight event handlers and announce loops quiesce
 		// before we tear down: opening a stream on a connection that is concurrently
 		// closing triggers an uncaught StreamStateError from yamux's window-update
@@ -477,6 +481,11 @@ export class FretService implements IFretService, Startable {
 		} catch (err) {
 			// A failed registration leaves the service degraded but running; it must not
 			// escape as an unhandled rejection (which is process-fatal under Node's default).
+			// NOTE: log-and-continue means a registrar failure yields a service that looks
+			// started but answers nothing, with no signal to the caller. Acceptable while the
+			// only realistic failure is duplicate registration (start() already guards that);
+			// revisit if a registrar failure is ever observed in practice, at which point
+			// start() should surface a degraded state rather than a silent one.
 			log.error('registerRpcHandlers failed - %e', err);
 		}
 	}
@@ -487,6 +496,9 @@ export class FretService implements IFretService, Startable {
 			await this.node.unhandle(Object.values(this.protocols));
 		} catch (err) {
 			// The node itself may already be stopping; a failed unhandle is not fatal to shutdown.
+			// NOTE: a failure for any *other* reason leaves a stopped service still answering.
+			// Not distinguished today because libp2p's registrar unhandle is a map delete that
+			// does not throw; revisit if a libp2p version makes it fallible.
 			log.error('unregisterRpcHandlers failed - %e', err);
 		}
 	}
@@ -648,7 +660,7 @@ export class FretService implements IFretService, Startable {
 			if (this.stopped || gen !== this.runGen) { release(); return; }
 			this.preconnectTimer = setTimeout(tick, 1000);
 		};
-		void tick();
+		this.detach(tick(), 'active preconnect loop');
 	}
 
 	private computeReplacements(selfCoord: Uint8Array, spNeighborIds: Set<string>, selfStr: string): string[] {
@@ -960,7 +972,7 @@ export class FretService implements IFretService, Startable {
 				}
 			}
 		};
-		void tick();
+		this.detach(tick(), 'stabilization loop');
 	}
 
 	private async seedFromBootstraps(): Promise<void> {

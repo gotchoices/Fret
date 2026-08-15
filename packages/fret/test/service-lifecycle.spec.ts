@@ -3,19 +3,15 @@ import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
 import { createMemNode } from './helpers/libp2p.js'
 import { FretService } from '../src/service/fret-service.js'
-import { makeProtocols } from '../src/rpc/protocols.js'
-
-// @types/node is not a dependency of this package; declare only the surface this spec needs.
-declare const process: {
-	on(event: 'unhandledRejection', listener: (reason: unknown) => void): void
-	off(event: 'unhandledRejection', listener: (reason: unknown) => void): void
-}
+import { makeProtocols, isUnsupportedProtocolError } from '../src/rpc/protocols.js'
+import { sendPing } from '../src/rpc/ping.js'
 
 const NETWORK = 'lifecycle-test'
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
+const PROTOCOLS = makeProtocols(NETWORK)
 /** Protocols this service registers, so assertions ignore libp2p's own handlers. */
-const ours = Object.values(makeProtocols(NETWORK))
+const ours = Object.values(PROTOCOLS)
 
 function fretProtocols(node: Libp2p): string[] {
 	return node.getProtocols().filter((p) => ours.includes(p))
@@ -146,5 +142,62 @@ describe('FretService start/stop lifecycle', function () {
 		expect(armed(), 'repeated setMode does not arm a second loop').to.equal(gen)
 		await svc.stop()
 		expect(armed(), 'loop released on stop').to.equal(-1)
+	})
+
+	it('stops answering namespaced RPCs after stop(), not merely deregistering them', async () => {
+		// getProtocols() going empty is the registrar's view; a peer holding an open
+		// connection is the view that matters, so assert from the far side of the wire.
+		const peer = await createMemNode()
+		await peer.start()
+		try {
+			await peer.dial(node.getMultiaddrs()[0]!)
+			await svc.start()
+			const live = await sendPing(peer, node.peerId.toString(), PROTOCOLS.PROTOCOL_PING)
+			expect(live.ok, 'ping answered while running').to.equal(true)
+
+			await svc.stop()
+			let failure: unknown
+			try {
+				await sendPing(peer, node.peerId.toString(), PROTOCOLS.PROTOCOL_PING)
+			} catch (err) { failure = err }
+			expect(failure, 'ping after stop must not be answered').to.not.equal(undefined)
+			expect(isUnsupportedProtocolError(failure), `unexpected error: ${String(failure)}`).to.equal(true)
+		} finally {
+			await peer.stop()
+		}
+	})
+
+	it('does not re-arm the stabilization timer when stop() lands mid-tick', async () => {
+		// Exercises the *second* generation guard — the one after the tick's awaits, which
+		// the cadence specs above cannot reach (they only cover the guard at the top of the
+		// tick). Assert on the timer handle, not on tick counts: a tick armed after stop()
+		// still short-circuits at the top guard, so the count stays 0 either way.
+		let unpark: (() => void) | undefined
+		const parked = new Promise<void>((tickEntered) => {
+			;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {
+				tickEntered()
+				await new Promise<void>((resume) => { unpark = resume })
+			}
+		})
+		const timer = () => (svc as unknown as { stabilizeTimer: unknown }).stabilizeTimer
+
+		await svc.start()
+		await parked
+		await svc.stop()
+		expect(timer(), 'timer cleared by stop()').to.equal(null)
+
+		unpark!()
+		await delay(50)
+		expect(timer(), 'interrupted tick must not re-arm the timer').to.equal(null)
+	})
+
+	it('double stop() does not repeat the shutdown work', async () => {
+		let leaves = 0
+		;(svc as unknown as { sendLeaveToNeighbors: () => Promise<void> }).sendLeaveToNeighbors = async () => { leaves++ }
+
+		await svc.start()
+		await svc.stop()
+		await svc.stop()
+		expect(leaves, 'leave fan-out runs once per started run').to.equal(1)
 	})
 })
