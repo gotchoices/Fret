@@ -1594,7 +1594,7 @@ export class FretService implements IFretService, Startable {
 		const coord = await hashKey(keyBytes);
 		const right = this.getNeighbors(coord, 'right', this.cfg.m);
 		const left = this.getNeighbors(coord, 'left', this.cfg.m);
-		const anchors = this.pickAnchors([...right.slice(0, 3), ...left.slice(0, 3)]);
+		const anchors = this.pickAnchors([...right.slice(0, 3), ...left.slice(0, 3)], coord);
 		return {
 			v: 1,
 			anchors,
@@ -1637,16 +1637,13 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	private pickAnchors(candidates: string[]): string[] {
+	private pickAnchors(candidates: string[], targetCoord: Uint8Array): string[] {
 		const unique = Array.from(new Set(candidates));
 		if (unique.length === 0) return [];
 		const linkQ = (_id: string) => 0.5; // neutral until reputation is enabled
-		// Without a specific target here, prefer connected-first by using self coord as proxy
-		// Compute self coord once
-		const selfCoord = new Uint8Array(32);
-		const first = chooseNextHop(this.store, selfCoord, unique, (id) => this.isConnected(id), linkQ);
+		const first = chooseNextHop(this.store, targetCoord, unique, (id) => this.isConnected(id), linkQ);
 		const rest = unique.filter((id) => id !== first);
-		const second = chooseNextHop(this.store, selfCoord, rest, (id) => this.isConnected(id), linkQ);
+		const second = chooseNextHop(this.store, targetCoord, rest, (id) => this.isConnected(id), linkQ);
 		return [first, second].filter((x): x is string => Boolean(x));
 	}
 
@@ -1727,7 +1724,7 @@ export class FretService implements IFretService, Startable {
 	private buildNearAnchor(coord: Uint8Array, n: number, confidence: number): NearAnchorV1 {
 		const right = this.getNeighbors(coord, 'right', this.cfg.m);
 		const left = this.getNeighbors(coord, 'left', this.cfg.m);
-		const anchors = this.pickAnchors([...right.slice(0, 4), ...left.slice(0, 4)]);
+		const anchors = this.pickAnchors([...right.slice(0, 4), ...left.slice(0, 4)], coord);
 		return {
 			v: 1,
 			anchors,
