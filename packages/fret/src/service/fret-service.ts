@@ -732,12 +732,28 @@ export class FretService implements IFretService, Startable {
 		this.dedupCache.set(this.dedupKey(msg), result);
 	}
 
+	/**
+	 * Static, zero-computation rejection for messages that fail a cheap validity check
+	 * (breadcrumb loop, stale/future timestamp, expired TTL, oversized payload). Deliberately
+	 * *not* {@link nearAnchorOnly} — that call still hashes the key and walks the ring twice,
+	 * which is exactly the per-message cost the rate limit below exists to bound, so a flood of
+	 * trivially-invalid messages must not be able to force it.
+	 */
+	private staticReject(): NearAnchorV1 {
+		return { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 };
+	}
+
 	private async handleMaybeAct(
 		msg: RouteAndMaybeActV1
 	): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }> {
+		// Rate limit first, before any per-message computation: otherwise a flood of messages
+		// that all fail a cheap validity check below (loop/stale/expired-TTL/oversized) would
+		// never reach this check and the bucket would bound nothing.
+		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
+
 		// Breadcrumb loop detection: reject if self already visited
 		const selfId = this.node.peerId.toString();
-		if (msg.breadcrumbs?.includes(selfId)) return await this.nearAnchorOnly(msg);
+		if (msg.breadcrumbs?.includes(selfId)) return this.staticReject();
 
 		// Correlation-ID dedup: return cached result if seen before
 		if (msg.correlation_id) {
@@ -752,13 +768,12 @@ export class FretService implements IFretService, Startable {
 		// needs diagnosing in the field, record the observed offset here rather than a bare tally.
 		if (!validateTimestamp(msg.timestamp)) {
 			this.diag.rejected.timestampBounds++;
-			return await this.nearAnchorOnly(msg);
+			return this.staticReject();
 		}
 
 		// Quick guards
-		if (msg.ttl <= 0) { this.diag.rejected.ttlExpired++; return await this.nearAnchorOnly(msg); }
-		if (msg.activity && msg.activity.length > 128 * 1024) { this.diag.rejected.payloadTooLarge++; return await this.nearAnchorOnly(msg); }
-		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
+		if (msg.ttl <= 0) { this.diag.rejected.ttlExpired++; return this.staticReject(); }
+		if (msg.activity && msg.activity.length > 128 * 1024) { this.diag.rejected.payloadTooLarge++; return this.staticReject(); }
 		const limit = this.cfg.profile === 'core' ? 16 : 4;
 		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 		this.inflightAct++;
@@ -1590,16 +1605,16 @@ export class FretService implements IFretService, Startable {
 
 	// Routing
 	/**
-	 * The reject-path reply (breadcrumb loop, TTL expired, oversized payload, routeAct threw):
-	 * deliberately the cheaper twin of `buildNearAnchor` — narrower cohort hint, and no size
-	 * estimate computed — because these guards answer *before* the maybeAct token bucket, so
-	 * their cost is what an abusive sender gets for free. Anchors are still measured against
-	 * the key coordinate; both twins must stay that way (see `test/pick-anchors.spec.ts`).
+	 * Fallback reply used only when `routeAct` throws unexpectedly, after the rate-limit token
+	 * has already been taken and real routing work was attempted. The cheap validity guards
+	 * (breadcrumb loop, timestamp, TTL, oversized payload) use {@link staticReject} instead —
+	 * they run pre-bucket-adjacent and must not force a key hash plus two ring walks on every
+	 * trivially-invalid message. Anchors here are still measured against the key coordinate,
+	 * same as `buildNearAnchor` (see `test/pick-anchors.spec.ts`).
 	 *
 	 * NOTE: `estimated_cluster_size` / `confidence` are placeholders here — no consumer reads
 	 * either field today. If one starts to, this must report the real estimate
-	 * (`estimateSizeAndConfidence`) rather than the configured k and a flat 0.5, and the extra
-	 * per-message cost on the pre-bucket path has to be weighed at that point.
+	 * (`estimateSizeAndConfidence`) rather than the configured k and a flat 0.5.
 	 */
 	private async nearAnchorOnly(msg: RouteAndMaybeActV1): Promise<NearAnchorV1> {
 		const keyBytes = u8FromString(msg.key, 'base64url');

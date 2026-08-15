@@ -186,7 +186,7 @@ describe('Payload bounds and TTL validation', function () {
 			}
 
 			const result = await (svc as any).handleMaybeAct(msg)
-			// Should return a NearAnchor (rejected via nearAnchorOnly)
+			// Should return a NearAnchor-shaped static rejection (no ring walk performed)
 			expect(result).to.have.property('anchors')
 
 			const diag = svc.getDiagnostics()

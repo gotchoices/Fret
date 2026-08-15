@@ -22,6 +22,7 @@ interface AnchorInternals {
 	store: DigitreeStore
 	pickAnchors(candidates: string[], targetCoord: Uint8Array): string[]
 	handleMaybeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>
+	routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }>
 }
 
 const internals = (svc: CoreFretService): AnchorInternals => svc as unknown as AnchorInternals
@@ -151,14 +152,36 @@ describe('NearAnchor replies anchor on the key coordinate', function () {
 		}
 	})
 
-	it('the breadcrumb-loop reply anchors on the key\'s nearest peer', async () => {
+	it('the breadcrumb-loop reply is a static rejection, not a ring walk', async () => {
 		const keyBytes = u8FromString('pick-anchors-loop', 'utf8')
 		const { node, svc } = await seedRing(await hashKey(keyBytes))
 		try {
-			// Self in the breadcrumb trail is a routing loop; the reply comes from the sibling
-			// call site, `nearAnchorOnly`, which is otherwise unreached by the tests above.
+			// Self in the breadcrumb trail is a routing loop. This must answer without doing any
+			// ring/next-hop work — see fret-service.ts `staticReject` — so it carries no anchors,
+			// unlike the sibling call site (`nearAnchorOnly`) covered below.
 			const msg = baseMsg(keyBytes, { breadcrumbs: [node.peerId.toString()] })
 			const res = await internals(svc).handleMaybeAct(msg)
+
+			expect(res, 'expected a NearAnchor-shaped reply').to.have.property('anchors')
+			expect((res as NearAnchorV1).anchors).to.deep.equal([])
+			expect((res as NearAnchorV1).cohort_hint).to.deep.equal([])
+		} finally {
+			await stopAll([node])
+		}
+	})
+
+	it('the routeAct-threw fallback (nearAnchorOnly) anchors on the key\'s nearest peer', async () => {
+		const keyBytes = u8FromString('pick-anchors-fallback', 'utf8')
+		const { node, svc } = await seedRing(await hashKey(keyBytes))
+		try {
+			// Force the routing attempt itself to fail so handleMaybeAct falls through to its
+			// catch arm, the only remaining caller of `nearAnchorOnly` — otherwise unreached by
+			// the tests above now that the cheap validity guards use a static rejection.
+			const priv = internals(svc)
+			priv.routeAct = async () => { throw new Error('forced failure for nearAnchorOnly coverage') }
+
+			const msg = baseMsg(keyBytes)
+			const res = await priv.handleMaybeAct(msg)
 
 			expect(res, 'expected a NearAnchor reply').to.have.property('anchors')
 			expect((res as NearAnchorV1).anchors[0]).to.equal('true-nearest')
