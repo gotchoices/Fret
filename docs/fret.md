@@ -88,7 +88,7 @@ Single pipeline for discovery and action:
   - minSigs: num required activity signatures (k−x)
   - digest: lightweight summary (for non-in-cluster probes)
   - activity: optional payload (pend/commit). Included when near enough by size/distribution estimate
-  - breadcrumbs: visited peers to prevent loops and provide traceability
+  - breadcrumbs: the peers this *message* has already passed through, to prevent loops and provide traceability. A receiver that finds itself in the trail treats the message as a loop and answers with anchors only, so a message must **never** carry its own destination. That matters most on the activity resend: its destination is normally the peer that just answered the probe (it named itself as an anchor — that is the point of the two-phase flow), so stamping that peer into the trail would make it refuse the resend as a loop and the activity would silently never run. The resend carries the probed peer only when it is resending to a *different* anchor, where it is a genuine "don't bounce back" hint.
   - correlationId: identifies a request **phase**, not a whole lookup. A find-then-act lookup mints two: one shared by every digest-only probe it sends, one shared by every activity-bearing message. Each is minted once per lookup (not per message), which is what makes a retry idempotent — a peer that already performed the work recognises the repeat and returns its stored certificate rather than doing it twice.
 
 Routing rule:
@@ -96,6 +96,7 @@ Routing rule:
    - If activity included: perform activity (callback) given the two-sided cohort (expand/filter as needed to satisfy minSigs), then return commit certificate
    - If no activity: reply with NearAnchor { anchors: [succ, pred], cohortHint: PeerId[], estimatedClusterSize, confidence } inviting a resend with activity
    - Cache result to handle duplicate requests, keyed on correlation ID **and phase** (digest-only vs activity-bearing). Keying on the ID alone is wrong: the probe and the resend that follows it share an ID, so the probe's NearAnchor would be served as the answer to the message carrying the work and the activity would never run. Since the responder's own anchor list normally names itself, that resend usually arrives right back at the peer holding the probe's cache entry. The phase is read off the message's `activity` field; the payload itself is not hashed into the key, so a re-encoded-but-equivalent retry still hits the cache instead of re-performing the work.
+   - **Only a terminal answer is cached.** For a digest probe the NearAnchor *is* the answer. For an activity-bearing message a NearAnchor is a refusal — "I did not perform the work; the ring says try over there" — returned when no activity handler is installed, or when the peer is not in-cluster and its forward found no hop or failed. Storing a refusal would answer every retry of that work for the cache TTL with the same refusal and lose the activity silently, which is the phase-collision failure one level in. So an activity-bearing message caches only a commit certificate. The cost is that a replayed activity can re-drive a forward attempt; that is correct, because the work was never performed, and TTL decrement, breadcrumbs and the rate-limit bucket already bound it.
 2. Else (not in-cluster): forward towards h by choosing the next hop that minimizes absolute ring distance to h using S/P (and optional finger cache). Optionally attach redirect hints (local near-h successors/predessors) to speed convergence.
    - Next-hop selection heuristic (connected-first bias):
      - Define cost(peer) = w_d·normDist(h, peer) − w_conn·isConnected(peer) − w_q·linkQuality(peer) + w_b·backoffPenalty(peer).
@@ -260,7 +261,7 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
 
 #### Current state
 - Timestamp bounds (±5 min) for message freshness
-- Correlation ID + phase dedup cache (30s TTL, 1024 entries) for maybeAct — the key is the correlation ID paired with whether the message carries an activity, so a digest probe and the activity resend sharing that ID get separate cache slots (see the routing rule above)
+- Correlation ID + phase dedup cache (30s TTL, 1024 entries) for maybeAct — the key is the correlation ID paired with whether the message carries an activity, so a digest probe and the activity resend sharing that ID get separate cache slots, and only a terminal answer is stored (see the routing rule above)
 - Rate limiting via global token buckets (per-protocol, profile-tuned Edge/Core), including the inbound announce handler (gated before any merge work; on rejection the message is dropped and `diag.rejected.rateLimited` increments)
 - Inbound snapshot-merge caps: both the neighbor-fetch merge and the announce merge slice remote successors/predecessors/sample to the same per-profile bounds (Core 16/16/8, Edge 8/8/6) before iterating, so one crafted message cannot force thousands of parse+hash+upsert ops regardless of the 128 KB byte limit
 - Breadcrumb loop detection and TTL limits on routing

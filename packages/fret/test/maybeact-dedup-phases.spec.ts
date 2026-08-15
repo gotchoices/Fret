@@ -4,6 +4,7 @@ import { createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { PROTOCOL_MAYBE_ACT } from '../src/rpc/protocols.js'
+import type { Libp2p } from 'libp2p'
 import type { RouteAndMaybeActV1 } from '../src/index.js'
 
 /**
@@ -48,7 +49,7 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 	it('runs the activity on a resend that shares the probe\'s correlation id', async () => {
 		const { requester, responder, svcRequester, svcResponder } = await makePair()
 		let fired = 0
-		let seenCorrelationIds: string[] = []
+		const seenCorrelationIds: string[] = []
 		svcResponder.setActivityHandler(async (_activity, _cohort, _minSigs, corrId) => {
 			fired++
 			seenCorrelationIds.push(corrId)
@@ -120,18 +121,75 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		await svcRequester.stop(); await svcResponder.stop()
 		await stopAll([requester, responder])
 	})
+
+	it('does not cache a NearAnchor as the answer to an activity-bearing message', async () => {
+		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const corrId = 'refusal-not-cached-1'
+		const responderId = responder.peerId.toString()
+		const msg = { ...baseMsg(corrId), activity: 'payload-data' }
+
+		// No activity handler installed yet: the responder is in-cluster but cannot perform the
+		// work, so it answers with anchors. That is a refusal, not the answer to this work.
+		const refused = await sendMaybeAct(requester, responderId, msg, PROTOCOL_MAYBE_ACT)
+		expect(refused, 'no handler installed → anchors').to.have.property('anchors')
+
+		let fired = 0
+		svcResponder.setActivityHandler(async () => {
+			fired++
+			return { commitCertificate: 'cert-ok' }
+		})
+
+		const retry = await sendMaybeAct(
+			requester, responderId, { ...msg, timestamp: Date.now() }, PROTOCOL_MAYBE_ACT
+		)
+		expect(retry, 'the retry must re-attempt the work, not replay the cached refusal')
+			.to.have.property('commitCertificate')
+		expect(fired).to.equal(1)
+
+		await svcRequester.stop(); await svcResponder.stop()
+		await stopAll([requester, responder])
+	})
+
+	it('completes a find-then-act lookup end to end through iterativeLookup', async () => {
+		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		let fired = 0
+		svcResponder.setActivityHandler(async () => {
+			fired++
+			return { commitCertificate: 'cert-e2e' }
+		})
+
+		const events: string[] = []
+		let completed: { commitCertificate: string } | undefined
+		for await (const evt of svcRequester.iterativeLookup(new TextEncoder().encode('e2e-key'), {
+			wantK: 7,
+			minSigs: 1,
+			digest: 'Zg',
+			activity: 'payload-data',
+			ttl: 3,
+		})) {
+			events.push(evt.type)
+			if (evt.type === 'complete') completed = evt.result
+		}
+
+		expect(completed, `lookup did not complete; events: ${events.join(' -> ')}`)
+			.to.deep.equal({ commitCertificate: 'cert-e2e' })
+		expect(fired, 'activity performed exactly once').to.equal(1)
+
+		await svcRequester.stop(); await svcResponder.stop()
+		await stopAll([requester, responder])
+	})
 })
 
 describe('iterativeLookup does not re-probe a peer', function () {
 	this.timeout(25000)
 
 	it('yields no duplicate peer across the probing events of one lookup', async () => {
-		const nodes = [] as any[]
+		const nodes: Libp2p[] = []
 		for (let i = 0; i < 4; i++) { const n = await createMemoryNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
+		const services: CoreFretService[] = []
 		for (let i = 0; i < nodes.length; i++) {
 			const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()]
-			const svc = new CoreFretService(nodes[i], { profile: 'edge', k: 7, bootstraps: boot })
+			const svc = new CoreFretService(nodes[i]!, { profile: 'edge', k: 7, bootstraps: boot })
 			await svc.start()
 			services.push(svc)
 		}

@@ -677,6 +677,30 @@ export class FretService implements IFretService, Startable {
 		return `${msg.correlation_id}|${msg.activity ? 'act' : 'digest'}`;
 	}
 
+	/**
+	 * Store a response under the message's dedup key — but only when it is a *terminal* answer
+	 * for that phase.
+	 *
+	 * For a digest probe a `NearAnchor` is the answer, so it caches. For an activity-bearing
+	 * message a `NearAnchor` is the opposite: it means "I did not perform the work — the ring
+	 * says try over there" (no handler installed, or not in-cluster and the forward found no
+	 * hop or failed). Caching it would answer every retry of that work for the TTL with the
+	 * same refusal, and the activity would be lost — the very failure {@link dedupKey} exists
+	 * to prevent, one level in, and just as silent.
+	 *
+	 * Not caching a refusal means a replayed activity can re-drive the forward attempt. That is
+	 * the correct trade: the work was never performed, so re-attempting is not a duplicate, and
+	 * TTL decrement, breadcrumbs and the rate-limit bucket already bound the cost.
+	 */
+	private cacheResponse(
+		msg: RouteAndMaybeActV1,
+		result: NearAnchorV1 | { commitCertificate: string }
+	): void {
+		if (!msg.correlation_id) return;
+		if (msg.activity && !('commitCertificate' in result)) return;
+		this.dedupCache.set(this.dedupKey(msg), result);
+	}
+
 	private async handleMaybeAct(
 		msg: RouteAndMaybeActV1
 	): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }> {
@@ -705,8 +729,7 @@ export class FretService implements IFretService, Startable {
 		this.inflightAct++;
 		try {
 			const result = await this.routeAct(msg);
-			// Cache result for dedup
-			if (msg.correlation_id) this.dedupCache.set(this.dedupKey(msg), result);
+			this.cacheResponse(msg, result);
 			return result;
 		} catch (err) {
 			log.error('routeAct failed - %e', err);
@@ -1978,6 +2001,11 @@ export class FretService implements IFretService, Startable {
 				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT);
 
 				if (isBusy(result)) {
+					// NOTE: `target` is already in `visited`, so a busy peer is retired for the rest
+					// of this lookup rather than retried. Free today — the attempt loop has no delay,
+					// so an immediate retry would meet the same empty token bucket. If the walk ever
+					// honours `retry_after_ms` with a real wait, keep busy responders out of
+					// `visited` so the wait can pay off.
 					this.recordBackoff(target);
 					continue;
 				}
@@ -2019,7 +2047,15 @@ export class FretService implements IFretService, Startable {
 						// this message from the probe's cache entry and never run the activity.
 						correlation_id: activityId,
 						ttl: 1,
-						breadcrumbs: [selfId, target],
+						// Breadcrumbs are the peers this *message* has already passed through, and
+						// the receiver rejects any message whose trail names itself. The resend's
+						// destination is normally `target` — the peer that just named itself as an
+						// anchor, which is the whole point of the two-phase flow — so listing
+						// `target` unconditionally makes the receiver refuse its own resend as a
+						// loop and the activity is silently never performed. Keep `target` only
+						// when it is a *different* peer, where it is a genuine "don't bounce back"
+						// hint. Invariant: a message never carries its own destination.
+						breadcrumbs: [selfId, target].filter((id) => id !== actTarget),
 					};
 
 					try {
