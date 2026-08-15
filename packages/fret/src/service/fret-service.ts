@@ -154,6 +154,19 @@ export class FretService implements IFretService, Startable {
 	private readonly departureDebounce = new Map<string, number>();
 	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
 	/**
+	 * Peer ids libp2p currently holds at least one multiaddr for — the backing set for
+	 * {@link hasAddresses}.
+	 *
+	 * The authoritative source is `node.peerStore`, but its `get` is async while every
+	 * caller of `hasAddresses` is a synchronous `.filter()` predicate. So the answer is
+	 * cached here: rebuilt wholesale from the `peerStore.all()` walk `seedFromPeerStore`
+	 * already performs each stabilization tick (bounded by peerStore size, and self-pruning
+	 * because it is a replacement rather than a merge), and refreshed per-peer on identify
+	 * so a freshly-learned address is usable before the next tick. Not `readonly`: the
+	 * rebuild swaps the whole set.
+	 */
+	private addressKnown = new Set<string>();
+	/**
 	 * Consecutive failed protocol negotiations before a peer is demoted to `foreign`.
 	 *
 	 * Delaying the `unknown → foreign` demotion costs nothing in correctness — `unknown` is
@@ -485,6 +498,9 @@ export class FretService implements IFretService, Startable {
 				// Ensure an entry exists to label, but don't reset an existing one.
 				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
 				this.classifyByProtocols(id, evt?.detail?.protocols);
+				// identify is where a peer's addresses usually arrive; pick them up now rather
+				// than at the next stabilization tick, so the peer is dialable immediately.
+				await this.refreshAddressKnown(id);
 			} catch (err) { log.error('peer:identify handler failed - %e', err) }
 		});
 		this.addNodeListener('peer:update', async (evt: any) => {
@@ -496,6 +512,9 @@ export class FretService implements IFretService, Startable {
 				if (!id) return;
 				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
 				this.classifyByProtocols(id, peer?.protocols);
+				// The event carries the updated Peer record, so its addresses are authoritative
+				// here — no peerStore round-trip needed.
+				this.setAddressKnown(id, (peer?.addresses?.length ?? 0) > 0);
 			} catch (err) { log.error('peer:update handler failed - %e', err) }
 		});
 	}
@@ -679,13 +698,49 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	/**
+	 * True when libp2p holds at least one multiaddr for `id`, i.e. a dial can plausibly
+	 * succeed even though no connection is open.
+	 *
+	 * FRET's own wire messages carry peer-id strings only and contribute no addresses, so
+	 * this is entirely about what libp2p itself learned (identify over a direct connection,
+	 * a bootstrap entry, a transport's own discovery). Answered from {@link addressKnown};
+	 * see that field for why the peerStore is not read directly here.
+	 */
 	private hasAddresses(id: string): boolean {
+		return this.addressKnown.has(id);
+	}
+
+	/**
+	 * True when an outbound RPC to `id` can plausibly be delivered: `openRpcStream` reuses an
+	 * open connection if there is one, and otherwise dials the *bare peer id* — which only
+	 * resolves if libp2p holds an address for it. A peer that is neither is undialable, and
+	 * every FRET RPC to it fails with `NoValidAddressesError`.
+	 */
+	private isDialable(id: string): boolean {
+		return this.isConnected(id) || this.hasAddresses(id);
+	}
+
+	/** Record whether libp2p holds an address for `id`, keeping {@link addressKnown} in sync. */
+	private setAddressKnown(id: string, known: boolean): void {
+		if (known) this.addressKnown.add(id);
+		else this.addressKnown.delete(id);
+	}
+
+	/**
+	 * Refresh one peer's address-known state from the peerStore, so an address learned via
+	 * identify is usable immediately rather than at the next stabilization tick.
+	 *
+	 * "Not in the peerStore" is the ordinary negative answer, not a fault; any *other* failure
+	 * is logged rather than swallowed.
+	 */
+	private async refreshAddressKnown(id: string): Promise<void> {
 		try {
-			// libp2p >=2 exposes getMultiaddrsForPeer
-			const addrs = (this.node as any).getMultiaddrsForPeer?.(peerIdFromString(id)) ?? [];
-			return Array.isArray(addrs) && addrs.length > 0;
-		} catch {
-			return false;
+			const peer = await this.node.peerStore.get(peerIdFromString(id));
+			this.setAddressKnown(id, (peer.addresses?.length ?? 0) > 0);
+		} catch (err) {
+			if ((err as { name?: string })?.name === 'NotFoundError') { this.addressKnown.delete(id); return; }
+			log.error('refreshAddressKnown failed for %s - %e', id, err);
 		}
 	}
 
@@ -697,12 +752,19 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	/**
+	 * Single choke point for outbound announces. Every announce target list is chosen to
+	 * *prefer* non-connected peers (a connected peer learns via normal exchange), so this
+	 * dials — and therefore has to be the place the dialability guard is applied. Checked
+	 * before the token bucket so an undialable target does not burn an announce token.
+	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		for (const id of ids) {
 			if (this.stopped) break;
+			if (!this.isDialable(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
 				this.diag.announcementsSent++;
 			} catch (err) { log.error('announce failed to %s - %e', id, err); }
 		}
@@ -738,7 +800,7 @@ export class FretService implements IFretService, Startable {
 				...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
 			])).filter((id) => id !== selfStr);
 			for (const id of ids) {
-				if (this.isConnected(id) || this.hasAddresses(id)) {
+				if (this.isDialable(id)) {
 					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('preconnectNeighbors ping failed for %s - %e', id, err) }
 				}
 			}
@@ -764,7 +826,7 @@ export class FretService implements IFretService, Startable {
 					...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
 				])).filter((id) => id !== selfStr).slice(0, budget);
 				for (const id of ids) {
-					if (this.isConnected(id) || this.hasAddresses(id)) {
+					if (this.isDialable(id)) {
 					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('active preconnect ping failed for %s - %e', id, err) }
 				}
 			}
@@ -805,6 +867,10 @@ export class FretService implements IFretService, Startable {
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
 			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 			for (const id of ids) {
+				// Undialable neighbors are skipped, not attempted: this runs inside stop(), so a
+				// stack of dials that can only end in NoValidAddressesError also delays shutdown.
+				// (`ids` itself stays unfiltered — it defines the S/P set the replacements exclude.)
+				if (!this.isDialable(id)) continue;
 				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
@@ -858,14 +924,19 @@ export class FretService implements IFretService, Startable {
 			for (const id of localNew) {
 				if (!seen.has(id)) { newIds.push(id); seen.add(id); }
 			}
-			// proactively warm a bounded number of replacements and merge their neighbor views
-			const warm = newIds.slice(0, Math.min(newIds.length, 6));
+			// Proactively warm a bounded number of replacements and merge their neighbor views.
+			// Replacement ids come straight off the wire, so most are peers we hold no address
+			// for; dialing those can only fail, so they are filtered out before the budget is
+			// applied (filtering after would waste warm slots on undialable ids).
+			const warm = newIds.filter((id) => this.isDialable(id)).slice(0, 6);
 			for (const id of warm) {
 				try {
 					await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
 					if (!this.isConnected(id) && this.bucketAnnounce.tryTake()) {
 						const snap = await this.snapshot();
-						await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE);
+						// `warm` is dialability-filtered above, so dialing here is warranted:
+						// the target is address-known and we are deliberately not connected to it.
+						await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
 						this.diag.announcementsSent++;
 					}
 				} catch (err) {
@@ -1032,10 +1103,14 @@ export class FretService implements IFretService, Startable {
 			// skip hashing for ids already in the store (reuse the stored coord).
 			const peers = await this.node.peerStore.all();
 			const discovered: string[] = [];
+			// Rebuilt wholesale rather than merged, so a peer whose addresses the peerStore
+			// dropped stops reading as dialable (see `addressKnown`).
+			const addressKnown = new Set<string>();
 			for (const p of peers) {
 				try {
-					const coord = await hashPeerId(p.id);
 					const pidStr = p.id.toString();
+					if (p.addresses.length > 0) addressKnown.add(pidStr);
+					const coord = await hashPeerId(p.id);
 					if (!this.store.getById(pidStr)) discovered.push(pidStr);
 					this.store.upsert(pidStr, coord);
 					// If identify has populated the peerStore, classify off its protocol
@@ -1048,6 +1123,7 @@ export class FretService implements IFretService, Startable {
 					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
 				}
 			}
+			this.addressKnown = addressKnown;
 			try {
 				const coord = await hashPeerId(this.node.peerId);
 				const selfStr = this.node.peerId.toString();
@@ -1125,8 +1201,13 @@ export class FretService implements IFretService, Startable {
 		const selfCoord = await hashPeerId(this.node.peerId);
 		const selfStr = this.node.peerId.toString();
 		const nearAll = this.getNeighbors(selfCoord, 'both', Math.max(2, this.cfg.m));
-		const near = nearAll.filter((id) => id !== selfStr && (this.isConnected(id) || this.hasAddresses(id)));
+		const near = nearAll.filter((id) => id !== selfStr && this.isDialable(id));
 		await this.probeNeighborsLatency(near.slice(0, 4));
+		// NOTE: `fetchNeighbors` is connection-only (`requireExisting`), so for an address-known
+		// but non-connected peer it returns an empty snapshot while `snapshotsFetched` still
+		// counts it — a diagnostics overcount, not a correctness problem, and the preceding ping
+		// usually opens the connection anyway. If snapshot counts are ever used for anything
+		// load-bearing, have fetchNeighbors report the skip instead of returning an empty result.
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
 		await this.classifyUnknownPeers();
 		await this.reprobeForeignPeers();
@@ -1471,7 +1552,13 @@ export class FretService implements IFretService, Startable {
 			// requested count, so a long breadcrumb trail would dead-end routing while the ring
 			// still held usable next hops.
 			const exclude = new Set([...(msg.breadcrumbs ?? []), selfId]);
-			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude);
+			// Dialability is a hard filter on the *candidate list*, not a post-hoc skip of the
+			// winner: the selector then picks the best reachable hop instead of dead-ending a
+			// route that still had usable hops behind it. Same rule as the breadcrumb exclusions
+			// above — filter into the walk, never out of the result. An empty set after this
+			// falls through to the NearAnchor reply below, exactly as no-next-hop already did.
+			const candidates = this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude)
+				.filter((id) => this.isDialable(id));
 
 			const hopOpts = this.buildNextHopOptions(n, confidence);
 			const linkQ = (id: string) => this.linkQuality(id);
@@ -1735,11 +1822,17 @@ export class FretService implements IFretService, Startable {
 				? shouldIncludePayload(distToKey, n, confidence, options.wantK)
 				: false;
 
-			// Pick candidates: use anchors from prior hints if available, else local cohort
+			// Pick candidates: use anchors from prior hints if available, else local cohort.
+			// Both lists are hard-filtered for dialability before selection (see routeAct for
+			// why the filter goes into the walk). Remote-supplied anchors are the likeliest to
+			// be undialable — FRET's wire format carries no addresses — so when the filter
+			// empties them we fall back to the local cohort rather than declaring the lookup
+			// exhausted; only an empty set from *both* ends the walk.
 			const exclude = new Set([selfId]);
-			const candidates = bestAnchors.length > 0
-				? bestAnchors.filter((id) => !exclude.has(id))
-				: this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude);
+			const anchorCandidates = bestAnchors.filter((id) => !exclude.has(id) && this.isDialable(id));
+			const candidates = anchorCandidates.length > 0
+				? anchorCandidates
+				: this.assembleCohort(coord, Math.max(4, this.cfg.m), exclude).filter((id) => this.isDialable(id));
 
 			if (candidates.length === 0) {
 				yield { type: 'exhausted', hop };
@@ -1791,9 +1884,14 @@ export class FretService implements IFretService, Startable {
 				const anchor = result as NearAnchorV1;
 				yield { type: 'near_anchor', hop, nearAnchor: anchor, peerId: target };
 
-				// If we have activity but didn't include it, resend with activity to the anchor
-				if (currentActivity && !includePayload && anchor.anchors.length > 0) {
-					const actTarget = anchor.anchors[0]!;
+				// If we have activity but didn't include it, resend with activity to the anchor.
+				// The anchors are remote-supplied ids we may hold no address for, so take the
+				// first *dialable* one; when none is, fall through to the bestAnchors update
+				// below and let the next iteration route locally instead of failing a dial.
+				const actTarget = currentActivity && !includePayload
+					? anchor.anchors.find((id) => this.isDialable(id))
+					: undefined;
+				if (actTarget) {
 					yield { type: 'activity_sent', hop: hop + 1, peerId: actTarget };
 
 					const actMsg: RouteAndMaybeActV1 = {

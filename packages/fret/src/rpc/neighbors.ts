@@ -93,18 +93,28 @@ export async function fetchNeighbors(
 	}
 }
 
+/**
+ * Push our snapshot to `peerIdOrStr`.
+ *
+ * Connection-only by default (announcing is maintenance; dialing for it adds churn). Callers
+ * that deliberately target *non-connected* peers — the "tell peers we just learned about"
+ * paths, whose whole point is reaching someone we are not talking to yet — pass `dial: true`.
+ * Those callers own the reachability check: dialing a peer libp2p holds no address for can
+ * only fail (FRET's wire format carries peer ids, never multiaddrs).
+ */
 export async function announceNeighbors(
 	node: Libp2p,
 	peerIdOrStr: string,
 	snapshot: NeighborSnapshotV1,
-	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE
+	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE,
+	opts: { dial?: boolean } = {}
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdOrStr);
 	let stream: Stream | undefined;
 	try {
-		stream = await openRpcStream(node, pid, [protocol], { requireExisting: true });
+		stream = await openRpcStream(node, pid, [protocol], { requireExisting: opts.dial !== true });
 		if (stream == null) {
-			return; // skip if not connected
+			return; // no connection and dialing not requested
 		}
 		stream.send(await encodeJson(snapshot));
 		await stream.close();
