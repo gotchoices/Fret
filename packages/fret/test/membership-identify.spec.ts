@@ -122,6 +122,40 @@ describe('Ring membership classification (identify-driven)', function () {
 		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 're-admission must not have sent any outbound probe')
 	})
 
+	// An identify protocol list describes what the remote advertised *at capture time*, which can
+	// predate our own handler registration — so it is weak evidence in the negative direction and
+	// must never overturn a peer we have positively confirmed. Here C is a genuine net-a member,
+	// confirmed via RPC, and A then receives a peer:update carrying C's *pre-registration* list
+	// (identify + ping only, none of ours). Before the strength ordering this flipped C
+	// member → foreign, shutting a real member out of routing and discovery.
+	//
+	// The assertion is synchronous: A's peer:update listener classifies inline (no await is taken
+	// for a peer already in the store), so nothing can re-promote C between the dispatch and the
+	// check — a demotion, had one happened, would still be visible.
+	it('a stale identify update does not demote an RPC-confirmed member', async () => {
+		const nodeA = await createIdentifyNode(); await nodeA.start()
+		const nodeC = await createIdentifyNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		const svcC = new CoreFretService(nodeC, { profile: 'core', networkName: 'net-a' })
+		services = [svcA, svcC]
+		await svcA.start(); await svcC.start()
+		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+
+		const store = svcA.getStore()
+		const idC = nodeC.peerId.toString()
+		await waitFor(() => store.getById(idC)?.membership === 'member')
+		expect(store.getById(idC)?.membership).to.equal('member', 'C should first be confirmed a member')
+
+		nodeA.dispatchEvent(new CustomEvent('peer:update', {
+			detail: { peer: { id: nodeC.peerId, protocols: ['/ipfs/id/1.0.0', '/ipfs/ping/1.0.0'] } }
+		}))
+
+		expect(store.getById(idC)?.membership).to.equal('member',
+			'a stale identify list must not demote a confirmed member')
+	})
+
 	// Isolates the peerStore *poll* path — seedFromPeerStore enumerates `node.peerStore.all()` and
 	// classifies each entry off its identify-advertised protocol list — from the peer:identify /
 	// peer:update event handlers (which the two tests above leave racing). start() awaits

@@ -23,11 +23,14 @@ function isBusy(res: unknown): res is BusyResponseV1 {
 export async function registerPing(
 	node: Libp2p,
 	protocol = PROTOCOL_PING,
-	getSizeEstimate?: SizeEstimateProvider
+	getSizeEstimate?: SizeEstimateProvider,
+	onInbound?: (from: string) => void
 ): Promise<void> {
-	// Ping carries no `from`; adopt the (stream, connection) shape for consistency
-	// so the authenticated identity is available and new handlers copy it correctly.
-	await node.handle(protocol, async (stream: Stream, _connection: Connection) => {
+	// Ping carries no `from`, but the connection's remote peer is transport-authenticated —
+	// and reaching this handler at all means the remote dialed *this network's* namespaced
+	// protocol. `onInbound` hands that proof to the caller.
+	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
+		onInbound?.(connection.remotePeer.toString());
 		if (getSizeEstimate) {
 			try {
 				const sizeInfo = await getSizeEstimate();

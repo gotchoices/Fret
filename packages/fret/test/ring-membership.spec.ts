@@ -8,7 +8,9 @@ import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { FretPeerDiscovery } from '../src/service/peer-discovery.js'
 import { createSparsityModel } from '../src/store/relevance.js'
 import { hashPeerId } from '../src/ring/hash.js'
-import { isUnsupportedProtocolError } from '../src/rpc/protocols.js'
+import { isUnsupportedProtocolError, makeProtocols } from '../src/rpc/protocols.js'
+import { registerPing, sendPing } from '../src/rpc/ping.js'
+import { fetchNeighbors } from '../src/rpc/neighbors.js'
 import type { Libp2p } from 'libp2p'
 
 /** Member predicate mirroring FretService's internal one; gates the ring views below. */
@@ -164,6 +166,35 @@ describe('DigitreeStore membership field', () => {
 		s2.importEntries(exported)
 		expect(s2.getById('m')?.membership).to.equal('member')
 		expect(s2.getById('f')?.membership).to.equal('foreign')
+	})
+
+	// The negotiate-failure counter is what turns a single failed handshake from a verdict into
+	// mere evidence, so it has to survive the network-agnostic re-seeds the same way membership
+	// does — otherwise every stabilization tick would reset the run and the threshold could
+	// never be reached.
+	it('defaults negotiateFailures to 0 and preserves it across a re-upsert', () => {
+		const s = new DigitreeStore()
+		expect(s.upsert('id1', new Uint8Array(32)).negotiateFailures).to.equal(0)
+		s.update('id1', { negotiateFailures: 2 })
+		s.upsert('id1', new Uint8Array(32)) // simulate a peerStore / peer:connect re-seed
+		expect(s.getById('id1')?.negotiateFailures).to.equal(2)
+	})
+
+	// Handshake history describes a live connection attempt; after a restart (ours or the
+	// remote's) it says nothing. Reset it on import for the same reason `state` is forced
+	// to 'disconnected' — while the membership label itself is preserved.
+	it('resets negotiateFailures to 0 on import while preserving membership', () => {
+		const s = new DigitreeStore()
+		s.upsert('m', new Uint8Array(32))
+		s.update('m', { membership: 'member', negotiateFailures: 2 })
+
+		const exported = s.exportEntries()
+		expect(exported.find((e) => e.id === 'm')?.negotiateFailures).to.equal(2, 'exported for diagnostics')
+
+		const s2 = new DigitreeStore()
+		s2.importEntries(exported)
+		expect(s2.getById('m')?.negotiateFailures).to.equal(0)
+		expect(s2.getById('m')?.membership).to.equal('member')
 	})
 
 	it('defaults a missing membership field to unknown on import (back-compat)', () => {
@@ -391,8 +422,25 @@ describe('Foreign re-probe backoff growth', function () {
 	})
 })
 
+async function waitFor(predicate: () => boolean, timeoutMs = 20000, stepMs = 25): Promise<void> {
+	const deadline = Date.now() + timeoutMs
+	while (Date.now() < deadline) {
+		if (predicate()) return
+		await new Promise((r) => setTimeout(r, stepMs))
+	}
+}
+
+/** Stub out a service's outbound stabilization pass so it can only classify off inbound signals. */
+function disableProbing(svc: CoreFretService): void {
+	;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {}
+}
+
+function negotiateFailures(svc: CoreFretService, id: string): number {
+	return svc.getStore().getById(id)?.negotiateFailures ?? 0
+}
+
 describe('Ring membership classification (probe-based, no identify)', function () {
-	this.timeout(30000)
+	this.timeout(40000)
 
 	let nodes: Libp2p[] = []
 	let services: CoreFretService[] = []
@@ -427,13 +475,18 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		await nodeB.dial(nodeA.getMultiaddrs()[0]!)
 		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
 
-		// Several passive stabilization ticks (1.5s each) run the probe pass.
-		await new Promise((r) => setTimeout(r, 6000))
-
 		const store = svcA.getStore()
 		const idA = nodeA.peerId.toString()
 		const idB = nodeB.peerId.toString()
 		const idC = nodeC.peerId.toString()
+
+		// Several passive stabilization ticks (1.5s each) run the probe pass. B needs a *run* of
+		// failed negotiations (not one) before it is confirmed foreign, and those probes are
+		// spread across the growing re-probe backoff, so wait on the labels rather than a clock.
+		await waitFor(() =>
+			store.getById(idC)?.membership === 'member' &&
+			store.getById(idB)?.membership === 'foreign'
+		)
 
 		expect(store.getById(idA)?.membership).to.equal('member', 'self should be member')
 		expect(store.getById(idC)?.membership).to.equal('member', 'same-network peer C should be member')
@@ -456,12 +509,15 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		await nodeB.dial(nodeA.getMultiaddrs()[0]!)
 		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
 
-		await new Promise((r) => setTimeout(r, 6000))
-
 		const store = svcA.getStore()
 		const idA = nodeA.peerId.toString()
 		const idB = nodeB.peerId.toString()
 		const idC = nodeC.peerId.toString()
+
+		await waitFor(() =>
+			store.getById(idC)?.membership === 'member' &&
+			store.getById(idB)?.membership === 'foreign'
+		)
 
 		// Precondition: classification has resolved (mirrors the labeling test above).
 		expect(store.getById(idB)?.membership).to.equal('foreign')
@@ -511,15 +567,20 @@ describe('Ring membership classification (probe-based, no identify)', function (
 	// We tag C foreign as soon as it appears in A's store — i.e. *before* the unknown-probe
 	// pass would ping it — so the eventual re-admitting ping is delivered by the foreign
 	// re-probe pass, which is exactly the path under test.
+	//
+	// C runs NO FretService here, only a bare net-a ping handler. A full svcC would ping A as
+	// part of its own classification pass, and that *inbound* RPC would promote C at A on its
+	// own (see the inbound-promotion tests below) — masking the re-probe path this test exists
+	// to cover. With C silent, A's own outbound re-probe is the only thing that can re-admit it.
 	it('re-admits a same-network peer that was mislabeled foreign (foreign re-probe)', async () => {
 		const nodeA = await createMemNode(); await nodeA.start()
 		const nodeC = await createMemNode(); await nodeC.start()
 		nodes = [nodeA, nodeC]
 
 		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
-		const svcC = new CoreFretService(nodeC, { profile: 'core', networkName: 'net-a' })
-		services = [svcA, svcC]
-		await svcA.start(); await svcC.start()
+		services = [svcA]
+		await svcA.start()
+		await registerPing(nodeC, makeProtocols('net-a').PROTOCOL_PING)
 
 		const store = svcA.getStore()
 		const idC = nodeC.peerId.toString()
@@ -528,17 +589,140 @@ describe('Ring membership classification (probe-based, no identify)', function (
 
 		// As soon as A's peer:connect listener inserts C (as `unknown`), tag it `foreign`,
 		// standing in for an identify race that mislabeled a genuine net-a peer.
-		const deadline = Date.now() + 4000
-		while (Date.now() < deadline && !store.getById(idC)) {
-			await new Promise((r) => setTimeout(r, 20))
-		}
+		await waitFor(() => store.getById(idC) != null, 4000, 20)
 		expect(store.getById(idC), 'C should appear in A\'s store after dial').to.not.equal(undefined)
 		store.setMembership(idC, 'foreign')
 		expect(store.getById(idC)?.membership).to.equal('foreign')
 
 		// A few stabilization ticks run the foreign re-probe, whose successful ping re-admits C.
-		await new Promise((r) => setTimeout(r, 6000))
+		await waitFor(() => store.getById(idC)?.membership === 'member')
 		expect(store.getById(idC)?.membership).to.equal('member', 'mislabeled member should be re-admitted via foreign re-probe')
+	})
+
+	// Arm 1: a single failed protocol negotiation is evidence, not a verdict.
+	//
+	// `svcC.stop()` unhandles all five net-a protocols while leaving the node (and the
+	// connection) up, which is exactly what a restarting peer looks like from A's side: the
+	// next ping fails with UnsupportedProtocolError. Before the strength ordering, that one
+	// error demoted a *confirmed member* to foreign and shut it out of the ring until a slow
+	// re-probe rescued it.
+	it('does not demote a confirmed member on a single failed negotiation', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeC = await createMemNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		const svcC = new CoreFretService(nodeC, { profile: 'core', networkName: 'net-a' })
+		services = [svcA, svcC]
+		await svcA.start(); await svcC.start()
+		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+
+		const store = svcA.getStore()
+		const idC = nodeC.peerId.toString()
+		await waitFor(() => store.getById(idC)?.membership === 'member')
+		expect(store.getById(idC)?.membership).to.equal('member', 'C should first be confirmed a member')
+
+		// C's FRET service goes away (its five protocol handlers are unhandled); the node and
+		// the connection stay up, so A's next ping fails to negotiate rather than timing out.
+		await svcC.stop()
+
+		// Failures arrive one per stabilization tick (1.5 s apart) and the threshold is 3, so
+		// observing the first one leaves ample margin before any demotion could occur.
+		await waitFor(() => negotiateFailures(svcA, idC) >= 1)
+		expect(negotiateFailures(svcA, idC)).to.be.greaterThan(0, 'A should have recorded the failed negotiation')
+		expect(store.getById(idC)?.membership).to.equal('member', 'one failed negotiation must not demote a confirmed member')
+
+		// The whole point of not demoting: C keeps participating in the ring through the blip.
+		const selfCoord = await hashPeerId(nodeA.peerId)
+		expect(svcA.getNeighbors(selfCoord, 'both', 8)).to.include(idC, 'C must stay in the ring during a transient blip')
+	})
+
+	// The counter is a *consecutive*-failure run: any positive proof clears it, so a peer that
+	// blips and comes back never carries the strikes forward.
+	it('clears the failure run when the peer comes back', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeC = await createMemNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		const svcC = new CoreFretService(nodeC, { profile: 'core', networkName: 'net-a' })
+		services = [svcA, svcC]
+		await svcA.start(); await svcC.start()
+		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+
+		const store = svcA.getStore()
+		const idC = nodeC.peerId.toString()
+		await waitFor(() => store.getById(idC)?.membership === 'member')
+
+		await svcC.stop()
+		await waitFor(() => negotiateFailures(svcA, idC) >= 1)
+		expect(store.getById(idC)?.membership).to.equal('member')
+
+		// C restarts and re-registers its handlers; A's next successful RPC resets the run.
+		await svcC.start()
+		await waitFor(() => negotiateFailures(svcA, idC) === 0)
+		expect(negotiateFailures(svcA, idC)).to.equal(0, 'a success must clear the consecutive-failure run')
+		expect(store.getById(idC)?.membership).to.equal('member')
+
+		const selfCoord = await hashPeerId(nodeA.peerId)
+		expect(svcA.getNeighbors(selfCoord, 'both', 8)).to.include(idC)
+	})
+
+	// Arm 3: an inbound namespaced RPC is the strongest membership proof there is — the remote
+	// dialed a protocol only this network's peers speak, over a transport-authenticated
+	// connection. It re-admits a mislabeled peer immediately and for free, which matters most
+	// for a NAT'd peer that serves the network but that we struggle to dial: it reaches us.
+	it('promotes a foreign-labelled peer to member on an inbound ping (no outbound probe)', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeC = await createMemNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		services = [svcA]
+		disableProbing(svcA) // inbound traffic must be the only thing that can classify
+		await svcA.start()
+
+		const store = svcA.getStore()
+		const idA = nodeA.peerId.toString()
+		const idC = nodeC.peerId.toString()
+
+		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+		await waitFor(() => store.getById(idC) != null)
+		store.setMembership(idC, 'foreign')
+
+		// C dials A's net-a ping protocol — something only a net-a peer can do.
+		const res = await sendPing(nodeC, idA, makeProtocols('net-a').PROTOCOL_PING)
+		expect(res.ok).to.equal(true, 'the inbound ping should have been answered')
+
+		await waitFor(() => store.getById(idC)?.membership === 'member')
+		expect(store.getById(idC)?.membership).to.equal('member', 'inbound namespaced RPC must re-admit the sender')
+		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 'promotion must not have cost an outbound probe')
+	})
+
+	it('promotes a foreign-labelled peer to member on an inbound neighbors request', async () => {
+		const nodeA = await createMemNode(); await nodeA.start()
+		const nodeC = await createMemNode(); await nodeC.start()
+		nodes = [nodeA, nodeC]
+
+		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+		services = [svcA]
+		disableProbing(svcA)
+		await svcA.start()
+
+		const store = svcA.getStore()
+		const idA = nodeA.peerId.toString()
+		const idC = nodeC.peerId.toString()
+
+		await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+		await waitFor(() => store.getById(idC) != null)
+		store.setMembership(idC, 'foreign')
+
+		const snap = await fetchNeighbors(nodeC, idA, makeProtocols('net-a').PROTOCOL_NEIGHBORS)
+		expect(snap.from).to.equal(idA, 'the neighbors request should have been served by A')
+
+		await waitFor(() => store.getById(idC)?.membership === 'member')
+		expect(store.getById(idC)?.membership).to.equal('member')
+		expect(svcA.getDiagnostics().pingsSent).to.equal(0, 'promotion must not have cost an outbound probe')
 	})
 
 	it('marks self member even with zero peers (single-node dev)', async () => {

@@ -27,6 +27,15 @@ export interface PeerEntry {
 	lastAccess: number;
 	state: PeerState;
 	membership: MembershipState;
+	/**
+	 * Consecutive "could not negotiate this protocol" handshake failures against this peer.
+	 *
+	 * A single failure is weak evidence — the remote may simply not have registered its
+	 * handlers yet, or be mid-restart — so callers demote to `foreign` only after a run of
+	 * them, and reset the counter on any positive proof of membership. Like `membership`,
+	 * the store only stores and exposes the count; it never branches on it.
+	 */
+	negotiateFailures: number;
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -41,6 +50,7 @@ export interface SerializedPeerEntry {
 	lastAccess: number;
 	state: PeerState;
 	membership?: MembershipState; // optional for back-compat with older snapshots
+	negotiateFailures?: number; // optional; exported for diagnostics, reset on import
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -112,6 +122,7 @@ export class DigitreeStore {
 			lastAccess: now,
 			state: 'disconnected',
 			membership: 'unknown',
+			negotiateFailures: 0,
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
@@ -301,6 +312,7 @@ export class DigitreeStore {
 			lastAccess: e.lastAccess,
 			state: e.state,
 			membership: e.membership,
+			negotiateFailures: e.negotiateFailures,
 			accessCount: e.accessCount,
 			successCount: e.successCount,
 			failureCount: e.failureCount,
@@ -322,6 +334,9 @@ export class DigitreeStore {
 				// A persisted table is same-network by construction; default a missing
 				// field to 'unknown' for back-compat with snapshots predating membership.
 				membership: s.membership ?? 'unknown',
+				// Handshake history cannot survive a restart — the remote may have restarted
+				// too. Reset for the same reason `state` is forced to 'disconnected'.
+				negotiateFailures: 0,
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,

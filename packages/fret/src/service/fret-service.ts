@@ -58,6 +58,28 @@ function isBusy(res: unknown): res is BusyResponseV1 {
 const isMember = (e: PeerEntry): boolean => e.membership === 'member';
 
 /**
+ * What produced a membership observation, ordered by how much it actually proves.
+ *
+ * | signal              | strength | what it proves                                         | may set  |
+ * |---------------------|----------|--------------------------------------------------------|----------|
+ * | `rpc-success`       | strong   | the remote served this network's protocol just now      | member   |
+ * | `rpc-inbound`       | strong   | the remote dialed this network's protocol just now      | member   |
+ * | `identify-member`   | strong   | the remote advertised our protocol as of capture time   | member   |
+ * | `identify-foreign`  | weak     | it advertised none of ours *at capture time* — which    | foreign, |
+ * |                     |          | may predate our own handler registration                | from unknown only |
+ * | `negotiate-failure` | weak     | it had no answerable handler *at that instant*          | foreign at threshold only |
+ *
+ * A weaker or staler signal never overrides a stronger, more recent one; the ordering is
+ * enforced in one place, `FretService.applyMembershipSignal`.
+ */
+type MembershipSignal =
+	| 'rpc-success'
+	| 'rpc-inbound'
+	| 'identify-member'
+	| 'identify-foreign'
+	| 'negotiate-failure';
+
+/**
  * Select sample entries spread across diverse ring positions using sparsity-biased scoring.
  * Excludes self and entries already in successors/predecessors (they're redundant).
  *
@@ -131,6 +153,16 @@ export class FretService implements IFretService, Startable {
 	private readonly announceFanout: number;
 	private readonly departureDebounce = new Map<string, number>();
 	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
+	/**
+	 * Consecutive failed protocol negotiations before a peer is demoted to `foreign`.
+	 *
+	 * Delaying the `unknown → foreign` demotion costs nothing in correctness — `unknown` is
+	 * already excluded from every ring view — so the whole price is ~2 extra pings per
+	 * genuinely-foreign peer, once, spread over the existing backoff schedule (1 s + 2 s + 4 s).
+	 * Where identify is available a genuinely foreign peer is still labelled on first sight from
+	 * its protocol list, so the common case is unchanged.
+	 */
+	private static readonly NEGOTIATE_FAILURE_THRESHOLD = 3;
 	private firstStabilizeDone = false;
 	private readonly diag = {
 		peersDiscovered: 0,
@@ -259,16 +291,16 @@ export class FretService implements IFretService, Startable {
 		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
 		const x = normalizedLogDistance(await this.selfCoord(), coord);
 		const next = scoreSuccess(entry, latencyMs, x, this.sparsity);
-		// Every applySuccess call in this service follows a completed RPC over this
-		// network's namespaced protocol (ping or maybeAct), which proves the peer
-		// serves this network → confirm membership for free off normal traffic.
 		this.store.update(id, {
 			lastAccess: next.lastAccess,
 			relevance: next.relevance,
 			successCount: next.successCount,
 			avgLatencyMs: next.avgLatencyMs,
-			membership: 'member'
 		});
+		// Every applySuccess call in this service follows a completed RPC over this
+		// network's namespaced protocol (ping or maybeAct), which proves the peer
+		// serves this network → confirm membership for free off normal traffic.
+		this.applyMembershipSignal(id, 'rpc-success');
 	}
 
 	private async applyFailure(id: string, coord: Uint8Array): Promise<void> {
@@ -282,33 +314,82 @@ export class FretService implements IFretService, Startable {
 		});
 	}
 
-	/** Confirm `id` serves this network (idempotent; no-op if absent or already member). */
-	private markMember(id: string): void {
+	/**
+	 * Apply one membership observation about `id`, honouring the evidence-strength ordering.
+	 *
+	 * Every classification in this service routes through here so the ordering is stated once
+	 * and a call site added later inherits it instead of re-deriving it. The rule, in one line:
+	 * **`member` is only ever set by positive proof, and only ever cleared by repeated direct
+	 * proof of absence.** Concretely — promotions always apply (and reset the negotiate-failure
+	 * run); an identify list that merely *lacks* our protocol is weak, possibly-stale evidence
+	 * and may demote only a peer we have never confirmed; and a single failed protocol
+	 * negotiation is evidence, not a verdict, so it demotes only once a run of them accumulates.
+	 *
+	 * Foreign is never permanent: a later successful namespaced RPC (in either direction) or a
+	 * re-identify promotes back to member. We tag and retain rather than evict — an evicted
+	 * foreign peer is just re-added by the next peer:connect / peerStore seed and re-probed in
+	 * a loop.
+	 */
+	private applyMembershipSignal(id: string, signal: MembershipSignal): void {
 		const e = this.store.getById(id);
-		if (e && e.membership !== 'member') this.store.setMembership(id, 'member');
+		if (!e) return;
+		switch (signal) {
+			case 'rpc-success':
+			case 'rpc-inbound':
+			case 'identify-member': {
+				// Positive proof outranks whatever label the peer currently carries.
+				const patch: Partial<PeerEntry> = { negotiateFailures: 0 };
+				if (e.membership !== 'member') patch.membership = 'member';
+				if (e.membership !== 'member' || e.negotiateFailures !== 0) this.store.update(id, patch);
+				return;
+			}
+			case 'identify-foreign': {
+				// The protocol list is only what the remote advertised *at capture time*; it can
+				// predate our own handler registration, so it must not overturn a confirmed member.
+				if (e.membership === 'unknown') this.store.setMembership(id, 'foreign');
+				return;
+			}
+			case 'negotiate-failure': {
+				// Clamped at the threshold so the counter stays bounded for a peer we keep
+				// re-probing; a peer already at the threshold simply stays foreign.
+				const failures = Math.min(e.negotiateFailures + 1, FretService.NEGOTIATE_FAILURE_THRESHOLD);
+				const patch: Partial<PeerEntry> = { negotiateFailures: failures };
+				if (failures >= FretService.NEGOTIATE_FAILURE_THRESHOLD && e.membership !== 'foreign') {
+					patch.membership = 'foreign';
+				}
+				this.store.update(id, patch);
+				return;
+			}
+		}
 	}
 
 	/**
-	 * Confirm `id` does NOT serve this network (idempotent). Foreign is reversible —
-	 * a later successful namespaced RPC or re-identify promotes it back to member.
-	 * We tag and retain rather than evict: an evicted foreign peer is just re-added by
-	 * the next peer:connect/peerStore seed and re-probed in a loop.
+	 * Record that `id` dialed one of *our* namespaced protocols — the strongest membership
+	 * proof available, since only this network's peers speak them and the sender identity is
+	 * transport-authenticated. Upserts first so a peer we have never seen is promoted rather
+	 * than dropped, which is what re-admits a NAT'd peer we struggle to dial but that reaches us.
 	 */
-	private markForeign(id: string): void {
-		const e = this.store.getById(id);
-		if (e && e.membership !== 'foreign') this.store.setMembership(id, 'foreign');
+	private async noteInboundRpc(id: string): Promise<void> {
+		if (this.stopped) return;
+		try {
+			if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(peerIdFromString(id)));
+			this.applyMembershipSignal(id, 'rpc-inbound');
+		} catch (err) {
+			log.error('noteInboundRpc failed for %s - %e', id, err);
+		}
 	}
 
 	/**
 	 * Classify `id` from a libp2p-reported protocol list (available once identify has
 	 * run). Member if any of our namespaced protocols appears; foreign if the list is
 	 * non-empty but contains none of them; left unknown if empty (identify pending).
+	 * The demotion arm is deliberately weak — see `applyMembershipSignal`.
 	 */
 	private classifyByProtocols(id: string, protocols: string[] | undefined): void {
 		if (!protocols || protocols.length === 0) return; // identify not complete → stay unknown
 		const mine = Object.values(this.protocols);
-		if (protocols.some((p) => mine.includes(p))) this.markMember(id);
-		else this.markForeign(id);
+		const signal = protocols.some((p) => mine.includes(p)) ? 'identify-member' : 'identify-foreign';
+		this.applyMembershipSignal(id, signal);
 	}
 
 	async start(): Promise<void> {
@@ -461,11 +542,18 @@ export class FretService implements IFretService, Startable {
 					(from, snap) => this.handleAnnounce(from, snap),
 					this.protocols,
 					this.maxBytesNeighbors(),
-					() => { this.diag.rejected.identityMismatch++; }
+					() => { this.diag.rejected.identityMismatch++; },
+					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(neighbors)')
 				),
-				// `_from` is the transport-authenticated sender; unused for now but reserved
-				// for future per-peer rate limiting / diagnostics.
-				registerMaybeAct(this.node, async (msg, _from) => this.handleMaybeAct(msg), this.protocols.PROTOCOL_MAYBE_ACT, this.maxBytesMaybeAct()),
+				registerMaybeAct(
+					this.node,
+					async (msg, from) => {
+						this.detach(this.noteInboundRpc(from), 'noteInboundRpc(maybeAct)');
+						return await this.handleMaybeAct(msg);
+					},
+					this.protocols.PROTOCOL_MAYBE_ACT,
+					this.maxBytesMaybeAct()
+				),
 				registerLeave(
 					this.node,
 					async (notice) => this.handleLeave(notice),
@@ -475,7 +563,8 @@ export class FretService implements IFretService, Startable {
 				registerPing(
 					this.node,
 					this.protocols.PROTOCOL_PING,
-					() => this.handlePingRequest()
+					() => this.handlePingRequest(),
+					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(ping)')
 				),
 			]);
 		} catch (err) {
@@ -866,6 +955,9 @@ export class FretService implements IFretService, Startable {
 			if (!this.store.getById(from)) discovered.push(from);
 			this.store.upsert(from, selfCoord);
 			await this.applyTouch(from, selfCoord);
+			// `from` is transport-authenticated (the handler drops any mismatch) and it dialed
+			// our namespaced announce protocol — strongest possible membership proof.
+			this.applyMembershipSignal(from, 'rpc-inbound');
 
 			if (snap.metadata) {
 				// Update metadata via store.update to avoid mutating frozen entries
@@ -923,10 +1015,11 @@ export class FretService implements IFretService, Startable {
 					if (!this.store.getById(pidStr)) discovered.push(pidStr);
 					this.store.upsert(pidStr, coord);
 					// If identify has populated the peerStore, classify off its protocol
-					// list now rather than waiting for an outbound probe.
-					if (this.store.getById(pidStr)?.membership === 'unknown') {
-						this.classifyByProtocols(pidStr, p.protocols);
-					}
+					// list now rather than waiting for an outbound probe. No `unknown`-only
+					// guard here any more — that rule is now general (see
+					// `applyMembershipSignal`: an identify list lacking our protocol demotes
+					// only from `unknown`, wherever the list came from).
+					this.classifyByProtocols(pidStr, p.protocols);
 				} catch (err) {
 					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
 				}
@@ -1033,10 +1126,11 @@ export class FretService implements IFretService, Startable {
 				// benign during churn - do not warn each tick
 				// console.warn('ping failed for', id, err);
 				try {
-					// An explicit unsupported-protocol error is definitive: the peer is
-					// reachable but does not serve this network → foreign. A timeout /
-					// transient error is NOT — leave the peer unclassified for a later tick.
-					if (isUnsupportedProtocolError(err)) this.markForeign(id);
+					// A failed negotiation is evidence, not a verdict — this path is member-gated,
+					// so `id` is a *confirmed* member and the likeliest cause is a restart or a
+					// handler not yet registered. Count it; only a run of them demotes. A timeout /
+					// transient error is not even that, and leaves the label untouched.
+					if (isUnsupportedProtocolError(err)) this.applyMembershipSignal(id, 'negotiate-failure');
 					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
 					await this.applyFailure(id, coord);
 					this.diag.pingsFail++;
@@ -1099,8 +1193,14 @@ export class FretService implements IFretService, Startable {
 		);
 		if (foreign.length === 0) return;
 		// Only reachable peers are probeable; prefer connected over has-addresses.
-		const connected = foreign.filter((e) => this.isConnected(e.id));
-		const reachable = foreign.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id));
+		// Within each group, probe the least-backed-off first: backoff factor is a proxy for
+		// "how many times we already confirmed this peer foreign", so a freshly-demoted peer
+		// (factor 0/1) — the one most likely to be mislabeled — is serviced before a
+		// long-confirmed foreign one (factor 32) rather than queueing behind it.
+		const byBackoffFactor = (a: PeerEntry, b: PeerEntry): number =>
+			(this.backoffMap.get(a.id)?.factor ?? 0) - (this.backoffMap.get(b.id)?.factor ?? 0);
+		const connected = foreign.filter((e) => this.isConnected(e.id)).sort(byBackoffFactor);
+		const reachable = foreign.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id)).sort(byBackoffFactor);
 		const targets = [...connected, ...reachable].slice(0, budget);
 		for (const e of targets) {
 			if (this.stopped) break;
@@ -1130,11 +1230,13 @@ export class FretService implements IFretService, Startable {
 		} catch (err) {
 			this.diag.pingsFail++;
 			if (isUnsupportedProtocolError(err)) {
-				// Confirmed foreign. Back off so the occasional foreign re-probe (which exists
-				// to recover a *mislabeled* same-network peer) does not hammer a genuinely-
-				// foreign peer that keeps returning this error. The backoff grows exponentially
-				// (factor doubles each window, up to 32×) so probing tapers toward ~once/32s.
-				this.markForeign(id);
+				// Evidence of absence — foreign only once a run of these accumulates (a peer that
+				// has simply not registered its handlers yet produces the identical error). Back
+				// off either way so the occasional foreign re-probe (which exists to recover a
+				// *mislabeled* same-network peer) does not hammer a genuinely-foreign peer that
+				// keeps returning this error. The backoff grows exponentially (factor doubles
+				// each window, up to 32×) so probing tapers toward ~once/32s.
+				this.applyMembershipSignal(id, 'negotiate-failure');
 				this.recordBackoff(id);
 			} else {
 				this.recordBackoff(id); // timeout / transient — retry a later tick
@@ -1371,8 +1473,10 @@ export class FretService implements IFretService, Startable {
 					}
 				} catch (err) {
 					log.error('forward maybeAct failed to %s - %e', next, err);
-					// Unsupported-protocol means this hop belongs to another network.
-					if (isUnsupportedProtocolError(err)) this.markForeign(next);
+					// A failed negotiation hints this hop belongs to another network, but `next`
+					// came from the member-gated cohort, so it is a confirmed member and a restart
+					// looks identical. Count it; only a run of them demotes.
+					if (isUnsupportedProtocolError(err)) this.applyMembershipSignal(next, 'negotiate-failure');
 					this.recordBackoff(next);
 				}
 			}

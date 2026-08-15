@@ -20,12 +20,14 @@ export async function registerNeighbors(
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
 	maxBytes = 128 * 1024,
-	onIdentityMismatch?: (claimed: string, actual: string) => void
+	onIdentityMismatch?: (claimed: string, actual: string) => void,
+	onInbound?: (from: string) => void
 ): Promise<void> {
-	// Request handler carries no inbound `from`; it only replies with our own
-	// snapshot. Adopt the (stream, connection) shape so the authenticated identity
-	// is available and new handlers copy the correct signature.
-	await node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, _connection: Connection) => {
+	// The request carries no inbound `from`, but the connection's remote peer is
+	// transport-authenticated — and reaching this handler at all means the remote dialed
+	// *this network's* namespaced protocol. `onInbound` hands that proof to the caller.
+	await node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, connection: Connection) => {
+		onInbound?.(connection.remotePeer.toString());
 		try {
 			const snap = await getSnapshot();
 			stream.send(await encodeJson(snap));
