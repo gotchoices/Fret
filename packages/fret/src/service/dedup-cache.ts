@@ -23,8 +23,20 @@ export type Clock = ExpiringMapClock;
 export class DedupCache<T> {
 	private readonly entries: ExpiringMap<T>;
 
-	constructor(ttlMs = DEDUP_TTL_MS, maxSize = 1024, now: Clock = Date.now) {
-		this.entries = new ExpiringMap<T>({ capacity: maxSize, ttlMs, now });
+	constructor(ttlMs = DEDUP_TTL_MS, capacity = 1024, now: Clock = Date.now) {
+		this.entries = new ExpiringMap<T>({ capacity, ttlMs, now });
+	}
+
+	/**
+	 * The hard entry ceiling actually in force, after {@link ExpiringMap}'s normalization.
+	 *
+	 * Exposed because the capacity is a stated security bound — an entry evicted before its TTL is
+	 * a replay hole (see the profile-derived sizing in `FretService`) — so it has to be readable to
+	 * be checkable. Reading it off the wrapped map keeps this a view rather than a second copy that
+	 * could drift from the value the map enforces.
+	 */
+	get capacity(): number {
+		return this.entries.capacity;
 	}
 
 	get(key: string): T | undefined {

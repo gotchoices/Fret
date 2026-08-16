@@ -105,11 +105,11 @@ describe('replay hardening', function () {
 	})
 
 	describe('dedup cache capacity', () => {
-		// Reads the cache's private capacity rather than filling it: proving 2048 slots
+		// Reads the cache's declared capacity rather than filling it: proving 2048 slots
 		// behaviorally would mean driving 2049 inbound RPCs, which is minutes of wall clock for
 		// a constant. What matters here is that the profile is wired through at all.
 		const capacityOf = (svc: CoreFretService): number =>
-			(svc as any).dedupCache.maxSize as number
+			(svc as any).dedupCache.capacity as number
 
 		it('sizes Core larger than Edge', async () => {
 			const node = await createMemNode()
