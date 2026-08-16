@@ -199,6 +199,39 @@ describe('FretPeerDiscovery', function () {
 		expect(peers.length).to.equal(3, 'first scan should emit exactly batchSize peers');
 	});
 
+	it('debounce map caps at maxTracked and evicts, so an evicted peer is emitted again later', async () => {
+		const count = 5;
+		const nodes = await Promise.all(Array.from({ length: count }, () => createMemNode()));
+		await Promise.all(nodes.map(n => n.start()));
+		const ids = nodes.map(n => n.peerId.toString());
+		const coords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)));
+		const store = makeStore(ids, coords);
+
+		const disc = new FretPeerDiscovery(store, {
+			emissionIntervalMs: 100,
+			batchSize: 2,
+			debounceMs: 60_000,
+			maxTracked: 4,
+		});
+
+		const emitted: string[] = [];
+		const handler = (evt: CustomEvent<PeerInfo>) => { emitted.push(evt.detail.id.toString()); };
+		disc.addEventListener('peer', handler);
+		await disc.start();
+		await new Promise(r => setTimeout(r, 1800));
+		disc.removeEventListener('peer', handler);
+		await disc.stop();
+		await stopAll(nodes);
+
+		const emittedSet = new Set(emitted);
+		for (const id of ids) expect(emittedSet.has(id)).to.equal(true, `${id} must eventually be emitted`);
+
+		const counts = new Map<string, number>();
+		for (const id of emitted) counts.set(id, (counts.get(id) ?? 0) + 1);
+		expect(Array.from(counts.values()).some(c => c > 1)).to.equal(true,
+			'an evicted peer must be re-emitted, not dropped forever');
+	});
+
 	it('never emits self when the source supplies a self id', async () => {
 		const nodes = await Promise.all([createMemNode(), createMemNode()]);
 		await Promise.all(nodes.map(n => n.start()));

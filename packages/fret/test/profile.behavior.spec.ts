@@ -3,6 +3,8 @@ import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
+import { peerDiscoverySymbol } from '@libp2p/interface'
+import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
 
 // Helper: create a started service with given profile, returning both node and service
 async function createService(profile: 'edge' | 'core') {
@@ -426,6 +428,56 @@ describe('Profile behavior tests', function () {
 
 			await svc.stop()
 			await node.stop()
+		})
+	})
+
+	// ----- Bounded internal map capacities (backoffMap, departureDebounce, discovery debounce) -----
+
+	describe('Bounded internal map capacities', () => {
+		it('Core backoffMap capacity defaults to routing-table capacity (2048)', async () => {
+			const { node, svc } = await createService('core')
+			expect((svc as any).backoffMap.capacity).to.equal(2048)
+			await svc.stop()
+			await node.stop()
+		})
+
+		it('Edge backoffMap capacity is capped at 512', async () => {
+			const { node, svc } = await createService('edge')
+			expect((svc as any).backoffMap.capacity).to.equal(512)
+			await svc.stop()
+			await node.stop()
+		})
+
+		it('Core departureDebounce capacity defaults to 512', async () => {
+			const { node, svc } = await createService('core')
+			expect((svc as any).departureDebounce.capacity).to.equal(512)
+			await svc.stop()
+			await node.stop()
+		})
+
+		it('Edge departureDebounce capacity defaults to 128', async () => {
+			const { node, svc } = await createService('edge')
+			expect((svc as any).departureDebounce.capacity).to.equal(128)
+			await svc.stop()
+			await node.stop()
+		})
+
+		it('Core discovery debounce map (maxTracked) defaults to 4096', () => {
+			const svc = new Libp2pFretService({}, { profile: 'core', k: 7 })
+			const disc = svc[peerDiscoverySymbol] as any
+			expect(disc.emitted.capacity).to.equal(4096)
+		})
+
+		it('Edge discovery debounce map (maxTracked) defaults to 1024', () => {
+			const svc = new Libp2pFretService({}, { profile: 'edge', k: 7 })
+			const disc = svc[peerDiscoverySymbol] as any
+			expect(disc.emitted.capacity).to.equal(1024)
+		})
+
+		it('an explicit discoveryCfg.maxTracked overrides the profile default', () => {
+			const svc = new Libp2pFretService({}, { profile: 'core', k: 7 }, { maxTracked: 77 })
+			const disc = svc[peerDiscoverySymbol] as any
+			expect(disc.emitted.capacity).to.equal(77)
 		})
 	})
 })
