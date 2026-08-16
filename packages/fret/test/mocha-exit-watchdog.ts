@@ -35,6 +35,10 @@ function constructorName(value: unknown): string {
 // (see tickets/complete/) into a single stack trace naming the leaking call site directly.
 // A future leak can still be found the slow way (bisect files, then --grep within the file);
 // a maintainer may reasonably judge that cost acceptable and leave this off by default forever.
+// NOTE: only the globals are wrapped. A timer armed through `node:timers` / `node:timers/promises`
+// imports is invisible here; nothing in this package does that today, so widening the patch would
+// be untested machinery. If a future dump reports a live Timeout with no origin captured, that
+// import style is the first thing to check.
 const TRACE_ENABLED = process.env.FRET_TEST_EXIT_TRACE === '1';
 
 type TimerHandle = ReturnType<typeof setTimeout>;
@@ -48,8 +52,11 @@ const timerOrigins = new Map<TimerHandle, TimerOrigin>();
 
 function captureStack(): string {
 	const stack = new Error('timer created here').stack ?? '(no stack available)';
-	// Drop the "Error: timer created here" line and this function's own frame.
-	return stack.split('\n').slice(2).join('\n');
+	// Drop three lines: the "Error: timer created here" message, this function's own
+	// frame, and the wrapper frame that called it — so the first line printed is the
+	// call site that actually armed the timer. `mocha-exit-watchdog.spec.ts` asserts on
+	// that first line, so an added frame between here and the wrapper fails there.
+	return stack.split('\n').slice(3).join('\n');
 }
 
 function installTimerTracing(): void {

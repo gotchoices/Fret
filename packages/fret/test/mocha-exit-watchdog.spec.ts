@@ -18,11 +18,11 @@ interface ChildResult {
 	stderr: string;
 }
 
-function runFixture(fixture: string): Promise<ChildResult> {
+function runFixture(fixture: string, extraEnv: Record<string, string> = {}): Promise<ChildResult> {
 	const child = spawn(
 		process.execPath,
 		['--import', './register.mjs', 'node_modules/mocha/bin/mocha.js', `test/fixtures/${fixture}`],
-		{ cwd: packageDir, env: { ...process.env, FRET_TEST_EXIT_GRACE_MS: String(GRACE_MS) } },
+		{ cwd: packageDir, env: { ...process.env, FRET_TEST_EXIT_GRACE_MS: String(GRACE_MS), ...extraEnv } },
 	);
 	let stdout = '';
 	let stderr = '';
@@ -47,6 +47,22 @@ describe('mocha exit watchdog', function () {
 		expect(stderr).to.contain(`${GRACE_MS}ms`);
 		// The leaked `setInterval` is what `getActiveResourcesInfo()` should be reporting.
 		expect(stderr).to.match(/resources:.*Timeout/);
+	});
+
+	it('names the leaking call site when timer tracing is enabled', async () => {
+		const { code, stderr } = await runFixture('exit-watchdog-leak.fixture.ts', { FRET_TEST_EXIT_TRACE: '1' });
+		expect(code).to.equal(1);
+		expect(stderr).to.contain('timer origins:');
+		expect(stderr).to.contain('[interval]');
+		// The whole point of the trace: the *first* frame is the call site that armed the
+		// timer, not a frame inside the watchdog's own wrapper. Pins the stack-slice depth.
+		const firstFrame = stderr.slice(stderr.indexOf('[interval]')).split('\n')[1] ?? '';
+		expect(firstFrame, `first traced frame was: ${firstFrame}`).to.contain('exit-watchdog-leak.fixture.ts');
+	});
+
+	it('tells you how to turn tracing on when it is off', async () => {
+		const { stderr } = await runFixture('exit-watchdog-leak.fixture.ts');
+		expect(stderr).to.contain('FRET_TEST_EXIT_TRACE=1');
 	});
 
 	it('stays silent and lets a clean run exit on its own', async () => {
