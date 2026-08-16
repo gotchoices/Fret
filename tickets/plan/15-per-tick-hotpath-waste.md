@@ -18,3 +18,10 @@ Expected outcome: no per-tick SHA-256 for already-known coords; the cached self-
 The plan agent should confirm the running-count bookkeeping stays correct across upsert/evict/membership transitions and settle where the counts are maintained.
 
 References: fret-service.ts `seedFromPeerStore` (~794-806), five `hashPeerId(self)` sites (across ~514-1061), `enforceCapacity` (~216-224), classification/re-probe passes (~939, 971). Review "Core service" minor finding (per-tick hot-path waste).
+
+Arm added during the `dead-state-exclusion-recovery` review: point (d) is now **three** full-store
+walks per tick, not two. The re-probe pass gained a second arm (`dead`, alongside `foreign`), and
+each arm plus `classifyUnknownPeers` materializes its own `store.list()` array. A `NOTE:` at
+`classifyUnknownPeers` in `fret-service.ts` records the same thing at the code site. Whatever
+running-count bookkeeping this ticket lands should cover all three target sets — or, equivalently,
+do one walk per tick and partition it into the three candidate lists.

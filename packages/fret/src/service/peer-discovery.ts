@@ -3,6 +3,7 @@ import { peerDiscoverySymbol } from '@libp2p/interface';
 import { TypedEventEmitter } from 'main-event';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { DigitreeStore } from '../store/digitree-store.js';
+import { isLiveMember } from './live-member.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('service:peer-discovery');
@@ -115,11 +116,13 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		let count = 0;
 		for (const entry of store.list()) {
 			if (count >= this.batchSize) break;
-			if (entry.state === 'dead') continue;
-			// Member-scoped: only same-network peers are surfaced to libp2p's discovery
-			// pipeline. The whole store is re-scanned each tick, so a peer is emitted as soon
-			// as the classification probe labels it `member`.
-			if (entry.membership !== 'member') continue;
+			// Ring-scoped, through the *same* predicate every other ring-shaped read uses (see
+			// `isLiveMember`): only live same-network peers are surfaced to libp2p's discovery
+			// pipeline, so a foreign, unclassified, or dead peer is never re-seeded into peer
+			// selection upstream. The whole store is re-scanned each tick, so a peer is emitted as
+			// soon as the classification probe labels it `member` — or as soon as the dead re-probe
+			// arm resurrects it.
+			if (!isLiveMember(entry)) continue;
 			// Self is seeded `member` and lives in the store, so without this every debounce
 			// window would produce one "discovery mechanism discovered self" error from libp2p.
 			if (selfId !== null && entry.id === selfId) continue;

@@ -31,6 +31,7 @@ import { DedupCache, DEDUP_TTL_MS } from './dedup-cache.js';
 import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js';
 import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
+import { isLiveMember } from './live-member.js';
 import {
     createSparsityModel,
     normalizedLogDistance,
@@ -69,25 +70,6 @@ function randomToken(): string {
 	}
 	throw new Error('no WebCrypto RNG available (globalThis.crypto): cannot mint a correlation id');
 }
-
-/**
- * Ring views are scoped to this network **and to peers we still believe are alive**: a peer
- * participates in the ring (neighbor set, cohort, size estimate, sample, discovery) only once
- * confirmed to serve this network's FRET protocol, and only while it is not marked `dead`.
- *
- * Self is seeded `member` and is never marked dead, so it always passes. `unknown` peers are
- * excluded until the classification probe pass (see `classifyUnknownPeers`) resolves them —
- * typically within ~1 tick — so they are not permanently starved; `dead` peers are excluded
- * until the dead re-probe arm (see `reprobeOffRing`) finds one alive again.
- *
- * Both exclusions are one predicate rather than a second guard bolted onto each reader, so
- * every ring-shaped read inherits them at once. Two consequences fall out rather than needing
- * their own code: FRET stores no separate successor/predecessor *set* — those windows are this
- * filtered walk — so exclusion here **is** removal from S/P; and `enforceCapacity` protects
- * only the peers this predicate returns around self, so a dead peer loses its protected slot
- * and, with a decayed relevance, becomes a preferred eviction victim.
- */
-const isLiveMember = (e: PeerEntry): boolean => e.membership === 'member' && e.state !== 'dead';
 
 /**
  * What produced a membership observation, ordered by how much it actually proves.
@@ -1069,25 +1051,43 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * Would a maintenance dial to this peer be wasted breath?
+	 *
+	 * The maintenance fan-outs (announces, leave notices) deliberately draw their targets from
+	 * *unfiltered* store walks — a member-scoped walk would drop a freshly-connected peer that is
+	 * still `unknown` and stall bootstrap before the classification pass can label it — so each of
+	 * them needs this guard stated explicitly rather than inheriting {@link isLiveMember}. Having
+	 * it in one place is what keeps the two fan-outs from drifting apart, which they had:
+	 *
+	 * - **undialable** — a bare-id dial with no peerStore address can only raise
+	 *   `NoValidAddressesError` (see *Dialability* in `docs/fret.md`).
+	 * - **`foreign`** — a peer already proved to serve another network can only answer a dial on
+	 *   one of our namespaced protocols with `UnsupportedProtocolError`.
+	 * - **`dead`** — a run of failed contacts says the dial fails outright. Re-probing it is the
+	 *   dead arm of {@link reprobeOffRing}'s job, which is budgeted for exactly that; a maintenance
+	 *   fan-out is not, and would re-probe every dead peer on every tick with no backoff.
+	 *
+	 * `unknown` is deliberately *not* doomed — it may yet turn out to be a member.
+	 *
+	 * On the leave path this also protects shutdown: `sendLeaveToNeighbors` runs inside `stop()`,
+	 * where a stack of dials that can only fail delays the whole teardown.
+	 */
+	private isDoomedDial(id: string): boolean {
+		if (!this.isDialable(id)) return true;
+		const entry = this.store.getById(id);
+		return entry?.membership === 'foreign' || entry?.state === 'dead';
+	}
+
+	/**
 	 * Single choke point for outbound announces. Every announce target list is chosen to
 	 * *prefer* non-connected peers (a connected peer learns via normal exchange), so this
-	 * dials — and therefore has to be the place the dialability guard is applied. Checked
-	 * before the token bucket so an undialable target does not burn an announce token.
-	 *
-	 * Confirmed-foreign and `dead` peers are skipped for the same reason: announce target lists
-	 * walk the store unfiltered (so a freshly-connected `unknown` peer is not stalled), but a
-	 * peer we already proved does not serve this network can only answer the dial with
-	 * `UnsupportedProtocolError`, and a peer a run of failed contacts marked dead can only fail
-	 * the dial outright. Re-probing a dead peer is the dead re-probe arm's job (see
-	 * {@link reprobeOffRing}), which is budgeted for it; an announce is not. `unknown` is still
-	 * announced to — it may yet be a member.
+	 * dials — and therefore has to be the place {@link isDoomedDial} is applied. Checked
+	 * before the token bucket so a doomed target does not burn an announce token.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		for (const id of ids) {
 			if (this.stopped) break;
-			if (!this.isDialable(id)) continue;
-			const entry = this.store.getById(id);
-			if (entry?.membership === 'foreign' || entry?.state === 'dead') continue;
+			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
 				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
@@ -1164,11 +1164,26 @@ export class FretService implements IFretService, Startable {
 		this.detach(tick(), 'active preconnect loop');
 	}
 
+	/**
+	 * Replacement hints for a leave notice: the live members just outside our own S/P window,
+	 * best-connected and most-relevant first.
+	 *
+	 * **Live-member-scoped, because this list goes on the wire.** It is the same
+	 * transitive-propagation guard the outgoing snapshot's neighbor lists and sample carry: a
+	 * departing node must not hand its neighbors peers it knows serve another network, or peers a
+	 * run of failed contacts already marked dead. The recipient acts on these directly — it dials
+	 * and pings up to six of them (`handleLeave`) — so an unfiltered list spends someone else's
+	 * dial budget on peers we had already given up on, and re-seeds a foreign peer into a
+	 * same-network view that the ring gating exists to keep it out of.
+	 *
+	 * The *targets* of the notice (`sendLeaveToNeighbors`'s `ids`) stay unfiltered by contrast:
+	 * that walk defines the S/P set this list excludes, not a list we advertise.
+	 */
 	private computeReplacements(selfCoord: Uint8Array, spNeighborIds: Set<string>, selfStr: string): string[] {
 		const maxReplacements = 6;
 		const wider = Array.from(new Set([
-			...this.store.neighborsRight(selfCoord, this.cfg.m * 2),
-			...this.store.neighborsLeft(selfCoord, this.cfg.m * 2),
+			...this.store.neighborsRight(selfCoord, this.cfg.m * 2, isLiveMember),
+			...this.store.neighborsLeft(selfCoord, this.cfg.m * 2, isLiveMember),
 		])).filter((id) => id !== selfStr && !spNeighborIds.has(id));
 		wider.sort((a, b) => {
 			const connA = this.isConnected(a) ? 1 : 0;
@@ -1193,17 +1208,17 @@ export class FretService implements IFretService, Startable {
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
 			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 			for (const id of ids) {
-				// Undialable and dead neighbors are skipped, not attempted: this runs inside stop(),
-				// so a stack of dials that can only fail also delays shutdown. A peer marked dead by
-				// a run of failed contacts is exactly such a dial.
+				// Doomed dials are skipped, not attempted (see `isDoomedDial`): this runs inside
+				// stop(), so a stack of dials that can only fail also delays shutdown.
 				// (`ids` itself stays unfiltered — it defines the S/P set the replacements exclude.)
-				if (!this.isDialable(id)) continue;
-				if (this.store.getById(id)?.state === 'dead') continue;
+				if (this.isDoomedDial(id)) continue;
 				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
 			const fanOut = this.cfg.profile === 'core' ? 4 : 2;
 			const expanded = this.expandCohort(ids, selfCoord, fanOut, new Set([selfStr]));
+			// No `isDoomedDial` here: everything outside `spSet` came from the live-member-scoped
+			// `assembleCohort` inside `expandCohort`, and `isConnected` already implies dialable.
 			const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
 			for (const id of extra) {
 				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
@@ -1634,6 +1649,12 @@ export class FretService implements IFretService, Startable {
 		// Arms are disjoint by construction: a peer that is both foreign and dead belongs to the
 		// dead arm alone, so no peer is probed twice in one tick. Recovering it there fixes both
 		// labels at once, since `applySuccess` promotes membership and resurrects together.
+		//
+		// NOTE: the arms share one `backoffMap`, so a peer that accumulated backoff while foreign
+		// carries it into the dead arm. Intended today — it is the same "don't hammer this peer"
+		// budget, and the arms are disjoint so no peer is charged twice per tick. If the two ever
+		// need independent cadence (e.g. dead recovery made more eager than foreign re-probing),
+		// they need separate backoff maps, not just separate budgets.
 		await this.reprobeOffRing((e) => e.membership === 'foreign' && e.state !== 'dead', budget);
 		await this.reprobeOffRing((e) => e.state === 'dead', budget);
 	}

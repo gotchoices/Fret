@@ -455,6 +455,23 @@ describe('dead state: exclusion from ring views', () => {
 		expect(st.getById(selfId), 'self protected').to.not.equal(undefined)
 	})
 
+	// Leave-notice replacement hints are the same transitive-propagation channel as the outgoing
+	// snapshot's neighbor lists and sample: the recipient dials and pings what we name here, so a
+	// peer we have given up on (or proved serves another network) must not be advertised as a
+	// suggested neighbor.
+	it('never advertises a dead or foreign peer as a leave-notice replacement', async () => {
+		live('live-a', 60); live('live-b', 160)
+		dead('gone', 61)
+		store.upsert('other-net', coordAt(62)); store.setMembership('other-net', 'foreign')
+
+		const selfCoord = await hashPeerId(node.peerId)
+		const replacements = (svc as any).computeReplacements(
+			selfCoord, new Set<string>(), node.peerId.toString()
+		) as string[]
+
+		expect(replacements).to.have.members(['live-a', 'live-b'])
+	})
+
 	it('re-admits a resurrected peer to the ring views', () => {
 		const key = coordAt(100)
 		dead('back', 101)
@@ -582,7 +599,36 @@ describe('dead state: recovery through the re-probe pass', () => {
 
 	// The announce and leave fan-outs walk the store unfiltered (so a freshly-connected `unknown`
 	// peer is not stalled), which means they need their own dead skip: the dial can only fail, and
-	// the leave path runs inside stop() where a stack of doomed dials also delays shutdown.
+	// the leave path runs inside stop() where a stack of doomed dials also delays shutdown. Both
+	// share one predicate — `isDoomedDial` — which is what these two tests pin: the announce test
+	// drives it end to end through the choke point, this one covers the classification directly
+	// (the leave fan-out's `sendLeave` is a module import with no seam to count attempts at).
+	it('treats undialable, foreign, and dead maintenance targets as doomed dials', () => {
+		const doomed = (id: string): boolean => (svc as any).isDoomedDial(id) as boolean
+
+		store.upsert('no-address', coordAt(10)); store.setMembership('no-address', 'member')
+		expect(doomed('no-address'), 'no peerStore address').to.equal(true)
+
+		store.upsert('live', coordAt(20)); store.setMembership('live', 'member')
+		;(svc as any).setAddressKnown('live', true)
+		expect(doomed('live'), 'dialable live member').to.equal(false)
+
+		// `unknown` is deliberately still a target — it may yet turn out to be a member, and
+		// starving it is what would stall bootstrap.
+		store.upsert('unclassified', coordAt(30))
+		;(svc as any).setAddressKnown('unclassified', true)
+		expect(doomed('unclassified'), 'unknown is not doomed').to.equal(false)
+
+		store.upsert('other-net', coordAt(40)); store.setMembership('other-net', 'foreign')
+		;(svc as any).setAddressKnown('other-net', true)
+		expect(doomed('other-net'), 'foreign answers only UnsupportedProtocolError').to.equal(true)
+
+		store.upsert('gone', coordAt(50)); store.setMembership('gone', 'member')
+		store.update('gone', { state: 'dead' })
+		;(svc as any).setAddressKnown('gone', true)
+		expect(doomed('gone'), 'dead is the dead arm\'s job, not a fan-out\'s').to.equal(true)
+	})
+
 	it('skips dead targets in the announce fan-out', async () => {
 		store.upsert('alive', coordAt(10)); store.setMembership('alive', 'member')
 		store.upsert('gone', coordAt(20)); store.setMembership('gone', 'member')

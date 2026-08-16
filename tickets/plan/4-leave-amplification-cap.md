@@ -21,3 +21,12 @@ This covers review finding M-core-5 (leave handler is an amplification lever).
 The plan agent should settle the outbound ceiling (and whether it is profile-tuned), confirm inserting replacements as `unknown` integrates cleanly with the classification/re-probe passes, and settle whether the four `fetchNeighbors` are kept, reduced, or deferred to normal stabilization.
 
 References: fret-service.ts `handleLeave` (~615-676). Review "Core service" major finding (leave handler is an amplification lever); threat-analysis.md §4.2.
+
+Arm added during the `dead-state-exclusion-recovery` review: the warm loop pings suggested
+replacements after filtering only for dialability, so a replacement that is locally `foreign` or
+`dead` is dialed here outside the budgeted, backing-off re-probe pass that otherwise owns re-probing
+those peers. Inserting replacements as `unknown` and handing them to the classification pass — the
+redesign this ticket already proposes — resolves that too; whatever lands should not reintroduce a
+direct dial on an untrusted id. (The *outgoing* half is fixed: `computeReplacements` now advertises
+only live members, so a well-behaved peer no longer names such peers — but the list is untrusted and
+this is the receiving side.)
