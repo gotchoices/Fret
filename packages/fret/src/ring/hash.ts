@@ -20,13 +20,27 @@ export async function hashKey(key: Uint8Array): Promise<RingCoord> {
 	return digest;
 }
 
+/** Byte value → its fixed-width hex pair. Built once; see {@link coordToHex}. */
+const HEX_PAIR: readonly string[] = Array.from(
+	{ length: 256 },
+	(_, b) => b.toString(16).padStart(2, '0')
+);
+
+/**
+ * Fixed-length 64 hex chars — the encoding the routing store's tree key is built from.
+ *
+ * This is the hottest pure function in FRET: `DigitreeStore` embeds the hex coordinate in
+ * every tree key, so it runs once per store write *and* once per ring walk (each walk seeks
+ * by `hex(coord)`), which puts it under neighbor exchange, cohort assembly, next-hop
+ * selection and size estimation alike. Formatting each byte with
+ * `toString(16).padStart(2, '0')` allocates two throwaway strings per byte — 64 per
+ * coordinate — and measured **38% of total CPU** in the N=100 simulation spec. The lookup
+ * table is therefore load-bearing rather than a micro-optimization: the output is identical,
+ * but the per-byte allocations are gone.
+ */
 export function coordToHex(coord: RingCoord): string {
-	// Fixed-length 64 hex chars
 	let s = '';
-	for (let i = 0; i < coord.length; i++) {
-		const b = coord[i]!.toString(16).padStart(2, '0');
-		s += b;
-	}
+	for (let i = 0; i < coord.length; i++) s += HEX_PAIR[coord[i]!];
 	return s;
 }
 

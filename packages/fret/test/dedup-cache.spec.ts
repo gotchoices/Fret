@@ -1,6 +1,20 @@
 import { describe, it } from 'mocha'
 import { DedupCache } from '../src/service/dedup-cache.js'
 
+/**
+ * A clock the test steps by hand.
+ *
+ * Expiry is a rule about the clock, not about `setTimeout` accuracy, so the TTL specs below
+ * drive time rather than sleep through it. Sleeping made them assert that the host scheduler
+ * overshoots a wait by less than the slack left in the TTL — a margin under 2x that a loaded
+ * machine closes, which is what made these specs flake in a full-suite run while passing in
+ * isolation. Stepping is also exact: it can land *on* a boundary, which no sleep can.
+ */
+function fakeClock(start = 1_000_000): { now: () => number; advance: (ms: number) => void } {
+	let t = start
+	return { now: () => t, advance: (ms: number) => { t += ms } }
+}
+
 describe('DedupCache', () => {
 	it('caches and retrieves a value by key', () => {
 		const cache = new DedupCache<string>()
@@ -15,11 +29,15 @@ describe('DedupCache', () => {
 		if (cache.has('missing')) throw new Error('expected has() to be false')
 	})
 
-	it('expires entries after TTL', async () => {
-		const cache = new DedupCache<string>(50) // 50ms TTL
+	it('expires entries after TTL', () => {
+		const clock = fakeClock()
+		const cache = new DedupCache<string>(50, 1024, clock.now)
 		cache.set('a', 'val')
 		if (cache.get('a') !== 'val') throw new Error('expected cached value before TTL')
-		await new Promise(r => setTimeout(r, 80))
+		// The boundary itself is still live — expiry is `expires < now`, not `<=`.
+		clock.advance(50)
+		if (cache.get('a') !== 'val') throw new Error('expected cached value at the TTL boundary')
+		clock.advance(1)
 		if (cache.get('a') !== undefined) throw new Error('expected undefined after TTL')
 	})
 
@@ -83,13 +101,14 @@ describe('DedupCache', () => {
 	// `evictOldest` no longer sweeps for expired entries; its O(1) correctness rests on insertion
 	// order and expiry order agreeing under a constant ttlMs. Pin that: at capacity the victim is
 	// the oldest-inserted entry, which is therefore also the expired one — never a live entry.
-	it('evicts an expired entry rather than a live one when at capacity', async () => {
-		const cache = new DedupCache<number>(150, 3)
-		cache.set('a', 1) // expires ~t+150
-		await new Promise(r => setTimeout(r, 100))
-		cache.set('b', 2) // expires ~t+250
-		cache.set('c', 3)
-		await new Promise(r => setTimeout(r, 80)) // t~180: 'a' expired, 'b'/'c' still live
+	it('evicts an expired entry rather than a live one when at capacity', () => {
+		const clock = fakeClock()
+		const cache = new DedupCache<number>(150, 3, clock.now)
+		cache.set('a', 1) // expires t+150
+		clock.advance(100)
+		cache.set('b', 2) // expires t+250
+		cache.set('c', 3) // expires t+250
+		clock.advance(80) // t+180: 'a' expired, 'b'/'c' still live
 		cache.set('d', 4) // at capacity: the victim must be the expired 'a'
 		if (cache.has('a')) throw new Error('expected expired "a" to be gone')
 		if (!cache.has('b')) throw new Error('expected live "b" to survive')
@@ -97,12 +116,15 @@ describe('DedupCache', () => {
 		if (!cache.has('d')) throw new Error('expected "d" to be present')
 	})
 
-	it('refreshing a key restarts its TTL', async () => {
-		const cache = new DedupCache<string>(200)
+	it('refreshing a key restarts its TTL', () => {
+		const clock = fakeClock()
+		const cache = new DedupCache<string>(200, 1024, clock.now)
 		cache.set('k', 'v1')
-		await new Promise(r => setTimeout(r, 120))
+		clock.advance(120)
 		cache.set('k', 'v2') // restarts the 200ms window
-		await new Promise(r => setTimeout(r, 120)) // past 200ms from the first set, not the second
+		clock.advance(120) // past 200ms from the first set, not the second
 		if (cache.get('k') !== 'v2') throw new Error('expected refreshed entry to still be live')
+		clock.advance(81) // now past 200ms from the second set too
+		if (cache.get('k') !== undefined) throw new Error('expected the restarted window to expire')
 	})
 })
