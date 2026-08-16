@@ -1828,6 +1828,12 @@ export class FretService implements IFretService, Startable {
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
+			// Selecting phase-2 targets is three full store walks; the pool would only `skip` every
+			// one of them once the budget has gone. This early return does not *cause* the skip —
+			// phase 2 is behind a barrier on phase 1, and one phase-1 task's worst case (2 s ping +
+			// 5 s fetch) already exceeds the 5 s tick budget, so a single stalled near peer starves
+			// phase 2 for the whole tick. Tracked as `bug-tick-budget-starves-phase-two`.
+			if (budget.signal.aborted) return;
 			const targets = [...this.classifyTargets(), ...this.reprobeExcludedTargets()];
 			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
 			logRejected(probed, targets, 'probeMembership');
@@ -2073,9 +2079,12 @@ export class FretService implements IFretService, Startable {
 	 * past it. If snapshot counts are ever used for anything load-bearing, have `fetchNeighbors`
 	 * distinguish "skipped" from "empty" rather than adding a check here.
 	 *
-	 * NOTE: two near peers' snapshots can name the **same** third peer, so with the fetches pooled a
-	 * concurrent `applyTouch(pid)` on it is genuinely possible. Harmless — the field the race can
-	 * lose is `accessCount`, which only feeds a relevance score recomputed on every call (see the
+	 * NOTE: pooling makes concurrent scoring of one peer genuinely possible, in two ways — two near
+	 * peers' snapshots naming the **same** third peer (`applyTouch` against `applyTouch`), and a
+	 * snapshot naming a near peer another task is pinging (`applyTouch` against `applySuccess`).
+	 * The tick's four candidate sets being disjoint does not cover the second: the ids a snapshot
+	 * *names* are not one of those sets. Harmless either way — the fields the race can lose
+	 * (`accessCount`, `successCount`) only feed a relevance score recomputed on every call (see the
 	 * NOTE on `applySuccess`).
 	 */
 	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
