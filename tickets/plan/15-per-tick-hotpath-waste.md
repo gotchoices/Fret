@@ -19,6 +19,15 @@ The plan agent should confirm the running-count bookkeeping stays correct across
 
 References: fret-service.ts `seedFromPeerStore` (~794-806), five `hashPeerId(self)` sites (across ~514-1061), `enforceCapacity` (~216-224), classification/re-probe passes (~939, 971). Review "Core service" minor finding (per-tick hot-path waste).
 
+Interaction (noted while planning `7-stabilization-concurrency`):
+`tickets/implement/7.5-stabilize-tick-concurrency` restructures the same three passes —
+`classifyUnknownPeers` and both `reprobeOffRing` arms become *selectors* that return target ids
+(keeping their independent per-tick budgets) while the tick drives the probes through a
+bounded-concurrency pool. That does not remove any of the three full-store walks, so point (d)
+still stands; but whatever running-count bookkeeping lands here should be written against the
+selector shape, and points (b) and (c) touch code that ticket rewrites. Land that ticket first
+or expect a merge by hand.
+
 Arm added during the `dead-state-exclusion-recovery` review: point (d) is now **three** full-store
 walks per tick, not two. The re-probe pass gained a second arm (`dead`, alongside `foreign`), and
 each arm plus `classifyUnknownPeers` materializes its own `store.list()` array. A `NOTE:` at

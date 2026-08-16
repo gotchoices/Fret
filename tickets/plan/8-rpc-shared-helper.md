@@ -37,4 +37,16 @@ Requirements:
 - Start the ping round-trip clock after the stream opens.
 - Tighten each RPC's max-bytes to the real ceiling so oversized payloads are rejected before full buffering.
 
+Arm resolved elsewhere (added while planning `7-stabilization-concurrency`): two of the
+requirements above — **thread an AbortSignal through send and read**, and **start the ping
+round-trip clock after the stream opens** — are landed by
+`tickets/implement/7-rpc-abort-deadlines`, which adds a `deadline()` helper
+(`src/utils/deadline.ts`), gives `openRpcStream` / `readAllBounded` / all five senders a
+`{ signal, timeoutMs }` contract with a shared `RPC_TIMEOUT_MS`, and adds a run-scoped
+`AbortController` on `FretService`. This consolidation should **absorb** that contract into
+the shared `rpcRequest` helper rather than re-designing it — the cancellation rule it
+establishes ("our own abort is not evidence about the peer", so it never scores a contact
+failure) is a correctness rule the shared helper must preserve, and it is the natural place
+for the `unreachable` / `decode-error` / `timeout` distinction this ticket already wants.
+
 References: review RPC-section findings "Handler error paths leak streams", "fetchNeighbors fabricates success on every failure", "Zero shape validation of decoded messages", and "RPC boilerplate duplicated 4-5x with three error contracts" (neighbors.ts:24/29-44/60-70, maybe-act.ts:16/19/23-25, leave.ts:32/40-42, ping.ts:28/50-51, protocols.ts:59/78-83). This consolidation deletes roughly half of the rpc directory.
