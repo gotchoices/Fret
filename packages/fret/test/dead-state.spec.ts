@@ -155,6 +155,45 @@ describe('dead state: liveness seam', () => {
 		expect(store.getById(id)?.membership).to.equal('foreign')
 	})
 
+	// A disconnect is not proof of life, and it is the event that *follows* a run of failed
+	// contacts — so if it cleared `dead` the seam would undo nearly every transition it makes,
+	// re-admitting the peer to every ring view with its counter still clamped at the threshold.
+	it('does not resurrect a dead peer when its connection drops', async () => {
+		const id = seedPeer('peer-k')
+		store.update(id, { state: 'dead', contactFailures: 3 })
+
+		;(svc as any).noteDisconnected(id)
+
+		expect(store.getById(id)?.state).to.equal('dead')
+		expect(store.getById(id)?.contactFailures).to.equal(3, 'counter left clamped')
+	})
+
+	it('still records a disconnect for a peer that is not dead', () => {
+		const id = seedPeer('peer-l')
+		store.setState(id, 'connected')
+
+		;(svc as any).noteDisconnected(id)
+
+		expect(store.getById(id)?.state).to.equal('disconnected')
+	})
+
+	// The spacing stamp only means anything inside one run. Carrying it past a recovery makes the
+	// first failure of the *next* run land inside the previous run's window and be discarded, so
+	// the peer gets a free miss after every recovery.
+	it('clears the spacing stamp on proof of life so the next run starts clean', async () => {
+		const id = seedPeer('peer-m')
+		await strike(id)
+		expect(store.getById(id)?.lastContactFailureAt).to.be.greaterThan(0)
+
+		;(svc as any).noteProofOfLife(id)
+		expect(store.getById(id)?.lastContactFailureAt).to.equal(0)
+
+		// Immediately after recovery — well inside the spacing window of the strike above — the
+		// next failure must still count.
+		await strike(id)
+		expect(store.getById(id)?.contactFailures).to.equal(1)
+	})
+
 	// libp2p closes idle connections routinely, and the disconnect handler's only response is
 	// relevance decay. Counting those would kill a healthy peer after three ordinary cycles.
 	it('does not strike on a bare relevance decay (the peer:disconnect path)', async () => {
@@ -265,5 +304,75 @@ describe('dead state: liveness seam', () => {
 		}
 		expect(store.getById(id)?.contactFailures).to.equal(3)
 		expect(store.getById(id)?.state).to.equal('dead')
+	})
+})
+
+// The tests above drive the seam helpers directly, which leaves the wiring at the outbound-RPC
+// call sites unasserted — a call site that forgot to route its catch through `noteRpcFailure`
+// would pass every one of them. These drive a real `sendPing` instead, so the transition is
+// observed end to end through `probeNeighborsLatency`.
+describe('dead state: through a real outbound RPC call site', () => {
+	let node: Libp2p
+	let svc: CoreFretService
+	let store: DigitreeStore
+	const spares: Libp2p[] = []
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Not started: the transitions here are driven explicitly, and a live stabilization loop
+		// would probe the same peers on its own schedule and make the counts non-deterministic.
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		store = svc.getStore()
+	})
+
+	afterEach(async () => {
+		try { await svc.stop() } catch {}
+		await stopAll([node, ...spares.splice(0)])
+	})
+
+	/** A well-formed peer id this node holds no address for — every dial to it fails outright. */
+	async function unreachablePeer(): Promise<string> {
+		const ghost = await createMemNode()
+		const id = ghost.peerId.toString()
+		await stopAll([ghost])
+		store.upsert(id, await hashPeerId(ghost.peerId))
+		store.setMembership(id, 'member')
+		return id
+	}
+
+	it('marks an unreachable neighbor dead after a run of failed pings', async () => {
+		const id = await unreachablePeer()
+		for (let i = 0; i < 3; i++) {
+			await (svc as any).probeNeighborsLatency([id])
+			store.update(id, { lastContactFailureAt: 0 }) // stand in for the spacing interval
+		}
+
+		expect(store.getById(id)?.contactFailures).to.equal(3)
+		expect(store.getById(id)?.state).to.equal('dead')
+		// A dial that never reached the remote says nothing about which network it serves.
+		expect(store.getById(id)?.membership).to.equal('member')
+	})
+
+	it('resurrects a dead peer once a ping to it succeeds again', async () => {
+		const other = await createMemNode()
+		spares.push(other)
+		await other.start()
+		const otherSvc = new CoreFretService(other, { profile: 'core', networkName: 'net-test' })
+		try {
+			await otherSvc.start() // registers this network's ping handler on the remote
+			await node.dial(other.getMultiaddrs()[0]!)
+			const id = other.peerId.toString()
+			store.upsert(id, await hashPeerId(other.peerId))
+			store.update(id, { state: 'dead', contactFailures: 3, lastContactFailureAt: Date.now() })
+
+			await (svc as any).probeNeighborsLatency([id])
+
+			expect(store.getById(id)?.state).to.equal('connected')
+			expect(store.getById(id)?.contactFailures).to.equal(0)
+			expect(store.getById(id)?.lastContactFailureAt).to.equal(0)
+		} finally {
+			await otherSvc.stop()
+		}
 	})
 })

@@ -137,6 +137,19 @@ export function selectDiverseSample(
 	}));
 }
 
+/**
+ * A caller-supplied "how many times before we act" count, forced into a usable whole number.
+ *
+ * A threshold is compared against a counter that only ever increments by one, so anything that
+ * is not a finite integer ≥ 1 fails silently rather than loudly: 0 fires on the first
+ * observation, a fraction fires one observation early or late, and `NaN` / `Infinity` compare
+ * false forever and disable the transition altogether with nothing in the logs.
+ */
+function normalizeThreshold(value: number | undefined, fallback: number): number {
+	if (value === undefined || !Number.isFinite(value)) return fallback;
+	return Math.max(1, Math.floor(value));
+}
+
 export class FretService implements IFretService, Startable {
 	private mode: FretMode = 'passive';
 	private readonly store = new DigitreeStore();
@@ -258,8 +271,10 @@ export class FretService implements IFretService, Startable {
 			profile: cfg?.profile ?? 'core',
 			bootstraps: cfg?.bootstraps ?? [],
 			networkName: cfg?.networkName ?? 'default',
-			// At least 1: a threshold of 0 would mark every peer dead on its first failure.
-			deadAfterFailures: Math.max(1, cfg?.deadAfterFailures ?? 3),
+			// At least 1 whole failure: 0 would mark every peer dead on its first failure, and a
+			// non-finite value would compare false against the counter forever — silently
+			// disabling the transition rather than failing where the caller could see it.
+			deadAfterFailures: normalizeThreshold(cfg?.deadAfterFailures, 3),
 		};
 		// Create network-specific protocols
 		this.protocols = makeProtocols(this.cfg.networkName);
@@ -429,6 +444,12 @@ export class FretService implements IFretService, Startable {
 	 * recomputed on every call, but not for a threshold counter, where a lost strike silently
 	 * delays or prevents the transition. So this reads, patches, and returns with no await in
 	 * between, exactly like `applyMembershipSignal`.
+	 *
+	 * NOTE: this and `applyMembershipSignal`'s `negotiate-failure` arm are the same shape — a
+	 * spacing guard, a clamped increment, a state transition at the threshold — written twice.
+	 * Two instances with different constants, different counters and different transitions are
+	 * cheaper left apart than behind a parameterized helper; if a third spaced-run counter ever
+	 * appears, factor all three out rather than adding another copy.
 	 */
 	private applyContactStrike(id: string): void {
 		// Self is never a normal RPC target, but a dead self would drop out of every ring view —
@@ -467,10 +488,36 @@ export class FretService implements IFretService, Startable {
 		const e = this.store.getById(id);
 		if (!e) return;
 		const patch: PeerPatch = {};
-		if (e.contactFailures !== 0) patch.contactFailures = 0;
+		// The spacing stamp is cleared alongside the count, because it only means anything
+		// *within* a run: leaving it behind makes the first failure of the next run land inside
+		// the spacing window of a failure from the run just ended, so that strike is discarded
+		// and the peer gets a free miss after every recovery.
+		if (e.contactFailures !== 0 || e.lastContactFailureAt !== 0) {
+			patch.contactFailures = 0;
+			patch.lastContactFailureAt = 0;
+		}
 		if (e.state === 'dead') patch.state = this.isConnected(id) ? 'connected' : 'disconnected';
 		if (Object.keys(patch).length === 0) return; // already settled
 		this.store.update(id, patch);
+	}
+
+	/**
+	 * Record that the transport connection to `id` closed.
+	 *
+	 * `dead` is a liveness *verdict*, not a connection state, so a disconnect must never overwrite
+	 * it. A peer marked dead by a run of failed contacts is still dead when its half-open
+	 * connection finally drops — and that drop is exactly the event that follows the failures, so
+	 * a plain `setState(id, 'disconnected')` here would undo almost every transition the seam
+	 * makes. Nothing about a closing connection is proof of life, and the counter behind the
+	 * label is still clamped at the threshold, so the peer would be re-admitted only to be
+	 * re-killed by its next failure: a peer flapping in and out of every ring view.
+	 *
+	 * Clearing `dead` is `noteProofOfLife`'s job alone (plus `peer:connect`, where a connection
+	 * genuinely formed and `setState(id, 'connected')` is itself the proof).
+	 */
+	private noteDisconnected(id: string): void {
+		if (this.store.getById(id)?.state === 'dead') return;
+		this.store.setState(id, 'disconnected');
 	}
 
 	/**
@@ -642,9 +689,9 @@ export class FretService implements IFretService, Startable {
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt?.detail?.toString?.();
 				if (!id) return;
-				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+				const coord = await this.coordOf(id);
 				const wasNear = this.isNearNeighbor(id, coord);
-				this.store.setState(id, 'disconnected');
+				this.noteDisconnected(id);
 				await this.applyFailure(id, coord);
 				// Proactive: announce to neighbors around departed peer if it was a near neighbor
 				if (wasNear && !this.stopped) {
