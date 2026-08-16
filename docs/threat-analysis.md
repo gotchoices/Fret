@@ -152,18 +152,14 @@ Any peer on the network can craft messages with arbitrary `from` fields. The `fr
 #### 3.2 Leave Notice Spoofing
 **Severity: Critical**
 
-`handleLeave` (`fret-service.ts:473-534`) accepts a leave notice, removes the specified peer from the store, and then:
-1. Warms up to 6 replacement peers (pings + announces)
-2. Fetches neighbor snapshots from up to 4 replacements
-3. Announces replacement info to neighbors
+`handleLeave` accepts a leave notice, removes the specified peer from the store, and — when this was written — then warmed up to 6 replacement peers (pings + announces), fetched neighbor snapshots from up to 4 of them, and announced replacement info to neighbors.
 
-An attacker sends `LeaveNoticeV1` with `from: <honest_peer_id>` to all of the honest peer's neighbors. Each recipient removes the honest peer from their routing table and starts expensive replacement warming. The honest peer is effectively erased from the network's view without actually leaving.
-
-The `replacements` field in the spoofed notice can point to attacker-controlled nodes, which recipients will then ping and merge into their routing tables.
+An attacker sends `LeaveNoticeV1` with `from: <honest_peer_id>` to all of the honest peer's neighbors. Each recipient removes the honest peer from their routing table. The honest peer is effectively erased from the network's view without actually leaving.
 
 - **Preconditions**: Knowledge of target peer's ID and its neighbors.
-- **Impact**: Targeted peer removal from the network. Replacement poisoning. Amplified resource consumption (each recipient does 6 pings + 4 snapshot fetches).
-- **Current mitigations**: Rate limiting via `bucketLeave` (20 tokens, 10/s refill for core). Timestamp validation (±30s since the replay-hardening work; ±5 min when this was written). `sanitizeReplacements` validates peer ID format. But no authentication of the sender.
+- **Impact**: Targeted peer removal from the network. Replacement poisoning.
+- **Current mitigations**: Transport identity verification — `registerLeave` drops any notice whose `from` does not equal `connection.remotePeer`, so a notice can now only remove *the sender itself*. Rate limiting via `bucketLeave` (20 tokens, 10/s refill for core). Timestamp validation (±30s since the replay-hardening work; ±5 min when this was written). `sanitizeReplacements` validates peer ID format.
+- **Status — the amplification arm is closed.** `handleLeave` no longer warms anything: replacements are recorded as untrusted `unknown` entries and left to the already-budgeted classification pass (see *Leave* in `fret.md`). One accepted leave now costs 0 pings and 0 snapshot fetches. The *removal* arm is bounded rather than closed — identity verification means a spoofed notice can no longer erase a third party, but leave notices are still unsigned and undeduped, so the leave-authentication work below still stands.
 
 #### 3.3 Replay Attacks with Future Timestamps
 **Severity: High**
@@ -263,19 +259,12 @@ Once exhausted, all legitimate peers receive `BusyResponseV1` or have their requ
 #### 4.2 Leave Storm Amplification
 **Severity: High**
 
-Each `handleLeave` invocation (`fret-service.ts:473-534`) triggers:
-1. Store removal of the departed peer
-2. Up to 6 replacement pings (outbound network I/O)
-3. Up to 4 neighbor snapshot fetches (outbound network I/O + parsing)
-4. Announcement to up to 4 neighbors (outbound network I/O)
-
-An attacker sending N leave notices (with different `from` values) triggers ~14N outbound operations. The `bucketLeave` rate limits leave *handling* to 20/10 per second, but each accepted leave generates far more outbound traffic.
-
-If the attacker's leave notices include `replacements` pointing to slow/unresponsive hosts, each replacement warming operation blocks waiting for timeouts, compounding the amplification.
+When this was written, each `handleLeave` invocation triggered store removal of the departed peer, up to 6 replacement pings, up to 4 neighbor snapshot fetches, and an announcement to up to 4 neighbors — so N leave notices bought ~14N outbound operations, and replacements pointing at slow hosts made each one block on a timeout. `bucketLeave` limited leave *handling* to 20/10 per second, but each accepted leave generated far more outbound traffic than it cost to send.
 
 - **Preconditions**: One connection, crafted leave notices.
 - **Impact**: Bandwidth and CPU amplification. Target node spends resources chasing phantom departures. Outbound connection exhaustion.
-- **Current mitigations**: `bucketLeave` rate limiting. `departureDebounce` (2s per coordinate region). Maximum 6 replacements per leave. But the amplification factor is still ~7x per accepted leave.
+- **Status — closed.** `handleLeave` performs no outbound RPC of its own. Replacements are recorded locally and probed later by the classification pass, which has its own per-tick budget and backoff, so a leave notice cannot borrow it. The remaining per-leave ceiling is ≤ 12 local hash + upsert operations and at most `announceFanout` announces (Core 8 / Edge 4), and that announce is the *shared* debounced `announceOnDeparture` — one burst per departed coordinate per 2 s, further metered by the global `bucketAnnounce`. Amplification is now < 1 outbound op per notice in steady state, and scaling it requires N distinct transport-authenticated connections rather than N crafted messages. See *Leave* in `fret.md`.
+- **Current mitigations**: `bucketLeave` rate limiting. `departureDebounce` (2s per departed coordinate). `bucketAnnounce` caps the node's total outbound announce rate across every source.
 
 #### 4.3 Unbounded Map Growth
 **Severity: Medium**
@@ -363,6 +352,7 @@ libp2p's `node.handle()` callback actually receives `IncomingStreamData` which c
 - **Preconditions**: Any connection. Forged `from` field in any message.
 - **Impact**: Trivial impersonation. Leave spoofing. Snapshot impersonation.
 - **Remediation**: Accept the full `IncomingStreamData` in each handler and verify `connection.remotePeer.toString() === message.from`.
+- **Status — done.** Every handler now takes `(stream, connection)`; the two message types carrying a `from` (leave notice, announce snapshot) are dropped on mismatch and counted in `diag.rejected.identityMismatch`. The handlers without a `from` take the argument too, so the authenticated sender is available to them. This does not replace per-message signatures (5.1): it authenticates the *direct* sender only, so a forged `from` still travels freely inside a relayed or gossiped payload.
 
 #### 5.3 Coordinate Spoofing in Sample Entries
 **Severity: High**
@@ -541,13 +531,12 @@ This achieves a network-wide eclipse without needing to control the target's own
 #### 7.2 Leave Replacement Poisoning
 **Severity: High**
 
-When `handleLeave` processes a leave notice, it merges `notice.replacements` with locally computed candidates, with **suggested replacements taking priority** ("Suggested first (departing peer vouched for them), then locally discovered", line 504-509).
-
-An attacker sends leave notices with `replacements` pointing to Sybil nodes. Recipients trust these replacements, warm them (ping + announce), and merge their snapshots.
+When this was written, `handleLeave` merged `notice.replacements` with locally computed candidates and gave the **suggested ones priority**, then warmed them (ping + announce) and merged their snapshots. An attacker sending leave notices with `replacements` pointing to Sybil nodes therefore got them contacted and their snapshot contents absorbed.
 
 - **Preconditions**: Ability to send leave notices.
 - **Impact**: Attacker-controlled nodes inserted as trusted replacements.
-- **Current mitigations**: `sanitizeReplacements` validates peer ID format. Max 12 replacements. But no validation of replacement quality or authenticity.
+- **Status — reduced, not closed.** A replacement is now recorded as an untrusted hint: `membership: 'unknown'` at relevance 0, never touched, never contacted from the handler, and excluded from every ring view until the classification pass confirms it with a namespaced ping. Nothing the attacker names is merged, and relevance 0 makes it a preferred eviction victim rather than a squatter. What remains is that an id the local peerStore already holds an address for can be *named into* the table and will consume one slot of the classification pass's per-tick budget. There is still no validation of replacement quality or authenticity, which is what the leave-signature work below would add.
+- **Current mitigations**: `sanitizeReplacements` validates peer ID format. Max 12 replacements per notice, deduped. Undialable ids are dropped outright, which bounds the attack to peers the local peerStore already knows.
 
 #### 7.3 Join Flooding
 **Severity: Medium**
@@ -569,8 +558,8 @@ A flood of 1000+ joins in a short window can overwhelm bootstrap nodes and desta
 
 An attacker rapidly joins and leaves with different identities:
 1. Join: triggers discovery events, snapshot exchanges, announcement fanout.
-2. Leave: triggers leave handling, replacement warming, re-announcement.
-3. Each cycle generates 10-20+ outbound operations on affected peers.
+2. Leave: triggers leave handling and one debounced re-announcement (replacement warming is gone — see 4.2).
+3. Each cycle still generates several outbound operations on affected peers, now dominated by the join half.
 
 At scale, this creates continuous stabilization pressure that degrades routing accuracy and consumes bandwidth.
 
@@ -696,12 +685,12 @@ The 100ms idle timeout after first data (`protocols.ts:53`) is fragile:
 | 10 | **Global (not per-peer) rate limiting** | High | DoS (4.1) |
 | 11 | **No rate limit on inbound announcements** | High | Protocol (3.4) |
 | 12 | ~~**Replay attacks with 9.5-minute window**~~ — window closed; leave-notice dedup still open | High | Protocol (3.3) |
-| 13 | **Leave storm amplification** | High | DoS (4.2) |
+| 13 | ~~**Leave storm amplification**~~ — closed; `handleLeave` makes no outbound RPC | High | DoS (4.2) |
 | 14 | **Network size estimate manipulation** | High | Eclipse (2.4) |
 | 15 | **Bootstrap poisoning** | High | Partition (7.5) |
 | 16 | **Route hijacking** | High | Eclipse (2.2) |
 | 17 | **Byzantine routing — undetectable misrouting** | High | Partition (7.7) |
-| 18 | **Leave replacement poisoning** | High | Partition (7.2) |
+| 18 | **Leave replacement poisoning** — reduced; named ids are untrusted, unranked hints | High | Partition (7.2) |
 | 19 | **ID grinding** | High | Identity (1.2) |
 | 20 | **Cohort manipulation** | High | Identity (1.4) |
 

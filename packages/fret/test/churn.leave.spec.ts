@@ -274,7 +274,7 @@ describe('Leave amplification cap', function () {
 			const after = rig.svc.getDiagnostics()
 			expect(after.pingsSent, 'no replacement was pinged').to.equal(before.pingsSent)
 			expect(after.snapshotsFetched, 'no neighbor snapshot was fetched').to.equal(before.snapshotsFetched)
-			expect(after.leaveReplacementsInserted - before.leaveReplacementsInserted,
+			expect(after.leaveReplacementsRecorded - before.leaveReplacementsRecorded,
 				'premise: the replacement really was processed').to.equal(1)
 		} finally { await rig.stop() }
 	})
@@ -306,7 +306,7 @@ describe('Leave amplification cap', function () {
 			await rig.leave([ghost])
 
 			expect(rig.svc.getStore().getById(ghost), 'undialable id never enters the table').to.equal(undefined)
-			expect(rig.svc.getDiagnostics().leaveReplacementsInserted, 'nothing inserted').to.equal(0)
+			expect(rig.svc.getDiagnostics().leaveReplacementsRecorded, 'nothing inserted').to.equal(0)
 		} finally { await rig.stop() }
 	})
 
@@ -347,8 +347,28 @@ describe('Leave amplification cap', function () {
 			await rig.leave([selfId, departingId, replacement])
 
 			expect(store.getById(selfId)!.membership, 'self stays a member of its own network').to.equal('member')
-			expect(rig.svc.getDiagnostics().leaveReplacementsInserted,
+			expect(rig.svc.getDiagnostics().leaveReplacementsRecorded,
 				'only the third id was recorded').to.equal(1)
+		} finally { await rig.stop() }
+	})
+
+	// `isDialable`, not `isDoomedDial`: we are not dialing, so a locally `foreign` (or `dead`)
+	// replacement is still worth recording — `upsert` preserves the label, and the matching
+	// `reprobeOffRing` arm owns re-probing it with its backoff intact. Filtering it out here
+	// would instead make a leave notice able to *erase* our own classification work.
+	it('records a foreign replacement without clearing its label', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+			const store = rig.svc.getStore()
+			store.upsert(replacement, await hashPeerId(peerIdFromString(replacement)))
+			store.setMembership(replacement, 'foreign')
+
+			await rig.leave([replacement])
+
+			expect(store.getById(replacement)!.membership, 'foreign label survives').to.equal('foreign')
+			expect(rig.svc.getDiagnostics().leaveReplacementsRecorded,
+				'recorded rather than skipped as a doomed dial').to.equal(1)
 		} finally { await rig.stop() }
 	})
 
@@ -361,10 +381,38 @@ describe('Leave amplification cap', function () {
 
 			await rig.leave(Array.from({ length: 12 }, () => replacement))
 
-			expect(rig.svc.getDiagnostics().leaveReplacementsInserted, 'one insert, not twelve').to.equal(1)
+			expect(rig.svc.getDiagnostics().leaveReplacementsRecorded, 'one insert, not twelve').to.equal(1)
 			expect(rig.svc.getStore().getById(replacement), 'the single entry exists').to.not.equal(undefined)
 		} finally { await rig.stop() }
 	})
+
+	/**
+	 * Place `count` announce-eligible neighbors immediately either side of the departing peer's
+	 * coordinate — addressable but not connected, which is the arm `announceTargetsAround`
+	 * prefers. Returns their ids.
+	 *
+	 * Coordinates alternate ±1, ±2, … so both halves of the two-sided walk find candidates even
+	 * when `count` exceeds what one side returns.
+	 */
+	async function seedAnnounceTargets(rig: LeaveRig, count: number): Promise<string[]> {
+		const nodes: Libp2p[] = []
+		for (let i = 0; i < count; i++) {
+			const target = await rig.addNode()
+			await registerNeighbors(target, () => emptySnapshot(target), () => {}, protocols)
+			await rig.receiver.peerStore.merge(target.peerId, { multiaddrs: target.getMultiaddrs() })
+			nodes.push(target)
+		}
+		// Populate `addressKnown` first: the seed walk re-upserts every peerStore peer at its
+		// *hashed* coordinate, which would undo the placement below if it ran after.
+		await (rig.svc as any).seedFromPeerStore()
+		const store = rig.svc.getStore()
+		return nodes.map((target, i) => {
+			const id = target.peerId.toString()
+			const step = Math.floor(i / 2) + 1
+			store.upsert(id, ringOffset(rig.departingCoord, i % 2 === 0 ? step : -step))
+			return id
+		})
+	}
 
 	// A graceful departure fires the leave notice *and* the `peer:disconnect` that follows it.
 	// Routing both through the debounced `announceOnDeparture` collapses them into one burst; two
@@ -372,21 +420,7 @@ describe('Leave amplification cap', function () {
 	it('announces at most one debounced burst per departing peer', async () => {
 		const rig = await makeLeaveRig()
 		try {
-			const store = rig.svc.getStore()
-			const targets: Libp2p[] = []
-			for (let i = 0; i < 2; i++) {
-				const target = await rig.addNode()
-				await registerNeighbors(target, () => emptySnapshot(target), () => {}, protocols)
-				await rig.receiver.peerStore.merge(target.peerId, { multiaddrs: target.getMultiaddrs() })
-				targets.push(target)
-			}
-			// Populate `addressKnown` first: the seed walk re-upserts every peerStore peer at its
-			// *hashed* coordinate, which would undo the placement below if it ran after.
-			await (rig.svc as any).seedFromPeerStore()
-			for (const [i, target] of targets.entries()) {
-				store.upsert(target.peerId.toString(), ringOffset(rig.departingCoord, i === 0 ? 1 : -1))
-			}
-			const fanout = (rig.svc as any).announceFanout as number
+			const targets = await seedAnnounceTargets(rig, 2)
 			const before = rig.svc.getDiagnostics().announcementsSent
 
 			await rig.leave(undefined, 500)
@@ -395,8 +429,25 @@ describe('Leave amplification cap', function () {
 			const afterSecond = rig.svc.getDiagnostics().announcementsSent
 
 			expect(afterFirst - before, 'one burst reached both seeded neighbors').to.equal(targets.length)
-			expect(afterFirst - before, 'burst bounded by announceFanout').to.be.at.most(fanout)
 			expect(afterSecond, 'a second leave inside the debounce window adds nothing').to.equal(afterFirst)
+		} finally { await rig.stop() }
+	})
+
+	// The other half of the announce ceiling: the debounce spec seeds fewer targets than the
+	// fan-out, so on its own it cannot tell a clamp from an empty candidate list. Here the ring
+	// offers more neighbors than `announceFanout`, so the burst size is decided by the clamp.
+	it('clamps the departure burst to announceFanout when more neighbors are eligible', async () => {
+		const rig = await makeLeaveRig('edge')
+		try {
+			const fanout = (rig.svc as any).announceFanout as number
+			const targets = await seedAnnounceTargets(rig, fanout + 2)
+			expect(targets.length, 'premise: more eligible neighbors than the fan-out').to.be.greaterThan(fanout)
+			const before = rig.svc.getDiagnostics().announcementsSent
+
+			await rig.leave(undefined, 500)
+
+			expect(rig.svc.getDiagnostics().announcementsSent - before,
+				'exactly announceFanout announces, not one per eligible neighbor').to.equal(fanout)
 		} finally { await rig.stop() }
 	})
 

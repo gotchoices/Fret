@@ -235,8 +235,13 @@ export class FretService implements IFretService, Startable {
 		pingsFail: 0,
 		maybeActForwarded: 0,
 		evictions: 0,
-		/** Replacement ids recorded from inbound leave notices (see `recordLeaveReplacements`). */
-		leaveReplacementsInserted: 0,
+		/**
+		 * Replacement ids recorded from inbound leave notices (see `recordLeaveReplacements`).
+		 * Counts ids that passed every filter, which is *not* the same as new table entries: an
+		 * id already in the store is recorded too (the upsert preserves it). Named "recorded"
+		 * rather than "inserted" so it is not read as a table-pollution gauge.
+		 */
+		leaveReplacementsRecorded: 0,
 		rejected: {
 			payloadTooLarge: 0,
 			timestampBounds: 0,
@@ -1104,22 +1109,34 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	private async announceNeighborsBounded(maxCount?: number): Promise<void> {
-		const fanout = maxCount ?? this.announceFanout;
-		const selfCoord = await hashPeerId(this.node.peerId);
-		const selfStr = this.node.peerId.toString();
-		// Announce *targets* walk the store unfiltered (member-scoped `getNeighbors` would drop
-		// a freshly-connected peer that is still `unknown`, stalling bootstrap before the probe
-		// pass can classify it). Only the snapshot *contents* are member-scoped. Matches the
-		// sibling maintenance walks (announceOnDeparture / sendLeaveToNeighbors / etc.).
+	/**
+	 * Target selection shared by the two ring-walking announce paths — {@link
+	 * announceNeighborsBounded} (around self) and {@link announceOnDeparture} (around a departed
+	 * coordinate). Two rules live here rather than being restated per caller, which is what stops
+	 * them drifting; before this they were duplicated and a comment merely *promised* they matched.
+	 *
+	 * - The walk is **unfiltered**: a member-scoped walk would drop a freshly-connected peer that
+	 *   is still `unknown`, stalling bootstrap before the classification pass can label it. Only
+	 *   the snapshot *contents* are member-scoped.
+	 * - Non-connected-but-addressable peers come **first**, because a connected peer learns the
+	 *   same content through normal exchange. That preference is why the choke point dials, and
+	 *   therefore why {@link isDoomedDial} is applied there rather than here.
+	 */
+	private announceTargetsAround(coord: Uint8Array, exclude: Set<string>, fanout: number): string[] {
 		const all = Array.from(new Set([
-			...this.store.neighborsRight(selfCoord, this.cfg.m),
-			...this.store.neighborsLeft(selfCoord, this.cfg.m)
-		])).filter((id) => id !== selfStr);
-		// Prefer non-connected peers (connected learn via normal exchange)
+			...this.store.neighborsRight(coord, this.cfg.m),
+			...this.store.neighborsLeft(coord, this.cfg.m)
+		])).filter((id) => !exclude.has(id));
 		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
 		const connected = all.filter((id) => this.isConnected(id));
-		const ids = [...nonConnected, ...connected].slice(0, fanout);
+		return [...nonConnected, ...connected].slice(0, fanout);
+	}
+
+	private async announceNeighborsBounded(maxCount?: number): Promise<void> {
+		const selfCoord = await hashPeerId(this.node.peerId);
+		const exclude = new Set([this.node.peerId.toString()]);
+		const ids = this.announceTargetsAround(selfCoord, exclude, maxCount ?? this.announceFanout);
+		if (ids.length === 0) return;
 		await this.sendAnnouncementsRateLimited(ids, await this.snapshot());
 	}
 
@@ -1315,8 +1332,17 @@ export class FretService implements IFretService, Startable {
 			// lets it outrank a genuine but not-yet-contacted peer when `enforceCapacity` evicts by
 			// relevance. A replacement is a name we were handed, not a peer we contacted: it starts
 			// at relevance 0 and earns a score once the classification pass actually reaches it.
+			//
+			// NOTE: on an id *already* in the store, `upsert` refreshes `lastAccess` (relevance,
+			// health, state and membership are all preserved). `lastAccess` feeds the recency term
+			// the next time that peer is scored, so naming a peer here nudges its future relevance
+			// up a little without any contact having happened. Harmless today — eviction sorts on
+			// relevance alone, and the nudge helps the *named* peer, not the namer. Revisit if
+			// eviction ever sorts on `lastAccess`, or if the recency weight grows enough that a
+			// repeat-named id could out-survive a genuine peer: the fix is a
+			// `refreshLastAccess: false` upsert variant, not a filter here.
 			this.store.upsert(id, coord);
-			this.diag.leaveReplacementsInserted++;
+			this.diag.leaveReplacementsRecorded++;
 		}
 		// Once, after the loop rather than per insert: `enforceCapacity` lists and fully sorts the
 		// store.
@@ -1335,15 +1361,8 @@ export class FretService implements IFretService, Startable {
 			for (const [k, v] of this.departureDebounce) { if (now - v > FretService.DEPARTURE_DEBOUNCE_MS * 2) this.departureDebounce.delete(k); }
 		}
 
-		const selfStr = this.node.peerId.toString();
-		const all = Array.from(new Set([
-			...this.store.neighborsRight(coord, this.cfg.m),
-			...this.store.neighborsLeft(coord, this.cfg.m),
-		])).filter((id) => id !== selfStr && id !== departedId);
-		// Prefer non-connected peers; connected peers learn via normal exchange
-		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
-		const connected = all.filter((id) => this.isConnected(id));
-		const targets = [...nonConnected, ...connected].slice(0, this.announceFanout);
+		const exclude = new Set([this.node.peerId.toString(), departedId]);
+		const targets = this.announceTargetsAround(coord, exclude, this.announceFanout);
 		if (targets.length === 0) return;
 		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
 	}

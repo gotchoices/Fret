@@ -171,7 +171,7 @@ describe('dialability guard on outbound RPC', function () {
 			})
 
 			expect(svcA.getStore().getById(nodeB.peerId.toString()), 'address-known replacement recorded').to.not.equal(undefined)
-			expect(svcA.getDiagnostics().leaveReplacementsInserted, 'exactly one').to.equal(1)
+			expect(svcA.getDiagnostics().leaveReplacementsRecorded, 'exactly one').to.equal(1)
 		} finally {
 			await svcB.stop()
 			await stopAll([nodeA, nodeB])
