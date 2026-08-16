@@ -1771,8 +1771,9 @@ export class FretService implements IFretService, Startable {
 		// returns an empty snapshot rather than rethrowing, so `mergeNeighborSnapshots`'s
 		// `wasCancelled` break never fires and a stop() mid-tick walks the remaining ids instead
 		// of stopping at the first. Harmless today: `openRpcStream` throws on an aborted signal
-		// before dialing, so the walk opens no streams, merges nothing, and records no strikes —
-		// the only effect is the overcount above. It stops being harmless if `fetchNeighbors` ever
+		// before dialing, so the walk opens no streams, merges nothing, and records no strikes — the
+		// effects are the overcount above plus one `fetchNeighbors` error line per remaining id
+		// (bounded by this pass's 4). It stops being harmless if `fetchNeighbors` ever
 		// grows work ahead of that check, or if the pass is widened past its current 4 ids; the fix
 		// is the same one — have `fetchNeighbors` distinguish "skipped" from "empty" — not a second
 		// `stopped` check here.

@@ -231,6 +231,7 @@ With multiple connections, this ties up handler threads and exhausts the in-flig
 - **Preconditions**: Multiple connections to target.
 - **Impact**: Handler exhaustion, effective DoS.
 - **Current mitigations**: 5-second absolute timeout. `readAllBounded` byte limit. In-flight concurrency cap on maybeAct (16 core). libp2p connection limits.
+- **Status — partly overtaken**: the 100ms idle timeout described above no longer exists. `readAllBounded` is bounded by one overall deadline (`RPC_TIMEOUT_MS`, 5s) and ends a read on iterator EOF or on the stream reporting the remote finished writing. That kills the trickle variant — pacing bytes to stay inside an idle window buys the attacker nothing, because there is no window to stay inside — but leaves the hold itself: a stalled inbound stream still occupies a handler for the full 5s, bounded by the per-profile inbound stream caps. The `NOTE:` on `readAllBounded` records the intended fix if slow-loris pressure ever shows up (a shorter read deadline for inbound handlers specifically) and rules out reintroducing an idle timer, which truncated healthy transfers and failure-scored honest senders.
 
 ---
 
@@ -666,6 +667,8 @@ The 100ms idle timeout after first data (`protocols.ts:53`) is fragile:
 - In high-latency networks, legitimate responses may arrive in chunks >100ms apart.
 - Muxer implementations may buffer differently.
 - This could cause truncated reads of legitimate messages, interpreted as protocol errors.
+
+- **Status — obsolete**: the idle timeout was removed. `readAllBounded` is bounded only by its overall deadline, so a chunk gap is treated as a slow link rather than end-of-stream and the truncation this finding describes can no longer happen. Reintroducing an idle timer is ruled out at the function's `NOTE:`.
 
 ---
 

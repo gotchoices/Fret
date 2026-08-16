@@ -304,9 +304,9 @@ Unchanged.
 Unchanged.
 
 #### 8.4 `readAllBounded` Timing Sensitivity
-**Original: Low | Residual: Low**
+**Original: Low | Residual: none — finding obsolete**
 
-Unchanged.
+Not an RiR effect: the idle timeout this finding was about was removed from `readAllBounded`, which is now bounded only by its overall deadline. See the status note on 8.4 in [threat-analysis.md](threat-analysis.md).
 
 ---
 
