@@ -87,9 +87,13 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		this.emissionIntervalMs = cfg?.emissionIntervalMs ?? 5000;
 		this.batchSize = cfg?.batchSize ?? 20;
 		this.debounceMs = cfg?.debounceMs ?? 600_000;
-		// The cap can bind before the debounce lapses, and that is intended — see the profile
-		// sizing note in `Libp2pFretService`. A wrong eviction costs one extra emission of that
-		// peer, which is idempotent in libp2p's peerStore and already capped at `batchSize`/tick.
+		// The cap can bind before the debounce lapses — see the profile sizing note in
+		// `Libp2pFretService`.
+		// NOTE: that note claims a wrong eviction costs "one extra emission". Measured, that is
+		// false whenever the live-member population exceeds this capacity: because `scan` restarts
+		// at ring index 0 every tick, the evict/re-emit churn never advances past roughly
+		// `capacity + batchSize` entries, so every member beyond that ring position is emitted
+		// *never*, not twice. Tracked as `tickets/fix/bug-discovery-scan-starves-ring-tail`.
 		this.emitted = new ExpiringMap<number>({
 			capacity: cfg?.maxTracked ?? 4096,
 			ttlMs: this.debounceMs,
@@ -125,9 +129,13 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 	}
 
 	// NOTE: emits at most `batchSize` peers per tick (20 per 5s by default), so a large restored
-	// routing table surfaces slowly — a full 2048-entry table takes ~8.5 min to drain. Fine today
-	// because peers are re-learned from libp2p's peerStore anyway; if fast cold-start matters,
-	// track a scan cursor or raise the batch for the first few ticks.
+	// routing table surfaces slowly — a full 2048-entry table takes ~8.5 min to drain.
+	// NOTE: that "drains" only holds while the live-member population fits in `emitted`'s
+	// capacity. Above it, restarting at ring index 0 every tick means the scan never advances
+	// past roughly `capacity + batchSize` entries and the rest of the ring is emitted never —
+	// a permanent, coordinate-determined bias, not a delay. Shipped Edge defaults
+	// (`maxTracked` 1024 against a routing-table capacity of 2048) can reach it. The fix is a
+	// resumable cursor; tracked as `tickets/fix/bug-discovery-scan-starves-ring-tail`.
 	private scan(): void {
 		const source = this.resolveSource();
 		if (!source) return;

@@ -199,6 +199,13 @@ describe('FretPeerDiscovery', function () {
 		expect(peers.length).to.equal(3, 'first scan should emit exactly batchSize peers');
 	});
 
+	// NOTE: `maxTracked: 4` against 5 members is deliberate and load-bearing, not an arbitrary
+	// number. `scan` restarts at ring index 0 every tick and breaks once `batchSize` peers have
+	// been emitted, so for some (population, maxTracked, batchSize) combinations the
+	// evict/re-emit churn settles into a stable cycle that never advances far enough to reach
+	// the ring-order-last member — at `maxTracked: 3` this exact test starves member #5 forever.
+	// That is a real defect in `scan`, tracked by `tickets/fix/bug-discovery-scan-starves-ring-tail`;
+	// once the resumable cursor lands, any capacity works and this comment can go.
 	it('debounce map caps at maxTracked and evicts, so an evicted peer is emitted again later', async () => {
 		const count = 5;
 		const nodes = await Promise.all(Array.from({ length: count }, () => createMemNode()));

@@ -20,10 +20,14 @@ export class Libp2pFretService implements Startable {
 	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>, discoveryCfg?: FretPeerDiscoveryConfig) {
 		// Profile-tuned debounce-map capacity, merged so an explicit caller value still wins.
 		// Core 4096 / Edge 1024. At the default emission rate (batchSize 20 per 5 s = 4/s) the live
-		// population under a 600 s debounce is ~2400, so **Edge's cap binds before its TTL does and
-		// that is intended**: it effectively shortens the debounce to ≈ maxTracked / (batchSize /
-		// emissionIntervalMs) ≈ 256 s. The cost of a wrong eviction is one extra emission of that
-		// peer, which is idempotent in libp2p's peerStore and already capped at `batchSize`/tick.
+		// population under a 600 s debounce is ~2400, so Edge's cap binds before its TTL does: it
+		// effectively shortens the debounce to ≈ maxTracked / (batchSize / emissionIntervalMs)
+		// ≈ 256 s.
+		// NOTE: this used to claim that costs "one extra emission" and is therefore harmless.
+		// That is wrong once the live-member population exceeds the cap — see the starvation NOTE
+		// on `FretPeerDiscovery.scan`. Until `tickets/fix/bug-discovery-scan-starves-ring-tail`
+		// lands, Edge's 1024 against a default routing-table capacity of 2048 is a reachable
+		// hazard, not a tuned tradeoff.
 		const profile = cfg?.profile ?? 'core';
 		this.discovery = new FretPeerDiscovery(() => this.discoverySource(), {
 			...discoveryCfg,

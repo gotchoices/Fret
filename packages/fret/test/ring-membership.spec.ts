@@ -365,7 +365,7 @@ describe('Foreign re-probe backoff growth', function () {
 		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
 		await svc.start()
 
-		const bo = (svc as any).backoffMap as Map<string, { until: number; factor: number }>
+		const bo = (svc as any).backoffMap as ExpiringMap<{ until: number; factor: number }>
 		const record = (id: string): void => (svc as any).recordBackoff(id)
 		const penalty = (id: string): number => (svc as any).getBackoffPenalty(id)
 
@@ -400,7 +400,7 @@ describe('Foreign re-probe backoff growth', function () {
 		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
 		await svc.start()
 
-		const bo = (svc as any).backoffMap as Map<string, { until: number; factor: number }>
+		const bo = (svc as any).backoffMap as ExpiringMap<{ until: number; factor: number }>
 		const record = (id: string): void => (svc as any).recordBackoff(id)
 		const prune = (): void => (svc as any).pruneBackoffMap()
 
@@ -484,10 +484,17 @@ describe('Foreign re-probe backoff growth', function () {
 	// Read off the real constants (not copies) so retuning either side fails this test loudly
 	// rather than silently reintroducing the bug BACKOFF_RETAIN_MS exists to prevent: a peer
 	// re-probed at the slowest cadence (32 s) having its entry forgotten between probes.
-	it('BACKOFF_RETAIN_MS comfortably exceeds the longest possible backoff window', () => {
+	// Title states exactly what is asserted: strict inequality is the whole invariant — at
+	// `retain <= window` a peer probed at the slowest cadence loses its entry between probes.
+	// The shipped ~9x margin is a sizing choice, not a rule, so it is not pinned here.
+	it('BACKOFF_RETAIN_MS exceeds the longest possible backoff window', () => {
 		const base = (CoreFretService as any).BACKOFF_BASE_MS
 		const maxFactor = (CoreFretService as any).BACKOFF_MAX_FACTOR
 		const retain = (CoreFretService as any).BACKOFF_RETAIN_MS
+		// Guards a typo'd constant name reading `undefined`, which would make the comparison
+		// vacuous rather than failing loudly.
+		expect(base).to.be.a('number')
+		expect(maxFactor).to.be.a('number')
 		expect(retain).to.be.greaterThan(base * maxFactor)
 	})
 })
