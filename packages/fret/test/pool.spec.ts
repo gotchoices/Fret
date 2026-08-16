@@ -33,6 +33,11 @@ describe('runPooled', () => {
 					expect(maxInFlight).to.be.at.most(concurrency)
 					expect(results).to.have.length(tasks.length)
 					expect(results.every((r) => r.status === 'fulfilled')).to.equal(true)
+					// Index alignment under out-of-order completion is the whole point of the result
+					// array, and this is the only case that generates out-of-order completion — each
+					// task returns its own hop count, so a result parked at the wrong index shows up
+					// as a mismatch against `delays`.
+					expect(results.map((r) => (r.status === 'fulfilled' ? r.value : null))).to.deep.equal(delays)
 
 					if (tasks.length > concurrency) outcome.moreTasksThanConcurrency++
 					if (maxInFlight === concurrency) outcome.saturated++
@@ -114,6 +119,24 @@ describe('runPooled', () => {
 			}
 			expect(started).to.deep.equal([0, 1, 2], 'an aborted pool must never pull a fresh index')
 		})
+
+		// Reachable in the intended caller, not hypothetical: `deadline(ms, parent)` returns an
+		// already-aborted signal synchronously when `parent` is already aborted
+		// (`src/utils/deadline.ts`), so a tick armed after `stop()` hands the pool exactly this.
+		it('runs nothing when the signal is already aborted before the call', async () => {
+			const controller = new AbortController()
+			controller.abort()
+			let started = 0
+			const tasks = Array.from({ length: 4 }, () => async () => {
+				started++
+				return 1
+			})
+
+			const results = await runPooled(tasks, { concurrency: 2, signal: controller.signal })
+
+			expect(started).to.equal(0, 'no task may run once the signal is already aborted')
+			expect(results).to.deep.equal(Array.from({ length: 4 }, () => ({ status: 'skipped' })))
+		})
 	})
 
 	describe('degenerate concurrency', () => {
@@ -137,6 +160,23 @@ describe('runPooled', () => {
 				expect(maxInFlight).to.equal(1, '"unbounded" must not be a reachable concurrency')
 			})
 		}
+
+		it('floors a fractional concurrency instead of spawning a partial worker', async () => {
+			let inFlight = 0
+			let maxInFlight = 0
+			const tasks = Array.from({ length: 4 }, () => async () => {
+				inFlight++
+				maxInFlight = Math.max(maxInFlight, inFlight)
+				await Promise.resolve()
+				inFlight--
+				return true
+			})
+
+			const results = await runPooled(tasks, { concurrency: 2.9 })
+
+			expect(results.every((r) => r.status === 'fulfilled')).to.equal(true)
+			expect(maxInFlight).to.equal(2, '2.9 must floor to 2, not round to 3')
+		})
 
 		it('empty task list resolves to [] without running or skipping anything', async () => {
 			const results = await runPooled([], { concurrency: 4 })

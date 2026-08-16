@@ -35,6 +35,12 @@ export interface PoolOptions {
  *
  * A task that throws synchronously, before returning a promise, is caught the same as a
  * rejected one — nothing escapes the pool.
+ *
+ * NOTE: this is deliberately a plain function rather than an `async` one. The worker loops are
+ * spawned *before* it returns, so the first `min(concurrency, tasks.length)` tasks have already
+ * run up to their own first `await` by the time the caller's next statement executes. Wrapping
+ * the body in an `async function` would defer that by a microtask; the abort test in
+ * `test/pool.spec.ts` asserts the synchronous start directly and fails if it changes.
  */
 export function runPooled<T>(
 	tasks: ReadonlyArray<() => Promise<T>>,

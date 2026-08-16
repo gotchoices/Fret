@@ -14,7 +14,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   ├── rpc/{protocols,neighbors,maybe-act,leave,ping}.ts
 │   │   ├── selector/next-hop.ts
 │   │   ├── estimate/size-estimator.ts
-│   │   └── utils/token-bucket.ts
+│   │   └── utils/{token-bucket,expiring-map,deadline,pool}.ts
 │   └── test/
 │       ├── helpers/libp2p.ts      # In-memory libp2p node factory
 │       ├── simulation/            # Deterministic simulation harness
