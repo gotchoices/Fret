@@ -77,14 +77,31 @@ async function ringPositions(nodes: Libp2p[]) {
 	return entries
 }
 
-function allHaveMinPeers(services: CoreFretService[], min: number): boolean {
-	return services.every(s => s.listPeers().length >= min)
+// Every count below excludes self. A node's own entry is seeded at `start()` and a ring walk
+// anchored at self returns self first on *both* sides, so `listPeers().length >= 2` (self +
+// bootstrap seed) and `getNeighbors(selfCoord, …).length > 0` are both true before a single
+// stabilization tick has run — as a convergence gate they would wait on nothing.
+
+function remotePeers(svc: CoreFretService, selfId: string): string[] {
+	return svc.listPeers().map(p => p.id).filter(id => id !== selfId)
 }
 
-function allHaveNeighbors(services: CoreFretService[], coords: Uint8Array[], m: number): boolean {
+function remoteNeighbors(
+	svc: CoreFretService, coord: Uint8Array, selfId: string, direction: 'left' | 'right', m: number
+): string[] {
+	return svc.getNeighbors(coord, direction, m).filter(id => id !== selfId)
+}
+
+function allKnowRemotes(services: CoreFretService[], selfIds: string[], min: number): boolean {
+	return services.every((s, i) => remotePeers(s, selfIds[i]!).length >= min)
+}
+
+function allHaveNeighbors(
+	services: CoreFretService[], coords: Uint8Array[], selfIds: string[], m: number
+): boolean {
 	return services.every((s, i) =>
-		s.getNeighbors(coords[i]!, 'right', m).length > 0 &&
-		s.getNeighbors(coords[i]!, 'left', m).length > 0
+		remoteNeighbors(s, coords[i]!, selfIds[i]!, 'right', m).length > 0 &&
+		remoteNeighbors(s, coords[i]!, selfIds[i]!, 'left', m).length > 0
 	)
 }
 
@@ -112,24 +129,26 @@ describe('libp2p in-process integration', function () {
 		nodes = mesh.nodes
 		services = mesh.services
 
+		const selfIds = nodes.map(n => n.peerId.toString())
+
 		// Wait for stabilization to converge instead of sleeping a fixed number of ticks: each
-		// node should know at least 2 peers (self + at least 1 remote), the bootstrap should know
-		// every other node, and at least one snapshot exchange should have occurred.
+		// node should know at least 1 remote peer, the bootstrap should know every other node,
+		// and at least one snapshot exchange should have occurred.
 		await waitFor(() => {
-			if (!allHaveMinPeers(services, 2)) return false
-			const node0Ids = new Set(services[0]!.listPeers().map(p => p.id))
+			if (!allKnowRemotes(services, selfIds, 1)) return false
+			const node0Ids = new Set(remotePeers(services[0]!, selfIds[0]!))
 			for (let j = 1; j < 3; j++) {
-				if (!node0Ids.has(nodes[j]!.peerId.toString())) return false
+				if (!node0Ids.has(selfIds[j]!)) return false
 			}
 			const totalSnaps = services.reduce((sum, svc) => sum + svc.getDiagnostics().snapshotsFetched, 0)
 			return totalSnaps > 0
 		}, 8000, 25, '3-node neighbor exchange convergence')
 
-		// Each node should know at least 2 peers (self + at least 1 remote)
+		// Each node should know at least 1 remote peer
 		for (let i = 0; i < 3; i++) {
-			const peers = services[i]!.listPeers()
-			expect(peers.length).to.be.at.least(2,
-				`node ${i} should know at least 2 peers (self + neighbors)`)
+			const peers = remotePeers(services[i]!, selfIds[i]!)
+			expect(peers.length).to.be.at.least(1,
+				`node ${i} should know at least 1 remote peer`)
 		}
 
 		// Node 0 (bootstrap, listener for all) should know all peers
@@ -153,27 +172,33 @@ describe('libp2p in-process integration', function () {
 
 		const m = 4 // ceil(7/2)
 		const selfCoords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)))
+		const selfIds = nodes.map(n => n.peerId.toString())
 
+		// NOTE: the gate deliberately does not require a leaf to hold *two* live members. FRET's
+		// wire format carries no multiaddrs, so a peer a leaf learned only through gossip has no
+		// peerStore address, the classification probe skips it as undialable, and it stays
+		// `unknown` — hence outside every ring view — indefinitely. In this star mesh a leaf's
+		// only live member is the bootstrap. Revisit if address hints ever land on the wire.
 		await waitFor(() =>
-			allHaveMinPeers(services, 2) &&
-			allHaveNeighbors(services, selfCoords, m) &&
-			services[0]!.listPeers().length >= 8
-		, 10000, 25, '10-node neighbor exchange convergence')
+			allKnowRemotes(services, selfIds, 1) &&
+			allHaveNeighbors(services, selfCoords, selfIds, m) &&
+			remotePeers(services[0]!, selfIds[0]!).length >= 8 &&
+			services.some(s => s.getDiagnostics().snapshotsFetched > 0)
+		, 12000, 25, '10-node neighbor exchange convergence')
 
 		for (let i = 0; i < 10; i++) {
-			const peers = services[i]!.listPeers()
-			// Each node should know at least 2 peers (self + bootstrap/neighbor)
-			expect(peers.length).to.be.at.least(2,
-				`node ${i} should know at least 2 peers, has ${peers.length}`)
+			const peers = remotePeers(services[i]!, selfIds[i]!)
+			expect(peers.length).to.be.at.least(1,
+				`node ${i} should know at least 1 remote peer, has ${peers.length}`)
 
-			const right = services[i]!.getNeighbors(selfCoords[i]!, 'right', m)
-			const left = services[i]!.getNeighbors(selfCoords[i]!, 'left', m)
+			const right = remoteNeighbors(services[i]!, selfCoords[i]!, selfIds[i]!, 'right', m)
+			const left = remoteNeighbors(services[i]!, selfCoords[i]!, selfIds[i]!, 'left', m)
 			expect(right.length).to.be.greaterThan(0, `node ${i} has empty successor set`)
 			expect(left.length).to.be.greaterThan(0, `node ${i} has empty predecessor set`)
 		}
 
 		// Bootstrap node (index 0) should discover the majority of peers
-		const node0Peers = services[0]!.listPeers()
+		const node0Peers = remotePeers(services[0]!, selfIds[0]!)
 		expect(node0Peers.length).to.be.at.least(8,
 			`bootstrap node should know most peers, has ${node0Peers.length}`)
 	})
@@ -184,7 +209,8 @@ describe('libp2p in-process integration', function () {
 		nodes = mesh.nodes
 		services = mesh.services
 
-		await waitFor(() => allHaveMinPeers(services, 2), 6000, 25, '5-node convergence before routeAct')
+		const selfIds = nodes.map(n => n.peerId.toString())
+		await waitFor(() => allKnowRemotes(services, selfIds, 2), 8000, 25, '5-node convergence before routeAct')
 
 		const keyBytes = u8FromString('test-key-alpha', 'utf8')
 		const keyB64 = Buffer.from(keyBytes).toString('base64url')
@@ -203,7 +229,8 @@ describe('libp2p in-process integration', function () {
 		nodes = mesh.nodes
 		services = mesh.services
 
-		await waitFor(() => allHaveMinPeers(services, 2), 6000, 25, '5-node convergence before activity routing')
+		const selfIds = nodes.map(n => n.peerId.toString())
+		await waitFor(() => allKnowRemotes(services, selfIds, 2), 8000, 25, '5-node convergence before activity routing')
 
 		const invocations: Array<{ nodeIdx: number; activity: string }> = []
 
@@ -250,8 +277,9 @@ describe('libp2p in-process integration', function () {
 		const m = 4 // ceil(7/2)
 		const coordsByIdx: Uint8Array[] = new Array(6)
 		for (const entry of ring) coordsByIdx[entry.idx] = entry.coord
+		const selfIds = nodes.map(n => n.peerId.toString())
 
-		await waitFor(() => allHaveNeighbors(services, coordsByIdx, m), 8000, 25, '6-node ring convergence')
+		await waitFor(() => allHaveNeighbors(services, coordsByIdx, selfIds, m), 8000, 25, '6-node ring convergence')
 
 		// Check ring invariant for the bootstrap node (index 0) which has
 		// the best view of the network since all nodes connect to it
@@ -278,8 +306,9 @@ describe('libp2p in-process integration', function () {
 		// Verify ALL nodes have non-empty S/P sets
 		for (const entry of ring) {
 			const svc = services[entry.idx]!
-			const s = svc.getNeighbors(entry.coord, 'right', m)
-			const p = svc.getNeighbors(entry.coord, 'left', m)
+			const selfId = selfIds[entry.idx]!
+			const s = remoteNeighbors(svc, entry.coord, selfId, 'right', m)
+			const p = remoteNeighbors(svc, entry.coord, selfId, 'left', m)
 			expect(s.length + p.length).to.be.greaterThan(0,
 				`node ${entry.idx} should have at least one neighbor`)
 		}
@@ -295,15 +324,15 @@ describe('libp2p in-process integration', function () {
 		const leavingId = nodes[leavingIdx]!.peerId.toString()
 		const m = 4
 		const selfCoords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)))
+		const selfIds = nodes.map(n => n.peerId.toString())
 
 		await waitFor(() =>
-			allHaveMinPeers(services, 2) &&
-			services[0]!.listPeers().some(p => p.id === leavingId)
-		, 6000, 25, '5-node convergence before leave')
+			allKnowRemotes(services, selfIds, 2) &&
+			remotePeers(services[0]!, selfIds[0]!).includes(leavingId)
+		, 8000, 25, '5-node convergence before leave')
 
-		// Verify the leaving node is known by at least the bootstrap
-		const knownBefore = services[0]!.listPeers().some(p => p.id === leavingId)
-		expect(knownBefore).to.equal(true, 'leaving peer should be known before departure')
+		expect(remotePeers(services[0]!, selfIds[0]!)).to.include(leavingId,
+			'leaving peer should be known before departure')
 
 		const diagBefore = { ...services[0]!.getDiagnostics() }
 
@@ -311,36 +340,20 @@ describe('libp2p in-process integration', function () {
 		await services[leavingIdx]!.stop()
 		await nodes[leavingIdx]!.stop()
 
-		await waitFor(() => {
-			if (!(services[0]!.getDiagnostics().pingsSent > diagBefore.pingsSent)) return false
-			for (let i = 0; i < 5; i++) {
-				if (i === leavingIdx) continue
-				const right = services[i]!.getNeighbors(selfCoords[i]!, 'right', m)
-				const left = services[i]!.getNeighbors(selfCoords[i]!, 'left', m)
-				if (right.length + left.length === 0) return false
-			}
-			return true
-		}, 6000, 25, 'remaining peers restabilize after leave')
+		/** Every node but the departed one still holds at least one neighbor other than itself. */
+		const survivorsHaveNeighbors = (): boolean => services.every((svc, i) => i === leavingIdx ||
+			remoteNeighbors(svc, selfCoords[i]!, selfIds[i]!, 'right', m).length +
+			remoteNeighbors(svc, selfCoords[i]!, selfIds[i]!, 'left', m).length > 0)
 
-		// Remaining services should still be functioning
-		for (let i = 0; i < 5; i++) {
-			if (i === leavingIdx) continue
-			expect(services[i]!.getDiagnostics()).to.have.property('pingsSent')
-		}
+		await waitFor(() =>
+			services[0]!.getDiagnostics().pingsSent > diagBefore.pingsSent && survivorsHaveNeighbors()
+		, 8000, 25, 'remaining peers restabilize after leave')
 
 		// Bootstrap should have continued stabilization (more pings after leave)
-		const diagAfter = services[0]!.getDiagnostics()
-		expect(diagAfter.pingsSent).to.be.greaterThan(diagBefore.pingsSent,
+		expect(services[0]!.getDiagnostics().pingsSent).to.be.greaterThan(diagBefore.pingsSent,
 			'bootstrap should continue pinging after leave')
-
-		// Remaining nodes should still have functioning S/P sets
-		for (let i = 0; i < 5; i++) {
-			if (i === leavingIdx) continue
-			const right = services[i]!.getNeighbors(selfCoords[i]!, 'right', m)
-			const left = services[i]!.getNeighbors(selfCoords[i]!, 'left', m)
-			expect(right.length + left.length).to.be.greaterThan(0,
-				`node ${i} should still have neighbors after leave`)
-		}
+		expect(survivorsHaveNeighbors()).to.equal(true,
+			'remaining nodes should still have functioning S/P sets after leave')
 
 		// Routing should still work among the remaining 4 nodes
 		const keyBytes = u8FromString('post-leave-routing', 'utf8')
@@ -362,11 +375,13 @@ describe('libp2p in-process integration', function () {
 
 		const m = 4 // ceil(7/2)
 		const selfCoords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)))
+		const selfIds = nodes.map(n => n.peerId.toString())
 		await waitFor(() =>
-			allHaveMinPeers(services, 2) &&
-			allHaveNeighbors(services, selfCoords, m) &&
-			services[0]!.listPeers().length >= 8
-		, 10000, 25, '10-node convergence before scale routing')
+			allKnowRemotes(services, selfIds, 1) &&
+			allHaveNeighbors(services, selfCoords, selfIds, m) &&
+			remotePeers(services[0]!, selfIds[0]!).length >= 8 &&
+			services.some(s => s.getDiagnostics().snapshotsFetched > 0)
+		, 12000, 25, '10-node convergence before scale routing')
 
 		const keys = ['alpha', 'bravo', 'charlie', 'delta', 'echo']
 		const results: Array<{ key: string; type: string }> = []
