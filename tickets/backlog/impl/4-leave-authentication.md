@@ -4,6 +4,28 @@ files: src/service/fret-service.ts (handleLeave ~501-562), src/rpc/leave.ts, src
 tradeoffs: A liveness ping before every removal delays a legitimate departure by up to five seconds and adds an outbound request per leave notice — which is itself the amplification the leave-amplification-cap ticket is trying to shrink; a maintainer may prefer to wait for signed leave notices and drop the ping entirely. The dedup arm is cheap and defensible on its own.
 ----
 
+> ### ⚠️ Sections 1 and 2 are superseded — read before promoting
+>
+> This ticket was written before `transport-identity-verification` landed. That ticket now makes
+> `src/rpc/leave.ts` drop any notice whose `from` does not equal the transport-authenticated
+> `connection.remotePeer`, so **a leave notice can only ever remove the peer that sent it.**
+>
+> - **§1 Liveness verification — drop it.** It existed to defeat a spoofed leave naming a victim;
+>   that vector is closed at the transport layer. Keeping it would add exactly the outbound
+>   amplification `4-leave-amplification-cap` removes (this ticket's own `tradeoffs:` line says so).
+> - **§2 Untrusted replacement handling — superseded, do not implement.**
+>   `tickets/implement/4-leave-amplification-cap` deletes the warm loop entirely, so there is no
+>   priority ordering and no ping to gate. Replacements become bare `unknown` upserts vetted by the
+>   classification pass. Re-adding a ping here would undo that.
+> - **§3 Leave notice dedup — still standalone and still valid**, though lower value than when
+>   written: with identity verification, a replayed notice must arrive over a connection
+>   authenticated as its own `from`, and post-amplification-cap the cost of processing a duplicate
+>   is a no-op remove plus ≤ 12 local upserts. The `bucketLeave` token bucket already bounds the
+>   flood. Weigh it on that basis.
+> - **§4's `livenessCheckPassed` counter** goes with §1; only `duplicateLeave` survives.
+> - The test plan and TODO phases below are scoped to the same sections — Phases 2 and 3, and the
+>   liveness / replacement-priority test cases, go with §1 and §2.
+
 ### Overview
 
 `handleLeave` currently removes a peer immediately on receipt of a leave notice and prioritizes attacker-controllable suggested replacements. Three independent hardening measures close the spoofing / replay / Sybil-injection vectors without waiting for the message-signatures or transport-identity tickets:
