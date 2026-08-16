@@ -7,7 +7,10 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { openRpcStream, isLimitedConnection, releaseRpcStream, readAllBounded } from '../src/rpc/protocols.js'
 import { abortReasonError, DeadlineExpiredError } from '../src/utils/deadline.js'
 import { sendPing } from '../src/rpc/ping.js'
-import { fetchNeighbors } from '../src/rpc/neighbors.js'
+import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
+import { sendMaybeAct } from '../src/rpc/maybe-act.js'
+import { sendLeave } from '../src/rpc/leave.js'
+import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 
 // Minimal recording stubs. openRpcStream only touches `node.getConnections`,
 // `node.dialProtocol`, and per-connection `{ status, limits, remoteAddr,
@@ -308,10 +311,11 @@ function makeSilentStreamNode(): Libp2p {
  * loose (a 100 ms budget checked against 80–1000 ms) because the property under test is "bounded
  * at all", not scheduler precision.
  *
- * NOTE: these are the only wall-clock-sensitive assertions in the suite. If they ever flake on a
- * loaded box, raise `MAX_MS` — but mocha's own 2s per-test default is the harder ceiling, so
- * anything past ~1.5s needs a `this.timeout()` too. Do not swap the elapsed-time assertion for a
- * bare "it rejected": that is exactly the assertion the bug would have passed.
+ * NOTE: these are the wall-clock-sensitive assertions in this file (the deadline-fires test in
+ * `deadline.spec.ts` carries the only other one, a lower bound on a 50ms budget). If they ever
+ * flake on a loaded box, raise `MAX_MS` — but mocha's own 2s per-test default is the harder
+ * ceiling, so anything past ~1.5s needs a `this.timeout()` too. Do not swap the elapsed-time
+ * assertion for a bare "it rejected": that is exactly the assertion the bug would have passed.
  */
 describe('RPC deadlines', () => {
 	const TIMEOUT_MS = 100
@@ -438,6 +442,66 @@ describe('RPC deadlines', () => {
 		expect(snap.successors, 'successors').to.deep.equal([])
 		expect(snap.predecessors, 'predecessors').to.deep.equal([])
 		expectBounded(elapsed)
+	})
+
+	// The remaining three senders. Each was previously argued correct only from sharing the
+	// `deadline()` + `openRpcStream` + `releaseRpcStream` shape with the two above — but a shape is
+	// not an assertion, and the shapes are not in fact identical: these three also `close()` the
+	// stream, and `close()` is the one await in the sequence that never receives the deadline
+	// signal (tracked as `8-rpc-shared-helper`'s "close() escapes the deadline" arm). What is
+	// common, and what these pin, is that a hanging *open* costs a budget rather than the caller.
+
+	it('sendMaybeAct gives up on a dial that never resolves', async () => {
+		const msg: RouteAndMaybeActV1 = {
+			v: 1, key: 'AAAA', want_k: 4, ttl: 4, min_sigs: 3,
+			correlation_id: 'test-correlation', timestamp: Date.now(), signature: '',
+		}
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await sendMaybeAct(makeHangingDialNode(), peer, msg, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
+		} catch (err) {
+			thrown = err
+		}
+
+		expect(thrown, 'sendMaybeAct must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expectBounded(Date.now() - t0)
+	})
+
+	it('sendLeave gives up on a dial that never resolves', async () => {
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await sendLeave(
+				makeHangingDialNode(), peer,
+				{ v: 1, from: peer, timestamp: Date.now() },
+				PROTOCOLS[0], { timeoutMs: TIMEOUT_MS }
+			)
+		} catch (err) {
+			thrown = err
+		}
+
+		// This one runs inside `stop()`, so an unbounded open would hold shutdown open per departed
+		// peer — the reason the leave fan-out gets a budget at all.
+		expect(thrown, 'sendLeave must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expectBounded(Date.now() - t0)
+	})
+
+	it('announceNeighbors gives up on a dial that never resolves, swallowing the timeout', async () => {
+		const snapshot: NeighborSnapshotV1 = {
+			v: 1, from: peer, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
+		}
+		const t0 = Date.now()
+		// `dial: true` because the default is connection-only, which would return immediately
+		// against a node with no connections and never reach the open at all.
+		await announceNeighbors(
+			makeHangingDialNode(), peer, snapshot, PROTOCOLS[0],
+			{ dial: true, timeoutMs: TIMEOUT_MS }
+		)
+
+		// Announce is fire-and-forget: it logs and resolves rather than throwing, so elapsed time is
+		// the whole assertion here — without the deadline this call never returns.
+		expectBounded(Date.now() - t0)
 	})
 })
 

@@ -37,6 +37,35 @@ Requirements:
 - Start the ping round-trip clock after the stream opens.
 - Tighten each RPC's max-bytes to the real ceiling so oversized payloads are rejected before full buffering.
 
+Additional arm (added by the `7.1-rpc-deadline-tests` review): **closing the stream is the one step
+of an outbound call that the call's own time limit does not cover.** `7-rpc-abort-deadlines` gave
+every outbound RPC a whole-call budget and threaded its cancellation signal into the dial, the
+stream open and the read — but not into `close()`, which is also a waiting operation. libp2p's
+`close()` accepts a cancellation signal (`Stream.close(options?: AbortOptions)`,
+`@libp2p/interface` `message-stream.d.ts:139`) and is documented as resolving only "when any unsent
+data has been written into the underlying resource" — so a peer that accepts a stream and then stops
+reading holds the close open, and neither FRET site passes a signal:
+
+- `protocols.ts:317` — `releaseRpcStream`'s non-cancelled arm does a bare `await stream.close()`.
+  Every sender runs this from a `finally` *before* cancelling its deadline, so a call that already
+  has its answer can still sit here past its budget. The cancelled arm is fine: it uses the
+  synchronous `abort()`, which is exactly why that arm was written.
+- `maybe-act.ts:64` — the half-close that flushes the request sits inside the `try`, so if it
+  stalls the deadline fires with nothing listening, the `finally` is never reached, and the stream
+  is held as well as the caller.
+
+Worst case is the shutdown path: `sendLeave` and `announceNeighbors` run from `stop()`'s leave
+fan-out, whose stated reason for having a budget is to keep shutdown bounded. Whether anything
+bounds the tail at all depends on the muxer's `inactivityTimeout`; no default for it was found in
+this repo's installed dependencies, so no magnitude is claimed here beyond "not FRET's budget".
+Established by reading the code and libp2p's type declarations, not by running it — confirming it
+needs a remote that accepts a stream and then stops reading, which no current test stub does.
+
+This belongs here rather than as a point fix because the shared `rpcRequest` helper is what makes
+the class unrepresentable: when one helper owns every await in the open/write/read/close sequence,
+no call site can perform an unsignalled one. Threading the signal into both sites above is the
+interim fix if this consolidation is deferred.
+
 Arm resolved elsewhere (added while planning `7-stabilization-concurrency`): two of the
 requirements above — **thread an AbortSignal through send and read**, and **start the ping
 round-trip clock after the stream opens** — are landed by
