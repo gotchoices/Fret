@@ -166,8 +166,17 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * Mirrors `runGen`'s placement for the same reason that counter exists: a start→stop→start
 	 * cycle must mint a **fresh** controller, because a reused, already-aborted one would silently
-	 * cancel every RPC of the new run. `null` between runs. The leave fan-out deliberately does
-	 * *not* use it — it runs after the abort, on its own budget (see `sendLeaveToNeighbors`).
+	 * cancel every RPC of the new run. `null` only before the first `start()`. The leave fan-out
+	 * deliberately does *not* use it — it runs after the abort, on its own budget (see
+	 * `sendLeaveToNeighbors`).
+	 *
+	 * The aborted controller is deliberately **kept** after `stop()` rather than nulled, and is
+	 * replaced only by the next `start()`. Nulling it turns "cancelled" back into "no signal" for
+	 * every call site that reads {@link runSignal} *after* the abort — and several do: a `stop()`
+	 * landing mid-tick leaves the rest of `stabilizeOnce` (which has no `stopped` re-check between
+	 * its passes) to capture the signal fresh, so those probes would dial after teardown, hold
+	 * shutdown open, and score contact strikes against healthy peers — the exact failure the abort
+	 * exists to prevent.
 	 */
 	private runAbort: AbortController | null = null;
 	private stabilizeTimer: ReturnType<typeof setTimeout> | null = null;
@@ -631,7 +640,11 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	/** The current run's cancellation signal; `undefined` between runs. See {@link runAbort}. */
+	/**
+	 * The current run's cancellation signal — already **aborted** once `stop()` has run, and
+	 * `undefined` only before the first `start()`. See {@link runAbort} for why the stopped run's
+	 * signal is kept rather than cleared.
+	 */
 	private get runSignal(): AbortSignal | undefined {
 		return this.runAbort?.signal;
 	}
@@ -862,8 +875,9 @@ export class FretService implements IFretService, Startable {
 		// load-bearing on both sides: after `clearLoopTimers()` (nothing new gets armed) and
 		// before `sendLeaveToNeighbors()`, which must still go out — it carries its own budget,
 		// not this signal, which is why aborting here does not silence it.
+		// Left in place (not nulled) so a late `runSignal` read still reports "cancelled"; the next
+		// start() mints a fresh controller. See `runAbort`.
 		this.runAbort?.abort();
-		this.runAbort = null;
 		this.removeNodeListeners();
 		// Unhandle before the leave notices: unhandle only removes *inbound* handlers,
 		// while the leave notices go out over our own outbound streams.
