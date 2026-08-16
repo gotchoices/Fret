@@ -1319,6 +1319,42 @@ export class FretService implements IFretService, Startable {
 		await this.sendAnnouncementsRateLimited(ids, await this.snapshot());
 	}
 
+	/**
+	 * Warm-up ping fan-out, shared by the two connection warm-up passes: the one-shot pass at
+	 * `start()` ({@link preconnectNeighbors}) and the per-second active-mode tick in
+	 * {@link startActivePreconnectLoop}. Both were serial dial chains — precisely what the *Active
+	 * vs passive state* section of `docs/fret.md` says active mode exists to avoid — so both take
+	 * the same treatment the stabilization tick did.
+	 *
+	 * - **Pooled at {@link maintenanceConcurrency}** (Core 6 / Edge 2), the same cap a tick uses.
+	 * - **Against the run signal, not a tick deadline.** Neither pass runs inside `stabilizeOnce`,
+	 *   so there is no tick budget to inherit; the per-ping {@link MAINTENANCE_RPC_TIMEOUT_MS}
+	 *   bounds each task and `stop()` collapses the whole fan-out at once.
+	 * - **`isDialable` is filtered before the task list is built**, not inside the task, so every
+	 *   pool slot goes to a peer that can actually be dialed rather than to a no-op.
+	 *
+	 * `pingsSent` counts only a ping that completed, as it did serially. Cancellation is not
+	 * evidence: a task that fails under an aborted run logs nothing — these paths never scored
+	 * anything, so the guard suppresses only the log line — and a task the pool never started is
+	 * `skipped`, so an aborted run issues no dial at all.
+	 */
+	private async pingWarmupTargets(ids: readonly string[], label: string): Promise<void> {
+		// Captured before the tasks are built, so a mid-flight stop()+start() cannot change what
+		// `wasCancelled` compares against — see `wasCancelled`.
+		const sig = this.runSignal;
+		const targets = ids.filter((id) => this.isDialable(id));
+		const results = await runPooled(targets.map((id) => async () => {
+			try {
+				await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+				this.diag.pingsSent++;
+			} catch (err) {
+				if (this.wasCancelled(sig)) return;
+				log.error('%s ping failed for %s - %e', label, id, err);
+			}
+		}), { concurrency: this.maintenanceConcurrency, signal: sig });
+		logRejected(results, targets, label);
+	}
+
 	private async preconnectNeighbors(): Promise<void> {
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
@@ -1329,18 +1365,7 @@ export class FretService implements IFretService, Startable {
 				...this.store.neighborsRight(selfCoord, Math.min(6, this.cfg.m)),
 				...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
 			])).filter((id) => id !== selfStr);
-			const sig = this.runSignal;
-			for (const id of ids) {
-				if (this.isDialable(id)) {
-					try {
-						await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-						this.diag.pingsSent++;
-					} catch (err) {
-						if (this.wasCancelled(sig)) return;
-						log.error('preconnectNeighbors ping failed for %s - %e', id, err);
-					}
-				}
-			}
+			await this.pingWarmupTargets(ids, 'preconnectNeighbors');
 		} catch (err) { log.error('preconnectNeighbors outer failed - %e', err) }
 	}
 
@@ -1362,18 +1387,7 @@ export class FretService implements IFretService, Startable {
 					...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
 					...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
 				])).filter((id) => id !== selfStr).slice(0, budget);
-				const sig = this.runSignal;
-				for (const id of ids) {
-					if (this.isDialable(id)) {
-						try {
-							await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-							this.diag.pingsSent++;
-						} catch (err) {
-							if (this.wasCancelled(sig)) break;
-							log.error('active preconnect ping failed for %s - %e', id, err);
-						}
-					}
-				}
+				await this.pingWarmupTargets(ids, 'active preconnect');
 			} catch (err) { log.error('active preconnect tick failed - %e', err) }
 			// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
 			if (this.stopped || gen !== this.runGen) { release(); return; }
@@ -2916,11 +2930,12 @@ function fulfilledValues<T>(results: ReadonlyArray<PoolResult<T>>): T[] {
 }
 
 /**
- * Log every task of a stabilization pool run that rejected. Each task the tick pools catches its
- * own RPC failures, so a rejection here is a bug in the task's bookkeeping, not evidence about the
- * peer — logged, never scored, and never fatal to the rest of the tick (the pool isolates it). It
- * used to surface as `stabilize tick failed:` and abort the serial walk; the pool must not turn
- * that into silence. Results are index-aligned with `ids`.
+ * Log every task of a pooled maintenance run that rejected — the stabilization tick's two phases
+ * and the warm-up fan-out alike. Each pooled task catches its own RPC failures, so a rejection here
+ * is a bug in the task's bookkeeping, not evidence about the peer — logged, never scored, and never
+ * fatal to the rest of the pass (the pool isolates it). It used to surface as `stabilize tick
+ * failed:` and abort the serial walk; the pool must not turn that into silence. Results are
+ * index-aligned with `ids`.
  */
 function logRejected(results: ReadonlyArray<PoolResult<unknown>>, ids: readonly string[], label: string): void {
 	results.forEach((r, i) => {

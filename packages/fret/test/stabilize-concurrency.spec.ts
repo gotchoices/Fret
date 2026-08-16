@@ -1,16 +1,8 @@
 import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
-import type { Libp2p } from 'libp2p'
-import type { Connection, PeerId, Stream } from '@libp2p/interface'
-import { generateKeyPair } from '@libp2p/crypto/keys'
-import { peerIdFromPrivateKey } from '@libp2p/peer-id'
-import { createMemNode, stopAll } from './helpers/libp2p.js'
-import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { DigitreeStore, type MembershipState, type PeerPatch } from '../src/store/digitree-store.js'
-import { encodeJson } from '../src/rpc/protocols.js'
-import { abortReasonError } from '../src/utils/deadline.js'
-import { hashPeerId } from '../src/ring/hash.js'
-import type { NeighborSnapshotV1 } from '../src/index.js'
+import { buildMaintenanceRig, type MaintenanceRig, type PeerRig } from './helpers/maintenance-rig.js'
+import type { FretService as CoreFretService } from '../src/service/fret-service.js'
+import type { DigitreeStore } from '../src/store/digitree-store.js'
 
 // One stabilization tick runs its outbound RPCs *pooled* — at most `maintenanceConcurrency` in
 // flight (Core 6 / Edge 2) — under one tick-wide budget (`STABILIZE_TICK_BUDGET_MS`), instead of
@@ -25,140 +17,20 @@ import type { NeighborSnapshotV1 } from '../src/index.js'
 //   evidence about the peer);
 // - candidate lists rotate under truncation, so a budget-cut tick never re-derives the same head.
 //
-// Harness: every outbound RPC funnels through `openRpcStream`, which consults
-// `node.getConnections(pid)` before dialing. Overriding that on a real memory node to return one
-// stub open connection per peer gives per-peer control of both the ping and the fetch in one
-// place — and is the only way to exercise `fetchNeighbors` at all, which is connection-only and
-// otherwise returns an empty snapshot. Neither sender *writes* to the stream (they open and read),
-// so a stub stream needs only an async iterator yielding one JSON chunk, plus `close`/`abort`.
-// The service is never started: the tick is driven directly so the loop cannot race the
-// assertions, and `runSignal` is then `undefined`, which the tick accepts.
-
-type Behavior = 'answers' | 'hangs'
-
-interface StreamOpts { signal?: AbortSignal }
-
-/**
- * A stream open that settles only when the caller's signal aborts — libp2p's `AbortOptions`
- * contract for `newStream`, and the only thing that can end a stalled open. A stub that ignored
- * the signal would never settle and the tick under test would hang the run.
- */
-function hangsUntilAbort(opts: StreamOpts, onSettle: () => void): Promise<Stream> {
-	return new Promise<Stream>((_resolve, reject) => {
-		const signal = opts.signal
-		if (signal == null) return
-		const fail = (): void => { onSettle(); reject(abortReasonError(signal)) }
-		if (signal.aborted) { fail(); return }
-		signal.addEventListener('abort', fail, { once: true })
-	})
-}
-
-function sleep(ms: number): Promise<void> {
-	return new Promise((r) => setTimeout(r, ms))
-}
-
-/**
- * A stream that yields `bytes` once (after `holdMs`, so overlapping opens stay open together
- * long enough for the in-flight high-water mark to be real) and then reports EOF. `onRelease`
- * fires once, on whichever of `close` / `abort` the sender's `releaseRpcStream` picks.
- */
-function stubStream(bytes: Uint8Array, holdMs: number, onRelease: () => void): Stream {
-	let released = false
-	const release = (): void => { if (!released) { released = true; onRelease() } }
-	let sent = false
-	const stream = {
-		id: 'stub-stream',
-		[Symbol.asyncIterator]: () => ({
-			next: async (): Promise<IteratorResult<Uint8Array>> => {
-				if (sent) return { done: true, value: undefined }
-				if (holdMs > 0) await sleep(holdMs)
-				sent = true
-				return { done: false, value: bytes }
-			},
-		}),
-		close: async () => { release() },
-		abort: () => { release() },
-	}
-	return stream as unknown as Stream
-}
-
-/**
- * Per-peer control of every outbound RPC the tick issues, plus the recordings the assertions
- * read: which protocols each peer saw and in what order, and the outbound in-flight count with
- * its high-water mark.
- */
-class PeerRig {
-	readonly behavior = new Map<string, Behavior>()
-	/** id → protocols opened against it, in call order. */
-	readonly opened = new Map<string, string[]>()
-	inFlight = 0
-	highWater = 0
-	holdMs = 0
-
-	constructor(
-		private readonly pingProtocol: string,
-		private readonly neighborsProtocol: string,
-	) {}
-
-	connectionFor(id: string): Connection {
-		return {
-			status: 'open',
-			remoteAddr: { toString: () => '/memory/stub' },
-			newStream: (protocols: string[], opts: StreamOpts) => this.open(id, protocols, opts),
-		} as unknown as Connection
-	}
-
-	private open(id: string, protocols: string[], opts: StreamOpts): Promise<Stream> {
-		const protocol = protocols[0]!
-		const seen = this.opened.get(id) ?? []
-		seen.push(protocol)
-		this.opened.set(id, seen)
-		this.inFlight++
-		this.highWater = Math.max(this.highWater, this.inFlight)
-		const settle = (): void => { this.inFlight-- }
-		if ((this.behavior.get(id) ?? 'answers') === 'hangs') return hangsUntilAbort(opts, settle)
-		return this.reply(id, protocol).then(
-			(bytes) => stubStream(bytes, this.holdMs, settle),
-			(err: unknown) => { settle(); throw err },
-		)
-	}
-
-	private reply(id: string, protocol: string): Promise<Uint8Array> {
-		if (protocol === this.pingProtocol) return encodeJson({ ok: true, ts: Date.now() })
-		if (protocol === this.neighborsProtocol) {
-			const snap: NeighborSnapshotV1 = { v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }
-			return encodeJson(snap)
-		}
-		return Promise.reject(new Error(`unexpected protocol opened during a stabilization tick: ${protocol}`))
-	}
-
-	protocolsSeenBy(id: string): string[] {
-		return this.opened.get(id) ?? []
-	}
-}
+// The libp2p / stub-connection harness lives in `helpers/maintenance-rig.ts`, shared with the
+// warm-up pass tests in `preconnect-concurrency.spec.ts`.
 
 describe('stabilization tick: pooled RPCs under one tick budget', function () {
 	this.timeout(10000)
 
-	let node: Libp2p
+	let harness: MaintenanceRig
 	let svc: CoreFretService
 	let store: DigitreeStore
 	let rig: PeerRig
-	let originalGetConnections: Libp2p['getConnections']
-	const originalTickBudget = (CoreFretService as any).STABILIZE_TICK_BUDGET_MS as number
 
 	async function build(profile: 'core' | 'edge'): Promise<void> {
-		node = await createMemNode()
-		await node.start()
-		svc = new CoreFretService(node, { profile, networkName: 'net-test' })
-		store = svc.getStore()
-		const protocols = (svc as any).protocols as { PROTOCOL_PING: string; PROTOCOL_NEIGHBORS: string }
-		rig = new PeerRig(protocols.PROTOCOL_PING, protocols.PROTOCOL_NEIGHBORS)
-		originalGetConnections = node.getConnections.bind(node)
-		// Every peer id resolves to one open stub connection — which also makes `isConnected` true
-		// for every peer, so all of them are dialable and none is skipped as unreachable.
-		;(node as any).getConnections = (pid?: PeerId): Connection[] =>
-			pid == null ? [] : [rig.connectionFor(pid.toString())]
+		harness = await buildMaintenanceRig(profile)
+		;({ svc, store, rig } = harness)
 	}
 
 	beforeEach(async () => {
@@ -166,48 +38,22 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 	})
 
 	async function teardown(): Promise<void> {
-		;(CoreFretService as any).STABILIZE_TICK_BUDGET_MS = originalTickBudget
-		;(node as any).getConnections = originalGetConnections
-		try { await svc.stop() } catch {}
-		await stopAll([node])
+		await harness.teardown()
 	}
 
 	afterEach(teardown)
 
-	function setTickBudget(ms: number): void {
-		;(CoreFretService as any).STABILIZE_TICK_BUDGET_MS = ms
-	}
-
-	function concurrency(): number {
-		return (svc as any).maintenanceConcurrency as number
-	}
+	const setTickBudget = (ms: number): void => { harness.setTickBudget(ms) }
+	const concurrency = (): number => harness.concurrency()
+	const seedPeers: MaintenanceRig['seedPeers'] = (count, membership, patch) => harness.seedPeers(count, membership, patch)
+	const ping = (): string => harness.ping()
+	const neighbors = (): string => harness.neighbors()
 
 	async function tick(): Promise<number> {
 		const t0 = Date.now()
 		await (svc as any).stabilizeOnce()
 		return Date.now() - t0
 	}
-
-	/**
-	 * Seed `count` peers with real Ed25519 ids (`sendPing` / `fetchNeighbors` parse the id before
-	 * anything else) at their true ring coordinates, dialable, in the given membership.
-	 */
-	async function seedPeers(count: number, membership: MembershipState, patch: PeerPatch = {}): Promise<string[]> {
-		const ids: string[] = []
-		for (let i = 0; i < count; i++) {
-			const pid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'))
-			const id = pid.toString()
-			store.upsert(id, await hashPeerId(pid))
-			store.setMembership(id, membership)
-			if (Object.keys(patch).length > 0) store.update(id, patch)
-			;(svc as any).setAddressKnown(id, true)
-			ids.push(id)
-		}
-		return ids
-	}
-
-	function ping(): string { return (svc as any).protocols.PROTOCOL_PING as string }
-	function neighbors(): string { return (svc as any).protocols.PROTOCOL_NEIGHBORS as string }
 
 	/** The evidence a tick may record against a peer — snapshotted before, compared after. */
 	function evidence(id: string): Record<string, unknown> {
