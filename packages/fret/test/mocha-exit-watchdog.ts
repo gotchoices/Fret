@@ -2,11 +2,6 @@ import { writeSync } from 'node:fs';
 
 const DEFAULT_GRACE_MS = 10_000;
 
-// NOTE: verified against Node v24.2.0 — _getActiveHandles/_getActiveRequests are
-// present but always return [] there (they're long-deprecated internals with no
-// stated stability guarantee), so getActiveResourcesInfo() above is the only signal
-// actually trustworthy on current Node; these two are kept for older runtimes/as a
-// documented tally per the ticket, not relied on as the primary diagnostic.
 interface ProcessInternals {
 	_getActiveHandles?: () => unknown[];
 	_getActiveRequests?: () => unknown[];
@@ -31,12 +26,17 @@ function constructorName(value: unknown): string {
 	if (value !== null && typeof value === 'object') {
 		return value.constructor?.name || 'anonymous';
 	}
-	return typeof value;
+	return value === null ? 'null' : typeof value;
 }
 
 function describeStillOpen(): string {
 	const internals = process as unknown as ProcessInternals;
 	const resources = process.getActiveResourcesInfo();
+	// NOTE: verified against Node v24.2.0 — _getActiveHandles/_getActiveRequests are
+	// present but always return [] there (long-deprecated internals with no stated
+	// stability guarantee), so getActiveResourcesInfo() is the only one of the three
+	// actually trustworthy on current Node. The other two are kept for older runtimes
+	// and as a documented tally, not relied on as the primary diagnostic.
 	const handles = (internals._getActiveHandles?.() ?? []).map(constructorName);
 	const requests = (internals._getActiveRequests?.() ?? []).map(constructorName);
 	return [
@@ -46,6 +46,17 @@ function describeStillOpen(): string {
 	].join('\n');
 }
 
+// `process.exit(1)` alone is NOT enough, and silently so: without `--exit`, mocha ends a
+// run via `exitMochaLater`, which registers `process.on('exit', () => process.exitCode = <test
+// result>)`. That handler runs during our exit and stamps the passing code back over ours, so
+// the watchdog would print its diagnosis and still report success — defeating its whole point.
+// Exit handlers fire in registration order, so registering ours here (after mocha's, since the
+// run has already finished) makes it the last writer and the winner.
+function failExit(): never {
+	process.on('exit', () => { process.exitCode = 1; });
+	process.exit(1);
+}
+
 function armWatchdog(): void {
 	const grace = graceMs();
 	// Unref'd: a healthy run reaches process.exit() on its own once Mocha's summary
@@ -53,7 +64,7 @@ function armWatchdog(): void {
 	const timer = setTimeout(() => {
 		log(`\n[exit-watchdog] process still alive ${grace}ms after the last test finished. Still open:`);
 		log(describeStillOpen());
-		process.exit(1);
+		failExit();
 	}, grace);
 	timer.unref();
 }

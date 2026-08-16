@@ -41,6 +41,11 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - **Test framework**: Mocha + Chai; tests `*.spec.ts` (not `*.test.ts`)
 - **TS execution**: `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
 - **No root tsconfig** — always run `tsc` from `packages/fret/`
+- **Exit watchdog**: `packages/fret/.mocharc.json` requires `test/mocha-exit-watchdog.ts` into
+  every mocha run started from `packages/fret/`. If the process is still alive 10s after the last
+  test, it dumps what is still open to stderr and fails the run instead of hanging. Widen with
+  `FRET_TEST_EXIT_GRACE_MS`. The `test` script still passes `--exit`, which force-quits before the
+  watchdog can see a leaked handle — see `tickets/` for the unresolved leak that keeps it there.
 - **Formatting**: tabs for indent (see tsconfig + existing code)
 - **NOTE: don't run `yarn format`.** There is no prettier config, so it applies prettier's
   space-indent defaults and rewrites every source file against the house style above.
