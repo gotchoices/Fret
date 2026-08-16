@@ -3,6 +3,7 @@ import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService, selectDiverseSample } from '../src/service/fret-service.js'
+import { ExpiringMap } from '../src/utils/expiring-map.js'
 import { DigitreeStore, type PeerEntry, type MembershipState } from '../src/store/digitree-store.js'
 import { assembleCohort } from '../src/service/cohort.js'
 import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
@@ -420,6 +421,74 @@ describe('Foreign re-probe backoff growth', function () {
 		expect(bo.has(ghost)).to.equal(false, 'evicted peer backoff entry must be pruned')
 		// peer-y was not in the store either (no upsert), also pruned
 		expect(bo.has(id)).to.equal(false, 'evicted peer-y entry must also be pruned')
+	})
+
+	// Escalation must outlive a single expired backoff window as long as it stays within
+	// BACKOFF_RETAIN_MS — the window (how long we wait before the next probe) and the
+	// retention (how long we remember the escalation) are deliberately different constants.
+	it('backoff escalation survives an expired window, within retention', async () => {
+		node = await createMemNode()
+		await node.start()
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		await svc.start()
+
+		const bo = (svc as any).backoffMap as ExpiringMap<{ until: number; factor: number }>
+		const record = (id: string): void => (svc as any).recordBackoff(id)
+
+		const id = 'peer-within-retention'
+		record(id) // factor = 1
+		expect(bo.get(id)!.factor).to.equal(1)
+
+		// Window expired, but nowhere near BACKOFF_RETAIN_MS (5 min) — same expiry-simulation
+		// idiom as the two specs above.
+		bo.set(id, { ...bo.get(id)!, until: Date.now() - 1 })
+		record(id)
+		expect(bo.get(id)!.factor).to.equal(2, 'escalation must survive an expired window within retention')
+	})
+
+	// The other half of the pair above: once BACKOFF_RETAIN_MS passes with no further failure,
+	// the entry is forgotten entirely and the next failure starts over at factor 1.
+	// `backoffMap` is stamped from the wall clock (`Date.now()`) inside `recordBackoff` itself,
+	// so 5 real minutes cannot be waited out here — swap in a fake-clock-driven ExpiringMap
+	// after start() so only *retention* (this map's own TTL) is under test, not the backoff
+	// window, which stays wall-clock-derived and is irrelevant to this test.
+	it('escalation resets to factor 1 after BACKOFF_RETAIN_MS with no further failure', async () => {
+		node = await createMemNode()
+		await node.start()
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		await svc.start()
+
+		const record = (id: string): void => (svc as any).recordBackoff(id)
+
+		let clockNow = Date.now()
+		const clock = { now: () => clockNow, advance: (ms: number) => { clockNow += ms } }
+		// NOTE: this swap is a fake *clock*, not a fake service — everything else (recordBackoff,
+		// the RPC layer, real Date.now() stamped into `until`) is untouched.
+		;(svc as any).backoffMap = new ExpiringMap({
+			capacity: 8,
+			ttlMs: (CoreFretService as any).BACKOFF_RETAIN_MS,
+			now: clock.now,
+		})
+
+		const id = 'peer-retention-expiry'
+		record(id)
+		expect((svc as any).backoffMap.get(id).factor).to.equal(1)
+
+		clock.advance((CoreFretService as any).BACKOFF_RETAIN_MS + 1)
+		expect((svc as any).backoffMap.has(id)).to.equal(false, 'entry must be forgotten past retention')
+
+		record(id)
+		expect((svc as any).backoffMap.get(id).factor).to.equal(1, 'escalation must reset once retention has elapsed')
+	})
+
+	// Read off the real constants (not copies) so retuning either side fails this test loudly
+	// rather than silently reintroducing the bug BACKOFF_RETAIN_MS exists to prevent: a peer
+	// re-probed at the slowest cadence (32 s) having its entry forgotten between probes.
+	it('BACKOFF_RETAIN_MS comfortably exceeds the longest possible backoff window', () => {
+		const base = (CoreFretService as any).BACKOFF_BASE_MS
+		const maxFactor = (CoreFretService as any).BACKOFF_MAX_FACTOR
+		const retain = (CoreFretService as any).BACKOFF_RETAIN_MS
+		expect(retain).to.be.greaterThan(base * maxFactor)
 	})
 })
 
