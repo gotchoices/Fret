@@ -18,6 +18,12 @@ import type { RouteAndMaybeActV1, RouteProgress } from '../src/index.js'
 //
 // The spacing guard between counted strikes is wall-clock, so every test that needs a *run* of
 // strikes rewinds `lastContactFailureAt` between them rather than sleeping.
+//
+// NOTE: at ~1000 lines this is the largest spec in the package (next is ring-membership at ~840).
+// Kept whole because its six blocks share one subject — what may and may not push a peer toward
+// `dead` — and each already owns its fixture, so a split would duplicate setup without separating
+// concerns. If a seventh block lands, split by *evidence source* (store-level, ring views, probe
+// passes, real RPC call sites) rather than by test count.
 
 /** 32-byte ring coordinate distinguished by its most-significant byte. */
 function coordAt(value: number): Uint8Array {
@@ -787,11 +793,21 @@ describe('cancellation is not evidence about a peer', () => {
 		for (const id of ids) (svc as any).setAddressKnown(id, true)
 	}
 
-	/** Nothing about this peer was scored: no strike, no dead label, no backoff. */
+	/**
+	 * Nothing about this peer was scored, across *both* arms of `noteRpcFailure`. The contact arm
+	 * is the obvious one (relevance decay via `failureCount`, then the strike and the `dead` label);
+	 * the membership arm is asserted too because a regression that moved a guard below
+	 * `noteRpcFailure` would be invisible here whenever the cancelled call happened to fail with an
+	 * unsupported-protocol error — that arm touches `negotiateFailures` / `membership` and neither
+	 * `contactFailures` nor `failureCount`.
+	 */
 	function expectUnscored(id: string, label = id): void {
 		const e = store.getById(id)
 		expect(e, `${label} still in the routing table`).to.not.equal(undefined)
 		expect(e?.contactFailures, `${label}: no contact strike`).to.equal(0)
+		expect(e?.failureCount, `${label}: no relevance decay`).to.equal(0)
+		expect(e?.negotiateFailures, `${label}: no membership evidence`).to.equal(0)
+		expect(e?.membership, `${label}: not demoted`).to.equal('member')
 		expect(e?.state, `${label}: not marked dead`).to.not.equal('dead')
 		expect((svc as any).backoffMap.get(id), `${label}: no backoff recorded`).to.equal(undefined)
 	}
