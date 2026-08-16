@@ -53,6 +53,18 @@ function isNear(dist: Uint8Array, nearRadius: Uint8Array): boolean {
 	return !lexLess(nearRadius, dist); // dist <= nearRadius
 }
 
+/**
+ * Minimum under a strict "a beats b" predicate. Only the winner is ever read, so a scan does
+ * the work a full sort did. It is also the safer shape: `beats` is false in *both* directions
+ * for two entries carrying the same id (a remote-supplied anchor list may repeat one), which
+ * is an inconsistent `sort` comparator but a well-defined scan.
+ */
+function best<T>(items: T[], beats: (a: T, b: T) => boolean): T {
+	let winner = items[0]!;
+	for (let i = 1; i < items.length; i++) if (beats(items[i]!, winner)) winner = items[i]!;
+	return winner;
+}
+
 // ── Cost function (fret.md §A5) ──────────────────────────────────────
 //
 // cost(peer) = w_d·adjNormDist + w_b·backoff
@@ -229,9 +241,14 @@ function chooseNextHopCost(
 	// tie-break for equal distances (docs/fret.md, "Identifier space and hashing"). That
 	// tie-break makes `betterByDist` a total order over distinct ids, so connectedness and
 	// cost never arbitrate here — the allowance applies to far mode alone.
+	//
+	// NOTE: backoff is inert here too, so near mode will pick the nearest peer over a live one
+	// a step behind it even when the nearest just failed us. That is the long-standing near-mode
+	// rule (distance alone) rather than something this partition introduced, and inside r_near
+	// the alternative hop is barely farther, so the timeout buys little. Revisit if near-mode
+	// hops are ever measured to stall on backed-off peers.
 	if (nearCandidates.length > 0) {
-		nearCandidates.sort((a, b) => (betterByDist(a.id, a.dist, b.id, b.dist) ? -1 : 1));
-		return nearCandidates[0]!.id;
+		return best(nearCandidates, (a, b) => betterByDist(a.id, a.dist, b.id, b.dist)).id;
 	}
 
 	// Far mode: use the cost function, evaluated once per surviving far candidate.
@@ -242,11 +259,9 @@ function chooseNextHopCost(
 		const costVal = cost(normalizedLogMagnitude(s.dist), slack, s.dist.length * 8, backoff(s.id), w);
 		return { ...s, costVal };
 	});
-	farScored.sort((a, b) => {
-		if (a.costVal !== b.costVal) return a.costVal - b.costVal;
-		return betterByDist(a.id, a.dist, b.id, b.dist) ? -1 : 1;
-	});
-	return farScored[0]!.id;
+	return best(farScored, (a, b) => (
+		a.costVal !== b.costVal ? a.costVal < b.costVal : betterByDist(a.id, a.dist, b.id, b.dist)
+	)).id;
 }
 
 function chooseNextHopLegacy(

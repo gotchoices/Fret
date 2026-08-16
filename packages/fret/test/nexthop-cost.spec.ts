@@ -75,6 +75,45 @@ describe('Next-hop cost-function mode', () => {
 		}
 	})
 
+	// The connected-first bias is *bounded* — that bound is the whole point of stating it in
+	// binary orders of ring distance rather than as a flat cost unit, and it is what stops a
+	// connected candidate outranking a disconnected one at any separation. Distances here are
+	// exact powers of two so "orders apart" is literal: a peer at 2^p sits p+1 orders out.
+	describe('far-mode connected allowance is bounded', () => {
+		const allFar = new Uint8Array(32) // zero radius → every non-zero distance is far
+
+		function pickBetween(connectedPow: number, disconnectedPow: number, confidence: number) {
+			const store = new DigitreeStore()
+			store.upsert('connected', pow2Coord(connectedPow))
+			store.upsert('disconnected', pow2Coord(disconnectedPow))
+			return chooseNextHop(
+				store, new Uint8Array(32),
+				['connected', 'disconnected'],
+				(id) => id === 'connected',
+				() => 0.5, // equal link quality, so the quality allowance cancels
+				{ nearRadius: allFar, confidence }
+			)
+		}
+
+		it('spends the allowance: connected wins 6 orders farther', () => {
+			expect(pickBetween(206, 200, 0.5)).to.equal('connected')
+		})
+
+		it('caps the allowance: connected loses 16 orders farther', () => {
+			expect(pickBetween(216, 200, 0.5)).to.equal('disconnected')
+		})
+
+		it('narrows the allowance at high confidence: 6 orders now loses', () => {
+			// confidence 1 → 4 orders of slack, so the same pair flips.
+			expect(pickBetween(206, 200, 1)).to.equal('disconnected')
+		})
+
+		it('widens the allowance at low confidence: 10 orders still wins', () => {
+			// confidence 0 → 12 orders of slack.
+			expect(pickBetween(210, 200, 0)).to.equal('connected')
+		})
+	})
+
 	it('penalizes peers with high backoff', () => {
 		const store = new DigitreeStore()
 		const target = coordByte(50)
