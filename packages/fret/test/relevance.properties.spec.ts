@@ -27,6 +27,8 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		membership: 'unknown',
 		negotiateFailures: 0,
 		lastNegotiateFailureAt: 0,
+		contactFailures: 0,
+		lastContactFailureAt: 0,
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,

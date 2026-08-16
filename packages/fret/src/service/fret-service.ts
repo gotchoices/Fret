@@ -140,7 +140,9 @@ export function selectDiverseSample(
 export class FretService implements IFretService, Startable {
 	private mode: FretMode = 'passive';
 	private readonly store = new DigitreeStore();
-	private readonly cfg: FretConfig;
+	// Every optional field is resolved to a default in the constructor, so the service never
+	// re-derives one at a read site.
+	private readonly cfg: Required<FretConfig>;
 	private readonly node: Libp2p;
 	private stopped = false;
 	private started = false;
@@ -207,6 +209,16 @@ export class FretService implements IFretService, Startable {
 	 * for a genuinely foreign peer is unchanged.
 	 */
 	private static readonly NEGOTIATE_FAILURE_MIN_SPACING_MS = 500;
+	/**
+	 * Minimum spacing between two contact failures that both count toward the dead-state run.
+	 *
+	 * Same reasoning as the negotiate spacing above — concurrent callers failing against one
+	 * restarting peer are a single observation, and a burst must not be able to reach the
+	 * threshold on its own — but a deliberately separate constant: the two runs mean different
+	 * things ("does not serve this network" vs "cannot be reached at all") and should be free to
+	 * diverge without one silently re-tuning the other.
+	 */
+	private static readonly CONTACT_FAILURE_MIN_SPACING_MS = 500;
 	private firstStabilizeDone = false;
 	private readonly diag = {
 		peersDiscovered: 0,
@@ -246,6 +258,8 @@ export class FretService implements IFretService, Startable {
 			profile: cfg?.profile ?? 'core',
 			bootstraps: cfg?.bootstraps ?? [],
 			networkName: cfg?.networkName ?? 'default',
+			// At least 1: a threshold of 0 would mark every peer dead on its first failure.
+			deadAfterFailures: Math.max(1, cfg?.deadAfterFailures ?? 3),
 		};
 		// Create network-specific protocols
 		this.protocols = makeProtocols(this.cfg.networkName);
@@ -371,6 +385,9 @@ export class FretService implements IFretService, Startable {
 		// network's namespaced protocol (ping or maybeAct), which proves the peer
 		// serves this network → confirm membership for free off normal traffic.
 		this.applyMembershipSignal(id, 'rpc-success');
+		// …and proves it is reachable, which clears any contact-failure run and resurrects it if
+		// a previous run had marked it dead.
+		this.noteProofOfLife(id);
 	}
 
 	private async applyFailure(id: string, coord: Uint8Array): Promise<void> {
@@ -382,6 +399,104 @@ export class FretService implements IFretService, Startable {
 			relevance: next.relevance,
 			failureCount: next.failureCount
 		});
+	}
+
+	/** This peer's stored ring coordinate, hashing its id when we hold no entry for it yet. */
+	private async coordOf(id: string): Promise<Uint8Array> {
+		return this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+	}
+
+	/**
+	 * The single seam for "we could not reach this peer": decay its relevance, then count the
+	 * strike toward the dead-state threshold.
+	 *
+	 * Callers must route *only* genuine unreachability here — the outbound RPC threw because the
+	 * dial, stream, or read failed. A peer that answered and refused (unsupported protocol), a
+	 * peer that replied `ok: false`, and an idle `peer:disconnect` all prove the remote is alive
+	 * or say nothing about it, so they keep their relevance decay and nothing more.
+	 */
+	private async applyContactFailure(id: string, coord: Uint8Array): Promise<void> {
+		await this.applyFailure(id, coord);
+		this.applyContactStrike(id);
+	}
+
+	/**
+	 * Count one failed contact against `id`, marking it `dead` once the run completes.
+	 *
+	 * **Synchronous by construction.** `applySuccess` / `applyFailure` read an entry, await the
+	 * self coordinate, then write a value derived before the await — so two concurrent chains
+	 * lose one increment (see the NOTE on `applySuccess`). That is harmless for a relevance score
+	 * recomputed on every call, but not for a threshold counter, where a lost strike silently
+	 * delays or prevents the transition. So this reads, patches, and returns with no await in
+	 * between, exactly like `applyMembershipSignal`.
+	 */
+	private applyContactStrike(id: string): void {
+		// Self is never a normal RPC target, but a dead self would drop out of every ring view —
+		// and out of the capacity protection that keeps it there — with no path back short of a
+		// restart. Cheap guard, unrecoverable failure avoided.
+		if (id === this.node.peerId.toString()) return;
+		const e = this.store.getById(id);
+		if (!e) return;
+		// A *run* means observations separated in time. Several forwards to one restarting hop all
+		// fail in the same instant; that is one observation, not three.
+		const now = Date.now();
+		if (now - e.lastContactFailureAt < FretService.CONTACT_FAILURE_MIN_SPACING_MS) return;
+		const threshold = this.cfg.deadAfterFailures;
+		// Clamped at the threshold so the counter stays bounded for a peer we keep re-probing;
+		// a peer already dead simply stays dead.
+		const failures = Math.min(e.contactFailures + 1, threshold);
+		const patch: PeerPatch = { contactFailures: failures, lastContactFailureAt: now };
+		if (failures >= threshold && e.state !== 'dead') patch.state = 'dead';
+		this.store.update(id, patch);
+	}
+
+	/**
+	 * Record that `id` is demonstrably alive: clear its contact-failure run and, if it was marked
+	 * `dead`, restore it to a live state.
+	 *
+	 * Called from every site that proves liveness — a completed outbound RPC (`applySuccess`), an
+	 * inbound RPC (`noteInboundRpc`), and a fresh transport connection (`peer:connect`). The
+	 * counter reset is the load-bearing half at the connect site: `setState(id, 'connected')`
+	 * there would otherwise resurrect a peer whose counter is still clamped at the threshold, so
+	 * its very next failure would re-kill it.
+	 *
+	 * Relevance is deliberately *not* reset to a baseline. `scoreSuccess` already up-ranks on
+	 * success, and wiping the health counters would erase the record of a peer that flaps.
+	 */
+	private noteProofOfLife(id: string): void {
+		const e = this.store.getById(id);
+		if (!e) return;
+		const patch: PeerPatch = {};
+		if (e.contactFailures !== 0) patch.contactFailures = 0;
+		if (e.state === 'dead') patch.state = this.isConnected(id) ? 'connected' : 'disconnected';
+		if (Object.keys(patch).length === 0) return; // already settled
+		this.store.update(id, patch);
+	}
+
+	/**
+	 * Route one failed outbound RPC to the evidence channel it actually belongs to.
+	 *
+	 * An unsupported-protocol error means the dial *succeeded* and the remote answered at the
+	 * transport layer — it is demonstrably alive, and the error is evidence about which network
+	 * it serves, so it takes the membership path and never a liveness strike. Anything else is a
+	 * failure to reach the peer at all and takes the contact-failure seam.
+	 *
+	 * It deliberately records **no backoff**: each call site keeps whatever backoff behavior it
+	 * already had, so routing failures through here introduces none where there was none.
+	 *
+	 * Never throws — it is bookkeeping on an already-failed path, and several call sites run it
+	 * from inside a `catch` where a second throw would escape into a background loop.
+	 */
+	private async noteRpcFailure(id: string, err: unknown): Promise<void> {
+		try {
+			if (isUnsupportedProtocolError(err)) {
+				this.applyMembershipSignal(id, 'negotiate-failure');
+				return;
+			}
+			await this.applyContactFailure(id, await this.coordOf(id));
+		} catch (e) {
+			log.error('noteRpcFailure bookkeeping failed for %s - %e', id, e);
+		}
 	}
 
 	/**
@@ -458,6 +573,8 @@ export class FretService implements IFretService, Startable {
 		try {
 			if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(peerIdFromString(id)));
 			this.applyMembershipSignal(id, 'rpc-inbound');
+			// The peer dialed *us*, which is proof of life however badly our own dials to it fared.
+			this.noteProofOfLife(id);
 		} catch (err) {
 			log.error('noteInboundRpc failed for %s - %e', id, err);
 		}
@@ -509,9 +626,13 @@ export class FretService implements IFretService, Startable {
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt?.detail?.toString?.();
 				if (!id) return;
-				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
+				const coord = await this.coordOf(id);
 				this.store.upsert(id, coord);
 				this.store.setState(id, 'connected');
+				// A transport connection formed, so the peer is reachable. `setState` above already
+				// cleared any `dead` label; this clears the counter behind it, which would otherwise
+				// stay clamped at the threshold and let the very next failure re-kill the peer.
+				this.noteProofOfLife(id);
 				await this.applyTouch(id, coord);
 			} catch (err) { log.error('peer:connect handler failed - %e', err) }
 		});
@@ -1362,27 +1483,23 @@ export class FretService implements IFretService, Startable {
 				const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
 				this.diag.pingsSent++;
 				if (res.ok) {
-					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
-					await this.applySuccess(id, coord, res.rttMs);
+					await this.applySuccess(id, await this.coordOf(id), res.rttMs);
 					this.diag.pingsOk++;
 				} else {
-					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
-					await this.applyFailure(id, coord);
+					// The peer answered — busy, empty, or undecodable, which `sendPing` collapses into
+					// one result — so it is alive. Decay relevance only; never a liveness strike.
+					await this.applyFailure(id, await this.coordOf(id));
 					this.diag.pingsFail++;
 				}
 			} catch (err) {
 				// benign during churn - do not warn each tick
 				// console.warn('ping failed for', id, err);
-				try {
-					// A failed negotiation is evidence, not a verdict — this path is member-gated,
-					// so `id` is a *confirmed* member and the likeliest cause is a restart or a
-					// handler not yet registered. Count it; only a run of them demotes. A timeout /
-					// transient error is not even that, and leaves the label untouched.
-					if (isUnsupportedProtocolError(err)) this.applyMembershipSignal(id, 'negotiate-failure');
-					const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
-					await this.applyFailure(id, coord);
-					this.diag.pingsFail++;
-				} catch {}
+				this.diag.pingsFail++;
+				// The seam decides which evidence this is: a failed negotiation is membership
+				// evidence about a peer that answered (this path is member-gated, so `id` is a
+				// *confirmed* member and the likeliest cause is a restart), while anything else is
+				// a failure to reach it at all and counts toward the dead-state run.
+				await this.noteRpcFailure(id, err);
 			}
 		}
 	}
@@ -1468,8 +1585,7 @@ export class FretService implements IFretService, Startable {
 			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
 			this.diag.pingsSent++;
 			if (res.ok) {
-				const coord = this.store.getById(id)?.coord ?? (await hashPeerId(peerIdFromString(id)));
-				await this.applySuccess(id, coord, res.rttMs); // marks member (and clears backoff)
+				await this.applySuccess(id, await this.coordOf(id), res.rttMs); // marks member (and clears backoff)
 				this.diag.pingsOk++;
 				this.clearBackoff(id);
 			} else {
@@ -1479,18 +1595,15 @@ export class FretService implements IFretService, Startable {
 			}
 		} catch (err) {
 			this.diag.pingsFail++;
-			if (isUnsupportedProtocolError(err)) {
-				// Evidence of absence — foreign only once a run of these accumulates (a peer that
-				// has simply not registered its handlers yet produces the identical error). Back
-				// off either way so the occasional foreign re-probe (which exists to recover a
-				// *mislabeled* same-network peer) does not hammer a genuinely-foreign peer that
-				// keeps returning this error. The backoff grows exponentially (factor doubles
-				// each window, up to 32×) so probing tapers toward ~once/32s.
-				this.applyMembershipSignal(id, 'negotiate-failure');
-				this.recordBackoff(id);
-			} else {
-				this.recordBackoff(id); // timeout / transient — retry a later tick
-			}
+			// Unsupported protocol is evidence of absence — foreign only once a run of these
+			// accumulates (a peer that has simply not registered its handlers yet produces the
+			// identical error); anything else is a failed contact and counts toward the dead-state
+			// run instead. Back off either way so the occasional foreign re-probe (which exists to
+			// recover a *mislabeled* same-network peer) does not hammer a genuinely-foreign peer
+			// that keeps returning this error. The backoff grows exponentially (factor doubles each
+			// window, up to 32×) so probing tapers toward ~once/32s.
+			await this.noteRpcFailure(id, err);
+			this.recordBackoff(id);
 		}
 	}
 
@@ -1725,7 +1838,7 @@ export class FretService implements IFretService, Startable {
 					if (isBusy(result)) {
 						this.recordBackoff(next);
 					} else {
-						const nextCoord = this.store.getById(next)?.coord ?? (await hashPeerId(peerIdFromString(next)));
+						const nextCoord = await this.coordOf(next);
 						// No latency sample: `sendMaybeAct` on the forward path returns only once
 						// the *entire remaining route* has completed downstream, so its wall time
 						// is the cost of the whole subtree, not of the link to `next`. Recording
@@ -1739,8 +1852,9 @@ export class FretService implements IFretService, Startable {
 					log.error('forward maybeAct failed to %s - %e', next, err);
 					// A failed negotiation hints this hop belongs to another network, but `next`
 					// came from the member-gated cohort, so it is a confirmed member and a restart
-					// looks identical. Count it; only a run of them demotes.
-					if (isUnsupportedProtocolError(err)) this.applyMembershipSignal(next, 'negotiate-failure');
+					// looks identical. Count it; only a run of them demotes. A dial/stream failure
+					// instead says the hop is unreachable and counts toward the dead-state run.
+					await this.noteRpcFailure(next, err);
 					this.recordBackoff(next);
 				}
 			}
@@ -2158,6 +2272,7 @@ export class FretService implements IFretService, Startable {
 						}
 					} catch (err) {
 						log.error('activity send to anchor %s failed - %e', actTarget, err);
+						await this.noteRpcFailure(actTarget, err);
 						this.recordBackoff(actTarget);
 					}
 				} else {
@@ -2177,6 +2292,7 @@ export class FretService implements IFretService, Startable {
 				hop++;
 			} catch (err) {
 				log.error('iterativeLookup hop %d to %s failed - %e', hop, target, err);
+				await this.noteRpcFailure(target, err);
 				this.recordBackoff(target);
 				// No need to drop `target` from `bestAnchors` — it is in `visited`, which every
 				// candidate path filters against.

@@ -278,6 +278,7 @@ Notes:
 - C (routing table capacity): 2048
 - Stabilization period Ts: 1–3s passive; 250–500ms active
 - Active pre-dial budget: 4–8 peers per second
+- deadAfterFailures (consecutive failed *contacts* before a peer is marked dead): 3, spaced ≥ 500ms apart
 
 ### Operating profiles (Edge vs Core)
 - Edge (lightweight/mobile):
@@ -580,6 +581,9 @@ interface SerializedPeerEntry {
   state: PeerState;             // 'connected' | 'disconnected' | 'dead'
   membership?: MembershipState; // 'unknown' | 'member' | 'foreign'; absent in pre-membership snapshots → 'unknown'
   negotiateFailures?: number;   // consecutive failed protocol negotiations; exported for diagnostics, reset to 0 on import
+  contactFailures?: number;     // consecutive failed contact attempts; exported for diagnostics, reset to 0 on import
+                                // (so an imported table never carries a `dead` peer — `state` is forced to
+                                // 'disconnected' and the counter that would re-kill it is cleared alongside)
   accessCount: number;
   successCount: number;
   failureCount: number;

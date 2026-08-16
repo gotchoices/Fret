@@ -45,6 +45,25 @@ export interface PeerEntry {
 	 * unlike the count it carries no diagnostic value across a restart. 0 = never counted.
 	 */
 	lastNegotiateFailureAt: number;
+	/**
+	 * Consecutive failures to *reach* this peer at all, since the last proof that it is alive.
+	 *
+	 * A strike is a failed contact — the outbound RPC threw (dial failure, no known address,
+	 * stream/read timeout, transport error). A negotiation refusal is deliberately *not* one:
+	 * the dial succeeded and the remote answered, so it is alive, and that error is membership
+	 * evidence instead (see `negotiateFailures`). A run of these is what marks a peer `dead`;
+	 * any proof of life — a completed RPC in either direction, or a fresh connection — resets it
+	 * to 0. Like `membership`, the store only stores and exposes the count; it never branches on it.
+	 */
+	contactFailures: number;
+	/**
+	 * Unix ms of the last contact failure that was *counted* toward `contactFailures`.
+	 *
+	 * Same reasoning as `lastNegotiateFailureAt`: several callers failing against one peer in the
+	 * same instant are one observation, not a run, so callers space counted failures apart. Not
+	 * serialized — it describes a live attempt and says nothing after a restart. 0 = never counted.
+	 */
+	lastContactFailureAt: number;
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -80,6 +99,7 @@ export interface SerializedPeerEntry {
 	state: PeerState;
 	membership?: MembershipState; // optional for back-compat with older snapshots
 	negotiateFailures?: number; // optional; exported for diagnostics, reset on import
+	contactFailures?: number; // optional; exported for diagnostics, reset on import
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -176,6 +196,8 @@ export class DigitreeStore {
 			membership: 'unknown',
 			negotiateFailures: 0,
 			lastNegotiateFailureAt: 0,
+			contactFailures: 0,
+			lastContactFailureAt: 0,
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
@@ -358,6 +380,7 @@ export class DigitreeStore {
 			state: e.state,
 			membership: e.membership,
 			negotiateFailures: e.negotiateFailures,
+			contactFailures: e.contactFailures,
 			accessCount: e.accessCount,
 			successCount: e.successCount,
 			failureCount: e.failureCount,
@@ -396,6 +419,12 @@ export class DigitreeStore {
 				// too. Reset for the same reason `state` is forced to 'disconnected'.
 				negotiateFailures: 0,
 				lastNegotiateFailureAt: 0,
+				// Likewise unreachability: a peer we could not contact before the restart may be
+				// reachable now. `state` is already forced to 'disconnected', so resetting the
+				// counter alongside it is what stops an imported table from re-killing that peer
+				// on its very next failure.
+				contactFailures: 0,
+				lastContactFailureAt: 0,
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,

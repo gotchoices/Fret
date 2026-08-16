@@ -9,6 +9,14 @@ export interface FretConfig {
 	profile: 'edge' | 'core';
 	bootstraps?: string[];
 	networkName?: string;
+	/**
+	 * Consecutive failed contact attempts before a peer is marked `dead` (default 3).
+	 *
+	 * A "failed contact" is failure to reach the peer at all — not a peer that answered and
+	 * refused, which is membership evidence instead. Failures closer together than the service's
+	 * spacing window count once, so the run is genuinely spread over time.
+	 */
+	deadAfterFailures?: number;
 }
 
 export interface NeighborSnapshotV1 {
