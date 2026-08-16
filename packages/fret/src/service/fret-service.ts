@@ -24,6 +24,7 @@ import { registerPing, sendPing } from '../rpc/ping.js';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
+import { ExpiringMap } from '../utils/expiring-map.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
@@ -173,14 +174,48 @@ export class FretService implements IFretService, Startable {
 	private activityHandler?: ActivityHandler;
 	/** Sized in the constructor, where the profile is known — see the sizing note there. */
 	private readonly dedupCache: DedupCache<NearAnchorV1 | { commitCertificate: string }>;
-	private readonly backoffMap = new Map<string, { until: number; factor: number }>();
+	/**
+	 * Per-peer probe backoff. Sized and expired in the constructor — see the sizing note there
+	 * and {@link BACKOFF_RETAIN_MS} for why the retention lifetime is *not* the backoff window.
+	 */
+	private readonly backoffMap: ExpiringMap<{ until: number; factor: number }>;
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
 	private readonly bucketAnnounce: TokenBucket;
 	private readonly bucketAnnounceInbound: TokenBucket;
 	private readonly announceFanout: number;
-	private readonly departureDebounce = new Map<string, number>();
+	/**
+	 * Coordinate regions announced for recently, so a burst of departures around one region
+	 * produces one announce burst. **Presence alone means "recently announced"** — the map's TTL
+	 * *is* {@link DEPARTURE_DEBOUNCE_MS}, so an entry still present is still inside its window and
+	 * the value (the announce timestamp) is diagnostics only. Sized in the constructor.
+	 */
+	private readonly departureDebounce: ExpiringMap<number>;
 	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
+	/**
+	 * First backoff window, doubled on each further failure up to {@link BACKOFF_MAX_FACTOR}.
+	 *
+	 * A named constant rather than a literal inside `recordBackoff` so the retention inequality
+	 * below can be asserted against the real value instead of a copy of it.
+	 */
+	private static readonly BACKOFF_BASE_MS = 1000;
+	/** Cap on the doubling factor: the longest window is `BACKOFF_BASE_MS × BACKOFF_MAX_FACTOR`. */
+	private static readonly BACKOFF_MAX_FACTOR = 32;
+	/**
+	 * How long a peer's backoff *escalation* is remembered after its last failure — deliberately
+	 * not the backoff window itself.
+	 *
+	 * `getBackoffPenalty` keeps an entry whose `until` has passed so the next `recordBackoff`
+	 * doubles `factor` instead of restarting at 1; that escalation is what tapers a genuinely
+	 * foreign or dead peer toward ~once/32 s. So retention means "forget a peer's escalation once
+	 * it has gone this long without failing again", and it must comfortably exceed the longest
+	 * backoff window (`BACKOFF_BASE_MS × BACKOFF_MAX_FACTOR` = 32 s) — otherwise a peer re-probed
+	 * at the slowest cadence would have its entry forgotten *between* probes and silently reset to
+	 * factor 1, which is exactly the escalation this constant exists to preserve. 5 min is ~9× the
+	 * longest window; `test/ring-membership.spec.ts` pins the inequality so tuning either side
+	 * fails loudly.
+	 */
+	private static readonly BACKOFF_RETAIN_MS = 300_000;
 	/**
 	 * Peer ids libp2p currently holds at least one multiaddr for — the backing set for
 	 * {@link hasAddresses}.
@@ -315,6 +350,23 @@ export class FretService implements IFretService, Startable {
 		// NOTE: these track the `bucketMaybeAct` rates above; raising those without raising
 		// these re-opens the eviction hole.
 		this.dedupCache = new DedupCache(DEDUP_TTL_MS, this.cfg.profile === 'core' ? 2048 : 512);
+		// An entry for a peer no longer in the store is dropped by `pruneBackoffMap` on the next
+		// tick regardless, so the routing table's own capacity is the only ceiling that can ever
+		// bind here — Core takes it as-is, Edge trades that worst case for memory. A wrong eviction
+		// costs one earlier probe of the stalest-failing peer, since losing the entry only resets
+		// that peer's escalation to factor 1.
+		this.backoffMap = new ExpiringMap<{ until: number; factor: number }>({
+			capacity: this.cfg.profile === 'core' ? this.cfg.capacity : Math.min(this.cfg.capacity, 512),
+			ttlMs: FretService.BACKOFF_RETAIN_MS,
+		});
+		// Live size is bounded by departures per DEPARTURE_DEBOUNCE_MS window, so Core's 512 leaves
+		// 256 departures/s of headroom before the cap can bind at all. A wrong eviction costs one
+		// extra announce burst, which `bucketAnnounce` already caps globally — the cheapest of the
+		// bounded maps to get wrong, which is why it carries the smallest capacity.
+		this.departureDebounce = new ExpiringMap<number>({
+			capacity: this.cfg.profile === 'core' ? 512 : 128,
+			ttlMs: FretService.DEPARTURE_DEBOUNCE_MS,
+		});
 	}
 
 	public getDiagnostics(): Readonly<typeof this.diag> {
@@ -752,6 +804,12 @@ export class FretService implements IFretService, Startable {
 		// while the leave notices go out over our own outbound streams.
 		await this.unregisterRpcHandlers();
 		try { await this.sendLeaveToNeighbors(); } catch (err) { console.warn('sendLeaveToNeighbors failed', err); }
+		// A start→stop→start cycle is a fresh run, so neither map may carry into it: a peer's
+		// backoff escalation is per-run handshake history, exactly like `negotiateFailures`, which
+		// the store already refuses to carry across a restart. Cleared after the leave fan-out so
+		// that fan-out still sees the run's state. Mirrors `FretPeerDiscovery.stop()`.
+		this.backoffMap.clear();
+		this.departureDebounce.clear();
 	}
 
 	/** Cancel any pending loop timers. Ticks already in flight exit on the generation check. */
@@ -1350,16 +1408,12 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async announceOnDeparture(departedId: string, coord: Uint8Array): Promise<void> {
-		// Debounce: skip if we recently announced for this coordinate region
+		// Debounce: skip if we recently announced for this coordinate region. The map's TTL *is*
+		// DEPARTURE_DEBOUNCE_MS, so presence is the whole test — no timestamp arithmetic, and no
+		// inline prune loop, since the map sweeps on the stabilization tick and is capacity-bounded.
 		const regionKey = coordToBase64url(coord);
-		const now = Date.now();
-		const lastAnnounce = this.departureDebounce.get(regionKey) ?? 0;
-		if (now - lastAnnounce < FretService.DEPARTURE_DEBOUNCE_MS) return;
-		this.departureDebounce.set(regionKey, now);
-		// Prune stale debounce entries
-		if (this.departureDebounce.size > 256) {
-			for (const [k, v] of this.departureDebounce) { if (now - v > FretService.DEPARTURE_DEBOUNCE_MS * 2) this.departureDebounce.delete(k); }
-		}
+		if (this.departureDebounce.has(regionKey)) return;
+		this.departureDebounce.set(regionKey, Date.now());
 
 		const exclude = new Set([this.node.peerId.toString(), departedId]);
 		const targets = this.announceTargetsAround(coord, exclude, this.announceFanout);
@@ -1581,6 +1635,7 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async stabilizeOnce(): Promise<void> {
+		this.sweepBoundedMaps();
 		const selfCoord = await hashPeerId(this.node.peerId);
 		const selfStr = this.node.peerId.toString();
 		const nearAll = this.getNeighbors(selfCoord, 'both', Math.max(2, this.cfg.m));
@@ -1684,7 +1739,9 @@ export class FretService implements IFretService, Startable {
 	 * list would put every dead peer behind that queue.
 	 */
 	private async reprobeExcludedPeers(): Promise<void> {
-		this.pruneBackoffMap();
+		// No prune here: sweeping bookkeeping maps is not a probe pass's job, and
+		// `sweepBoundedMaps` at the top of `stabilizeOnce` (this pass's only caller) already ran it
+		// this tick.
 		const budget = this.cfg.profile === 'core' ? 2 : 1;
 		// Arms are disjoint by construction: a peer that is both foreign and dead belongs to the
 		// dead arm alone, so no peer is probed twice in one tick. Recovering it there fixes both
@@ -2103,10 +2160,13 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private recordBackoff(id: string): void {
+		// Absent *or* retention-expired both read as `undefined` here, and both mean the same
+		// thing: this peer's escalation is forgotten, so the next window starts at factor 1.
 		const existing = this.backoffMap.get(id);
-		const factor = existing ? Math.min(existing.factor * 2, 32) : 1;
-		const baseMs = 1000;
-		this.backoffMap.set(id, { until: Date.now() + baseMs * factor, factor });
+		const factor = existing ? Math.min(existing.factor * 2, FretService.BACKOFF_MAX_FACTOR) : 1;
+		// The `set` also restarts the retention window, so retention is measured from the last
+		// failure rather than from the first — see BACKOFF_RETAIN_MS.
+		this.backoffMap.set(id, { until: Date.now() + FretService.BACKOFF_BASE_MS * factor, factor });
 	}
 
 	private clearBackoff(id: string): void {
@@ -2116,16 +2176,37 @@ export class FretService implements IFretService, Startable {
 	private getBackoffPenalty(id: string): number {
 		const bo = this.backoffMap.get(id);
 		if (!bo) return 0;
-		if (bo.until < Date.now()) return 0; // expired: retain entry so factor grows on the next recordBackoff
-		return Math.min(1, bo.factor / 32);
+		if (bo.until < Date.now()) return 0; // window over, entry retained so factor grows on the next recordBackoff
+		return Math.min(1, bo.factor / FretService.BACKOFF_MAX_FACTOR);
 	}
 
-	// Remove backoff entries for peers that have been evicted from the store; called
-	// once per stabilization tick so the map stays bounded by the store's capacity.
+	/**
+	 * Drop backoff entries for peers that have left the store.
+	 *
+	 * **Orthogonal to expiry, not a duplicate of it**: a peer evicted from the routing table may
+	 * still be well inside its retention window, and no TTL can see that it is gone. Walks the
+	 * key *snapshot* `ExpiringMap.keys()` returns, so deleting while iterating is safe.
+	 */
 	private pruneBackoffMap(): void {
 		for (const id of this.backoffMap.keys()) {
 			if (!this.store.getById(id)) this.backoffMap.delete(id);
 		}
+	}
+
+	/**
+	 * Periodic tidy-up for the two capacity-bounded bookkeeping maps.
+	 *
+	 * Both are hard-capped at construction, so this is not what keeps them bounded — it is what
+	 * keeps them bounded by *live* population rather than by peak, since an expired entry occupies
+	 * a slot until something removes it. Called once per stabilization tick;
+	 * `FretPeerDiscovery` sweeps its own map on its own interval (it is constructed before the
+	 * libp2p node, and therefore before this service exists, so a single shared sweep is not
+	 * available to it).
+	 */
+	private sweepBoundedMaps(): void {
+		this.backoffMap.sweep();
+		this.departureDebounce.sweep();
+		this.pruneBackoffMap();
 	}
 
 	report(_evt: ReportEvent): void {
