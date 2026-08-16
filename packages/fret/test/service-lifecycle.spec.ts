@@ -15,10 +15,13 @@ const NETWORK = 'lifecycle-test'
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
 /**
- * `private static` on the service. Read off the class rather than restating the number, so the
- * shutdown bound below tracks the constant instead of drifting from it.
+ * `private static` on the service. Read off the class rather than restating the numbers, so the
+ * shutdown bounds below track the constants instead of drifting from them.
  */
-const { SHUTDOWN_BUDGET_MS } = FretService as unknown as { SHUTDOWN_BUDGET_MS: number }
+const { SHUTDOWN_BUDGET_MS, LEAVE_NOTICE_TIMEOUT_MS } = FretService as unknown as {
+	SHUTDOWN_BUDGET_MS: number
+	LEAVE_NOTICE_TIMEOUT_MS: number
+}
 
 const PROTOCOLS = makeProtocols(NETWORK)
 /** Protocols this service registers, so assertions ignore libp2p's own handlers. */
@@ -35,6 +38,63 @@ function fretProtocols(node: Libp2p): string[] {
  */
 function listenerCount(svc: FretService): number {
 	return (svc as unknown as { nodeListeners: unknown[] }).nodeListeners.length
+}
+
+/**
+ * A peer libp2p holds an address for but that nothing answers at.
+ *
+ * Seeded through the peerStore rather than the service's `addressKnown` set because the
+ * stabilization tick rebuilds that set wholesale from the peerStore on every pass — a
+ * directly-poked entry would be dropped again before `stop()` ran. Returns the ghost's id.
+ */
+async function createGhost(node: Libp2p): Promise<string> {
+	const ghost = await createMemNode()
+	await ghost.start()
+	await node.peerStore.merge(ghost.peerId, { multiaddrs: ghost.getMultiaddrs() })
+	await ghost.stop()
+	return ghost.peerId.toString()
+}
+
+interface HangingDials {
+	/** Dials to a ghost that were actually issued. */
+	attempted: number
+	/** Ghost dials that arrived with no abort signal — see below; must stay 0. */
+	unsignaled: number
+	restore: () => void
+}
+
+/**
+ * Make dials to `ghosts` settle *only* on signal abort — libp2p's `AbortOptions` contract for
+ * `dialProtocol`, and therefore the only thing that can end a stalled open (see `hangsUntilAbort`
+ * in `rpc.protocols.spec.ts`). Non-ghost peers pass straight through.
+ *
+ * A ghost dial arriving with **no** signal is counted in `unsignaled` and rejected rather than
+ * left to hang. Hanging would also fail the run, but only as an opaque 30 s mocha timeout; the
+ * counter names the regression it guards — dropping `signal` from `openRpcStream`'s
+ * `NewStreamOptions`, which is what makes a stalled dial unbounded in the first place.
+ */
+function hangGhostDials(node: Libp2p, ghosts: Set<string>): HangingDials {
+	const originalDial = node.dialProtocol.bind(node)
+	const state: HangingDials = {
+		attempted: 0,
+		unsignaled: 0,
+		restore: () => { (node as unknown as { dialProtocol: unknown }).dialProtocol = originalDial },
+	}
+	;(node as unknown as { dialProtocol: unknown }).dialProtocol = (pid: PeerId, protocols: string[], opts: { signal?: AbortSignal }) => {
+		if (!ghosts.has(pid.toString())) return originalDial(pid, protocols, opts)
+		state.attempted++
+		const signal = opts?.signal
+		if (signal == null) {
+			state.unsignaled++
+			return Promise.reject(new Error('ghost dial issued with no abort signal'))
+		}
+		return new Promise<Stream>((_resolve, reject) => {
+			const fail = (): void => { reject(new Error('ghost dial aborted')) }
+			if (signal.aborted) { fail(); return }
+			signal.addEventListener('abort', fail, { once: true })
+		})
+	}
+	return state
 }
 
 describe('FretService start/stop lifecycle', function () {
@@ -220,22 +280,13 @@ describe('FretService start/stop lifecycle', function () {
 		const peer = await createMemNode()
 		await peer.start()
 		const peerSvc = new FretService(peer, { networkName: NETWORK })
-		const originalDial = node.dialProtocol.bind(node)
-		let ghostDials = 0
+		let dials: HangingDials | undefined
 		try {
 			await peerSvc.start()
 			// Connected, hence dialable and not a doomed dial: the notice to this one must land.
 			await node.dial(peer.getMultiaddrs()[0]!)
 
-			// A peer libp2p holds an address for but that nothing answers at. Seeded through the
-			// peerStore rather than the service's `addressKnown` set because the stabilization tick
-			// rebuilds that set wholesale from the peerStore on every pass — a directly-poked entry
-			// would be dropped again before stop() ran.
-			const ghost = await createMemNode()
-			await ghost.start()
-			const ghostId = ghost.peerId.toString()
-			await node.peerStore.merge(ghost.peerId, { multiaddrs: ghost.getMultiaddrs() })
-			await ghost.stop()
+			const ghostId = await createGhost(node)
 
 			// The tick's own probe passes would dial the ghost on their own schedule; the
 			// assertions here are about stop(), so keep the loop from racing them. `seedFromPeerStore`
@@ -244,22 +295,9 @@ describe('FretService start/stop lifecycle', function () {
 			await svc.start()
 			expect(svc.getStore().getById(ghostId), 'ghost seeded into the routing table').to.not.equal(undefined)
 
-			// Settles only on signal abort — libp2p's `AbortOptions` contract for `dialProtocol`, and
-			// therefore the only thing that can end a stalled open (see `hangsUntilAbort` in
-			// `rpc.protocols.spec.ts`). Given no signal it hangs forever, which is the pre-budget
-			// behavior this test exists to rule out. Only the ghost is intercepted; the connected
-			// peer never reaches `dialProtocol` at all, since `openRpcStream` reuses its connection.
-			;(node as unknown as { dialProtocol: unknown }).dialProtocol = (pid: PeerId, protocols: string[], opts: { signal?: AbortSignal }) => {
-				if (pid.toString() !== ghostId) return originalDial(pid, protocols, opts)
-				ghostDials++
-				return new Promise<Stream>((_resolve, reject) => {
-					const signal = opts?.signal
-					if (signal == null) return
-					const fail = (): void => { reject(new Error('ghost dial aborted')) }
-					if (signal.aborted) { fail(); return }
-					signal.addEventListener('abort', fail, { once: true })
-				})
-			}
+			// Only the ghost is intercepted; the connected peer never reaches `dialProtocol` at all,
+			// since `openRpcStream` reuses its connection.
+			dials = hangGhostDials(node, new Set([ghostId]))
 
 			// `registerLeave` bound the closure `(notice) => this.handleLeave(notice)` at start(), so
 			// overriding `handleLeave` now is still picked up. Counting here beats asserting "the
@@ -277,15 +315,49 @@ describe('FretService start/stop lifecycle', function () {
 			// property under test is "bounded at all", not scheduler precision. Do not swap it for a
 			// bare "stop() resolved" — that is exactly the assertion an unbounded dial would pass.
 			expect(elapsed, `stop() elapsed ${elapsed}ms`).to.be.at.most(SHUTDOWN_BUDGET_MS + 1500)
-			expect(ghostDials, 'the hanging dial was actually attempted').to.be.at.least(1)
+			expect(dials.attempted, 'the hanging dial was actually attempted').to.be.at.least(1)
+			expect(dials.unsignaled, 'every ghost dial carried an abort signal').to.equal(0)
 			// `sendLeave` is write-only — it does not await the remote handler — so the delivery is
 			// observed after stop() returns rather than by the time it does.
 			await waitFor(() => leaves === 1, 5000, 25, 'leave notice delivered to the reachable neighbor')
 			expect(leaves, 'exactly one notice per reachable neighbor').to.equal(1)
 		} finally {
-			;(node as unknown as { dialProtocol: unknown }).dialProtocol = originalDial
+			dials?.restore()
 			try { await peerSvc.stop() } catch { /* already stopped */ }
 			await peer.stop()
+		}
+	})
+
+	it('cuts the whole leave fan-out short once the shutdown budget expires', async () => {
+		// The test above pins the *per-notice* timeout: with one hanging neighbor that is what
+		// binds, since LEAVE_NOTICE_TIMEOUT_MS < SHUTDOWN_BUDGET_MS. Five hanging neighbors cost
+		// 5 × LEAVE_NOTICE_TIMEOUT_MS of per-notice timeouts, well past the whole-fan-out budget,
+		// so here it is SHUTDOWN_BUDGET_MS that has to bind — and the fan-out abandoning notices
+		// it never got to is the direct, clock-independent evidence that it did.
+		const GHOSTS = 5
+		expect(GHOSTS * LEAVE_NOTICE_TIMEOUT_MS, 'enough hanging notices to overrun the budget').to.be.above(SHUTDOWN_BUDGET_MS)
+
+		// Silence both passes that dial on their own schedule — the probe tick and the first-tick
+		// announce, which dials deliberately — so every dial counted below is the leave fan-out's.
+		;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {}
+		;(svc as unknown as { proactiveAnnounceOnStart: () => Promise<void> }).proactiveAnnounceOnStart = async () => {}
+
+		const ghosts = new Set<string>()
+		for (let i = 0; i < GHOSTS; i++) ghosts.add(await createGhost(node))
+		await svc.start()
+		for (const id of ghosts) expect(svc.getStore().getById(id), `ghost ${id} seeded into the routing table`).to.not.equal(undefined)
+
+		const dials = hangGhostDials(node, ghosts)
+		try {
+			const started = Date.now()
+			await svc.stop()
+			const elapsed = Date.now() - started
+			expect(elapsed, `stop() elapsed ${elapsed}ms`).to.be.at.most(SHUTDOWN_BUDGET_MS + 1500)
+			expect(dials.attempted, 'fan-out issued notices').to.be.at.least(1)
+			expect(dials.attempted, 'fan-out gave up before dialing every neighbor').to.be.below(GHOSTS)
+			expect(dials.unsignaled, 'every ghost dial carried an abort signal').to.equal(0)
+		} finally {
+			dials.restore()
 		}
 	})
 
@@ -347,7 +419,10 @@ describe('FretService start/stop lifecycle', function () {
 		}
 		try {
 			unpark!()
-			await delay(100)
+			// Wait on the tick actually finishing rather than sleeping a fixed span and hoping:
+			// `ticksCompleted` is the same completion signal the assertions below rest on, so a
+			// slow box makes this wait longer instead of making the test wrong.
+			await waitFor(() => ticksCompleted === 1, 5000, 10, 'interrupted tick ran to completion')
 		} finally {
 			;(node as unknown as { dialProtocol: unknown }).dialProtocol = originalDial
 		}
@@ -362,9 +437,13 @@ describe('FretService start/stop lifecycle', function () {
 		// ticks for a fetch that never opened a stream — the same diagnostics overcount already
 		// noted at `stabilizeOnce`'s call site. Nothing is merged and nothing is dialed, which is
 		// what `dials` above pins.
-		// The peer is healthy; our own cancellation is not evidence about it.
-		expect(store.getById(targetId)?.contactFailures, 'no contact strike against a healthy peer').to.equal(0)
-		expect(store.getById(targetId)?.state, 'healthy peer not marked dead').to.not.equal('dead')
+		// The peer is healthy; our own cancellation is not evidence about it. Read once and assert
+		// the entry exists first — `?.state` on a missing entry passes the `not.equal('dead')`
+		// check vacuously.
+		const target = store.getById(targetId)
+		expect(target, 'target still in the routing table').to.not.equal(undefined)
+		expect(target?.contactFailures, 'no contact strike against a healthy peer').to.equal(0)
+		expect(target?.state, 'healthy peer not marked dead').to.not.equal('dead')
 		// stop() clears the backoff map *before* the tick resumes, so an entry here is the tick's doing.
 		const backoff = (svc as unknown as { backoffMap: { get: (id: string) => unknown } }).backoffMap
 		expect(backoff.get(targetId), 'no backoff recorded against a peer we never dialed').to.equal(undefined)
