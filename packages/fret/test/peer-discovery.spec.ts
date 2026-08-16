@@ -6,9 +6,12 @@ import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
 import { hashPeerId, coordToBase64url } from '../src/ring/hash.js';
 import { createMemNode, stopAll } from './helpers/libp2p.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
-import { Libp2pFretService } from '../src/service/libp2p-fret-service.js';
+import { Libp2pFretService, fretService } from '../src/service/libp2p-fret-service.js';
 import type { SerializedPeerEntry, SerializedTable } from '../src/index.js';
-import type { Libp2p } from 'libp2p';
+import { createLibp2p, type Libp2p } from 'libp2p';
+import { memory } from '@libp2p/memory';
+import { plaintext } from '@libp2p/plaintext';
+import { yamux } from '@chainsafe/libp2p-yamux';
 
 // Discovery is now member-scoped: FretPeerDiscovery.scan only emits peers labeled `member`
 // (same-network). These fixtures represent confirmed same-network peers, so mark them member.
@@ -450,5 +453,60 @@ describe('Libp2pFretService discovery wiring', function () {
 		expect(emitted).to.not.include(foreignId, 'restored foreign peer must never be emitted');
 		expect(emitted).to.not.include(deadId, 'dead peer must never be emitted');
 		expect(emitted).to.not.include(host.peerId.toString(), 'self must never be emitted');
+	});
+
+	// The claim the whole `peerDiscoverySymbol` wiring rests on: libp2p subscribes to the
+	// symbol-provided object during node construction and merges what it hears into its own
+	// peerStore. Asserting on the `peer` event alone is one layer short of that, so this test
+	// registers FRET the way an application would — in the `services` map — and reads the
+	// peerStore. It also pins that a foreign peer never gets there.
+	it('a symbol-registered service lands emitted members in libp2p\'s own peerStore', async () => {
+		const others = await Promise.all([createMemNode(), createMemNode()]);
+		await Promise.all(others.map(n => n.start()));
+		const [member, foreign] = others as [Libp2p, Libp2p];
+		const coords = await Promise.all(others.map(n => hashPeerId(n.peerId)));
+
+		// `start: false` because the node cannot start until setLibp2p has run — see
+		// tickets/plan/21-libp2p-fret-service-cleanup (the service never reads its components).
+		const node = await createLibp2p({
+			start: false,
+			addresses: { listen: [`/memory/fret-symbol-${Date.now()}`] },
+			transports: [memory()],
+			connectionEncrypters: [plaintext()],
+			streamMuxers: [yamux()],
+			services: {
+				fret: fretService(
+					{ profile: 'edge', k: 7 },
+					{ emissionIntervalMs: 100, batchSize: 20, debounceMs: 60_000 }
+				)
+			}
+		});
+		try {
+			const svc = node.services.fret as unknown as Libp2pFretService;
+			svc.setLibp2p(node);
+			await svc.importTable({
+				v: 1,
+				peerId: node.peerId.toString(),
+				timestamp: Date.now(),
+				entries: [
+					serialized(member.peerId.toString(), coords[0]!, 'member'),
+					serialized(foreign.peerId.toString(), coords[1]!, 'foreign'),
+				],
+			});
+			await node.start();
+
+			// libp2p's discovery handler merges without awaiting, so poll rather than assume.
+			let merged = false;
+			for (let i = 0; i < 40 && !merged; i++) {
+				await new Promise(r => setTimeout(r, 100));
+				merged = await node.peerStore.has(member.peerId);
+			}
+			expect(merged).to.equal(true, 'emitted member must reach libp2p\'s peerStore');
+			expect(await node.peerStore.has(foreign.peerId)).to.equal(false,
+				'a foreign peer must never reach libp2p\'s peerStore');
+		} finally {
+			await node.stop();
+			await stopAll(others);
+		}
 	});
 });

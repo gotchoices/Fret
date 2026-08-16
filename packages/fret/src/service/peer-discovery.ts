@@ -41,9 +41,11 @@ export interface FretPeerDiscoveryConfig {
 
 /**
  * libp2p PeerDiscovery backed by FRET's Digitree — the single path by which FRET announces a
- * peer to libp2p. Reaches libp2p's own peerStore and auto-dialer via `peerDiscoverySymbol` on
+ * peer to libp2p. Reaches libp2p's own peerStore via `peerDiscoverySymbol` on
  * `Libp2pFretService`; dispatching `peer:discovery` straight at the node object (which two
  * now-deleted paths did) only reaches application listeners, never libp2p's internals.
+ * An emission creates the peerStore entry (and, first time, makes libp2p re-dispatch
+ * `peer:discovery` on the node) but never causes a dial — see the multiaddr NOTE in `scan`.
  *
  * Periodically scans the store for live (non-dead) member peers and emits `peer` events.
  * Recently emitted peers are debounced to avoid flooding the discovery pipeline.

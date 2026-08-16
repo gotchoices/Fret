@@ -1242,6 +1242,10 @@ export class FretService implements IFretService, Startable {
 			// so it is correct, just not free). Fine at current capacity (C=2048); if the peerStore
 			// grows large or the tick cadence tightens, gate re-seed on a peerStore change/epoch or
 			// skip hashing for ids already in the store (reuse the stored coord).
+			// NOTE: FretPeerDiscovery now feeds this loop — every member it emits becomes an
+			// (address-less) peerStore entry, so the peerStore is no longer bounded by peers
+			// libp2p learned on its own. It is still bounded by C=2048 via the FRET store the
+			// emissions come from, which is why the sizing above still holds.
 			const peers = await this.node.peerStore.all();
 			// Rebuilt wholesale rather than merged, so a peer whose addresses the peerStore
 			// dropped stops reading as dialable (see `addressKnown`).

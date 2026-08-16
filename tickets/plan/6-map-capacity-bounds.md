@@ -1,11 +1,11 @@
 ----
 description: Several internal bookkeeping maps have no hard size limit and are trimmed only during specific events, so an attacker generating many distinct peers or departures can grow them unbounded and pressure memory.
-files: packages/fret/src/service/fret-service.ts
+files: packages/fret/src/service/fret-service.ts, packages/fret/src/service/peer-discovery.ts
 difficulty: medium
 ----
 Several internal maps rely on lazy, event-triggered pruning with no hard capacity, so an attacker can grow them without bound:
 
-- The announce-debounce map (`announcedIds`) prunes only expired entries and only once it passes 4096 entries. With edge-profile 30-minute debounce TTLs, entries live long enough that the map can grow unbounded between prunes. This is the newly-identified piece (review finding m-core-12, partial).
+- The discovery-debounce map (`FretPeerDiscovery.emitted`, in `peer-discovery.ts`) prunes only expired entries and only once it passes 4096 entries. With a 10-minute debounce TTL, entries live long enough that the map can grow unbounded between prunes. **Retargeted:** this bullet used to name `FretService.announcedIds`; the `consolidate-discovery-emission` ticket deleted that map along with `emitDiscovered`, and the surviving map in `FretPeerDiscovery` has the identical shape (same 4096 threshold, same expired-only prune, same never-shrinks-below-threshold behavior). Originally review finding m-core-12, partial.
 - The failure backoff map grows with every peer that fails and is only pruned lazily — cleared on success or checked for expiry on read.
 - The departure-debounce map prunes at 256 entries but only on departure events.
 
