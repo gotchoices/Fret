@@ -269,7 +269,7 @@ describe('Seed new peers — estimator calibration from snapshots', function () 
 	it('reportNetworkSize reflects externally reported size on near-empty store', async () => {
 		const { node, svc } = await createService()
 		try {
-			// Directly report a size (mimicking what mergeNeighborSnapshots does)
+			// Directly report a size (mimicking what fetchAndMergeSnapshot does)
 			svc.reportNetworkSize(200, 0.9, 'snapshot:test')
 
 			const est = svc.getNetworkSizeEstimate()

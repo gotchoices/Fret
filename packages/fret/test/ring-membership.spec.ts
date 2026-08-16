@@ -628,7 +628,7 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		expect(emitted).to.not.include(idB, 'foreign peer B must never be surfaced to discovery')
 	})
 
-	// Gating excludes foreign peers from the ring, so `probeNeighborsLatency` no longer pings
+	// Gating excludes foreign peers from the ring, so `probeNeighborLatency` no longer pings
 	// them — the path that used to self-heal a *mislabeled* same-network peer. The foreign
 	// re-probe pass is the replacement backstop: a same-network peer tagged `foreign` here
 	// (standing in for an identify-race mislabel) must be re-admitted to `member` via RPC.

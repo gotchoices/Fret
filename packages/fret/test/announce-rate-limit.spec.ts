@@ -151,7 +151,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 	})
 
 	it('announce merge caps match the neighbor-fetch merge caps (single source of truth)', async () => {
-		// Both mergeAnnounceSnapshot and mergeNeighborSnapshots consume mergeSnapshotCaps(),
+		// Both mergeAnnounceSnapshot and fetchAndMergeSnapshot consume mergeSnapshotCaps(),
 		// so asserting the shared helper's values guarantees the two paths stay in lockstep.
 		const nodeC = await createMemNode()
 		const nodeE = await createMemNode()

@@ -395,7 +395,7 @@ describe('Leave amplification cap', function () {
 
 	// `isDialable`, not `isDoomedDial`: we are not dialing, so a locally `foreign` (or `dead`)
 	// replacement is still worth recording — `upsert` preserves the label, and the matching
-	// `reprobeOffRing` arm owns re-probing it with its backoff intact. Filtering it out here
+	// `reprobeOffRingTargets` arm owns re-probing it with its backoff intact. Filtering it out here
 	// would instead make a leave notice able to *erase* our own classification work.
 	it('records a foreign replacement without clearing its label', async () => {
 		const rig = await makeLeaveRig()
@@ -493,7 +493,7 @@ describe('Leave amplification cap', function () {
 	})
 
 	// The hand-off the whole redesign rests on: recording a replacement as `unknown` is not a
-	// dead end, because `classifyUnknownPeers` selects exactly that set on the next tick.
+	// dead end, because `classifyTargets` selects exactly that set on the next tick.
 	it('the classification pass probes and promotes a replacement recorded by a leave', async () => {
 		const rig = await makeLeaveRig()
 		let replacementSvc: CoreFretService | undefined

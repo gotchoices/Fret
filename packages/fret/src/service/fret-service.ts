@@ -1823,12 +1823,14 @@ export class FretService implements IFretService, Startable {
 		try {
 			const pool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
 			const merged = await runPooled(near.map((id) => () => this.probeAndFetch(id, budget.signal)), pool);
+			logRejected(merged, near, 'probeAndFetch');
 			const announced = fulfilledValues(merged).flat();
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
 			const targets = [...this.classifyTargets(), ...this.reprobeExcludedTargets()];
-			await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
+			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
+			logRejected(probed, targets, 'probeMembership');
 		} finally {
 			budget.cancel();
 		}
@@ -1947,7 +1949,7 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * - **`foreign`** — a same-network peer *mislabeled* foreign (e.g. identify completed before
 	 *   it registered our protocol handlers) is re-admitted by a successful namespaced ping.
-	 *   Before ring-membership gating this self-healed for free (`probeNeighborsLatency` pinged
+	 *   Before ring-membership gating this self-healed for free (`probeNeighborLatency` pinged
 	 *   near ring peers regardless of label); gating closed that path. The `peer:update` identify
 	 *   path also re-admits, but only if the remote pushes an update, so this is the dependable
 	 *   backstop.
@@ -2902,4 +2904,17 @@ export class FretService implements IFretService, Startable {
 /** The values of the fulfilled results of a pool run; rejected and skipped tasks contribute nothing. */
 function fulfilledValues<T>(results: ReadonlyArray<PoolResult<T>>): T[] {
 	return results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
+}
+
+/**
+ * Log every task of a stabilization pool run that rejected. Each task the tick pools catches its
+ * own RPC failures, so a rejection here is a bug in the task's bookkeeping, not evidence about the
+ * peer — logged, never scored, and never fatal to the rest of the tick (the pool isolates it). It
+ * used to surface as `stabilize tick failed:` and abort the serial walk; the pool must not turn
+ * that into silence. Results are index-aligned with `ids`.
+ */
+function logRejected(results: ReadonlyArray<PoolResult<unknown>>, ids: readonly string[], label: string): void {
+	results.forEach((r, i) => {
+		if (r.status === 'rejected') log.error('%s failed for %s - %e', label, ids[i], r.reason);
+	});
 }
