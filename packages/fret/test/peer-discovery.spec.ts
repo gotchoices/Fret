@@ -16,7 +16,7 @@ import { memory } from '@libp2p/memory';
 import { plaintext } from '@libp2p/plaintext';
 import { yamux } from '@chainsafe/libp2p-yamux';
 
-// Discovery is now member-scoped: FretPeerDiscovery.scan only emits peers labeled `member`
+// Discovery is member-scoped: FretPeerDiscovery.scanOnce only emits peers labeled `member`
 // (same-network). These fixtures represent confirmed same-network peers, so mark them member.
 function makeStore(ids: string[], coords: Uint8Array[]): DigitreeStore {
 	const store = new DigitreeStore();
@@ -361,6 +361,41 @@ describe('FretPeerDiscovery', function () {
 		await stopAll(nodes);
 
 		expect(peers.length).to.be.at.least(1, 'should re-emit after stop/start cycle');
+	});
+
+	// `stop` clears the debounce map *and* the sweep cursor. Clearing only the map would still
+	// let the test above pass — a 1-peer ring has nowhere else to resume — so this drives ticks
+	// directly over a 3-peer ring at `batchSize: 1`, where a retained cursor is visible: it would
+	// resume at the third member instead of the first.
+	it('stop resets the sweep cursor to the ring start', async () => {
+		const nodes = await Promise.all([createMemNode(), createMemNode(), createMemNode()]);
+		await Promise.all(nodes.map(n => n.start()));
+
+		const ids = nodes.map(n => n.peerId.toString());
+		const coords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)));
+		const store = makeStore(ids, coords);
+		const ringOrder = store.list().map(e => e.id);
+
+		const disc = new FretPeerDiscovery(store, {
+			// Never started, so no timer is armed and the tick source is the calls below.
+			emissionIntervalMs: 1_000_000,
+			batchSize: 1,
+			debounceMs: 60_000,
+		});
+		const emitted: string[] = [];
+		disc.addEventListener('peer', (evt: CustomEvent<PeerInfo>) => {
+			emitted.push(evt.detail.id.toString());
+		});
+
+		disc.scanOnce();
+		disc.scanOnce();
+		expect(emitted).to.deep.equal([ringOrder[0]!, ringOrder[1]!], 'sweep should advance in ring order');
+
+		await disc.stop();
+		disc.scanOnce();
+		await stopAll(nodes);
+
+		expect(emitted[2], 'a fresh run restarts at the ring start').to.equal(ringOrder[0]!);
 	});
 });
 

@@ -6,6 +6,15 @@ difficulty: easy
 The store and ring modules carry several small cleanups worth doing together:
 
 - Four near-identical wrap walks exist in the store; extract one directional walker and reuse it.
+  There are now **five**: the resumable paged walk added for peer discovery (`walkFrom`) is a
+  sixth-line-for-sixth-line copy of the same forward wrap-and-skip loop as the successor and
+  clockwise-neighbours walks, differing only in where it starts and whether it collects entries
+  or ids. Worth stating why this one matters beyond tidiness: the shared shape carries a
+  bounded-scan guard (stop after one full lap) that is the only thing stopping a filtered walk
+  from spinning forever on the wrap-around when nothing matches. Every copy is a place a future
+  walk can be written without that guard. Extracting the directional walker makes an unbounded
+  filtered ring walk unwritable in the store, rather than a convention each new method has to
+  remember.
 - The store re-implements a coordinate-to-hex helper that already lives in the ring hash module; use the exported one.
 - The lexicographic-less comparison pads left-aligned while the xor and clockwise helpers pad right-aligned; pick one padding convention.
 - A metadata field typed as a record of any should be a record of unknown.
