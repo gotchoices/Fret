@@ -5,6 +5,7 @@ import { chooseNextHop } from '../src/selector/next-hop.js'
 import { minDistance } from '../src/ring/distance.js'
 import { normalizedLogDistance } from '../src/store/relevance.js'
 import { computeNearRadius, shouldIncludePayload } from '../src/service/payload-heuristic.js'
+import { toBigInt } from './helpers/ring.js'
 
 // Regression vectors for the ring's wrap-around seam.
 //
@@ -33,12 +34,6 @@ const SELF = (() => {
 
 /** 0x8010 followed by zeros — 2^244 clockwise of KEY. */
 const RIVAL = coord(0x80, 0x10)
-
-function toBigInt(u: Uint8Array): bigint {
-	let v = 0n
-	for (const b of u) v = (v << 8n) | BigInt(b)
-	return v
-}
 
 describe('Ring distance across the wrap-around seam', () => {
 	it('measures the seam-adjacent peer as one arc-unit away', () => {

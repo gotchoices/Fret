@@ -1,5 +1,3 @@
-import { COORD_BYTES } from '../../src/ring/hash.js'
-
 /**
  * `base` shifted by `delta` ring units, exact modulo 2^256. The delta is added at the
  * *least-significant* byte (index `length - 1`) with carry/borrow propagated leftward across
@@ -27,11 +25,23 @@ export function ringOffset(base: Uint8Array, delta: number): Uint8Array {
 	return out
 }
 
-/** Ring coordinate exactly half the ring away from `base` (top bit flipped) — exact regardless of scale. */
+/**
+ * Ring coordinate exactly half the ring away from `base` (top bit flipped) — exact regardless
+ * of scale.
+ *
+ * NOTE: no spec calls this today; it is kept deliberately rather than deleted. Hand-rolled
+ * coordinate arithmetic in a spec is precisely what produced the flake this module replaced, so
+ * a correct, tested "half the ring away" is worth more here than a smaller export surface.
+ */
 export function oppositeCoord(base: Uint8Array): Uint8Array {
 	const c = new Uint8Array(base)
 	c[0] = (c[0]! ^ 0x80) & 0xff
 	return c
 }
 
-export { COORD_BYTES }
+/** Big-endian ring coordinate as a bigint — the shared oracle for coordinate assertions. */
+export function toBigInt(u: Uint8Array): bigint {
+	let v = 0n
+	for (const b of u) v = (v << 8n) | BigInt(b)
+	return v
+}

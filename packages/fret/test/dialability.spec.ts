@@ -199,11 +199,13 @@ describe('dialability guard on outbound RPC', function () {
 			seedMember(svcA, ghostPred, ringOffset(coord, -1))
 			const idBCoord = ringOffset(coord, 2)
 			seedMember(svcA, idB, idBCoord)
-			// Seed self at its real ring position, not a fabricated one — the store entry and
-			// the selector must agree on where self actually sits (see docs/fret.md, dialability
-			// self-position note). A uniformly random self coordinate is essentially never among
-			// the key's two nearest members when candidates sit this close to the key, so this
-			// stays out-of-cluster exactly as the old fabricated position did.
+			// Seed self at its real ring position, not a fabricated one. The store entry and the
+			// selector must agree on where self sits: the strict-improvement floor reads
+			// `FretService.selfCoord()` (the hashed peer id) and never the store, while the
+			// in-cluster test reads the store's self entry — a fabricated coordinate makes the
+			// two disagree and silently defeats this spec's own premise. A uniformly random self
+			// coordinate is essentially never among the key's two nearest members when candidates
+			// sit this close to the key, so this stays out-of-cluster as intended.
 			const selfCoord = await hashPeerId(nodeA.peerId)
 			seedMember(svcA, idA, selfCoord)
 			// Assert the premise `routeAct` relies on instead of assuming it: self must be

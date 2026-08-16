@@ -7,6 +7,7 @@ import {
 	coordToBase64url, base64urlToCoord,
 	COORD_BYTES,
 } from '../src/ring/hash.js'
+import { toBigInt } from './helpers/ring.js'
 
 const arbCoord = fc.uint8Array({ minLength: COORD_BYTES, maxLength: COORD_BYTES })
 
@@ -41,12 +42,6 @@ function addMod(a: Uint8Array, b: Uint8Array): Uint8Array {
 }
 
 const RING = 1n << BigInt(COORD_BYTES * 8)
-
-function toBigInt(u: Uint8Array): bigint {
-	let v = 0n
-	for (const b of u) v = (v << 8n) | BigInt(b)
-	return v
-}
 
 function toCoord(v: bigint): Uint8Array {
 	let x = ((v % RING) + RING) % RING
