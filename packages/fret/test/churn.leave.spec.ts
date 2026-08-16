@@ -1,6 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { waitFor } from './helpers/wait-for.js'
 import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { registerLeave, sendLeave, type LeaveNoticeV1 } from '../src/rpc/leave.js'
@@ -24,6 +25,38 @@ async function ghostPeerId(): Promise<string> {
 describe('Churn leave handling', function () {
 	this.timeout(20000)
 
+	// These rigs used to sleep a fixed 1.5-2.5s per phase and hope the ring had converged, which
+	// made them the file's whole runtime (4.5s of the failing test's 4.8s) and left them asserting
+	// on a wall-clock guess rather than on the ring. Measured, convergence lands at ~1.4-2.0s on an
+	// idle machine — one ~1.5s stabilization tick after the dials — so the guess carried under 2x
+	// headroom and nothing downstream could tell a slow tick from a broken one. The gates below
+	// wait for the condition instead: they return as soon as it holds and throw naming the stalled
+	// phase, so a future stall fails at the phase that stalled instead of as an opaque mocha
+	// timeout at a later assertion. Budgets are sized so the worst case of both waits still fits
+	// the 20s describe timeout alongside the rig's own setup and teardown.
+	// NOTE: this file was once reported failing at the 20s budget inside a full-suite run while
+	// passing in isolation. That has not been reproduced since (full suite green; this file green
+	// under 5 concurrent copies), and the ~15s of overshoot is more than the fixed sleeps can
+	// account for on their own — so if it recurs, the waitFor label is the first thing to read: a
+	// gate that timed out points at stabilization, and a clean pass that still overruns points at
+	// setup or teardown (the leave fan-out and `stopAll`), which these gates do not cover.
+	const CONVERGE_MS = 6000
+	const PROGRESS_MS = 5000
+
+	/**
+	 * Every service knows every other node and has completed at least one neighbour exchange.
+	 * Remote peers only: a store holds its own entry from `start()`, so a self-inclusive count is
+	 * already true at t=0 and would wait on nothing (see `helpers/wait-for.ts`).
+	 */
+	const allConverged = (services: any[], selfIds: string[]) => () =>
+		services.every((svc, i) =>
+			svc.listPeers().filter((p: { id: string }) => p.id !== selfIds[i]).length >= services.length - 1
+			&& svc.getDiagnostics().snapshotsFetched > 0)
+
+	/** At least one survivor ran a stabilization tick after the departure. */
+	const anyProgressed = (services: any[], before: Array<{ pingsSent: number }>, departed: number) => () =>
+		services.some((svc, i) => i !== departed && svc.getDiagnostics().pingsSent > before[i]!.pingsSent)
+
 	it('a graceful stop sends leave notices to its neighbors without throwing', async () => {
 		const nodes = [] as any[]
 		for (let i = 0; i < 4; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
@@ -37,11 +70,14 @@ describe('Churn leave handling', function () {
 		for (let i = 1; i < nodes.length; i++) {
 			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
 		}
-		await new Promise(r => setTimeout(r, 1500))
+		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
+			CONVERGE_MS, 25, 'star of 4 converges before the leave')
+		const diagsBefore = services.map((s: any) => ({ ...s.getDiagnostics() }))
 		// stop one node, which should send leave to its neighbors without throwing
 		await services[2].stop()
 		await nodes[2].stop()
-		await new Promise(r => setTimeout(r, 1000))
+		await waitFor(anyProgressed(services, diagsBefore, 2),
+			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 		// ensure remaining services still running
 		for (const s of [services[0], services[1], services[3]]) if (!(s as any).getDiagnostics) throw new Error('service down')
 		await Promise.all(services.map((s: any, i: number) => i === 2 ? Promise.resolve() : s.stop()))
@@ -69,14 +105,16 @@ describe('Churn leave handling', function () {
 			}
 		}
 
-		await new Promise(r => setTimeout(r, 2000))
+		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
+			CONVERGE_MS, 25, 'mesh of 6 converges before the leave')
 
 		const diagsBefore = services.map(s => ({ ...s.getDiagnostics() }))
 
 		// Stop node 2 (the middle node) — it should send leave with replacements
 		await services[2].stop()
 		await nodes[2].stop()
-		await new Promise(r => setTimeout(r, 1500))
+		await waitFor(anyProgressed(services, diagsBefore, 2),
+			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 
 		// All remaining services should continue to function after the leave. The departing peer
 		// may be re-added by the `peer:disconnect` scoring path (see
@@ -90,18 +128,10 @@ describe('Churn leave handling', function () {
 				`service ${idx} should still have peers after leave`)
 		}
 
-		// At least one neighbor should have received and processed the leave,
-		// evidenced by continued stabilization (more pings sent after leave).
-		const diagsAfter = services.map(s => s?.getDiagnostics?.() ?? null)
-		let anyProgressAfterLeave = false
-		for (let i = 0; i < services.length; i++) {
-			if (i === 2 || !diagsAfter[i]) continue
-			if (diagsAfter[i]!.pingsSent > diagsBefore[i]!.pingsSent) {
-				anyProgressAfterLeave = true
-				break
-			}
-		}
-		expect(anyProgressAfterLeave).to.equal(true,
+		// At least one neighbor should have received and processed the leave, evidenced by continued
+		// stabilization (more pings sent after leave). Same predicate the gate above waited on, so
+		// the wait and the assertion cannot drift apart.
+		expect(anyProgressed(services, diagsBefore, 2)()).to.equal(true,
 			'at least one service should show stabilization progress after leave')
 
 		await Promise.all(services.map((s, i) => i === 2 ? Promise.resolve() : s.stop()))
@@ -126,12 +156,23 @@ describe('Churn leave handling', function () {
 		for (let i = 1; i < nodes.length; i++) {
 			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
 		}
-		await new Promise(r => setTimeout(r, 2500))
+		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
+			CONVERGE_MS, 25, 'star of 8 converges before the leave')
 
-		// Stop node 3 (middle-ish) — with core profile, fan-out = 4
+		const diagsBefore = services.map(s => ({ ...s.getDiagnostics() }))
+
+		// Stop node 3 (middle-ish) — with core profile, fan-out = 4.
+		// NOTE: what this rig can observe is the departure being survived, not the fan-out itself.
+		// The extra (beyond-S/P) leave targets are `isConnected`-only, and the S/P targets are
+		// `isDoomedDial`-filtered; a memory-transport node runs no `identify`, so a peer learned
+		// only through gossip has no peerStore address and is undialable (`docs/fret.md`,
+		// *Dialability*). In a star, node 3 is connected to node 0 alone, so the notice reaches
+		// node 0 and nobody else. Observing a real beyond-S/P fan-out needs `createIdentifyNode`
+		// plus a topology where the departing node holds several connections.
 		await services[3].stop()
 		await nodes[3].stop()
-		await new Promise(r => setTimeout(r, 2000))
+		await waitFor(anyProgressed(services, diagsBefore, 3),
+			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 
 		// All remaining services should still be running
 		for (let i = 0; i < services.length; i++) {
