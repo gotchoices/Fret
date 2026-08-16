@@ -6,8 +6,9 @@ import { DigitreeStore } from '../src/store/digitree-store.js'
 import { assembleCohort } from '../src/service/cohort.js'
 import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { createSparsityModel } from '../src/store/relevance.js'
-import { hashPeerId } from '../src/ring/hash.js'
+import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
+import type { RouteAndMaybeActV1, RouteProgress } from '../src/index.js'
 
 // A peer that repeatedly cannot be reached is marked `dead`; any proof that it is alive clears
 // the run and resurrects it. The distinction these tests pin down is *what counts as a failed
@@ -711,6 +712,312 @@ describe('dead state: through a real outbound RPC call site', () => {
 			expect(store.getById(id)?.state).to.equal('connected')
 			expect(store.getById(id)?.contactFailures).to.equal(0)
 			expect(store.getById(id)?.lastContactFailureAt).to.equal(0)
+		} finally {
+			await otherSvc.stop()
+		}
+	})
+})
+
+// An RPC that failed because *we* cancelled it says nothing about the peer it was aimed at. Every
+// outbound call site therefore compares the failure against the run signal its caller captured
+// before the loop (`wasCancelled`) and, when that signal is aborted, records nothing at all: no
+// contact strike, no relevance decay, no backoff, no `pingsFail`. Without it a `stop()` landing on
+// a busy tick manufactures strikes against healthy neighbors and can mark them dead — inverting
+// the point of cancelling. These tests drive each guarded call site with an already-aborted run
+// signal, and pair the ones that could pass vacuously with a live-run contrast.
+describe('cancellation is not evidence about a peer', () => {
+	let node: Libp2p
+	let svc: CoreFretService
+	let store: DigitreeStore
+	const spares: Libp2p[] = []
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Not started: a live stabilization loop would probe these peers on its own schedule and
+		// make every count below non-deterministic.
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		store = svc.getStore()
+	})
+
+	afterEach(async () => {
+		try { await svc.stop() } catch {}
+		await stopAll([node, ...spares.splice(0)])
+	})
+
+	/**
+	 * The state `stop()` leaves behind: a run signal already aborted, kept rather than nulled.
+	 * `stopped` is deliberately left false, so what stops each pass below is the *signal* alone.
+	 * That `stop()` really produces this state is pinned separately by service-lifecycle.spec's
+	 * "mints a fresh run signal per start and leaves the stopped run aborted".
+	 */
+	function cancelRun(target: CoreFretService = svc): void {
+		const ac = new AbortController()
+		ac.abort(new Error('service stopped'))
+		;(target as any).runAbort = ac
+	}
+
+	/** A live run, for the contrast cases — `runAbort` is null until the first `start()`. */
+	function liveRun(target: CoreFretService = svc): AbortController {
+		const ac = new AbortController()
+		;(target as any).runAbort = ac
+		return ac
+	}
+
+	/**
+	 * A well-formed peer id this node holds no address for, so every dial to it fails outright.
+	 *
+	 * Real Ed25519 ids matter here rather than synthetic strings: `sendPing` / `sendMaybeAct` call
+	 * `peerIdFromString` on their first line, *outside* the try, so a synthetic id throws a parse
+	 * error — the cancelled-path tests would pass for the wrong reason and the contrast cases would
+	 * record a strike that has nothing to do with reachability.
+	 */
+	async function unreachablePeer(coord?: Uint8Array): Promise<string> {
+		const ghost = await createMemNode()
+		const id = ghost.peerId.toString()
+		const at = coord ?? await hashPeerId(ghost.peerId)
+		await stopAll([ghost])
+		store.upsert(id, at)
+		store.setMembership(id, 'member')
+		return id
+	}
+
+	/** Make a seeded id pass `isDialable` so it reaches the paths that dial. */
+	function dialable(...ids: string[]): void {
+		for (const id of ids) (svc as any).setAddressKnown(id, true)
+	}
+
+	/** Nothing about this peer was scored: no strike, no dead label, no backoff. */
+	function expectUnscored(id: string, label = id): void {
+		const e = store.getById(id)
+		expect(e, `${label} still in the routing table`).to.not.equal(undefined)
+		expect(e?.contactFailures, `${label}: no contact strike`).to.equal(0)
+		expect(e?.state, `${label}: not marked dead`).to.not.equal('dead')
+		expect((svc as any).backoffMap.get(id), `${label}: no backoff recorded`).to.equal(undefined)
+	}
+
+	/** Count `dialProtocol` calls — the direct form of "no dial was issued". */
+	function countDials(): { get: () => number; restore: () => void } {
+		let dials = 0
+		const original = node.dialProtocol.bind(node)
+		;(node as any).dialProtocol = (...args: unknown[]) => {
+			dials++
+			return (original as any)(...args)
+		}
+		return { get: () => dials, restore: () => { (node as any).dialProtocol = original } }
+	}
+
+	/** `coord` shifted by one in ring arithmetic, so a seeded peer sits immediately beside a key. */
+	function offsetCoord(coord: Uint8Array, delta: 1 | -1): Uint8Array {
+		const out = new Uint8Array(coord)
+		for (let i = out.length - 1; i >= 0; i--) {
+			const v = out[i]! + delta
+			out[i] = (v + 256) % 256
+			if (v >= 0 && v <= 255) break
+		}
+		return out
+	}
+
+	it('records nothing against a neighbor when its latency probe is cancelled', async () => {
+		const id = await unreachablePeer()
+		cancelRun()
+		const before = { ...svc.getDiagnostics() }
+
+		await (svc as any).probeNeighborsLatency([id])
+
+		expect(svc.getDiagnostics().pingsSent, 'no ping counted').to.equal(before.pingsSent)
+		expect(svc.getDiagnostics().pingsFail, 'no ping failure counted').to.equal(before.pingsFail)
+		expectUnscored(id)
+	})
+
+	// The contrast that keeps the guard from being over-broad: the same unreachable peer, the same
+	// call, but a live run — the failure is now genuinely about the peer and is scored exactly once.
+	// (The full run to `dead` is pinned by "marks an unreachable neighbor dead after a run of
+	// failed pings" above; this is the single-strike half, so the pair reads together.)
+	it('still strikes once from the latency probe when the run is live', async () => {
+		const id = await unreachablePeer()
+		liveRun()
+
+		await (svc as any).probeNeighborsLatency([id])
+
+		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
+		expect(svc.getDiagnostics().pingsFail).to.equal(1)
+	})
+
+	// `probeMembership` is the site that also backs off on the unguarded path, so the backoff
+	// assertion is the load-bearing one here: a cancelled probe must leave the next run free to
+	// probe this peer immediately rather than starting it in a backoff window it never earned.
+	it('records neither a strike nor a backoff when a membership probe is cancelled', async () => {
+		const id = await unreachablePeer()
+		cancelRun()
+		const before = { ...svc.getDiagnostics() }
+
+		await (svc as any).probeMembership(id)
+
+		expect(svc.getDiagnostics().pingsSent).to.equal(before.pingsSent)
+		expect(svc.getDiagnostics().pingsFail).to.equal(before.pingsFail)
+		expectUnscored(id)
+	})
+
+	it('still strikes and backs off from a membership probe when the run is live', async () => {
+		const id = await unreachablePeer()
+		liveRun()
+
+		await (svc as any).probeMembership(id)
+
+		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
+		expect((svc as any).backoffMap.get(id), 'backoff recorded').to.not.equal(undefined)
+		expect(svc.getDiagnostics().pingsFail).to.equal(1)
+	})
+
+	// `preconnectNeighbors` never increments `pingsSent` for a failed ping either way, so counting
+	// dials is what actually separates "cancelled before dialing" from "the target list was empty".
+	// `openRpcStream` throws on an already-aborted signal *before* dialing, which is the mechanism.
+	it('issues no dial from the preconnect pass when the run is cancelled', async () => {
+		const id = await unreachablePeer()
+		dialable(id)
+		const dials = countDials()
+		try {
+			cancelRun()
+			await (svc as any).preconnectNeighbors()
+
+			expect(dials.get(), 'cancelled: no dial issued').to.equal(0)
+			expect(svc.getDiagnostics().pingsSent).to.equal(0)
+			expectUnscored(id)
+
+			// Non-vacuity: the same pass on a live run really does reach the dial, so the zero above
+			// is the signal's doing rather than an empty candidate list.
+			liveRun()
+			await (svc as any).preconnectNeighbors()
+			expect(dials.get(), 'live: the seeded peer really was a preconnect target').to.equal(1)
+		} finally {
+			dials.restore()
+		}
+	})
+
+	// NOTE: `snapshotsFetched` is pinned at +1, not "unchanged". `fetchNeighbors` swallows every
+	// failure — the abort included — into a fabricated empty snapshot, so the counter ticks for a
+	// fetch that never opened a stream and `mergeNeighborSnapshots`'s own `wasCancelled` break
+	// cannot fire. That overcount is the accepted behaviour written up at the `stabilizeOnce` call
+	// site; flip this expectation to "unchanged" if `fetchNeighbors` ever distinguishes "skipped"
+	// from "empty". What matters — and is asserted — is that nothing was merged or scored.
+	it('merges nothing and scores nothing when a snapshot fetch is cancelled', async () => {
+		const id = await unreachablePeer()
+		cancelRun()
+		const before = svc.getDiagnostics().snapshotsFetched
+		const entriesBefore = store.list().length
+
+		await (svc as any).mergeNeighborSnapshots([id])
+
+		expect(svc.getDiagnostics().snapshotsFetched, 'accepted overcount').to.equal(before + 1)
+		expect(store.list().length, 'nothing merged').to.equal(entriesBefore)
+		expectUnscored(id)
+	})
+
+	// The announce loop is the one site where the catch cannot carry the guard: `announceNeighbors`
+	// swallows the abort, so the top-of-loop check is what stops a cancelled run from spending an
+	// announce token — and counting an `announcementsSent` — against every remaining target.
+	it('takes no announce token when the run is cancelled', async () => {
+		const a = await unreachablePeer()
+		const b = await unreachablePeer()
+		dialable(a, b)
+		let takes = 0
+		;(svc as any).bucketAnnounce = { tryTake: () => { takes++; return true } }
+		const snap = await (svc as any).snapshot()
+
+		cancelRun()
+		await (svc as any).sendAnnouncementsRateLimited([a, b], snap)
+		expect(takes, 'cancelled: not one token spent').to.equal(0)
+		expect(svc.getDiagnostics().announcementsSent).to.equal(0)
+
+		// Non-vacuity: both targets pass every other guard, so a live run spends one token each.
+		liveRun()
+		await (svc as any).sendAnnouncementsRateLimited([a, b], snap)
+		expect(takes, 'live: one token per live target').to.equal(2)
+	})
+
+	it('scores nothing against the forward hop when a routeAct forward is cancelled', async () => {
+		const keyBytes = new TextEncoder().encode('cancelled-forward-key')
+		const coord = await hashKey(keyBytes)
+		// Two members hugging the key, so the cohort of `want_k: 2` is filled by them and self
+		// (which is not even in the store) is never in-cluster — the message must forward.
+		const succ = await unreachablePeer(offsetCoord(coord, 1))
+		const pred = await unreachablePeer(offsetCoord(coord, -1))
+		dialable(succ, pred)
+
+		cancelRun()
+		const before = svc.getDiagnostics().maybeActForwarded
+		const msg: RouteAndMaybeActV1 = {
+			v: 1,
+			key: coordToBase64url(keyBytes),
+			want_k: 2,
+			ttl: 4,
+			min_sigs: 1,
+			correlation_id: 'cancel-forward',
+			timestamp: Date.now(),
+			signature: '',
+		}
+		const res = await svc.routeAct(msg)
+
+		// The counter increments just before the send, so it is what proves the forward path was
+		// actually taken rather than the message being answered in-cluster.
+		expect(svc.getDiagnostics().maybeActForwarded, 'forward path taken').to.equal(before + 1)
+		expect(res, 'the honest "did not forward" answer').to.have.property('anchors')
+		expectUnscored(succ, 'successor candidate')
+		expectUnscored(pred, 'predecessor candidate')
+	})
+
+	it('ends a cancelled lookup as exhausted without scoring the hop', async () => {
+		const keyBytes = new TextEncoder().encode('cancelled-lookup-key')
+		const coord = await hashKey(keyBytes)
+		const hop = await unreachablePeer(offsetCoord(coord, 1))
+		dialable(hop)
+
+		cancelRun()
+		const progress: RouteProgress[] = []
+		for await (const p of svc.iterativeLookup(keyBytes, { wantK: 2, minSigs: 1 })) progress.push(p)
+
+		// `probing` is yielded before the send, so the tail is what carries the outcome.
+		expect(progress.map((p) => p.type)).to.deep.equal(['probing', 'exhausted'])
+		expect(progress[0]?.peerId, 'the walk really picked the seeded hop').to.equal(hop)
+		expectUnscored(hop)
+	})
+
+	// The activity-resend arm: a lookup that probed, was invited to resend with the payload, and
+	// was cancelled before the resend could land. The activity is silently never delivered — which
+	// is exactly why the `exhausted`-vs-cancelled conflation carries a NOTE at the yield site — but
+	// the peer that never answered must still not be scored for it.
+	it('scores nothing against the anchor when the activity resend is cancelled', async () => {
+		const other = await createMemNode()
+		spares.push(other)
+		await other.start()
+		const otherSvc = new CoreFretService(other, { profile: 'core', networkName: 'net-test' })
+		try {
+			await otherSvc.start() // registers this network's maybeAct handler on the remote
+			await node.dial(other.getMultiaddrs()[0]!)
+			const id = other.peerId.toString()
+			store.upsert(id, await hashPeerId(other.peerId))
+			store.setMembership(id, 'member')
+
+			const keyBytes = new TextEncoder().encode('cancelled-resend-key')
+			const ac = liveRun()
+			// On a ring this small `shouldIncludePayload` is false regardless of distance —
+			// `probability * confidence >= 0.5` needs confidence >= 0.5, and confidence is
+			// 0.5*sizeFactor + 0.5*dispersion with sizeFactor = count / 2m — so the payload is
+			// withheld on the probe and the resend arm is the one taken.
+			const gen = svc.iterativeLookup(keyBytes, { wantK: 2, minSigs: 1, activity: 'work' })
+			const types: string[] = []
+			for (let r = await gen.next(); !r.done; r = await gen.next()) {
+				types.push(r.value.type)
+				// Cancel the run the moment the invitation to resend arrives, so the abort lands on
+				// the resend itself rather than on the probe.
+				if (r.value.type === 'near_anchor') ac.abort(new Error('service stopped'))
+			}
+
+			expect(types, 'the resend arm was reached and then cancelled').to.deep.equal(
+				['probing', 'near_anchor', 'activity_sent', 'exhausted']
+			)
+			expectUnscored(id, 'probed anchor')
 		} finally {
 			await otherSvc.stop()
 		}

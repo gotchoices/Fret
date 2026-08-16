@@ -1235,11 +1235,16 @@ export class FretService implements IFretService, Startable {
 	 * before the token bucket so a doomed target does not burn an announce token.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
-		// `stopped` is set in the same tick as the run abort, so the `break` below already stops
-		// the loop; the signal is what makes the announce *in flight* at that moment die promptly.
 		const sig = this.runSignal;
 		for (const id of ids) {
-			if (this.stopped) break;
+			// Both halves are load-bearing, and the check has to be *here* rather than in the catch
+			// below. `stopped` covers ordinary shutdown; the signal covers the case `stopped` cannot
+			// see — a stop() + start() landing mid-loop, where `sig` is the aborted controller of the
+			// run this loop belongs to while `stopped` is already back to false. A `wasCancelled`
+			// guard in the catch would never fire on that path: `announceNeighbors` swallows every
+			// error internally (the abort included), so the loop would keep taking an announce token
+			// and counting `announcementsSent` for every remaining target of a cancelled run.
+			if (this.stopped || this.wasCancelled(sig)) break;
 			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
@@ -1248,7 +1253,8 @@ export class FretService implements IFretService, Startable {
 				});
 				this.diag.announcementsSent++;
 			} catch (err) {
-				if (this.wasCancelled(sig)) return;
+				// Reachable only for a malformed id (`peerIdFromString` runs outside the sender's own
+				// try); cancellation is owned by the top-of-loop check above, not by this catch.
 				log.error('announce failed to %s - %e', id, err);
 			}
 		}
@@ -2731,6 +2737,15 @@ export class FretService implements IFretService, Startable {
 			}
 		}
 
+		// NOTE: `exhausted` conflates two different outcomes — "the ring offered no further hop" and
+		// "our own run was cancelled under the walk" (the two `wasCancelled` breaks above land here).
+		// A caller therefore cannot tell a genuinely exhausted lookup from one whose activity was
+		// never delivered because `stop()` landed mid-walk. Deliberate: `RouteProgress` is part of
+		// the public `FretService` interface, so a `{ type: 'cancelled' }` variant is an API change
+		// every consumer would have to learn, well beyond what the cancellation-evidence rule needs.
+		// A caller that must distinguish them already holds the discriminating fact — it owns the
+		// signal it cancelled. Revisit if a consumer ever needs the distinction without owning that
+		// signal.
 		yield { type: 'exhausted', hop };
 	}
 
