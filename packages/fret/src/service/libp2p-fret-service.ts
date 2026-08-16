@@ -23,11 +23,12 @@ export class Libp2pFretService implements Startable {
 		// population under a 600 s debounce is ~2400, so Edge's cap binds before its TTL does: it
 		// effectively shortens the debounce to ≈ maxTracked / (batchSize / emissionIntervalMs)
 		// ≈ 256 s.
-		// NOTE: this used to claim that costs "one extra emission" and is therefore harmless.
-		// That is wrong once the live-member population exceeds the cap — see the starvation NOTE
-		// on `FretPeerDiscovery.scan`. Until `tickets/fix/bug-discovery-scan-starves-ring-tail`
-		// lands, Edge's 1024 against a default routing-table capacity of 2048 is a reachable
-		// hazard, not a tuned tradeoff.
+		// That is a memory ceiling and nothing more, which is why the split is kept rather than
+		// collapsed: coverage comes from `FretPeerDiscovery`'s ring cursor, not from this map, so a
+		// bound that binds early costs only an earlier re-announcement of an already-announced peer.
+		// Re-announcement is idempotent in libp2p's peerStore and the outbound rate is hard-capped
+		// at batchSize / emissionIntervalMs regardless, so Edge holding fewer entries than Core is
+		// exactly what an edge profile should do.
 		const profile = cfg?.profile ?? 'core';
 		this.discovery = new FretPeerDiscovery(() => this.discoverySource(), {
 			...discoveryCfg,

@@ -1,9 +1,11 @@
 import { describe, it } from 'mocha'
+import { expect } from 'chai'
 import fc from 'fast-check'
 import {
 	DigitreeStore,
 	type MembershipState,
 	type PeerState,
+	type RingCursor,
 	type SerializedPeerEntry,
 } from '../src/store/digitree-store.js'
 import { coordToBase64url } from '../src/ring/hash.js'
@@ -359,5 +361,116 @@ describe('DigitreeStore index/tree invariant', () => {
 			if (e.membership !== 'member') throw new Error(`membership ${e.membership} !== member`)
 			if (e.successCount !== 3) throw new Error(`successCount ${e.successCount} !== 3`)
 		})
+	})
+})
+
+// `walkFrom` is what lets a caller sweep the whole ring in bounded pages without restarting —
+// the property `FretPeerDiscovery` rests on. The cases below pin the three parts that make a
+// resumed sweep cover the ring exactly once per lap: strictly-after resumption, the wrap, and
+// filter misses advancing the walk instead of ending it.
+describe('DigitreeStore.walkFrom', () => {
+	/** `coords[i]` ascends with `i` (its leading byte is `i * 29`), so ring order is p0..p(n-1). */
+	function ringStore(n: number): DigitreeStore {
+		const store = new DigitreeStore()
+		for (let i = 0; i < n; i++) store.upsert(ids[i]!, coords[i]!)
+		return store
+	}
+
+	const idsOf = (entries: Array<{ id: string }>) => entries.map((e) => e.id)
+
+	it('visits every entry exactly once per lap, in ring order', () => {
+		const store = ringStore(COORD_POOL)
+		const order = idsOf(store.list())
+
+		const visited: string[] = []
+		let cursor: RingCursor | null = null
+		for (let i = 0; i < COORD_POOL; i++) {
+			const page = store.walkFrom(cursor, 1)
+			expect(idsOf(page.entries), `page ${i} should yield exactly one entry`).to.have.length(1)
+			visited.push(page.entries[0]!.id)
+			cursor = page.next
+		}
+
+		expect(visited).to.deep.equal(order)
+	})
+
+	it('wraps past the end of the ring', () => {
+		const store = ringStore(COORD_POOL)
+		const order = idsOf(store.list())
+
+		const lap = store.walkFrom(null, COORD_POOL)
+		expect(idsOf(lap.entries)).to.deep.equal(order)
+
+		const wrapped = store.walkFrom(lap.next, 2)
+		expect(idsOf(wrapped.entries)).to.deep.equal([order[0]!, order[1]!])
+	})
+
+	// One page never yields an id twice, even asked for more than the ring holds — the bounded
+	// scan stops at one full lap rather than looping round onto entries it already returned.
+	it('caps a single page at one full lap', () => {
+		const store = ringStore(3)
+		const page = store.walkFrom(null, 10)
+		expect(idsOf(page.entries)).to.deep.equal(idsOf(store.list()))
+	})
+
+	it('re-yields the only entry of a single-peer ring', () => {
+		const store = ringStore(1)
+		const first = store.walkFrom(null, 1)
+		expect(idsOf(first.entries)).to.deep.equal([ids[0]!])
+
+		// "Strictly after X, wrapping" on a one-entry ring is X itself, which is what keeps a
+		// lone peer re-announced once its debounce lapses instead of never again.
+		const again = store.walkFrom(first.next, 1)
+		expect(idsOf(again.entries)).to.deep.equal([ids[0]!])
+	})
+
+	it('skips filter misses rather than spending page slots on them', () => {
+		const store = ringStore(COORD_POOL)
+		const wanted = new Set([ids[5]!, ids[6]!])
+
+		const page = store.walkFrom(null, 2, (e) => wanted.has(e.id))
+
+		expect(idsOf(page.entries)).to.deep.equal([ids[5]!, ids[6]!])
+	})
+
+	it('terminates and holds position when the filter matches nothing', () => {
+		const store = ringStore(COORD_POOL)
+		const first = store.walkFrom(null, 1)
+
+		const empty = store.walkFrom(first.next, 5, () => false)
+
+		expect(empty.entries).to.have.length(0)
+		expect(empty.next, 'an empty page must not move the cursor').to.equal(first.next)
+	})
+
+	it('terminates on an empty ring', () => {
+		const store = new DigitreeStore()
+		const page = store.walkFrom(null, 5)
+		expect(page.entries).to.have.length(0)
+		expect(page.next).to.equal(null)
+	})
+
+	// A cursor is a position, not a handle: the entry it names can be evicted between pages, and
+	// the sweep must resume at the next ring position rather than restarting from the ring start.
+	it('resumes after a cursor whose entry has since been removed', () => {
+		const store = ringStore(COORD_POOL)
+		const order = idsOf(store.list())
+
+		const first = store.walkFrom(null, 1)
+		expect(idsOf(first.entries)).to.deep.equal([order[0]!])
+		store.remove(order[0]!)
+
+		const next = store.walkFrom(first.next, 1)
+		expect(idsOf(next.entries)).to.deep.equal([order[1]!])
+	})
+
+	it('yields nothing for a non-positive count, leaving the cursor untouched', () => {
+		const store = ringStore(COORD_POOL)
+		const first = store.walkFrom(null, 1)
+
+		const page = store.walkFrom(first.next, 0)
+
+		expect(page.entries).to.have.length(0)
+		expect(page.next).to.equal(first.next)
 	})
 })

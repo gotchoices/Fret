@@ -1,5 +1,8 @@
-import { describe, it, afterEach } from 'mocha';
+import { describe, it, before, afterEach } from 'mocha';
 import { expect } from 'chai';
+import fc from 'fast-check';
+import { generateKeyPair } from '@libp2p/crypto/keys';
+import { peerIdFromPrivateKey } from '@libp2p/peer-id';
 import { FretPeerDiscovery, type DiscoverySnapshotSource } from '../src/service/peer-discovery.js';
 import { DigitreeStore } from '../src/store/digitree-store.js';
 import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
@@ -199,13 +202,11 @@ describe('FretPeerDiscovery', function () {
 		expect(peers.length).to.equal(3, 'first scan should emit exactly batchSize peers');
 	});
 
-	// NOTE: `maxTracked: 4` against 5 members is deliberate and load-bearing, not an arbitrary
-	// number. `scan` restarts at ring index 0 every tick and breaks once `batchSize` peers have
-	// been emitted, so for some (population, maxTracked, batchSize) combinations the
-	// evict/re-emit churn settles into a stable cycle that never advances far enough to reach
-	// the ring-order-last member — at `maxTracked: 3` this exact test starves member #5 forever.
-	// That is a real defect in `scan`, tracked by `tickets/fix/bug-discovery-scan-starves-ring-tail`;
-	// once the resumable cursor lands, any capacity works and this comment can go.
+	// `maxTracked: 2` is deliberately *below* the 5-member population, so the debounce map can
+	// never hold the whole ring at once. That is the configuration the old cursorless scan
+	// starved on — it restarted at ring index 0 every tick, so members past roughly
+	// `maxTracked + batchSize` were emitted never. With the resumed sweep the capacity is a pure
+	// memory bound and every member still gets emitted.
 	it('debounce map caps at maxTracked and evicts, so an evicted peer is emitted again later', async () => {
 		const count = 5;
 		const nodes = await Promise.all(Array.from({ length: count }, () => createMemNode()));
@@ -218,7 +219,7 @@ describe('FretPeerDiscovery', function () {
 			emissionIntervalMs: 100,
 			batchSize: 2,
 			debounceMs: 60_000,
-			maxTracked: 4,
+			maxTracked: 2,
 		});
 
 		const emitted: string[] = [];
@@ -360,6 +361,81 @@ describe('FretPeerDiscovery', function () {
 		await stopAll(nodes);
 
 		expect(peers.length).to.be.at.least(1, 'should re-emit after stop/start cycle');
+	});
+});
+
+// Coverage is a property over the whole parameter space, not one tuned case — a single tuned
+// case is exactly what let the starvation bug ship. The rule: with N live members, a debounce
+// capacity of C and a batch of B, *every* member is emitted within a bounded number of ticks,
+// for any (N, C, B) — including the N > C region where the old cursorless scan permanently
+// starved the ring tail.
+//
+// Ticks are driven directly rather than through `setInterval`: timing this through the scheduler
+// would assert on setTimeout overshoot instead of on the sweep rule, and would turn a ~200-case
+// property into minutes of wall clock. Same argument as `ExpiringMap`'s injectable `Clock`.
+describe('FretPeerDiscovery ring coverage (property)', function () {
+	this.timeout(120_000);
+
+	const POOL = 200;
+	/**
+	 * Real Ed25519 ids, minted once: `scanOnce` runs `peerIdFromString` on every emission, and
+	 * generating 200 keypairs per property case would dominate the run.
+	 */
+	const pool: Array<{ id: string; coord: Uint8Array }> = [];
+
+	before(async function () {
+		this.timeout(120_000);
+		for (let i = 0; i < POOL; i++) {
+			const peerId = peerIdFromPrivateKey(await generateKeyPair('Ed25519'));
+			pool.push({ id: peerId.toString(), coord: await hashPeerId(peerId) });
+		}
+	});
+
+	it('emits every live member within a bounded number of ticks, for any (population, maxTracked, batchSize)', () => {
+		// A correct sweep covers the ring in one lap plus the partial lap it started mid-way
+		// through, so twice the minimum plus slack is comfortable — and a starving sweep never
+		// converges at all, so no bound rescues it.
+		const tickBound = (n: number, batchSize: number) => 2 * Math.ceil(n / batchSize) + 2;
+		const region = { overCapacity: 0, withinCapacity: 0 };
+
+		fc.assert(fc.property(
+			fc.integer({ min: 1, max: POOL }),
+			fc.integer({ min: 1, max: 200 }),
+			fc.integer({ min: 1, max: 50 }),
+			(n, maxTracked, batchSize) => {
+				const members = pool.slice(0, n);
+				const store = makeStore(members.map(m => m.id), members.map(m => m.coord));
+
+				const disc = new FretPeerDiscovery(store, {
+					// Never fires — the loop below is the tick source. Not started, so no timer is
+					// ever armed and the exit watchdog stays happy.
+					emissionIntervalMs: 1_000_000,
+					batchSize,
+					// Long enough never to lapse, so the capacity rule is what is under test rather
+					// than wall-clock expiry (the debounce is driven by real time inside `emitted`).
+					debounceMs: 3_600_000,
+					maxTracked,
+				});
+
+				const emitted = new Set<string>();
+				disc.addEventListener('peer', (evt: CustomEvent<PeerInfo>) => {
+					emitted.add(evt.detail.id.toString());
+				});
+
+				if (n > maxTracked) region.overCapacity++; else region.withinCapacity++;
+
+				const ticks = tickBound(n, batchSize);
+				for (let t = 0; t < ticks; t++) disc.scanOnce();
+
+				return emitted.size === n;
+			}
+		), { numRuns: 200 });
+
+		// Assert on the generated distribution, following `test/nexthop-cost.spec.ts`: a green run
+		// that never reached N > maxTracked would say nothing about the region the bug lived in.
+		expect(region.overCapacity, 'no over-capacity (population > maxTracked) case was generated')
+			.to.be.greaterThan(0);
+		expect(region.withinCapacity, 'no within-capacity case was generated').to.be.greaterThan(0);
 	});
 });
 

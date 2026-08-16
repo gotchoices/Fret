@@ -136,7 +136,7 @@ export { hashKey, hashPeerId } from './ring/hash.js';
 export type { RingCoord } from './ring/hash.js';
 export { clockwiseDistance, minDistance, lexLess } from './ring/distance.js';
 export { DigitreeStore } from './store/digitree-store.js';
-export type { PeerEntry, PeerPatch, PeerState, MembershipState } from './store/digitree-store.js';
+export type { PeerEntry, PeerPatch, PeerState, MembershipState, RingCursor, RingWalkPage } from './store/digitree-store.js';
 export { estimateSizeAndConfidence } from './estimate/size-estimator.js';
 export type { SizeEstimate, SizeEstimateOptions } from './estimate/size-estimator.js';
 export { assembleCohort } from './service/cohort.js';

@@ -2,7 +2,7 @@ import type { PeerDiscovery, PeerDiscoveryEvents, PeerInfo, Startable } from '@l
 import { peerDiscoverySymbol } from '@libp2p/interface';
 import { TypedEventEmitter } from 'main-event';
 import { peerIdFromString } from '@libp2p/peer-id';
-import type { DigitreeStore } from '../store/digitree-store.js';
+import type { DigitreeStore, RingCursor } from '../store/digitree-store.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
 import { isLiveMember } from './live-member.js';
 import { createLogger } from '../logger.js';
@@ -42,6 +42,13 @@ export interface FretPeerDiscoveryConfig {
 	/**
 	 * Hard maximum peers held in the re-emission debounce map. Default: 4096.
 	 *
+	 * A pure memory bound: the sweep resumes from a ring cursor rather than restarting, so
+	 * coverage does not depend on this at all. Its only behavioural effect is to shorten the
+	 * effective debounce once the live-member population exceeds it — a peer is then re-announced
+	 * once per lap instead of once per `debounceMs`, which is harmless because re-announcement is
+	 * idempotent in libp2p's peerStore and the emission rate is already capped at
+	 * `batchSize / emissionIntervalMs`.
+	 *
 	 * `Libp2pFretService` supplies a profile-tuned value (Core 4096 / Edge 1024); this default is
 	 * for a `FretPeerDiscovery` constructed directly.
 	 */
@@ -70,6 +77,13 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 	 * construction: capacity `maxTracked`, lifetime `debounceMs`.
 	 */
 	private readonly emitted: ExpiringMap<number>;
+	/**
+	 * Where the next sweep resumes, in ring-coordinate order — `null` at the ring start.
+	 *
+	 * Opaque and minted by the store: the tree-key format the cursor wraps is private to
+	 * `DigitreeStore` (see its class doc), so this class never derives one.
+	 */
+	private cursor: RingCursor | null = null;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private running = false;
 
@@ -88,12 +102,9 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		this.batchSize = cfg?.batchSize ?? 20;
 		this.debounceMs = cfg?.debounceMs ?? 600_000;
 		// The cap can bind before the debounce lapses — see the profile sizing note in
-		// `Libp2pFretService`.
-		// NOTE: that note claims a wrong eviction costs "one extra emission". Measured, that is
-		// false whenever the live-member population exceeds this capacity: because `scan` restarts
-		// at ring index 0 every tick, the evict/re-emit churn never advances past roughly
-		// `capacity + batchSize` entries, so every member beyond that ring position is emitted
-		// *never*, not twice. Tracked as `tickets/fix/bug-discovery-scan-starves-ring-tail`.
+		// `Libp2pFretService`. That costs at most an early re-announcement, never coverage: the
+		// sweep resumes from `cursor`, so what a peer is emitted *after* is its ring predecessor,
+		// not whatever survived in this map.
 		this.emitted = new ExpiringMap<number>({
 			capacity: cfg?.maxTracked ?? 4096,
 			ttlMs: this.debounceMs,
@@ -103,8 +114,8 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 	async start(): Promise<void> {
 		if (this.running) return;
 		this.running = true;
-		this.scan();
-		this.timer = setInterval(() => this.scan(), this.emissionIntervalMs);
+		this.scanOnce();
+		this.timer = setInterval(() => this.scanOnce(), this.emissionIntervalMs);
 	}
 
 	async stop(): Promise<void> {
@@ -114,6 +125,9 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 			this.timer = null;
 		}
 		this.emitted.clear();
+		// A start→stop→start cycle is a fresh run, so the sweep restarts at the ring start —
+		// the same rule the service's backoff and departure-debounce maps follow.
+		this.cursor = null;
 	}
 
 	/** `null` when the source is not ready yet; `selfId` is `null` when the input is a bare store. */
@@ -128,35 +142,44 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		}
 	}
 
-	// NOTE: emits at most `batchSize` peers per tick (20 per 5s by default), so a large restored
-	// routing table surfaces slowly — a full 2048-entry table takes ~8.5 min to drain.
-	// NOTE: that "drains" only holds while the live-member population fits in `emitted`'s
-	// capacity. Above it, restarting at ring index 0 every tick means the scan never advances
-	// past roughly `capacity + batchSize` entries and the rest of the ring is emitted never —
-	// a permanent, coordinate-determined bias, not a delay. Shipped Edge defaults
-	// (`maxTracked` 1024 against a routing-table capacity of 2048) can reach it. The fix is a
-	// resumable cursor; tracked as `tickets/fix/bug-discovery-scan-starves-ring-tail`.
-	private scan(): void {
+	/**
+	 * One sweep tick: emit up to `batchSize` peers, resuming where the last tick stopped.
+	 *
+	 * Deliberately **not private.** Timing coverage through `setInterval` makes a test assert on
+	 * scheduler overshoot rather than on this rule, and turns a parameter-space property into
+	 * minutes of wall clock; `test/peer-discovery.spec.ts` drives ticks directly instead. Same
+	 * argument as {@link ExpiringMap}'s injectable `Clock`.
+	 *
+	 * NOTE: emits at most `batchSize` peers per tick (20 per 5s by default), so a large restored
+	 * routing table surfaces at a bounded rate — a full 2048-entry table takes ~8.5 min to drain.
+	 * The whole table does drain, for any population and any `maxTracked`: the walk resumes
+	 * strictly after the last emitted entry and wraps, so a lap costs `ceil(N / batchSize)` ticks
+	 * and `batchSize` buys latency rather than coverage.
+	 */
+	scanOnce(): void {
 		const source = this.resolveSource();
 		if (!source) return;
 		const { store, selfId } = source;
 		const now = Date.now();
-		let count = 0;
-		for (const entry of store.list()) {
-			if (count >= this.batchSize) break;
+		// Every exclusion is a *filter predicate*, not a post-filter, so a skipped entry advances
+		// the walk instead of consuming one of the tick's `batchSize` slots — the same rule the
+		// cohort and routing-candidate walks follow.
+		const page = store.walkFrom(this.cursor, this.batchSize, (entry) => {
 			// Ring-scoped, through the *same* predicate every other ring-shaped read uses (see
 			// `isLiveMember`): only live same-network peers are surfaced to libp2p's discovery
 			// pipeline, so a foreign, unclassified, or dead peer is never re-seeded into peer
-			// selection upstream. The whole store is re-scanned each tick, so a peer is emitted as
-			// soon as the classification probe labels it `member` — or as soon as the dead re-probe
-			// arm resurrects it.
-			if (!isLiveMember(entry)) continue;
+			// selection upstream. A peer is emitted on the lap after the classification probe
+			// labels it `member` — or after the dead re-probe arm resurrects it.
+			if (!isLiveMember(entry)) return false;
 			// Self is seeded `member` and lives in the store, so without this every debounce
 			// window would produce one "discovery mechanism discovered self" error from libp2p.
-			if (selfId !== null && entry.id === selfId) continue;
+			if (selfId !== null && entry.id === selfId) return false;
 			// Presence *is* the debounce: the map's TTL is `debounceMs`, so an entry still present
 			// is still inside its window.
-			if (this.emitted.has(entry.id)) continue;
+			return !this.emitted.has(entry.id);
+		});
+		this.cursor = page.next;
+		for (const entry of page.entries) {
 			try {
 				const id = peerIdFromString(entry.id);
 				// NOTE: multiaddrs are deliberately empty — FRET discovery is peerStore-relative
@@ -168,8 +191,9 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 				const info: PeerInfo = { id, multiaddrs: [] };
 				this.safeDispatchEvent('peer', { detail: info });
 				this.emitted.set(entry.id, now);
-				count++;
 			} catch (err) {
+				// The cursor has already advanced past this entry, so an unparseable id is retried
+				// once per lap rather than on every tick.
 				log.error('scan emit failed for %s - %e', entry.id, err);
 			}
 		}

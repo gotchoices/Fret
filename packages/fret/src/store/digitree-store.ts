@@ -91,6 +91,29 @@ export interface PeerEntry {
  */
 export type PeerPatch = Partial<Omit<PeerEntry, 'id'>>;
 
+/**
+ * An opaque resume position in ring-coordinate order, minted by {@link DigitreeStore.walkFrom}
+ * and only ever consumed by it.
+ *
+ * `key` is the store's internal tree key, whose format (`hex(coord)|id`) is deliberately private
+ * to this class — see the class doc. A caller that built a cursor itself would be a second copy
+ * of the key rule living outside its owner, and would silently scramble every resumed walk the
+ * moment that format changed.
+ */
+export interface RingCursor {
+	readonly key: string;
+}
+
+/** One page of a resumable ring walk — see {@link DigitreeStore.walkFrom}. */
+export interface RingWalkPage {
+	entries: PeerEntry[];
+	/**
+	 * Where to resume: strictly after the last entry of {@link entries}, or the cursor that was
+	 * passed in when the page came back empty — nothing matched, so the position did not move.
+	 */
+	next: RingCursor | null;
+}
+
 export interface SerializedPeerEntry {
 	id: string;
 	coord: string; // base64url
@@ -369,6 +392,48 @@ export class DigitreeStore {
 			p = this.byKey.prior(p);
 		}
 		return Array.from(new Set(out));
+	}
+
+	/**
+	 * One page of a resumable walk in ring-coordinate order.
+	 *
+	 * Starts **strictly after** `cursor` (at the ring start when `null`), wraps past the end of
+	 * the ring, skips filter misses, and visits at most `size()` entries — one full lap — so a
+	 * ring where nothing matches terminates rather than spinning on the wrap-around, exactly as
+	 * the filtered walks above do.
+	 *
+	 * Strictly-after is what makes a *paged sweep* cover the whole ring. Resuming at the cursor
+	 * instead re-yields that entry, which costs a slot on every page and, at `count: 1`, never
+	 * advances at all. The wrap is what keeps strictly-after correct on a one-entry ring, where
+	 * "strictly after X, wrapping" is X itself — so a single-peer ring still re-yields its peer.
+	 *
+	 * Returns entries rather than ids (unlike {@link neighborsRight}) so the caller gets its next
+	 * cursor without a second {@link getById} per page.
+	 */
+	walkFrom(cursor: RingCursor | null, count: number, filter?: (e: PeerEntry) => boolean): RingWalkPage {
+		const entries: PeerEntry[] = [];
+		const maxScan = this.size();
+		if (count <= 0 || maxScan === 0) return { entries, next: cursor };
+		// `next` of the cursor's path is the first entry strictly after it whether the path landed
+		// *on* that key or in the crack where it used to be — so a cursor whose entry has since been
+		// evicted resumes at the right ring position instead of restarting the sweep.
+		let p = cursor ? this.byKey.next(this.byKey.find(cursor.key)) : this.byKey.first();
+		let next = cursor;
+		let scanned = 0;
+		while (entries.length < count && scanned < maxScan) {
+			if (!p.on) {
+				p = this.byKey.first();
+				if (!p.on) break;
+			}
+			const e = this.byKey.at(p)!;
+			scanned++;
+			if (!filter || filter(e)) {
+				entries.push(e);
+				next = { key: makeKey(e) };
+			}
+			p = this.byKey.next(p);
+		}
+		return { entries, next };
 	}
 
 	exportEntries(): SerializedPeerEntry[] {
