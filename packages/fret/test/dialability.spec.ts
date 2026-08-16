@@ -141,14 +141,17 @@ describe('dialability guard on outbound RPC', function () {
 			await delay(100)
 
 			expect(dials(), 'zero dials for an addressless replacement').to.equal(0)
+			expect(svcA.getStore().getById(replacement), 'and it never enters the table').to.equal(undefined)
 		} finally {
 			await stopAll([nodeA])
 		}
 	})
 
 	// Positive control for the spec above: the guard must skip only the undialable peers.
-	// An address-known replacement is still warmed, which also proves the dial counter works.
-	it('handleLeave still warms a replacement whose address the peerStore holds', async () => {
+	// A leave notice no longer warms anything (see `churn.leave.spec.ts` — the replacement list is
+	// recorded and probed later by the classification pass), so what separates the two arms is
+	// whether the id is *recorded*, not whether it is dialed.
+	it('handleLeave records a replacement whose address the peerStore holds', async () => {
 		const nodeA = await createMemNode(); await nodeA.start()
 		const nodeB = await createMemNode(); await nodeB.start()
 		const svcB = new CoreFretService(nodeB, { profile: 'core', k: 7 })
@@ -162,13 +165,13 @@ describe('dialability guard on outbound RPC', function () {
 			// address we nonetheless hold.
 			svcA.getStore().remove(nodeB.peerId.toString())
 			const departing = await ghostPeerId()
-			const dials = countDials(nodeA)
 
 			await (svcA as any).handleLeave({
 				v: 1, from: departing, replacements: [nodeB.peerId.toString()], timestamp: Date.now()
 			})
 
-			expect(dials(), 'address-known replacement is warmed').to.be.greaterThan(0)
+			expect(svcA.getStore().getById(nodeB.peerId.toString()), 'address-known replacement recorded').to.not.equal(undefined)
+			expect(svcA.getDiagnostics().leaveReplacementsInserted, 'exactly one').to.equal(1)
 		} finally {
 			await svcB.stop()
 			await stopAll([nodeA, nodeB])

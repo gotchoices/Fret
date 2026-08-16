@@ -1,14 +1,30 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { sendLeave, type LeaveNoticeV1 } from '../src/rpc/leave.js'
+import { registerLeave, sendLeave, type LeaveNoticeV1 } from '../src/rpc/leave.js'
+import { registerNeighbors } from '../src/rpc/neighbors.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
+import { hashPeerId } from '../src/ring/hash.js'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id'
+import type { NeighborSnapshotV1 } from '../src/index.js'
+import type { Libp2p } from 'libp2p'
+
+const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
+const protocols = makeProtocols('default')
+
+/** A syntactically valid peer id nobody holds an address for — undialable by construction. */
+async function ghostPeerId(): Promise<string> {
+	const key = await generateKeyPair('Ed25519')
+	return peerIdFromPrivateKey(key).toString()
+}
 
 describe('Churn leave handling', function () {
 	this.timeout(20000)
 
-	it('sendLeave triggers stabilization and replacement warming', async () => {
+	it('a graceful stop sends leave notices to its neighbors without throwing', async () => {
 		const nodes = [] as any[]
 		for (let i = 0; i < 4; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
 		const services = [] as any[]
@@ -55,7 +71,6 @@ describe('Churn leave handling', function () {
 
 		await new Promise(r => setTimeout(r, 2000))
 
-		const node2Id = nodes[2].peerId.toString()
 		const diagsBefore = services.map(s => ({ ...s.getDiagnostics() }))
 
 		// Stop node 2 (the middle node) — it should send leave with replacements
@@ -63,10 +78,10 @@ describe('Churn leave handling', function () {
 		await nodes[2].stop()
 		await new Promise(r => setTimeout(r, 1500))
 
-		// All remaining services should continue to function after the leave.
-		// The leaving peer may be transiently re-added via snapshot merging
-		// (handleLeave's warming step races with sequential leave delivery),
-		// so we verify system health rather than exact store contents.
+		// All remaining services should continue to function after the leave. The departing peer
+		// may be re-added by the `peer:disconnect` scoring path (see
+		// `backlog/debt-scoring-resurrects-removed-peers`), so we verify system health rather than
+		// exact store contents.
 		for (const [idx, svc] of services.entries()) {
 			if (idx === 2) continue
 			const diag = svc.getDiagnostics()
@@ -88,48 +103,6 @@ describe('Churn leave handling', function () {
 		}
 		expect(anyProgressAfterLeave).to.equal(true,
 			'at least one service should show stabilization progress after leave')
-
-		await Promise.all(services.map((s, i) => i === 2 ? Promise.resolve() : s.stop()))
-		await stopAll(nodes.filter((_: any, i: number) => i !== 2))
-	})
-
-	it('recipients probe suggested replacements from leave notice', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 5; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'edge',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-		// Star topology
-		for (let i = 1; i < nodes.length; i++) {
-			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-		}
-		await new Promise(r => setTimeout(r, 2000))
-
-		const leavingId = nodes[2].peerId.toString()
-		const diagBefore = { ...services[1].getDiagnostics() }
-
-		// Stop node 2 — neighbors should handle the leave and probe replacements
-		await services[2].stop()
-		await nodes[2].stop()
-		await new Promise(r => setTimeout(r, 2000))
-
-		// Diagnostics should show ping activity from handling leave
-		const diagAfter = services[1].getDiagnostics()
-		// At minimum, pings should have been sent during leave handling
-		expect(diagAfter.pingsSent).to.be.greaterThanOrEqual(diagBefore.pingsSent)
-
-		// The leaving peer should be removed from node 1's peer list
-		const peersAfter = services[1].listPeers()
-		const stillHasLeaving = peersAfter.some(p => p.id === leavingId)
-		// It may be re-added by stabilization upsert; the important thing is it was processed
-		expect(diagAfter.announcementsSent).to.be.greaterThanOrEqual(diagBefore.announcementsSent)
 
 		await Promise.all(services.map((s, i) => i === 2 ? Promise.resolve() : s.stop()))
 		await stopAll(nodes.filter((_: any, i: number) => i !== 2))
@@ -178,7 +151,6 @@ describe('Churn leave handling', function () {
 			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
 		}
 
-		const protocols = makeProtocols('default')
 		let capturedReplacements: string[] | undefined
 
 		// Register a custom leave handler on node 0 to capture the sanitized notice
@@ -213,5 +185,246 @@ describe('Churn leave handling', function () {
 		expect(capturedReplacements!.length).to.be.at.most(12)
 
 		await stopAll(nodes)
+	})
+})
+
+/**
+ * One inbound leave notice used to answer with up to twenty outbound RPCs (six pings, six
+ * announces, four neighbor fetches, four more announces). These specs pin the replacement
+ * contract: the notice's suggested ids are *recorded* as untrusted local hints and probed later
+ * by the stabilization tick's classification pass, and the only outbound traffic a leave may
+ * still cause is one debounced announce burst.
+ */
+describe('Leave amplification cap', function () {
+	this.timeout(30000)
+
+	interface LeaveRig {
+		receiver: Libp2p
+		svc: CoreFretService
+		departing: Libp2p
+		/** Ring coordinate of the departing peer — where `announceOnDeparture` centres its walk. */
+		departingCoord: Uint8Array
+		/** Start another memory node, torn down with the rig. */
+		addNode(): Promise<Libp2p>
+		/** Send one real leave notice from `departing`, then let the handler settle. */
+		leave(replacements?: string[], settleMs?: number): Promise<void>
+		stop(): Promise<void>
+	}
+
+	/**
+	 * A receiver that answers *real* leave notices from a real second node — so
+	 * `registerLeave`'s transport identity check passes rather than being bypassed — but whose
+	 * `FretService` is deliberately never started. Every ping, neighbor fetch and announce these
+	 * specs count therefore came from `handleLeave` and nothing else; a started service's
+	 * stabilization loop would make the same deltas unattributable.
+	 */
+	async function makeLeaveRig(profile: 'core' | 'edge' = 'core'): Promise<LeaveRig> {
+		const nodes: Libp2p[] = []
+		const addNode = async (): Promise<Libp2p> => {
+			const n = await createMemNode()
+			await n.start()
+			nodes.push(n)
+			return n
+		}
+		const receiver = await addNode()
+		const departing = await addNode()
+		const svc = new CoreFretService(receiver, { profile, k: 7 })
+		await registerLeave(receiver, async (notice) => (svc as any).handleLeave(notice), protocols.PROTOCOL_LEAVE)
+		await departing.dial(receiver.getMultiaddrs()[0]!)
+		return {
+			receiver,
+			svc,
+			departing,
+			departingCoord: await hashPeerId(departing.peerId),
+			addNode,
+			async leave(replacements?: string[], settleMs = 250): Promise<void> {
+				const notice: LeaveNoticeV1 = {
+					v: 1, from: departing.peerId.toString(), replacements, timestamp: Date.now()
+				}
+				await sendLeave(departing, receiver.peerId.toString(), notice, protocols.PROTOCOL_LEAVE)
+				// The announce is detached, so settle rather than assert straight off the send.
+				await delay(settleMs)
+			},
+			async stop(): Promise<void> { await stopAll(nodes) }
+		}
+	}
+
+	/** A replacement the receiver can reach: connected, therefore dialable. */
+	async function dialableReplacement(rig: LeaveRig): Promise<string> {
+		const node = await rig.addNode()
+		await rig.receiver.dial(node.getMultiaddrs()[0]!)
+		return node.peerId.toString()
+	}
+
+	const emptySnapshot = (node: Libp2p): NeighborSnapshotV1 => ({
+		v: 1, from: node.peerId.toString(), timestamp: Date.now(), successors: [], predecessors: [], sig: ''
+	})
+
+	// The core regression guard. Against the old handler this fails loudly: a leave carrying a
+	// dialable replacement fired a ping, and (when the ping left the peer unconnected) an announce
+	// and a neighbor fetch on top.
+	it('an accepted leave sends no ping and no neighbor fetch', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+			const before = { ...rig.svc.getDiagnostics() }
+
+			await rig.leave([replacement])
+
+			const after = rig.svc.getDiagnostics()
+			expect(after.pingsSent, 'no replacement was pinged').to.equal(before.pingsSent)
+			expect(after.snapshotsFetched, 'no neighbor snapshot was fetched').to.equal(before.snapshotsFetched)
+			expect(after.leaveReplacementsInserted - before.leaveReplacementsInserted,
+				'premise: the replacement really was processed').to.equal(1)
+		} finally { await rig.stop() }
+	})
+
+	// A replacement is a name we were handed, not a peer we contacted. It must arrive
+	// unclassified (so the ring views exclude it until vetted) and at relevance 0 (so an
+	// attacker-named id cannot outrank a genuine peer when `enforceCapacity` evicts by relevance).
+	it('records a dialable replacement as an unclassified, zero-relevance entry', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+
+			await rig.leave([replacement])
+
+			const entry = rig.svc.getStore().getById(replacement)
+			expect(entry, 'replacement recorded').to.not.equal(undefined)
+			expect(entry!.membership, 'recorded as an untrusted hint, not as a member').to.equal('unknown')
+			expect(entry!.relevance, 'no relevance credit for a peer we never contacted').to.equal(0)
+		} finally { await rig.stop() }
+	})
+
+	// The bound on table pollution: an attacker cannot add peerStore addresses for ids it
+	// invents, and an id no pass could ever probe has no business consuming a table slot.
+	it('drops a replacement libp2p holds no address for', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const ghost = await ghostPeerId()
+
+			await rig.leave([ghost])
+
+			expect(rig.svc.getStore().getById(ghost), 'undialable id never enters the table').to.equal(undefined)
+			expect(rig.svc.getDiagnostics().leaveReplacementsInserted, 'nothing inserted').to.equal(0)
+		} finally { await rig.stop() }
+	})
+
+	// `upsert` preserves an existing entry, so a leave notice can never be used to demote or
+	// re-zero an established peer by naming it.
+	it('does not demote or re-zero an established member named as a replacement', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+			const store = rig.svc.getStore()
+			store.upsert(replacement, await hashPeerId(peerIdFromString(replacement)))
+			store.setMembership(replacement, 'member')
+			store.update(replacement, { relevance: 4.25 })
+
+			await rig.leave([replacement])
+
+			const entry = store.getById(replacement)
+			expect(entry!.membership, 'membership preserved').to.equal('member')
+			expect(entry!.relevance, 'relevance preserved').to.equal(4.25)
+		} finally { await rig.stop() }
+	})
+
+	// Self would be recreated as `unknown` and drop out of every member-only ring view; the
+	// departing peer would be re-added moments after `handleLeave` removed it.
+	it('never inserts self or the departing peer from the replacement list', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+			const selfId = rig.receiver.peerId.toString()
+			const departingId = rig.departing.peerId.toString()
+			const store = rig.svc.getStore()
+			store.upsert(selfId, await hashPeerId(rig.receiver.peerId))
+			store.setMembership(selfId, 'member')
+			// libp2p never holds self in its own peerStore, so without this the dialability filter
+			// would drop self first and the self guard would go untested.
+			;(rig.svc as any).setAddressKnown(selfId, true)
+
+			await rig.leave([selfId, departingId, replacement])
+
+			expect(store.getById(selfId)!.membership, 'self stays a member of its own network').to.equal('member')
+			expect(rig.svc.getDiagnostics().leaveReplacementsInserted,
+				'only the third id was recorded').to.equal(1)
+		} finally { await rig.stop() }
+	})
+
+	// The 12-id cap bounds the work only if repeats are free: twelve copies of one id must cost
+	// one hash and one upsert.
+	it('collapses duplicate replacement ids to a single entry', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const replacement = await dialableReplacement(rig)
+
+			await rig.leave(Array.from({ length: 12 }, () => replacement))
+
+			expect(rig.svc.getDiagnostics().leaveReplacementsInserted, 'one insert, not twelve').to.equal(1)
+			expect(rig.svc.getStore().getById(replacement), 'the single entry exists').to.not.equal(undefined)
+		} finally { await rig.stop() }
+	})
+
+	// A graceful departure fires the leave notice *and* the `peer:disconnect` that follows it.
+	// Routing both through the debounced `announceOnDeparture` collapses them into one burst; two
+	// notices from the same peer inside the window must therefore announce exactly once.
+	it('announces at most one debounced burst per departing peer', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const store = rig.svc.getStore()
+			const targets: Libp2p[] = []
+			for (let i = 0; i < 2; i++) {
+				const target = await rig.addNode()
+				await registerNeighbors(target, () => emptySnapshot(target), () => {}, protocols)
+				await rig.receiver.peerStore.merge(target.peerId, { multiaddrs: target.getMultiaddrs() })
+				targets.push(target)
+			}
+			// Populate `addressKnown` first: the seed walk re-upserts every peerStore peer at its
+			// *hashed* coordinate, which would undo the placement below if it ran after.
+			await (rig.svc as any).seedFromPeerStore()
+			for (const [i, target] of targets.entries()) {
+				store.upsert(target.peerId.toString(), ringOffset(rig.departingCoord, i === 0 ? 1 : -1))
+			}
+			const fanout = (rig.svc as any).announceFanout as number
+			const before = rig.svc.getDiagnostics().announcementsSent
+
+			await rig.leave(undefined, 500)
+			const afterFirst = rig.svc.getDiagnostics().announcementsSent
+			await rig.leave(undefined, 500)
+			const afterSecond = rig.svc.getDiagnostics().announcementsSent
+
+			expect(afterFirst - before, 'one burst reached both seeded neighbors').to.equal(targets.length)
+			expect(afterFirst - before, 'burst bounded by announceFanout').to.be.at.most(fanout)
+			expect(afterSecond, 'a second leave inside the debounce window adds nothing').to.equal(afterFirst)
+		} finally { await rig.stop() }
+	})
+
+	// The hand-off the whole redesign rests on: recording a replacement as `unknown` is not a
+	// dead end, because `classifyUnknownPeers` selects exactly that set on the next tick.
+	it('the classification pass probes and promotes a replacement recorded by a leave', async () => {
+		const rig = await makeLeaveRig()
+		let replacementSvc: CoreFretService | undefined
+		try {
+			const replacementNode = await rig.addNode()
+			replacementSvc = new CoreFretService(replacementNode, { profile: 'core', k: 7 })
+			await replacementSvc.start()
+			await rig.receiver.dial(replacementNode.getMultiaddrs()[0]!)
+			const replacement = replacementNode.peerId.toString()
+
+			await rig.leave([replacement])
+			expect(rig.svc.getStore().getById(replacement)!.membership,
+				'starts out unclassified').to.equal('unknown')
+
+			await (rig.svc as any).stabilizeOnce()
+
+			expect(rig.svc.getStore().getById(replacement)!.membership,
+				'one stabilization tick promotes it to member').to.equal('member')
+			expect(rig.svc.getDiagnostics().pingsOk,
+				'promoted by a real namespaced ping, not by assumption').to.be.greaterThan(0)
+		} finally {
+			await replacementSvc?.stop()
+			await rig.stop()
+		}
 	})
 })

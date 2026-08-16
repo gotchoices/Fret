@@ -235,6 +235,8 @@ export class FretService implements IFretService, Startable {
 		pingsFail: 0,
 		maybeActForwarded: 0,
 		evictions: 0,
+		/** Replacement ids recorded from inbound leave notices (see `recordLeaveReplacements`). */
+		leaveReplacementsInserted: 0,
 		rejected: {
 			payloadTooLarge: 0,
 			timestampBounds: 0,
@@ -805,6 +807,12 @@ export class FretService implements IFretService, Startable {
 					this.protocols.PROTOCOL_MAYBE_ACT,
 					this.maxBytesMaybeAct()
 				),
+				// NOTE: leave is deliberately the one inbound handler with no `noteInboundRpc`
+				// hook (compare neighbors / maybeAct / ping above and below). That hook applies
+				// the `rpc-inbound` membership signal to the sender, which here is the *departing*
+				// peer — it would re-insert it as a confirmed `member` immediately after
+				// `handleLeave` removed it. The asymmetry is the point; do not "fix" it while
+				// tidying these signatures.
 				registerLeave(
 					this.node,
 					async (notice) => this.handleLeave(notice),
@@ -1171,10 +1179,12 @@ export class FretService implements IFretService, Startable {
 	 * **Live-member-scoped, because this list goes on the wire.** It is the same
 	 * transitive-propagation guard the outgoing snapshot's neighbor lists and sample carry: a
 	 * departing node must not hand its neighbors peers it knows serve another network, or peers a
-	 * run of failed contacts already marked dead. The recipient acts on these directly — it dials
-	 * and pings up to six of them (`handleLeave`) — so an unfiltered list spends someone else's
-	 * dial budget on peers we had already given up on, and re-seeds a foreign peer into a
-	 * same-network view that the ring gating exists to keep it out of.
+	 * run of failed contacts already marked dead. The recipient no longer dials these ids — it
+	 * records them as untrusted `unknown` entries (`recordLeaveReplacements`) and lets its own
+	 * classification pass vet them — but an unfiltered list still re-seeds a foreign peer into a
+	 * same-network view that ring gating exists to keep it out of, and still spends the
+	 * recipient's *probe* budget on peers we had already given up on. The filter is what stops
+	 * a peer we abandoned from propagating through our departure.
 	 *
 	 * The *targets* of the notice (`sendLeaveToNeighbors`'s `ids`) stay unfiltered by contrast:
 	 * that walk defines the S/P set this list excludes, not a list we advertise.
@@ -1244,62 +1254,73 @@ export class FretService implements IFretService, Startable {
 			// remove leaving peer from the store
 			this.store.remove(peerId);
 			if (!coord) return;
-			// Merge suggested replacements from notice with locally computed ones
-			const suggested = (notice.replacements ?? []).filter((id) => {
-				try { peerIdFromString(id); return true; } catch { return false; }
-			});
-			const base = Array.from(
-				new Set([
-					...this.store.neighborsRight(coord, this.cfg.m),
-					...this.store.neighborsLeft(coord, this.cfg.m),
-				])
-			);
-			const expanded = this.expandCohort(base, coord, Math.max(2, Math.ceil(this.cfg.m / 2)));
-			const baseSet = new Set(base);
-			const localNew = expanded.filter((id) => !baseSet.has(id));
-			// Suggested first (departing peer vouched for them), then locally discovered
-			const selfStr = this.node.peerId.toString();
-			const seen = new Set([peerId, selfStr, ...base]);
-			const newIds: string[] = [];
-			for (const id of suggested) {
-				if (!seen.has(id)) { newIds.push(id); seen.add(id); }
-			}
-			for (const id of localNew) {
-				if (!seen.has(id)) { newIds.push(id); seen.add(id); }
-			}
-			// Proactively warm a bounded number of replacements and merge their neighbor views.
-			// Replacement ids come straight off the wire, so most are peers we hold no address
-			// for; dialing those can only fail, so they are filtered out before the budget is
-			// applied (filtering after would waste warm slots on undialable ids).
-			const warm = newIds.filter((id) => this.isDialable(id)).slice(0, 6);
-			for (const id of warm) {
-				try {
-					await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
-					// The ping usually opens the connection; announce only when it did not, and
-					// through the shared choke point so the dial flag, token accounting and
-					// counters stay in one place rather than being restated here.
-					if (!this.isConnected(id)) {
-						await this.sendAnnouncementsRateLimited([id], await this.snapshot());
-					}
-				} catch (err) {
-					log.error('warm/announce failed for %s - %e', id, err);
-				}
-			}
-			await this.mergeNeighborSnapshots(warm.slice(0, 4));
-			// Announce replacement info to immediate neighbors
-			this.detach(this.announceReplacementsToNeighbors(coord), 'announceReplacementsToNeighbors');
+			await this.recordLeaveReplacements(notice.replacements, peerId);
+			// One *debounced* announce per departure, shared with the `peer:disconnect` path. A
+			// graceful departure fires both (the notice, then the disconnect that follows it);
+			// routing both through `announceOnDeparture` collapses them into a single burst of at
+			// most `announceFanout` per departed coordinate per DEPARTURE_DEBOUNCE_MS, instead of
+			// the two undebounced fan-outs this path used to add on top.
+			this.detach(this.announceOnDeparture(peerId, coord), 'announceOnDeparture(leave)');
 		} catch (err) {
 			log.error('handleLeave failed for %s - %e', peerId, err);
 		}
 	}
 
-	private async announceReplacementsToNeighbors(aroundCoord: Uint8Array): Promise<void> {
+	/**
+	 * Record a leave notice's suggested replacements as untrusted local hints — and nothing more.
+	 *
+	 * No ping, no neighbor fetch, no announce: an inbound leave notice is one small message and
+	 * must not be amplifiable into a fan of outbound RPCs. The healing it used to attempt inline
+	 * is already someone else's job, on a pass that is budgeted, backed off and ordered:
+	 * {@link classifyUnknownPeers} selects exactly the entries inserted here (`unknown`, not
+	 * `dead`, off backoff, dialable) on the next stabilization tick and promotes them to `member`
+	 * on a successful ping, while a replacement that is locally `foreign` or `dead` is picked up
+	 * by the matching {@link reprobeOffRing} arm with its backoff intact. The cost is latency —
+	 * healing within ≤ 1 tick rather than one RPC round trip — which the departing peer's own
+	 * advance notice makes affordable.
+	 *
+	 * The list is already bounded at 12 and parse-checked by `sanitizeReplacements`
+	 * (`src/rpc/leave.ts`), which is what bounds the local hash + upsert work below.
+	 */
+	private async recordLeaveReplacements(replacements: string[] | undefined, departedId: string): Promise<void> {
+		if (!replacements || replacements.length === 0) return;
 		const selfStr = this.node.peerId.toString();
-		const neighbors = Array.from(new Set([
-			...this.store.neighborsRight(aroundCoord, this.cfg.m),
-			...this.store.neighborsLeft(aroundCoord, this.cfg.m),
-		])).filter((id) => id !== selfStr && this.isConnected(id)).slice(0, 4);
-		await this.sendAnnouncementsRateLimited(neighbors, await this.snapshot());
+		const seen = new Set<string>();
+		for (const id of replacements) {
+			// Skipping self is a correctness guard, not tidiness: were self ever absent from the
+			// store, upserting it here would recreate it as `unknown` and drop self out of every
+			// member-only ring view (see *Network-scoped admission* in `docs/fret.md`). Skipping
+			// the departed peer stops us re-adding the one `handleLeave` just removed. Duplicates
+			// inside one list collapse, so 12 copies of an id cost one hash and one upsert.
+			if (id === selfStr || id === departedId || seen.has(id)) continue;
+			seen.add(id);
+			// `isDialable`, not `isDoomedDial`: we are not dialing, so `foreign` / `dead` are no
+			// reason to drop the id — `upsert` preserves that state and the peer keeps its own
+			// re-probe arm and backoff. But an id libp2p holds no address for can never be probed
+			// by any pass, so inserting it would only pollute the table. This is also the bound on
+			// table pollution: an attacker cannot add peerStore addresses for ids it invents.
+			if (!this.isDialable(id)) continue;
+			let coord: Uint8Array;
+			try {
+				coord = await hashPeerId(peerIdFromString(id));
+			} catch (err) {
+				// `sanitizeReplacements` already parse-checked these, so this is unreachable in
+				// practice — but it must not throw out into the RPC handler.
+				log.error('handleLeave: could not hash replacement id %s - %e', id, err);
+				continue;
+			}
+			// Bare `upsert`, deliberately *no* `applyTouch` — unlike the two snapshot-merge paths
+			// (`mergeNeighborSnapshots` / `mergeAnnounceSnapshot`). `applyTouch` writes a
+			// sparsity-weighted relevance score, and giving an attacker-named id a non-zero score
+			// lets it outrank a genuine but not-yet-contacted peer when `enforceCapacity` evicts by
+			// relevance. A replacement is a name we were handed, not a peer we contacted: it starts
+			// at relevance 0 and earns a score once the classification pass actually reaches it.
+			this.store.upsert(id, coord);
+			this.diag.leaveReplacementsInserted++;
+		}
+		// Once, after the loop rather than per insert: `enforceCapacity` lists and fully sorts the
+		// store.
+		await this.enforceCapacity();
 	}
 
 	private async announceOnDeparture(departedId: string, coord: Uint8Array): Promise<void> {
