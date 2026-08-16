@@ -547,7 +547,7 @@ describe('dead state: recovery through the re-probe pass', () => {
 			const id = other.peerId.toString()
 			store.upsert(id, await hashPeerId(other.peerId))
 			// Dead *and* still unclassified: the recovery arm has to fix both labels, and it is the
-			// only pass that will look at this peer — `classifyUnknownPeers` skips dead candidates
+			// only pass that will look at this peer — `classifyTargets` skips dead candidates
 			// so the two arms never probe the same peer in one tick.
 			store.update(id, { state: 'dead', contactFailures: 3, lastContactFailureAt: Date.now() })
 			expect(store.getById(id)?.membership).to.equal('unknown')
@@ -569,8 +569,6 @@ describe('dead state: recovery through the re-probe pass', () => {
 	// Separate budgets, not one merged candidate list: the foreign arm is already near saturation
 	// around ~42 foreign peers, and a merged list would put every dead peer behind that queue.
 	it('does not let a large foreign population starve the dead arm', async () => {
-		const probed: string[] = []
-		;(svc as any).probeMembership = async (id: string) => { probed.push(id) }
 		for (let i = 0; i < 40; i++) {
 			const id = `foreign-${i}`
 			store.upsert(id, coordAt(i))
@@ -582,7 +580,9 @@ describe('dead state: recovery through the re-probe pass', () => {
 		store.update('gone', { state: 'dead' })
 		;(svc as any).setAddressKnown('gone', true)
 
-		await (svc as any).reprobeExcludedPeers()
+		// The pass now *selects* its targets and the tick pools the probes, so the selection is
+		// what carries the separate-budgets rule and is asserted directly.
+		const probed = (svc as any).reprobeExcludedTargets() as string[]
 
 		expect(probed).to.include('gone')
 		// Core budget is 2 per arm, so the foreign flood cannot consume the dead arm's slots.
@@ -592,14 +592,12 @@ describe('dead state: recovery through the re-probe pass', () => {
 	// A peer that is both foreign and dead belongs to the dead arm alone — otherwise one tick
 	// would spend two probes on the same peer, and a successful one fixes both labels anyway.
 	it('probes a foreign+dead peer exactly once per tick', async () => {
-		const probed: string[] = []
-		;(svc as any).probeMembership = async (id: string) => { probed.push(id) }
 		store.upsert('both', coordAt(42))
 		store.setMembership('both', 'foreign')
 		store.update('both', { state: 'dead' })
 		;(svc as any).setAddressKnown('both', true)
 
-		await (svc as any).reprobeExcludedPeers()
+		const probed = (svc as any).reprobeExcludedTargets() as string[]
 
 		expect(probed).to.deep.equal(['both'])
 	})
@@ -657,7 +655,7 @@ describe('dead state: recovery through the re-probe pass', () => {
 // The tests above drive the seam helpers directly, which leaves the wiring at the outbound-RPC
 // call sites unasserted — a call site that forgot to route its catch through `noteRpcFailure`
 // would pass every one of them. These drive a real `sendPing` instead, so the transition is
-// observed end to end through `probeNeighborsLatency`.
+// observed end to end through `probeNeighborLatency`.
 describe('dead state: through a real outbound RPC call site', () => {
 	let node: Libp2p
 	let svc: CoreFretService
@@ -691,7 +689,7 @@ describe('dead state: through a real outbound RPC call site', () => {
 	it('marks an unreachable neighbor dead after a run of failed pings', async () => {
 		const id = await unreachablePeer()
 		for (let i = 0; i < 3; i++) {
-			await (svc as any).probeNeighborsLatency([id])
+			await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
 			store.update(id, { lastContactFailureAt: 0 }) // stand in for the spacing interval
 		}
 
@@ -713,7 +711,7 @@ describe('dead state: through a real outbound RPC call site', () => {
 			store.upsert(id, await hashPeerId(other.peerId))
 			store.update(id, { state: 'dead', contactFailures: 3, lastContactFailureAt: Date.now() })
 
-			await (svc as any).probeNeighborsLatency([id])
+			await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
 
 			expect(store.getById(id)?.state).to.equal('connected')
 			expect(store.getById(id)?.contactFailures).to.equal(0)
@@ -839,7 +837,7 @@ describe('cancellation is not evidence about a peer', () => {
 		cancelRun()
 		const before = { ...svc.getDiagnostics() }
 
-		await (svc as any).probeNeighborsLatency([id])
+		await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
 
 		expect(svc.getDiagnostics().pingsSent, 'no ping counted').to.equal(before.pingsSent)
 		expect(svc.getDiagnostics().pingsFail, 'no ping failure counted').to.equal(before.pingsFail)
@@ -854,7 +852,7 @@ describe('cancellation is not evidence about a peer', () => {
 		const id = await unreachablePeer()
 		liveRun()
 
-		await (svc as any).probeNeighborsLatency([id])
+		await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
 
 		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
 		expect(svc.getDiagnostics().pingsFail).to.equal(1)
@@ -868,7 +866,7 @@ describe('cancellation is not evidence about a peer', () => {
 		cancelRun()
 		const before = { ...svc.getDiagnostics() }
 
-		await (svc as any).probeMembership(id)
+		await (svc as any).probeMembership(id, (svc as any).runSignal)
 
 		expect(svc.getDiagnostics().pingsSent).to.equal(before.pingsSent)
 		expect(svc.getDiagnostics().pingsFail).to.equal(before.pingsFail)
@@ -879,7 +877,7 @@ describe('cancellation is not evidence about a peer', () => {
 		const id = await unreachablePeer()
 		liveRun()
 
-		await (svc as any).probeMembership(id)
+		await (svc as any).probeMembership(id, (svc as any).runSignal)
 
 		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
 		expect((svc as any).backoffMap.get(id), 'backoff recorded').to.not.equal(undefined)
@@ -913,9 +911,9 @@ describe('cancellation is not evidence about a peer', () => {
 
 	// NOTE: `snapshotsFetched` is pinned at +1, not "unchanged". `fetchNeighbors` swallows every
 	// failure — the abort included — into a fabricated empty snapshot, so the counter ticks for a
-	// fetch that never opened a stream and `mergeNeighborSnapshots`'s own `wasCancelled` break
-	// cannot fire. That overcount is the accepted behaviour written up at the `stabilizeOnce` call
-	// site; flip this expectation to "unchanged" if `fetchNeighbors` ever distinguishes "skipped"
+	// fetch that never opened a stream and `fetchAndMergeSnapshot`'s own `wasCancelled` check
+	// cannot fire. That overcount is the accepted behaviour written up on `fetchAndMergeSnapshot`;
+	// flip this expectation to "unchanged" if `fetchNeighbors` ever distinguishes "skipped"
 	// from "empty". What matters — and is asserted — is that nothing was merged or scored.
 	it('merges nothing and scores nothing when a snapshot fetch is cancelled', async () => {
 		const id = await unreachablePeer()
@@ -923,7 +921,7 @@ describe('cancellation is not evidence about a peer', () => {
 		const before = svc.getDiagnostics().snapshotsFetched
 		const entriesBefore = store.list().length
 
-		await (svc as any).mergeNeighborSnapshots([id])
+		await (svc as any).fetchAndMergeSnapshot(id, (svc as any).runSignal)
 
 		expect(svc.getDiagnostics().snapshotsFetched, 'accepted overcount').to.equal(before + 1)
 		expect(store.list().length, 'nothing merged').to.equal(entriesBefore)

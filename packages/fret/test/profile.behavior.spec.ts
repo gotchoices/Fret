@@ -170,7 +170,7 @@ describe('Profile behavior tests', function () {
 		})
 	})
 
-	// ----- Phase 2b: Snapshot receive caps (mergeNeighborSnapshots) -----
+	// ----- Phase 2b: Snapshot receive caps (fetchAndMergeSnapshot) -----
 
 	describe('Snapshot receive caps', () => {
 		it('Edge truncates received successors to 8, predecessors to 8, sample to 6', async () => {
@@ -194,7 +194,7 @@ describe('Profile behavior tests', function () {
 			await receiver.start()
 
 			const storeBefore = receiver.getStore().size()
-			await (receiver as any).mergeNeighborSnapshots([nodes[0]!.peerId.toString()])
+			await (receiver as any).fetchAndMergeSnapshot(nodes[0]!.peerId.toString(), (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Edge receive caps: 8 succ + 8 pred + 6 sample = 22 max unique peers merged
@@ -228,7 +228,7 @@ describe('Profile behavior tests', function () {
 			await receiver.start()
 
 			const storeBefore = receiver.getStore().size()
-			await (receiver as any).mergeNeighborSnapshots([nodes[0]!.peerId.toString()])
+			await (receiver as any).fetchAndMergeSnapshot(nodes[0]!.peerId.toString(), (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Core receive caps: 16 succ + 16 pred + 8 sample = 40 max unique peers merged

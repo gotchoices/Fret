@@ -9,9 +9,9 @@ import type { PeerEntry } from '../store/digitree-store.js';
  * while it is not marked `dead`.
  *
  * Self is seeded `member` and is never marked dead, so it always passes. `unknown` peers are
- * excluded until the classification probe pass (`FretService.classifyUnknownPeers`) resolves them —
+ * excluded until the classification probe pass (`FretService.classifyTargets`) resolves them —
  * typically within ~1 tick — so they are not permanently starved; `dead` peers are excluded until
- * the dead arm of the re-probe pass (`FretService.reprobeOffRing`) finds one alive again.
+ * the dead arm of the re-probe pass (`FretService.reprobeOffRingTargets`) finds one alive again.
  *
  * Both exclusions are **one predicate** rather than a second guard bolted onto each reader, so
  * every ring-shaped read inherits them at once and a reader added later cannot forget one. That is

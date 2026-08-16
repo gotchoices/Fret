@@ -26,6 +26,7 @@ import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
 import { deadline } from '../utils/deadline.js';
+import { runPooled, type PoolResult } from '../utils/pool.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
@@ -291,6 +292,24 @@ export class FretService implements IFretService, Startable {
 	 */
 	private static readonly MAINTENANCE_RPC_TIMEOUT_MS = 2000;
 	/**
+	 * Wall-clock cap on one whole stabilization tick (`stabilizeOnce`).
+	 *
+	 * The tick's RPCs run pooled (`maintenanceConcurrency` in flight), each already bounded by its
+	 * own RPC budget, so this is the bound on the *tick*, not on any one peer: when it expires,
+	 * in-flight RPCs abort, not-yet-started tasks come back `skipped`, and the tick returns. It is
+	 * the same magnitude as the single-RPC default (`RPC_TIMEOUT_MS`, 5 s), so a tick can be
+	 * consumed by one round of slow peers, never by several rounds of them. Skipped work is not
+	 * lost — the next tick re-derives its candidates from the store and picks it up. It is a child
+	 * of the run signal, so a `stop()` collapses the whole tick at once, and every task compares
+	 * against it through `wasCancelled`, so an expiry records no strike, no backoff and no
+	 * `pingsFail` — exactly as a `stop()` does.
+	 *
+	 * NOTE: active mode ticks every 300 ms, so under mass failure a 5 s budget makes active
+	 * stabilization effectively continuous (the loop awaits the tick before re-arming — true today
+	 * as well). Tighten per mode only if warm-up latency ever measurably suffers.
+	 */
+	private static readonly STABILIZE_TICK_BUDGET_MS = 5000;
+	/**
 	 * Wall-clock cap on the whole leave fan-out inside `stop()`.
 	 *
 	 * The fan-out is `announceFanout`-bounded (Core 8 / Edge 4) plus a small connected-only
@@ -302,6 +321,11 @@ export class FretService implements IFretService, Startable {
 	/** Per-notice budget inside {@link SHUTDOWN_BUDGET_MS}, so one stalled peer cannot eat it whole. */
 	private static readonly LEAVE_NOTICE_TIMEOUT_MS = 1500;
 	private firstStabilizeDone = false;
+	/**
+	 * Plain `++` counters on a single-threaded event loop, so the pooled stabilization tick cannot
+	 * corrupt them. A tick truncated by `STABILIZE_TICK_BUDGET_MS` counts fewer pings/snapshots
+	 * than a serial tick would have — correct, since those RPCs did not happen.
+	 */
 	private readonly diag = {
 		peersDiscovered: 0,
 		snapshotsFetched: 0,
@@ -1214,7 +1238,7 @@ export class FretService implements IFretService, Startable {
 	 * - **`foreign`** — a peer already proved to serve another network can only answer a dial on
 	 *   one of our namespaced protocols with `UnsupportedProtocolError`.
 	 * - **`dead`** — a run of failed contacts says the dial fails outright. Re-probing it is the
-	 *   dead arm of {@link reprobeOffRing}'s job, which is budgeted for exactly that; a maintenance
+	 *   dead arm of {@link reprobeOffRingTargets}'s job, which is budgeted for exactly that; a maintenance
 	 *   fan-out is not, and would re-probe every dead peer on every tick with no backoff.
 	 *
 	 * `unknown` is deliberately *not* doomed — it may yet turn out to be a member.
@@ -1233,6 +1257,10 @@ export class FretService implements IFretService, Startable {
 	 * *prefer* non-connected peers (a connected peer learns via normal exchange), so this
 	 * dials — and therefore has to be the place {@link isDoomedDial} is applied. Checked
 	 * before the token bucket so a doomed target does not burn an announce token.
+	 *
+	 * Deliberately serial, unlike the pooled stabilization tick: the `break` on an empty bucket
+	 * below *is* the rate limit, and pooling would take every token up front before the first
+	 * announce completes.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		const sig = this.runSignal;
@@ -1468,10 +1496,10 @@ export class FretService implements IFretService, Startable {
 	 * No ping, no neighbor fetch, no announce: an inbound leave notice is one small message and
 	 * must not be amplifiable into a fan of outbound RPCs. The healing it used to attempt inline
 	 * is already someone else's job, on a pass that is budgeted, backed off and ordered:
-	 * {@link classifyUnknownPeers} selects exactly the entries inserted here (`unknown`, not
+	 * {@link classifyTargets} selects exactly the entries inserted here (`unknown`, not
 	 * `dead`, off backoff, dialable) on the next stabilization tick and promotes them to `member`
 	 * on a successful ping, while a replacement that is locally `foreign` or `dead` is picked up
-	 * by the matching {@link reprobeOffRing} arm with its backoff intact. The cost is latency —
+	 * by the matching {@link reprobeOffRingTargets} arm with its backoff intact. The cost is latency —
 	 * healing within ≤ 1 tick rather than one RPC round trip — which the departing peer's own
 	 * advance notice makes affordable.
 	 *
@@ -1506,7 +1534,7 @@ export class FretService implements IFretService, Startable {
 				continue;
 			}
 			// Bare `upsert`, deliberately *no* `applyTouch` — unlike the two snapshot-merge paths
-			// (`mergeNeighborSnapshots` / `mergeAnnounceSnapshot`). `applyTouch` writes a
+			// (`fetchAndMergeSnapshot` / `mergeAnnounceSnapshot`). `applyTouch` writes a
 			// sparsity-weighted relevance score, and giving an attacker-named id a non-zero score
 			// lets it outrank a genuine but not-yet-contacted peer when `enforceCapacity` evicts by
 			// relevance. A replacement is a name we were handed, not a peer we contacted: it starts
@@ -1574,7 +1602,7 @@ export class FretService implements IFretService, Startable {
 
 	/**
 	 * Per-message caps for merging a received neighbor/announce snapshot — single source of
-	 * truth shared by the neighbor-fetch merge (`mergeNeighborSnapshots`) and the inbound-announce
+	 * truth shared by the neighbor-fetch merge (`fetchAndMergeSnapshot`) and the inbound-announce
 	 * merge (`mergeAnnounceSnapshot`). Bounds how many remote-supplied ids one message can force
 	 * us to parse + SHA-256 hash + upsert, independent of the RPC byte limit.
 	 */
@@ -1755,63 +1783,118 @@ export class FretService implements IFretService, Startable {
 		await this.enforceCapacity();
 	}
 
-	private async stabilizeOnce(): Promise<void> {
-		this.sweepBoundedMaps();
-		const selfCoord = await hashPeerId(this.node.peerId);
-		const selfStr = this.node.peerId.toString();
-		const nearAll = this.getNeighbors(selfCoord, 'both', Math.max(2, this.cfg.m));
-		const near = nearAll.filter((id) => id !== selfStr && this.isDialable(id));
-		await this.probeNeighborsLatency(near.slice(0, 4));
-		// NOTE: `fetchNeighbors` is connection-only (`requireExisting`), so for an address-known
-		// but non-connected peer it returns an empty snapshot while `snapshotsFetched` still
-		// counts it — a diagnostics overcount, not a correctness problem, and the preceding ping
-		// usually opens the connection anyway. If snapshot counts are ever used for anything
-		// load-bearing, have fetchNeighbors report the skip instead of returning an empty result.
-		// NOTE: the same swallow covers *cancellation* — `fetchNeighbors` catches the abort and
-		// returns an empty snapshot rather than rethrowing, so `mergeNeighborSnapshots`'s
-		// `wasCancelled` break never fires and a stop() mid-tick walks the remaining ids instead
-		// of stopping at the first. Harmless today: `openRpcStream` throws on an aborted signal
-		// before dialing, so the walk opens no streams, merges nothing, and records no strikes — the
-		// effects are the overcount above plus one `fetchNeighbors` error line per remaining id
-		// (bounded by this pass's 4). It stops being harmless if `fetchNeighbors` ever
-		// grows work ahead of that check, or if the pass is widened past its current 4 ids; the fix
-		// is the same one — have `fetchNeighbors` distinguish "skipped" from "empty" — not a second
-		// `stopped` check here.
-		await this.mergeNeighborSnapshots(near.slice(0, 4));
-		await this.classifyUnknownPeers();
-		await this.reprobeExcludedPeers();
+	/**
+	 * Max outbound maintenance RPCs in flight during a stabilization tick. Core 6 / Edge 2 — the
+	 * pre-dial concurrency the *Operating profiles* section of `docs/fret.md` already states for
+	 * each profile, reused rather than re-invented. Edge's 2 is deliberately conservative: an Edge
+	 * tick under mass failure truncates on {@link STABILIZE_TICK_BUDGET_MS} more often than a Core
+	 * one, which is the profile's stated posture ("fewer probes per window"), not an oversight.
+	 */
+	private get maintenanceConcurrency(): number {
+		return this.cfg.profile === 'core' ? 6 : 2;
 	}
 
-	private async probeNeighborsLatency(ids: string[]): Promise<void> {
-		// Captured once, before the loop — see `wasCancelled` for why the *caller's* signal is the
-		// discriminator and why it must be a local.
-		const sig = this.runSignal;
-		for (const id of ids) {
-			try {
-				const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-				this.diag.pingsSent++;
-				if (res.ok) {
-					await this.applySuccess(id, await this.coordOf(id), res.rttMs);
-					this.diag.pingsOk++;
-				} else {
-					// The peer answered — busy, empty, or undecodable, which `sendPing` collapses into
-					// one result — so it is alive. Decay relevance only; never a liveness strike.
-					await this.applyFailure(id, await this.coordOf(id));
-					this.diag.pingsFail++;
-				}
-			} catch (err) {
-				// Our own cancellation says nothing about the peer: no strike, no counter, and no
-				// point continuing the pass.
-				if (this.wasCancelled(sig)) return;
-				// benign during churn - do not warn each tick
-				// console.warn('ping failed for', id, err);
+	/**
+	 * One stabilization tick: two pooled phases under one tick-wide budget.
+	 *
+	 * 1. For each near peer, ping **then** snapshot-fetch (`probeAndFetch`) — chained per peer,
+	 *    pooled across peers. Then one `enforceCapacity` and one announce for everything the
+	 *    merges saw for the first time; neither may run inside the pool (`enforceCapacity` sorts a
+	 *    snapshot of the store and would over-evict if two ran concurrently; a per-task announce
+	 *    would announce a peer once per task).
+	 * 2. The classification and re-probe *targets* — each still selected under its own per-tick
+	 *    budget and ordering (see `classifyTargets` / `reprobeExcludedTargets`; merging the
+	 *    candidate lists would repeal the separate-budgets rule) — pooled together through
+	 *    `probeMembership`.
+	 *
+	 * The four candidate sets are disjoint by construction (near = live member; classify =
+	 * `unknown` non-dead; foreign arm = `foreign` non-dead; dead arm = `dead`), which is what makes
+	 * pooling them safe against the lost-increment race on `applySuccess` / `applyFailure` (see the
+	 * NOTE there); `test/stabilize-concurrency.spec.ts` asserts the disjointness rather than trusting
+	 * it. Wall time is therefore on the order of the slowest single peer, bounded by the tick budget,
+	 * rather than the sum of 14–20 round trips.
+	 */
+	private async stabilizeOnce(): Promise<void> {
+		this.sweepBoundedMaps();
+		const near = await this.nearProbeTargets();
+		// `runSignal` is undefined before the first start(); `deadline` accepts that. `cancel()` in
+		// the finally is mandatory — see `deadline`.
+		const budget = deadline(FretService.STABILIZE_TICK_BUDGET_MS, this.runSignal);
+		try {
+			const pool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
+			const merged = await runPooled(near.map((id) => () => this.probeAndFetch(id, budget.signal)), pool);
+			const announced = fulfilledValues(merged).flat();
+			await this.enforceCapacity();
+			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
+
+			const targets = [...this.classifyTargets(), ...this.reprobeExcludedTargets()];
+			await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
+		} finally {
+			budget.cancel();
+		}
+	}
+
+	/**
+	 * The near peers a tick pings and snapshot-fetches: the dialable live members nearest self on
+	 * either side, at most 4, in **ring order** (closest first) — deliberately not rotated like the
+	 * other candidate lists. These are the peers ring correctness depends on most, so a truncated
+	 * tick should skip the 4th-closest and never the immediate successor; it self-corrects next tick.
+	 */
+	private async nearProbeTargets(): Promise<string[]> {
+		const selfStr = this.node.peerId.toString();
+		const nearAll = this.getNeighbors(await this.selfCoord(), 'both', Math.max(2, this.cfg.m));
+		return nearAll.filter((id) => id !== selfStr && this.isDialable(id)).slice(0, 4);
+	}
+
+	/**
+	 * Ping `id`, then fetch and merge its neighbor snapshot — one pooled task per near peer.
+	 *
+	 * The two stay in this order *per peer*: `fetchNeighbors` is connection-only
+	 * (`requireExisting`), so it returns an empty snapshot unless a connection already exists, and
+	 * it is usually the preceding ping that opens one. Fusing them per peer preserves that
+	 * dependency while the pool parallelises across peers — strictly better than the old "all
+	 * pings, then all fetches", which lost it for any peer whose ping landed late.
+	 *
+	 * Returns the ids the merge saw for the first time, for the tick's single announce.
+	 */
+	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
+		await this.probeNeighborLatency(id, signal);
+		// A tick that ran out of budget mid-ping has nothing to fetch — and `fetchNeighbors` would
+		// swallow the abort into an empty snapshot and count it as fetched.
+		if (this.wasCancelled(signal)) return [];
+		return this.fetchAndMergeSnapshot(id, signal);
+	}
+
+	/**
+	 * Ping one near neighbor and score the outcome. `signal` is the tick budget (a child of the run
+	 * signal) and is an explicit parameter rather than defaulted from `runSignal`, so no call site
+	 * can silently fall back to the run signal and escape the tick budget — see `wasCancelled` for
+	 * why the *caller's* signal is the discriminator.
+	 */
+	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<void> {
+		try {
+			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			this.diag.pingsSent++;
+			if (res.ok) {
+				await this.applySuccess(id, await this.coordOf(id), res.rttMs);
+				this.diag.pingsOk++;
+			} else {
+				// The peer answered — busy, empty, or undecodable, which `sendPing` collapses into
+				// one result — so it is alive. Decay relevance only; never a liveness strike.
+				await this.applyFailure(id, await this.coordOf(id));
 				this.diag.pingsFail++;
-				// The seam decides which evidence this is: a failed negotiation is membership
-				// evidence about a peer that answered (this path is member-gated, so `id` is a
-				// *confirmed* member and the likeliest cause is a restart), while anything else is
-				// a failure to reach it at all and counts toward the dead-state run.
-				await this.noteRpcFailure(id, err);
 			}
+		} catch (err) {
+			// Our own cancellation says nothing about the peer: no strike, no counter.
+			if (this.wasCancelled(signal)) return;
+			// benign during churn - do not warn each tick
+			// console.warn('ping failed for', id, err);
+			this.diag.pingsFail++;
+			// The seam decides which evidence this is: a failed negotiation is membership
+			// evidence about a peer that answered (this path is member-gated, so `id` is a
+			// *confirmed* member and the likeliest cause is a restart), while anything else is
+			// a failure to reach it at all and counts toward the dead-state run.
+			await this.noteRpcFailure(id, err);
 		}
 	}
 
@@ -1826,36 +1909,41 @@ export class FretService implements IFretService, Startable {
 	 * to at most N per tick. It runs only while unknowns exist; in single-network
 	 * steady state every peer becomes member and this is a no-op (no extra traffic).
 	 *
-	 * `dead` unknowns are left to the dead arm of {@link reprobeOffRing} so the two passes never
-	 * probe the same peer in one tick; a successful probe there promotes membership anyway
+	 * `dead` unknowns are left to the dead arm of {@link reprobeOffRingTargets} so the two passes
+	 * never probe the same peer in one tick; a successful probe there promotes membership anyway
 	 * (`applySuccess` applies both the `rpc-success` signal and the resurrection).
+	 *
+	 * Selects and returns only — the probing is the tick's pooled second phase. Candidates are
+	 * ordered by **ascending `lastAccess`** (least-recently-touched first) before the budget slice,
+	 * so a tick truncated by its budget never starves the tail: a probed unknown either succeeds
+	 * (`applySuccess` bumps `lastAccess`) or records backoff (dropping off this list until the
+	 * window passes), so it rotates to the back with no extra bookkeeping. A fixed store order would
+	 * re-derive the same head every tick — the discovery-scan starvation bug, re-introduced here.
 	 */
-	private async classifyUnknownPeers(): Promise<void> {
+	private classifyTargets(): string[] {
 		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
 		// NOTE: scans the whole store (O(table size)) every tick to find unknowns, even
-		// once steady state has none — and the two `reprobeOffRing` arms below each scan it
+		// once steady state has none — and the two `reprobeOffRingTargets` arms each scan it
 		// again, so a tick is three full walks. Fine at C=2048; if capacity or tick rate grows
 		// a lot, do one walk per tick and partition it into the three candidate sets.
 		const unknown = this.store.list().filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && e.state !== 'dead'
 				&& this.getBackoffPenalty(e.id) === 0
 		);
-		if (unknown.length === 0) return;
+		if (unknown.length === 0) return [];
+		unknown.sort((a, b) => a.lastAccess - b.lastAccess);
 		// Only peers we can actually reach are probeable; prefer connected over has-addresses.
+		// (Stable sort, so each group keeps the ascending-`lastAccess` order.)
 		const connected = unknown.filter((e) => this.isConnected(e.id));
 		const reachable = unknown.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id));
-		const targets = [...connected, ...reachable].slice(0, budget);
-		for (const e of targets) {
-			if (this.stopped) break;
-			await this.probeMembership(e.id);
-		}
+		return [...connected, ...reachable].slice(0, budget).map((e) => e.id);
 	}
 
 	/**
 	 * Re-probe the two kinds of peer the ring views exclude, so an exclusion can never be a
 	 * one-way door. Both arms share every mechanic below and differ only in which peers they
-	 * pick and how many per tick, so they run through {@link reprobeOffRing}.
+	 * pick and how many per tick, so they run through {@link reprobeOffRingTargets}.
 	 *
 	 * - **`foreign`** — a same-network peer *mislabeled* foreign (e.g. identify completed before
 	 *   it registered our protocol handlers) is re-admitted by a successful namespaced ping.
@@ -1875,7 +1963,7 @@ export class FretService implements IFretService, Startable {
 	 * peers by its own arithmetic (see the re-probe discussion in `docs/fret.md`), and a merged
 	 * list would put every dead peer behind that queue.
 	 */
-	private async reprobeExcludedPeers(): Promise<void> {
+	private reprobeExcludedTargets(): string[] {
 		// No prune here: sweeping bookkeeping maps is not a probe pass's job, and
 		// `sweepBoundedMaps` at the top of `stabilizeOnce` (this pass's only caller) already ran it
 		// this tick.
@@ -1889,25 +1977,30 @@ export class FretService implements IFretService, Startable {
 		// budget, and the arms are disjoint so no peer is charged twice per tick. If the two ever
 		// need independent cadence (e.g. dead recovery made more eager than foreign re-probing),
 		// they need separate backoff maps, not just separate budgets.
-		await this.reprobeOffRing((e) => e.membership === 'foreign' && e.state !== 'dead', budget);
-		await this.reprobeOffRing((e) => e.state === 'dead', budget);
+		return [
+			...this.reprobeOffRingTargets((e) => e.membership === 'foreign' && e.state !== 'dead', budget),
+			...this.reprobeOffRingTargets((e) => e.state === 'dead', budget),
+		];
 	}
 
 	/**
-	 * One bounded re-probe pass over peers matching `isCandidate` — the shared mechanics of both
-	 * arms of {@link reprobeExcludedPeers}: off-backoff and reachable candidates only, probed
-	 * least-backed-off first, at most `budget` per tick.
+	 * Select one bounded re-probe arm's targets — peers matching `isCandidate` — the shared
+	 * mechanics of both arms of {@link reprobeExcludedTargets}: off-backoff and reachable candidates
+	 * only, least-backed-off first, at most `budget` per tick. Selects and returns only; the probing
+	 * is the tick's pooled second phase.
 	 *
 	 * Bounded and self-limiting: every failed probe records a growing backoff (see
 	 * {@link probeMembership}), so a peer that is genuinely foreign, or genuinely gone, is
 	 * re-probed at most ~once per backoff window (doubling to a 32× cap) rather than every tick.
+	 * That growing factor is also what rotates the list under tick truncation: a probed peer's
+	 * factor grows, so it sorts behind the ones a truncated tick never reached.
 	 */
-	private async reprobeOffRing(isCandidate: (e: PeerEntry) => boolean, budget: number): Promise<void> {
+	private reprobeOffRingTargets(isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
 		const selfStr = this.node.peerId.toString();
 		const candidates = this.store.list().filter(
 			(e) => e.id !== selfStr && this.getBackoffPenalty(e.id) === 0 && isCandidate(e)
 		);
-		if (candidates.length === 0) return;
+		if (candidates.length === 0) return [];
 		// Only reachable peers are probeable; prefer connected over has-addresses.
 		// Within each group, probe the least-backed-off first: backoff factor is a proxy for
 		// "how many times we already confirmed this exclusion", so a freshly-excluded peer
@@ -1917,26 +2010,24 @@ export class FretService implements IFretService, Startable {
 			(this.backoffMap.get(a.id)?.factor ?? 0) - (this.backoffMap.get(b.id)?.factor ?? 0);
 		const connected = candidates.filter((e) => this.isConnected(e.id)).sort(byBackoffFactor);
 		const reachable = candidates.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id)).sort(byBackoffFactor);
-		const targets = [...connected, ...reachable].slice(0, budget);
-		for (const e of targets) {
-			if (this.stopped) break;
-			await this.probeMembership(e.id);
-		}
+		return [...connected, ...reachable].slice(0, budget).map((e) => e.id);
 	}
 
 	/**
 	 * Probe a single peer with a namespaced ping. Success → `applySuccess`, which confirms
 	 * membership *and* clears any contact-failure run, resurrecting a `dead` peer — which is what
-	 * makes both arms of {@link reprobeExcludedPeers} recoveries rather than mere reclassification.
+	 * makes both arms of {@link reprobeExcludedTargets} recoveries rather than mere reclassification.
 	 * Unsupported-protocol → one more strike toward the negotiate-failure threshold (see
 	 * `applyMembershipSignal`), demoting to foreign only once the run completes; any other failure
 	 * is a failed contact and counts toward the dead-state run. Every failure backs off either way
 	 * so we don't hammer an unreachable-but-connected peer every tick.
+	 *
+	 * `signal` is the tick budget (a child of the run signal), an explicit parameter for the same
+	 * reason as on `probeNeighborLatency`.
 	 */
-	private async probeMembership(id: string): Promise<void> {
-		const sig = this.runSignal;
+	private async probeMembership(id: string, signal: AbortSignal | undefined): Promise<void> {
 		try {
-			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
 			this.diag.pingsSent++;
 			if (res.ok) {
 				await this.applySuccess(id, await this.coordOf(id), res.rttMs); // marks member (and clears backoff)
@@ -1949,8 +2040,8 @@ export class FretService implements IFretService, Startable {
 			}
 		} catch (err) {
 			// Our own cancellation: not evidence about the peer, and no backoff either — the next
-			// run should probe it fresh.
-			if (this.wasCancelled(sig)) return;
+			// run (or tick) should probe it fresh.
+			if (this.wasCancelled(signal)) return;
 			this.diag.pingsFail++;
 			// Unsupported protocol is evidence of absence — foreign only once a run of these
 			// accumulates (a peer that has simply not registered its handlers yet produces the
@@ -1964,45 +2055,62 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	private async mergeNeighborSnapshots(ids: string[]): Promise<void> {
+	/**
+	 * Fetch one near neighbor's snapshot and merge it into the store. Returns the ids the merge saw
+	 * for the first time; the caller (`stabilizeOnce`) does the one `enforceCapacity` and the one
+	 * announce for the whole tick — neither belongs in a pooled task (see `stabilizeOnce`).
+	 *
+	 * NOTE: `fetchNeighbors` is connection-only (`requireExisting`), so for an address-known but
+	 * non-connected peer it returns an empty snapshot while `snapshotsFetched` still counts it — a
+	 * diagnostics overcount, not a correctness problem, and the preceding ping in `probeAndFetch`
+	 * usually opens the connection anyway. The same swallow covers *cancellation*: `fetchNeighbors`
+	 * catches an abort and returns an empty snapshot rather than rethrowing, so the `wasCancelled`
+	 * check in the catch below never fires for a fetch cancelled mid-flight and that fetch is
+	 * counted too. Harmless — `openRpcStream` throws on an aborted signal before dialing, so nothing
+	 * is merged and no strike is recorded; each fetch is its own pooled task, so nothing "walks on"
+	 * past it. If snapshot counts are ever used for anything load-bearing, have `fetchNeighbors`
+	 * distinguish "skipped" from "empty" rather than adding a check here.
+	 *
+	 * NOTE: two near peers' snapshots can name the **same** third peer, so with the fetches pooled a
+	 * concurrent `applyTouch(pid)` on it is genuinely possible. Harmless — the field the race can
+	 * lose is `accessCount`, which only feeds a relevance score recomputed on every call (see the
+	 * NOTE on `applySuccess`).
+	 */
+	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		const announced: string[] = [];
-		const sig = this.runSignal;
-		for (const id of ids) {
-			try {
-				// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
-				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal: sig });
-				this.diag.snapshotsFetched++;
-				const caps = this.mergeSnapshotCaps();
-				const succList = (snap.successors ?? []).slice(0, caps.successors);
-				const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
-				for (const pid of [...succList, ...predList]) {
-					try {
-						const coord = await hashPeerId(peerIdFromString(pid));
-						if (!this.store.getById(pid)) announced.push(pid);
-						this.store.upsert(pid, coord);
-						await this.applyTouch(pid, coord);
-					} catch (err) {
-						console.warn('failed to merge neighbor', pid, err);
-					}
+		try {
+			// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
+			const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal });
+			this.diag.snapshotsFetched++;
+			const caps = this.mergeSnapshotCaps();
+			const succList = (snap.successors ?? []).slice(0, caps.successors);
+			const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
+			for (const pid of [...succList, ...predList]) {
+				try {
+					const coord = await hashPeerId(peerIdFromString(pid));
+					if (!this.store.getById(pid)) announced.push(pid);
+					this.store.upsert(pid, coord);
+					await this.applyTouch(pid, coord);
+				} catch (err) {
+					console.warn('failed to merge neighbor', pid, err);
 				}
-				for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
-					try {
-						const coord = base64urlToCoord(s.coord);
-						if (!this.store.getById(s.id)) announced.push(s.id);
-						this.store.upsert(s.id, coord);
-						await this.applyTouch(s.id, coord);
-					} catch (err) { log.error('mergeNeighborSnapshots sample upsert failed for %s - %e', s.id, err) }
-				}
-				// Calibrate local size estimator from snapshot's estimate
-				this.calibrateSizeFromSnapshot(snap, id);
-			} catch (err) {
-				// Cancelled by stop(): the rest of the pass would only throw the same way.
-				if (this.wasCancelled(sig)) break;
-				console.warn('fetchNeighbors failed for', id, err);
 			}
+			for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
+				try {
+					const coord = base64urlToCoord(s.coord);
+					if (!this.store.getById(s.id)) announced.push(s.id);
+					this.store.upsert(s.id, coord);
+					await this.applyTouch(s.id, coord);
+				} catch (err) { log.error('fetchAndMergeSnapshot sample upsert failed for %s - %e', s.id, err) }
+			}
+			// Calibrate local size estimator from snapshot's estimate
+			this.calibrateSizeFromSnapshot(snap, id);
+		} catch (err) {
+			// Our own cancellation (stop() or the tick budget) is not evidence about the peer.
+			if (this.wasCancelled(signal)) return announced;
+			console.warn('fetchNeighbors failed for', id, err);
 		}
-		await this.enforceCapacity();
-		if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
+		return announced;
 	}
 
 	// Snapshots
@@ -2789,4 +2897,9 @@ export class FretService implements IFretService, Startable {
 		await this.enforceCapacity();
 		return count;
 	}
+}
+
+/** The values of the fulfilled results of a pool run; rejected and skipped tasks contribute nothing. */
+function fulfilledValues<T>(results: ReadonlyArray<PoolResult<T>>): T[] {
+	return results.flatMap((r) => (r.status === 'fulfilled' ? [r.value] : []));
 }
