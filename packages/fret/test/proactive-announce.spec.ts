@@ -78,7 +78,7 @@ describe('Proactive announcements', function () {
 		}
 		expect(additionalAnnouncements).to.be.greaterThan(0)
 
-		await Promise.all(services.filter((_, i) => i !== 2).map(s => s.stop()))
+		await Promise.all(services.map(s => s.stop()))
 		await stopAll(nodes.filter((_, i) => i !== 2))
 	})
 

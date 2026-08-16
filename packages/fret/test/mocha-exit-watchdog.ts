@@ -29,6 +29,72 @@ function constructorName(value: unknown): string {
 	return value === null ? 'null' : typeof value;
 }
 
+// Opt-in creation-stack capture for setTimeout/setInterval, gated behind FRET_TEST_EXIT_TRACE
+// because it wraps two Node globals for the whole process — fine for a one-off bisect, not
+// something a normal run should pay for. Turning this on turned a ~6-minute per-file bisect
+// (see tickets/complete/) into a single stack trace naming the leaking call site directly.
+// A future leak can still be found the slow way (bisect files, then --grep within the file);
+// a maintainer may reasonably judge that cost acceptable and leave this off by default forever.
+const TRACE_ENABLED = process.env.FRET_TEST_EXIT_TRACE === '1';
+
+type TimerHandle = ReturnType<typeof setTimeout>;
+
+interface TimerOrigin {
+	kind: 'timeout' | 'interval';
+	stack: string;
+}
+
+const timerOrigins = new Map<TimerHandle, TimerOrigin>();
+
+function captureStack(): string {
+	const stack = new Error('timer created here').stack ?? '(no stack available)';
+	// Drop the "Error: timer created here" line and this function's own frame.
+	return stack.split('\n').slice(2).join('\n');
+}
+
+function installTimerTracing(): void {
+	const nativeSetTimeout = globalThis.setTimeout;
+	const nativeSetInterval = globalThis.setInterval;
+	const nativeClearTimeout = globalThis.clearTimeout;
+	const nativeClearInterval = globalThis.clearInterval;
+
+	globalThis.setTimeout = ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+		const handle = nativeSetTimeout(() => {
+			timerOrigins.delete(handle);
+			callback(...args);
+		}, ms) as TimerHandle;
+		timerOrigins.set(handle, { kind: 'timeout', stack: captureStack() });
+		return handle;
+	}) as typeof globalThis.setTimeout;
+
+	globalThis.setInterval = ((callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+		const handle = nativeSetInterval(callback, ms, ...args) as TimerHandle;
+		timerOrigins.set(handle, { kind: 'interval', stack: captureStack() });
+		return handle;
+	}) as typeof globalThis.setInterval;
+
+	globalThis.clearTimeout = ((handle?: TimerHandle) => {
+		if (handle !== undefined) timerOrigins.delete(handle);
+		return nativeClearTimeout(handle);
+	}) as typeof globalThis.clearTimeout;
+
+	globalThis.clearInterval = ((handle?: TimerHandle) => {
+		if (handle !== undefined) timerOrigins.delete(handle);
+		return nativeClearInterval(handle);
+	}) as typeof globalThis.clearInterval;
+}
+
+if (TRACE_ENABLED) installTimerTracing();
+
+function describeTimerOrigins(): string {
+	if (!TRACE_ENABLED) return '(set FRET_TEST_EXIT_TRACE=1 to capture timer creation stacks)';
+	// hasRef() reflects live ref state; a cleared or fired timer is already out of the map,
+	// but this filter also excludes a deliberately unref'd timer that could not be the leak.
+	const live = [...timerOrigins.entries()].filter(([handle]) => handle.hasRef?.() ?? true);
+	if (live.length === 0) return '(none captured)';
+	return live.map(([, origin]) => `  [${origin.kind}]\n${origin.stack}`).join('\n');
+}
+
 function describeStillOpen(): string {
 	const internals = process as unknown as ProcessInternals;
 	const resources = process.getActiveResourcesInfo();
@@ -43,6 +109,7 @@ function describeStillOpen(): string {
 		`resources: ${resources.join(', ') || '(none)'}`,
 		`handles: ${handles.join(', ') || '(none)'}`,
 		`requests: ${requests.join(', ') || '(none)'}`,
+		`timer origins: ${describeTimerOrigins()}`,
 	].join('\n');
 }
 

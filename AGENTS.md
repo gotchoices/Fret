@@ -44,8 +44,11 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - **Exit watchdog**: `packages/fret/.mocharc.json` requires `test/mocha-exit-watchdog.ts` into
   every mocha run started from `packages/fret/`. If the process is still alive 10s after the last
   test, it dumps what is still open to stderr and fails the run instead of hanging. Widen with
-  `FRET_TEST_EXIT_GRACE_MS`. The `test` script still passes `--exit`, which force-quits before the
-  watchdog can see a leaked handle — see `tickets/` for the unresolved leak that keeps it there.
+  `FRET_TEST_EXIT_GRACE_MS`. The `test` script no longer passes `--exit`, so any future handle
+  leak now fails the run loudly instead of being force-quit over. Set `FRET_TEST_EXIT_TRACE=1` to
+  have the watchdog capture a creation stack per live `setTimeout`/`setInterval` and print the
+  stacks of whatever is still open — off by default since it wraps both globals for the whole
+  process.
 - **Formatting**: tabs for indent (see tsconfig + existing code)
 - **NOTE: don't run `yarn format`.** There is no prettier config, so it applies prettier's
   space-indent defaults and rewrites every source file against the house style above.
