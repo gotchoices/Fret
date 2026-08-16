@@ -9,9 +9,11 @@ export interface NextHopOptions {
 	/** Near-radius threshold; distances ≤ this trigger strict mode. */
 	nearRadius?: Uint8Array;
 	/**
-	 * The caller's own ring coordinate. Supplied, near mode measures strict improvement
+	 * The caller's own ring coordinate. Supplied, the selector measures strict improvement
 	 * against *our* distance to the target rather than only ordering candidates among
-	 * themselves, so a near hop can never be farther from the key than we already are.
+	 * themselves, so the chosen hop can never be farther from the key than we already are.
+	 * This is one rule applied in **both** near and far mode, not a near-mode special case:
+	 * ordering candidates against each other cannot see a pool that is entirely behind us.
 	 * Omitted, the selector behaves as it did before this option existed.
 	 *
 	 * Optional because not every caller is choosing a hop *for itself*, and one that is
@@ -53,50 +55,86 @@ function isNear(dist: Uint8Array, nearRadius: Uint8Array): boolean {
 
 // ── Cost function (fret.md §A5) ──────────────────────────────────────
 //
-// cost(peer) = w_d·normDist − w_conn·connected − w_q·linkQ + w_b·backoff
+// cost(peer) = w_d·adjNormDist + w_b·backoff
 //
-// Weight balance shifts with proximity and confidence:
-//   far  → higher w_conn, lower w_d, slack ε
-//   near → higher w_d, lower w_conn, strict ε ≈ 0
-//   low confidence  → increase w_conn
-//   high confidence → increase w_d
+// where adjNormDist is the peer's normalized log distance to the key *discounted by an
+// allowance stated in binary orders of ring distance* — see `connectedSlackOrders` and
+// `QUALITY_SLACK_ORDERS`.
+//
+// The connection and link-quality preferences used to be flat cost units subtracted
+// beside the distance term (`− w_conn·connected − w_q·linkQ`), and those units were not
+// commensurable with it. `normalizedLogMagnitude` is a log-scale *position*: its whole
+// dynamic range of 1.0 is spread over 256 binary orders, so one order of ring distance is
+// worth only w_d/256 ≈ 0.0016 of cost. A flat w_conn of 0.4 therefore outranked 256 orders
+// — the entire ring — and a connected candidate beat a disconnected one at any separation a
+// real candidate pool can express. Expressing the same preferences as a bounded number of
+// orders keeps the bias and states its price.
+//
+// The cost function is **far mode's** ordering only. Near candidates are ordered by strict
+// distance with the ring's lexicographic peer-id tie-break, which is already a total order,
+// so cost never arbitrates there and is not computed for them.
+//
+// Confidence still shifts the balance:
+//   low confidence  → widen the connected allowance, lower w_d
+//   high confidence → narrow the allowance, raise w_d
 
-interface CostWeights { wD: number; wConn: number; wQ: number; wB: number }
+interface CostWeights { wD: number; wB: number }
 
-function weightsForContext(near: boolean, confidence: number): CostWeights {
-	// Base weights (far)
-	let wD = 0.4;
-	let wConn = 0.4;
-	const wQ = 0.1;
+function farWeights(confidence: number): CostWeights {
+	// NOTE: backoff is deliberately left able to dominate distance. At these weights
+	// (w_d ≈ 0.4, w_b = 0.1) a fully backed-off peer concedes 0.1 / (w_d / 256) ≈ 64 binary
+	// orders of ring distance, far more than the connected allowance below. That is the
+	// intended reading rather than an accident of scale: a peer in backoff failed us
+	// recently and may be gone, so a hop through it likely spends a full timeout and buys no
+	// progress at all — worse than a working hop that is merely farther. Revisit if backoff
+	// peers are ever measured to recover fast enough that skipping them costs more hops than
+	// it saves.
 	const wB = 0.1;
 
-	if (near) {
-		// Strict distance when close to target
-		wD = 0.7;
-		wConn = 0.1;
-	}
+	// Confidence adjustment: a confident size estimate makes the distance term more
+	// trustworthy. The *connected* half of this adjustment now lives in `connectedSlackOrders`.
+	const wD = Math.max(0.1, 0.4 + (confidence - 0.5) * 0.2); // cAdj range [-0.1, 0.1]
 
-	// Confidence adjustment: low confidence → rely on connections, not distance
-	const cAdj = (confidence - 0.5) * 0.2; // range [-0.1, 0.1]
-	wD = Math.max(0.1, wD + cAdj);
-	wConn = Math.max(0.05, wConn - cAdj);
-
-	return { wD, wConn, wQ, wB };
+	return { wD, wB };
 }
+
+/**
+ * Connected-first bias, as the number of binary orders of ring distance a connected peer
+ * may give up against a disconnected one. 8 orders is one byte, matching the legacy path's
+ * `connectedToleranceBytes` default of 1, so both selector paths agree on what "slightly
+ * farther" means.
+ *
+ * NOTE: 8 ± 4 is reasoned from that legacy correspondence, not measured — nothing under
+ * `test/simulation/` drives the shipped selector today, so there is no routing-success or
+ * hop-count number to tune against. Retune once such a harness exists.
+ */
+const CONNECTED_SLACK_ORDERS = 8;
+const CONNECTED_SLACK_CONFIDENCE_SWING = 4;
+
+/** Low confidence widens the allowance (trust the link we have); high confidence narrows it. */
+function connectedSlackOrders(confidence: number): number {
+	return CONNECTED_SLACK_ORDERS + (0.5 - confidence) * 2 * CONNECTED_SLACK_CONFIDENCE_SWING;
+}
+
+/**
+ * Link-quality allowance: a perfect-quality peer may sit this many binary orders farther
+ * than a zero-quality one. Deliberately smaller than the connection allowance — quality is
+ * the softer signal, and at the old flat w_q of 0.1 it was worth 64 orders, a quarter of
+ * the ring.
+ */
+const QUALITY_SLACK_ORDERS = 4;
 
 function cost(
 	normDist: number,
-	connected: boolean,
-	linkQ: number,
+	slackOrders: number,
+	totalOrders: number,
 	backoff: number,
 	w: CostWeights
 ): number {
-	return (
-		w.wD * normDist
-		- w.wConn * (connected ? 1 : 0)
-		- w.wQ * linkQ
-		+ w.wB * backoff
-	);
+	// The allowance discounts *distance* rather than sitting beside it, which is what makes
+	// it commensurable: it moves the candidate a stated number of binary orders closer.
+	const adjNormDist = normDist - slackOrders / totalOrders;
+	return w.wD * adjNormDist + w.wB * backoff;
 }
 
 // ── Public API ───────────────────────────────────────────────────────
@@ -143,66 +181,72 @@ function chooseNextHopCost(
 	const backoff = opts.backoffPenalty ?? (() => 0);
 	const nearRadius = opts.nearRadius!;
 
-	// Depends only on (near, confidence), so there are two possible results for the whole
-	// call; computing it per candidate re-derived the same two values N times. In near mode
-	// the resulting cost is only ever a tertiary tie-break, so most of that work was discarded.
-	const nearW = weightsForContext(true, confidence);
-	const farW = weightsForContext(false, confidence);
-
-	// Our own distance to the target, when the caller told us where it sits. Only a *near*
-	// self constrains the choice; see the strict-improvement filter below.
+	// Our own distance to the target, when the caller told us where it sits. Constrains the
+	// choice in every mode; see the strict-improvement filter below.
 	const selfDist = opts.selfCoord ? minDistance(opts.selfCoord, targetCoord) : undefined;
-	const nearSelfDist = selfDist !== undefined && isNear(selfDist, nearRadius) ? selfDist : undefined;
 
-	type Scored = { id: string; dist: Uint8Array; near: boolean; connected: boolean; costVal: number };
+	type Scored = { id: string; dist: Uint8Array; near: boolean };
 	const scored: Scored[] = [];
 
 	for (const id of candidates) {
 		const entry = store.getById(id);
 		if (!entry) continue;
 		const dist = minDistance(entry.coord, targetCoord);
-		const near = isNear(dist, nearRadius);
-		const connected = isConnected(id);
-		const w = near ? nearW : farW;
-		const costVal = cost(normalizedLogMagnitude(dist), connected, linkQ(id), backoff(id), w);
-		scored.push({ id, dist, near, connected, costVal });
+		scored.push({ id, dist, near: isNear(dist, nearRadius) });
 	}
 
 	if (scored.length === 0) return undefined;
 
+	// Strict improvement against *our own* distance, in **every** mode. A candidate no closer
+	// than we already are moves the message backwards, which ordering candidates among
+	// themselves cannot see. Applied before the near/far partition, so it is one rule rather
+	// than a near-mode special case — and it subsumes the near-only filter it replaced:
+	//
+	//  • self near, some near candidate closer → that candidate is closer than self and so is
+	//    itself near; it survives and near mode picks it. Unchanged.
+	//  • self near, no near candidate closer → every far candidate has dist > nearRadius ≥
+	//    selfDist, so the filter removes those too and the answer is `undefined`. That is the
+	//    deliberate "no fall-through to far mode", now falling out of the general rule.
+	//  • self far, a near candidate exists → dist ≤ nearRadius < selfDist, so it survives.
+	//    Unchanged.
+	//  • self far, all candidates far → a candidate behind us is now ineligible. The fix.
+	//
+	// The floor is strict (`dist < selfDist`), not slack past self: the subsumption above
+	// depends on it, and slack belongs among candidates, never against our own position.
+	// Both callers handle `undefined` — it becomes a NearAnchor reply or an `exhausted`
+	// lookup. A forwarding node sits at index ≥ 2 of the key's cohort, so a strictly-improving
+	// hop normally exists; no hop means the closer peers were all excluded as breadcrumbs or
+	// as undialable, i.e. a genuinely exhausted local view.
+	const eligible = selfDist !== undefined ? scored.filter(s => lexLess(s.dist, selfDist)) : scored;
+	if (eligible.length === 0) return undefined;
+
 	// Partition: near-mode candidates use strict distance ordering;
 	// far-mode candidates use cost function.
-	let nearCandidates = scored.filter(s => s.near);
-	const farCandidates = scored.filter(s => !s.near);
+	const nearCandidates = eligible.filter(s => s.near);
+	const farCandidates = eligible.filter(s => !s.near);
 
-	if (nearSelfDist !== undefined) {
-		// Strict improvement against *our own* distance: a candidate no closer than we already
-		// are moves the message backwards, which ordering candidates among themselves cannot see.
-		nearCandidates = nearCandidates.filter(s => lexLess(s.dist, nearSelfDist));
-		// Deliberately no fall-through to far mode: every far candidate sits beyond
-		// nearRadius ≥ nearSelfDist, so it is guaranteed worse than staying put. Both callers
-		// handle `undefined` — it becomes a NearAnchor reply or an `exhausted` lookup.
-		if (nearCandidates.length === 0) return undefined;
-	}
-
-	// Near mode: strict distance improvement (ε ≈ 0); connection only breaks ties
+	// Near mode: strict distance improvement (ε ≈ 0), with the ring's lexicographic peer-id
+	// tie-break for equal distances (docs/fret.md, "Identifier space and hashing"). That
+	// tie-break makes `betterByDist` a total order over distinct ids, so connectedness and
+	// cost never arbitrate here — the allowance applies to far mode alone.
 	if (nearCandidates.length > 0) {
-		nearCandidates.sort((a, b) => {
-			if (betterByDist(a.id, a.dist, b.id, b.dist)) return -1;
-			if (betterByDist(b.id, b.dist, a.id, a.dist)) return 1;
-			// Equal distance: prefer connected, then lower cost
-			if (a.connected !== b.connected) return a.connected ? -1 : 1;
-			return a.costVal - b.costVal;
-		});
+		nearCandidates.sort((a, b) => (betterByDist(a.id, a.dist, b.id, b.dist) ? -1 : 1));
 		return nearCandidates[0]!.id;
 	}
 
-	// Far mode: use cost function
-	farCandidates.sort((a, b) => {
+	// Far mode: use the cost function, evaluated once per surviving far candidate.
+	const w = farWeights(confidence);
+	const connectedSlack = connectedSlackOrders(confidence);
+	const farScored = farCandidates.map(s => {
+		const slack = (isConnected(s.id) ? connectedSlack : 0) + linkQ(s.id) * QUALITY_SLACK_ORDERS;
+		const costVal = cost(normalizedLogMagnitude(s.dist), slack, s.dist.length * 8, backoff(s.id), w);
+		return { ...s, costVal };
+	});
+	farScored.sort((a, b) => {
 		if (a.costVal !== b.costVal) return a.costVal - b.costVal;
 		return betterByDist(a.id, a.dist, b.id, b.dist) ? -1 : 1;
 	});
-	return farCandidates[0]!.id;
+	return farScored[0]!.id;
 }
 
 function chooseNextHopLegacy(
