@@ -1,10 +1,12 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
 import { hashKey, hashPeerId } from '../src/ring/hash.js'
+import { minDistance, lexLess } from '../src/ring/distance.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
@@ -45,22 +47,6 @@ function countDials(node: Libp2p): () => number {
 function seedMember(svc: CoreFretService, id: string, coord: Uint8Array): void {
 	svc.getStore().upsert(id, coord)
 	svc.getStore().setMembership(id, 'member')
-}
-
-/** Ring coordinate `delta` steps clockwise of `base` (offset carried in the most-significant byte). */
-function offsetCoord(base: Uint8Array, delta: number): Uint8Array {
-	const c = new Uint8Array(base)
-	c[0] = (c[0]! + delta) & 0xff
-	return c
-}
-
-/**
- * Coordinate half a ring away from `base` (top bit flipped). Used for the test node's own
- * position so it is never in-cluster for the key, and so `shouldIncludePayload` stays false —
- * the anchor-resend path only runs when the payload was withheld.
- */
-function oppositeCoord(base: Uint8Array): Uint8Array {
-	return offsetCoord(base, 128)
 }
 
 const base64url = (s: string): string => u8ToString(u8FromString(s), 'base64url')
@@ -192,6 +178,9 @@ describe('dialability guard on outbound RPC', function () {
 	// Dialability is a hard filter on the candidate list, so the selector picks the best
 	// *reachable* hop instead of dead-ending on an unreachable nearest one. Ghosts sit closest
 	// to the key; B is farther but connected, and must be the hop that gets used.
+	// NOTE: the forward below is a real request/response over two libp2p nodes, bounded by
+	// `readAllBounded`'s 5s overall read deadline (src/rpc/protocols.ts) with no retry. Not
+	// observed to fail; this spec's success still depends on that deadline in principle.
 	it('routeAct forwards to the reachable candidate when nearer ones are undialable', async () => {
 		const nodeA = await createMemNode(); await nodeA.start()
 		const nodeB = await createMemNode(); await nodeB.start()
@@ -206,10 +195,20 @@ describe('dialability guard on outbound RPC', function () {
 			const idB = nodeB.peerId.toString()
 			const ghostSucc = await ghostPeerId()
 			const ghostPred = await ghostPeerId()
-			seedMember(svcA, ghostSucc, offsetCoord(coord, 1))
-			seedMember(svcA, ghostPred, offsetCoord(coord, -1))
-			seedMember(svcA, idB, offsetCoord(coord, 2))
-			seedMember(svcA, idA, oppositeCoord(coord))
+			seedMember(svcA, ghostSucc, ringOffset(coord, 1))
+			seedMember(svcA, ghostPred, ringOffset(coord, -1))
+			const idBCoord = ringOffset(coord, 2)
+			seedMember(svcA, idB, idBCoord)
+			// Seed self at its real ring position, not a fabricated one — the store entry and
+			// the selector must agree on where self actually sits (see docs/fret.md, dialability
+			// self-position note). A uniformly random self coordinate is essentially never among
+			// the key's two nearest members when candidates sit this close to the key, so this
+			// stays out-of-cluster exactly as the old fabricated position did.
+			const selfCoord = await hashPeerId(nodeA.peerId)
+			seedMember(svcA, idA, selfCoord)
+			// Assert the premise `routeAct` relies on instead of assuming it: self must be
+			// farther from the key than the hop we expect it to forward to.
+			expect(lexLess(minDistance(idBCoord, coord), minDistance(selfCoord, coord)), 'premise: hop nearer than self').to.equal(true)
 			const dials = countDials(nodeA)
 
 			const res = await svcA.routeAct({
@@ -246,9 +245,13 @@ describe('dialability guard on outbound RPC', function () {
 			const coord = await hashKey(u8FromString(keyB64, 'base64url'))
 			const idB = nodeB.peerId.toString()
 			// Two ghosts each side, so the alternating walk fills all four cohort slots.
-			for (const delta of [1, 2, -1, -2]) seedMember(svcA, await ghostPeerId(), offsetCoord(coord, delta))
-			seedMember(svcA, idB, offsetCoord(coord, 5))
-			seedMember(svcA, nodeA.peerId.toString(), oppositeCoord(coord))
+			for (const delta of [1, 2, -1, -2]) seedMember(svcA, await ghostPeerId(), ringOffset(coord, delta))
+			const idBCoord = ringOffset(coord, 5)
+			seedMember(svcA, idB, idBCoord)
+			// Seed self at its real ring position — see the route-key spec above for why.
+			const selfCoord = await hashPeerId(nodeA.peerId)
+			seedMember(svcA, nodeA.peerId.toString(), selfCoord)
+			expect(lexLess(minDistance(idBCoord, coord), minDistance(selfCoord, coord)), 'premise: hop nearer than self').to.equal(true)
 			const dials = countDials(nodeA)
 
 			await svcA.routeAct({
@@ -274,9 +277,9 @@ describe('dialability guard on outbound RPC', function () {
 			await nodeA.peerStore.merge(nodeB.peerId, { multiaddrs: nodeB.getMultiaddrs() })
 			await (svcA as any).seedFromPeerStore()
 			const selfCoord = await hashPeerId(nodeA.peerId)
-			seedMember(svcA, await ghostPeerId(), offsetCoord(selfCoord, 1))
-			seedMember(svcA, await ghostPeerId(), offsetCoord(selfCoord, -1))
-			seedMember(svcA, nodeB.peerId.toString(), offsetCoord(selfCoord, 2))
+			seedMember(svcA, await ghostPeerId(), ringOffset(selfCoord, 1))
+			seedMember(svcA, await ghostPeerId(), ringOffset(selfCoord, -1))
+			seedMember(svcA, nodeB.peerId.toString(), ringOffset(selfCoord, 2))
 			expect(nodeA.getConnections(nodeB.peerId).length, 'premise: not connected').to.equal(0)
 			const dials = countDials(nodeA)
 
@@ -316,9 +319,9 @@ describe('dialability guard on outbound RPC', function () {
 			const svcA = new CoreFretService(nodeA, { profile: 'core', k: 7 })
 			const key = u8FromString('lookup-key')
 			const coord = await hashKey(key)
-			seedMember(svcA, await ghostPeerId(), offsetCoord(coord, 1))
-			seedMember(svcA, await ghostPeerId(), offsetCoord(coord, -1))
-			seedMember(svcA, nodeA.peerId.toString(), oppositeCoord(coord))
+			seedMember(svcA, await ghostPeerId(), ringOffset(coord, 1))
+			seedMember(svcA, await ghostPeerId(), ringOffset(coord, -1))
+			seedMember(svcA, nodeA.peerId.toString(), await hashPeerId(nodeA.peerId))
 			const dials = countDials(nodeA)
 
 			const events: RouteProgress[] = []
@@ -348,8 +351,8 @@ describe('dialability guard on outbound RPC', function () {
 			const svcA = new CoreFretService(nodeA, { profile: 'core', k: 7, networkName: 'anchor-net' })
 			const key = u8FromString('anchor-key')
 			const coord = await hashKey(key)
-			seedMember(svcA, nodeB.peerId.toString(), offsetCoord(coord, 1))
-			seedMember(svcA, nodeA.peerId.toString(), oppositeCoord(coord))
+			seedMember(svcA, nodeB.peerId.toString(), ringOffset(coord, 1))
+			seedMember(svcA, nodeA.peerId.toString(), await hashPeerId(nodeA.peerId))
 			const dials = countDials(nodeA)
 
 			const events: RouteProgress[] = []
