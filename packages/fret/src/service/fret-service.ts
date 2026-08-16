@@ -1761,6 +1761,15 @@ export class FretService implements IFretService, Startable {
 		// counts it — a diagnostics overcount, not a correctness problem, and the preceding ping
 		// usually opens the connection anyway. If snapshot counts are ever used for anything
 		// load-bearing, have fetchNeighbors report the skip instead of returning an empty result.
+		// NOTE: the same swallow covers *cancellation* — `fetchNeighbors` catches the abort and
+		// returns an empty snapshot rather than rethrowing, so `mergeNeighborSnapshots`'s
+		// `wasCancelled` break never fires and a stop() mid-tick walks the remaining ids instead
+		// of stopping at the first. Harmless today: `openRpcStream` throws on an aborted signal
+		// before dialing, so the walk opens no streams, merges nothing, and records no strikes —
+		// the only effect is the overcount above. It stops being harmless if `fetchNeighbors` ever
+		// grows work ahead of that check, or if the pass is widened past its current 4 ids; the fix
+		// is the same one — have `fetchNeighbors` distinguish "skipped" from "empty" — not a second
+		// `stopped` check here.
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
 		await this.classifyUnknownPeers();
 		await this.reprobeExcludedPeers();

@@ -1,13 +1,24 @@
 import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
+import type { PeerId, Stream } from '@libp2p/interface'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { createMemNode } from './helpers/libp2p.js'
+import { waitFor } from './helpers/wait-for.js'
 import { FretService } from '../src/service/fret-service.js'
 import { makeProtocols, isUnsupportedProtocolError } from '../src/rpc/protocols.js'
 import { sendPing } from '../src/rpc/ping.js'
+import { hashPeerId } from '../src/ring/hash.js'
 
 const NETWORK = 'lifecycle-test'
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
+
+/**
+ * `private static` on the service. Read off the class rather than restating the number, so the
+ * shutdown bound below tracks the constant instead of drifting from it.
+ */
+const { SHUTDOWN_BUDGET_MS } = FretService as unknown as { SHUTDOWN_BUDGET_MS: number }
 
 const PROTOCOLS = makeProtocols(NETWORK)
 /** Protocols this service registers, so assertions ignore libp2p's own handlers. */
@@ -199,5 +210,177 @@ describe('FretService start/stop lifecycle', function () {
 		await svc.stop()
 		await svc.stop()
 		expect(leaves, 'leave fan-out runs once per started run').to.equal(1)
+	})
+
+	it('stays inside its shutdown budget when a dial hangs, and still notifies reachable neighbors', async () => {
+		// The leave fan-out runs *after* stop() aborted the run signal, so it carries its own
+		// budget instead. This asserts that budget actually binds: one neighbor whose dial never
+		// settles on its own must not hold the teardown open, and must not cost the reachable
+		// neighbor its notice.
+		const peer = await createMemNode()
+		await peer.start()
+		const peerSvc = new FretService(peer, { networkName: NETWORK })
+		const originalDial = node.dialProtocol.bind(node)
+		let ghostDials = 0
+		try {
+			await peerSvc.start()
+			// Connected, hence dialable and not a doomed dial: the notice to this one must land.
+			await node.dial(peer.getMultiaddrs()[0]!)
+
+			// A peer libp2p holds an address for but that nothing answers at. Seeded through the
+			// peerStore rather than the service's `addressKnown` set because the stabilization tick
+			// rebuilds that set wholesale from the peerStore on every pass — a directly-poked entry
+			// would be dropped again before stop() ran.
+			const ghost = await createMemNode()
+			await ghost.start()
+			const ghostId = ghost.peerId.toString()
+			await node.peerStore.merge(ghost.peerId, { multiaddrs: ghost.getMultiaddrs() })
+			await ghost.stop()
+
+			// The tick's own probe passes would dial the ghost on their own schedule; the
+			// assertions here are about stop(), so keep the loop from racing them. `seedFromPeerStore`
+			// is deliberately left alone — it is what puts both peers in the ring.
+			;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {}
+			await svc.start()
+			expect(svc.getStore().getById(ghostId), 'ghost seeded into the routing table').to.not.equal(undefined)
+
+			// Settles only on signal abort — libp2p's `AbortOptions` contract for `dialProtocol`, and
+			// therefore the only thing that can end a stalled open (see `hangsUntilAbort` in
+			// `rpc.protocols.spec.ts`). Given no signal it hangs forever, which is the pre-budget
+			// behavior this test exists to rule out. Only the ghost is intercepted; the connected
+			// peer never reaches `dialProtocol` at all, since `openRpcStream` reuses its connection.
+			;(node as unknown as { dialProtocol: unknown }).dialProtocol = (pid: PeerId, protocols: string[], opts: { signal?: AbortSignal }) => {
+				if (pid.toString() !== ghostId) return originalDial(pid, protocols, opts)
+				ghostDials++
+				return new Promise<Stream>((_resolve, reject) => {
+					const signal = opts?.signal
+					if (signal == null) return
+					const fail = (): void => { reject(new Error('ghost dial aborted')) }
+					if (signal.aborted) { fail(); return }
+					signal.addEventListener('abort', fail, { once: true })
+				})
+			}
+
+			// `registerLeave` bound the closure `(notice) => this.handleLeave(notice)` at start(), so
+			// overriding `handleLeave` now is still picked up. Counting here beats asserting "the
+			// departing id left the receiver's store": the receiver re-seeds from its own peerStore
+			// every tick and would put the id straight back.
+			let leaves = 0
+			const originalHandleLeave = (peerSvc as unknown as { handleLeave: (n: unknown) => Promise<void> }).handleLeave.bind(peerSvc)
+			;(peerSvc as unknown as { handleLeave: unknown }).handleLeave = async (n: unknown) => { leaves++; await originalHandleLeave(n) }
+
+			const started = Date.now()
+			await svc.stop()
+			const elapsed = Date.now() - started
+
+			// Generous on purpose (the per-notice timeout on top of the whole-fan-out budget): the
+			// property under test is "bounded at all", not scheduler precision. Do not swap it for a
+			// bare "stop() resolved" — that is exactly the assertion an unbounded dial would pass.
+			expect(elapsed, `stop() elapsed ${elapsed}ms`).to.be.at.most(SHUTDOWN_BUDGET_MS + 1500)
+			expect(ghostDials, 'the hanging dial was actually attempted').to.be.at.least(1)
+			// `sendLeave` is write-only — it does not await the remote handler — so the delivery is
+			// observed after stop() returns rather than by the time it does.
+			await waitFor(() => leaves === 1, 5000, 25, 'leave notice delivered to the reachable neighbor')
+			expect(leaves, 'exactly one notice per reachable neighbor').to.equal(1)
+		} finally {
+			;(node as unknown as { dialProtocol: unknown }).dialProtocol = originalDial
+			try { await peerSvc.stop() } catch { /* already stopped */ }
+			await peer.stop()
+		}
+	})
+
+	it('issues no dials and strikes nobody when stop() lands mid-tick', async () => {
+		// The tick captures `runSignal` inside each pass, and `stabilizeOnce` re-checks nothing
+		// between them — so an interrupted tick is stopped by the *signal*, not by a flag. That is
+		// why `stop()` keeps the aborted controller instead of nulling it; without this test the
+		// service can silently regress to a null and every pass would resume dialing after stop().
+		const store = svc.getStore()
+		// A well-formed, address-known member, so the resumed tick has a genuine probe target and
+		// the "nothing happened" assertions below are not vacuous.
+		const targetPid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'))
+		const targetId = targetPid.toString()
+		store.upsert(targetId, await hashPeerId(targetPid))
+		store.setMembership(targetId, 'member')
+		;(svc as unknown as { setAddressKnown: (id: string, known: boolean) => void }).setAddressKnown(targetId, true)
+
+		// Park `seedFromPeerStore`: it is the only awaited seam ahead of every signal capture, so
+		// parking there is what puts stop() *before* the passes rather than after them. start()
+		// awaits it once itself before arming the loop, so the second call is the tick's — that is
+		// the one to park. The stub does no seeding: the real one rebuilds `addressKnown` wholesale
+		// from the peerStore, which would drop the synthetic target above.
+		let seedCalls = 0
+		let unpark: (() => void) | undefined
+		const parked = new Promise<void>((tickEntered) => {
+			;(svc as unknown as { seedFromPeerStore: () => Promise<void> }).seedFromPeerStore = async () => {
+				if (++seedCalls < 2) return
+				tickEntered()
+				await new Promise<void>((resume) => { unpark = resume })
+			}
+		})
+		// Count completions of the real pass, so "the tick resumed and touched nothing" is
+		// distinguishable from "the tick never resumed".
+		let ticksCompleted = 0
+		const realStabilizeOnce = (svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce.bind(svc)
+		;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {
+			await realStabilizeOnce()
+			ticksCompleted++
+		}
+
+		await svc.start()
+		await parked
+
+		const selfCoord = await hashPeerId(node.peerId)
+		const ring = (svc as unknown as { getNeighbors: (c: Uint8Array, s: string, n: number) => string[] }).getNeighbors(selfCoord, 'both', 8)
+		expect(ring, 'seeded peer is a live probe target for the parked tick').to.include(targetId)
+
+		await svc.stop()
+		const before = { ...svc.getDiagnostics() }
+
+		// The target has no connection, so `dialProtocol` is the only way any pass could reach it —
+		// which makes this the direct form of "issues no dials", rather than inferring it from a
+		// diagnostics counter. Installed after stop() so it measures the resumed tick alone.
+		let dials = 0
+		const originalDial = node.dialProtocol.bind(node)
+		;(node as unknown as { dialProtocol: unknown }).dialProtocol = (pid: PeerId, protocols: string[], opts: unknown) => {
+			dials++
+			return originalDial(pid, protocols, opts as never)
+		}
+		try {
+			unpark!()
+			await delay(100)
+		} finally {
+			;(node as unknown as { dialProtocol: unknown }).dialProtocol = originalDial
+		}
+
+		expect(ticksCompleted, 'the interrupted tick ran its passes to completion').to.equal(1)
+		expect(dials, 'no dials issued by the resumed tick').to.equal(0)
+		const diag = svc.getDiagnostics()
+		expect(diag.pingsSent, 'no pings issued after stop()').to.equal(before.pingsSent)
+		expect(diag.pingsFail, 'no ping failures recorded after stop()').to.equal(before.pingsFail)
+		// NOTE: `snapshotsFetched` is deliberately *not* asserted unchanged. `fetchNeighbors`
+		// swallows the abort into an empty snapshot rather than rethrowing, so the counter still
+		// ticks for a fetch that never opened a stream — the same diagnostics overcount already
+		// noted at `stabilizeOnce`'s call site. Nothing is merged and nothing is dialed, which is
+		// what `dials` above pins.
+		// The peer is healthy; our own cancellation is not evidence about it.
+		expect(store.getById(targetId)?.contactFailures, 'no contact strike against a healthy peer').to.equal(0)
+		expect(store.getById(targetId)?.state, 'healthy peer not marked dead').to.not.equal('dead')
+		// stop() clears the backoff map *before* the tick resumes, so an entry here is the tick's doing.
+		const backoff = (svc as unknown as { backoffMap: { get: (id: string) => unknown } }).backoffMap
+		expect(backoff.get(targetId), 'no backoff recorded against a peer we never dialed').to.equal(undefined)
+	})
+
+	it('mints a fresh run signal per start and leaves the stopped run aborted', async () => {
+		const signal = (): AbortSignal | undefined => (svc as unknown as { runSignal: AbortSignal | undefined }).runSignal
+
+		expect(signal(), 'no run signal before the first start()').to.equal(undefined)
+		await svc.start()
+		expect(signal()?.aborted, 'live run signal while running').to.equal(false)
+		await svc.stop()
+		// The aborted controller is deliberately kept rather than nulled, so a late read from an
+		// interrupted tick still reports "cancelled" instead of "no signal at all".
+		expect(signal()?.aborted, 'run signal aborted by stop()').to.equal(true)
+		await svc.start()
+		expect(signal()?.aborted, 'restart mints a fresh controller').to.equal(false)
 	})
 })
