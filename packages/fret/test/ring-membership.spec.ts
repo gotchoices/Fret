@@ -1,6 +1,7 @@
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService, selectDiverseSample } from '../src/service/fret-service.js'
 import { DigitreeStore, type PeerEntry, type MembershipState } from '../src/store/digitree-store.js'
 import { assembleCohort } from '../src/service/cohort.js'
@@ -421,17 +422,6 @@ describe('Foreign re-probe backoff growth', function () {
 		expect(bo.has(id)).to.equal(false, 'evicted peer-y entry must also be pruned')
 	})
 })
-
-// Default timeout is deliberately well under the suite's per-test budget: several tests chain
-// three waits, and a wait that silently runs to the full budget would surface as an opaque mocha
-// timeout instead of the precise assertion that follows each call.
-async function waitFor(predicate: () => boolean, timeoutMs = 12000, stepMs = 25): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
-		if (predicate()) return
-		await new Promise((r) => setTimeout(r, stepMs))
-	}
-}
 
 /** Stub out a service's outbound stabilization pass so it can only classify off inbound signals. */
 function disableProbing(svc: CoreFretService): void {

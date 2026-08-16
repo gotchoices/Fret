@@ -1,6 +1,7 @@
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { createIdentifyNode, stopAll } from './helpers/libp2p.js'
+import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
 import type { Libp2p } from 'libp2p'
@@ -24,14 +25,6 @@ import type { Libp2p } from 'libp2p'
 /** Stub out the observer's outbound stabilization pass so classification can only come from identify. */
 function disableProbing(svc: CoreFretService): void {
 	;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {}
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 10000, stepMs = 25): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
-		if (predicate()) return
-		await new Promise((r) => setTimeout(r, stepMs))
-	}
 }
 
 describe('Ring membership classification (identify-driven)', function () {
