@@ -56,12 +56,16 @@ function seedMember(svc: CoreFretService, id: string, coord: Uint8Array): void {
  * The ghosts are addressless on purpose: when a spec expects a forward, the forward must find no
  * dialable hop, so the observable outcome is the NearAnchor fallback and a dial count of zero.
  */
-async function seedGhostsBefore(svc: CoreFretService, coord: Uint8Array, index: number): Promise<void> {
+async function seedGhostsBefore(svc: CoreFretService, coord: Uint8Array, index: number): Promise<string[]> {
+	const ids: string[] = []
 	for (let i = 0; i < index; i++) {
 		const step = Math.floor(i / 2) + 1
 		const delta = i % 2 === 0 ? step : -step
-		seedMember(svc, await ghostPeerId(), ringOffset(coord, delta))
+		const id = await ghostPeerId()
+		seedMember(svc, id, ringOffset(coord, delta))
+		ids.push(id)
 	}
+	return ids
 }
 
 const base64url = (s: string): string => u8ToString(u8FromString(s), 'base64url')
@@ -70,15 +74,21 @@ const base64url = (s: string): string => u8ToString(u8FromString(s), 'base64url'
 async function buildAt(node: Libp2p, keyB64: string, index: number): Promise<{
 	svc: CoreFretService
 	coord: Uint8Array
+	ghosts: string[]
 }> {
 	const svc = new CoreFretService(node, { profile: 'core', k: 7 })
 	const coord = await hashKey(u8FromString(keyB64, 'base64url'))
-	await seedGhostsBefore(svc, coord, index)
+	const ghosts = await seedGhostsBefore(svc, coord, index)
 	// Self must sit at its *real* ring position: the in-cluster test reads the store's self
 	// entry while the forwarding floor reads `selfCoord()` (the hashed peer id), and a fabricated
 	// coordinate makes the two disagree — see the note at test/dialability.spec.ts:202.
 	seedMember(svc, node.peerId.toString(), await hashPeerId(node.peerId))
-	return { svc, coord }
+	// Assert the premise rather than trusting the seeding arithmetic above: if a future change to
+	// the cohort walk moves self, every spec below should fail *here*, naming the real cause,
+	// instead of failing at the gate and reading as a membership-window regression.
+	expect(svc.neighborDistance(node.peerId.toString(), coord, index + 1),
+		`premise: self sits at cohort index ${index}`).to.equal(index)
+	return { svc, coord, ghosts }
 }
 
 /**
@@ -167,7 +177,7 @@ describe('in-cluster membership window', function () {
 		const nodeB = await createMemNode(); await nodeB.start()
 		try {
 			const keyB64 = base64url('width-index-3-digest')
-			const { svc, coord } = await buildAt(nodeA, keyB64, 3)
+			const { svc, coord, ghosts } = await buildAt(nodeA, keyB64, 3)
 			await seedDialableDecoy(svc, nodeA, nodeB, coord)
 			const handler = countingHandler(svc)
 			const dials = countDials(nodeA)
@@ -175,7 +185,12 @@ describe('in-cluster membership window', function () {
 			const res = await svc.routeAct(msg(keyB64))
 
 			expect('anchors' in res, 'NearAnchor reply').to.equal(true)
-			expect((res as { anchors: string[] }).anchors, 'anchors are real hints').to.not.be.empty
+			// Hint quality, not merely hint presence: `pickAnchors` measures against the *key's*
+			// coordinate, so an index-3 answerer names the same two key-adjacent peers a key-adjacent
+			// answerer would (the ghosts at key±1) — never itself or the farther decoy. Without this
+			// the widening could trade a hop for a worse hint and the spec would not notice.
+			expect(new Set((res as { anchors: string[] }).anchors), 'the two peers nearest the key')
+				.to.deep.equal(new Set([ghosts[0], ghosts[1]]))
 			expect(handler.calls(), 'no activity, so no handler call').to.equal(0)
 			expect(svc.getDiagnostics().maybeActForwarded, 'answered locally, not forwarded').to.equal(0)
 			expect(dials(), 'the reachable decoy hop was never dialed').to.equal(0)
@@ -202,6 +217,30 @@ describe('in-cluster membership window', function () {
 			expect(dials(), 'the ghosts are undialable, so nothing was dialed').to.equal(0)
 		} finally {
 			await stopAll([node])
+		}
+	})
+
+	// The exact boundary, which index 3 and index 8 straddle without pinning: a `want_k` of 7 makes
+	// the window 7, so cohort index 6 is the last one admitted and index 7 the first refused. An
+	// off-by-one in the window arithmetic (`<=` for `<`, or dropping the cohort-size cap inside
+	// `neighborDistance`) moves exactly this pair and nothing else in the file.
+	it('admits cohort index 6 and refuses index 7 for a want_k of 7', async () => {
+		const nodeIn = await createMemNode(); await nodeIn.start()
+		const nodeOut = await createMemNode(); await nodeOut.start()
+		try {
+			const keyIn = base64url('width-boundary-in')
+			const { svc: svcIn } = await buildAt(nodeIn, keyIn, 6)
+			const inHandler = countingHandler(svcIn)
+			await svcIn.routeAct(msg(keyIn, { activity: base64url('payload') }))
+			expect(inHandler.calls(), 'index 6 is the last index inside a 7-wide window').to.equal(1)
+
+			const keyOut = base64url('width-boundary-out')
+			const { svc: svcOut } = await buildAt(nodeOut, keyOut, 7)
+			const outHandler = countingHandler(svcOut)
+			await svcOut.routeAct(msg(keyOut, { activity: base64url('payload') }))
+			expect(outHandler.calls(), 'index 7 is the first index outside it').to.equal(0)
+		} finally {
+			await stopAll([nodeIn, nodeOut])
 		}
 	})
 

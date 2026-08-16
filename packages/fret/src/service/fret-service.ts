@@ -1933,17 +1933,18 @@ export class FretService implements IFretService, Startable {
 		});
 
 		// In-cluster test: `neighborDistance` returns Infinity when self is absent from a cohort of
-		// that size, so `< window` is exactly "self appears among the first `window` entries".
+		// that size, so the comparison is exactly "self appears among the first `clusterWindow`
+		// entries".
 		// Deliberately wider than the two key-adjacent anchors: `shouldIncludePayload` attaches an
 		// activity because the sender judged us near enough to act, so a cluster member that
 		// forwards spends a hop the sender never budgeted for.
-		const window = this.inClusterWindow(msg);
-		const inCluster = this.neighborDistance(selfId, coord, window) < window;
+		const clusterWindow = this.inClusterWindow(msg);
+		const inCluster = this.neighborDistance(selfId, coord, clusterWindow) < clusterWindow;
 
 		if (inCluster) {
 			// In-cluster with activity → perform via callback
 			if (msg.activity && this.activityHandler) {
-				// Deliberately `want_k`-wide, not `window`-wide: the cohort exists to gather
+				// Deliberately `want_k`-wide, not `clusterWindow`-wide: the cohort exists to gather
 				// `min_sigs` signatures and `min_sigs` derives from the full k, so `wants` narrows
 				// *who acts*, not *how many peers the actor gathers*.
 				const cohort = this.assembleCohort(coord, msg.want_k ?? this.cfg.k);
@@ -1952,7 +1953,13 @@ export class FretService implements IFretService, Startable {
 				);
 				return result;
 			}
-			// In-cluster without activity → return NearAnchor inviting resend
+			// In-cluster without activity → return NearAnchor inviting resend. An activity-bearing
+			// message with no handler installed lands here too, as a refusal.
+			// NOTE: an in-cluster node refuses rather than forwarding, so the widened window grows
+			// the set of peers that can strand an activity from 2 to `clusterWindow`. Harmless
+			// while a network installs the handler on every node or none. If a deployment ever runs
+			// a mixed population, forward instead of refusing when `msg.activity` is set and no
+			// handler exists.
 			return this.buildNearAnchor(coord, n, confidence);
 		}
 

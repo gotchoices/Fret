@@ -45,7 +45,7 @@ The `sample` field is particularly dangerous: it includes pre-computed `coord` v
 #### 1.4 Cohort/Coordinator Manipulation
 **Severity: High**
 
-`assembleCohort` (`fret-service.ts:850-870`) performs an alternating two-sided walk from successor/predecessor lists. If an attacker controls enough entries near a key coordinate, they control which peers appear in the cohort. Since `inCluster` is determined by `neighborDistance(selfId, coord, k) <= 1`, an attacker's Sybil nodes can:
+`assembleCohort` (`fret-service.ts`, "Cohort/neighbors" region) performs an alternating two-sided walk from successor/predecessor lists. If an attacker controls enough entries near a key coordinate, they control which peers appear in the cohort. Since `inCluster` is a purely local, unverified self-assessment — self appearing among the first `max(2, min(wants ?? want_k, want_k))` cohort entries for the key — an attacker's Sybil nodes can:
 
 - Claim to be in-cluster for any key
 - Be selected as activity handlers
@@ -53,7 +53,7 @@ The `sample` field is particularly dangerous: it includes pre-computed `coord` v
 
 - **Preconditions**: Sybil nodes in the target key's ring neighborhood.
 - **Impact**: Consensus subversion, forged commit certificates, censorship of legitimate cohort members.
-- **Current mitigations**: None beyond the cohort size k. No diversity or reputation checks on cohort membership.
+- **Current mitigations**: None beyond the cohort size k. No diversity or reputation checks on cohort membership. Note the membership window is the *honest* code path only — a receiver never verifies another peer's in-cluster claim, so widening or narrowing it changes how many well-behaved peers act, not what an attacker can assert.
 
 ---
 
