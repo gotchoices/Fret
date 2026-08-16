@@ -1,8 +1,11 @@
 import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
-import { FretService as CoreFretService } from '../src/service/fret-service.js'
+import { FretService as CoreFretService, selectDiverseSample } from '../src/service/fret-service.js'
 import { DigitreeStore } from '../src/store/digitree-store.js'
+import { assembleCohort } from '../src/service/cohort.js'
+import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
+import { createSparsityModel } from '../src/store/relevance.js'
 import { hashPeerId } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
 
@@ -304,6 +307,297 @@ describe('dead state: liveness seam', () => {
 		}
 		expect(store.getById(id)?.contactFailures).to.equal(3)
 		expect(store.getById(id)?.state).to.equal('dead')
+	})
+
+	// An inbound RPC arriving while an outbound probe is failing is the one interleaving both
+	// directions can hit. Both paths patch the entry synchronously (no await between read and
+	// write), so whichever lands last wins outright and the label always agrees with the counter
+	// behind it — the outcome that must never occur is a half-resurrection, i.e. `dead` with a
+	// cleared run (nothing would ever re-probe it out of the ring exclusion on its own schedule)
+	// or a live label with the run still clamped (the next failure re-kills it instantly).
+	it('never leaves a half-resurrected entry when an inbound RPC races a failing probe', async () => {
+		const id = seedPeer('peer-n')
+		await strike(id); unspace(id)
+		await strike(id); unspace(id)
+
+		await Promise.all([
+			(svc as any).applyContactFailure(id, coordAt(1)),
+			(svc as any).noteInboundRpc(id),
+		])
+
+		const e = store.getById(id)!
+		if (e.state === 'dead') expect(e.contactFailures).to.equal(3, 'dead implies a completed run')
+		else expect(e.contactFailures).to.be.lessThan(3, 'alive implies an incomplete run')
+	})
+})
+
+// Phase 4: a dead peer is not merely labelled — it drops out of every ring-shaped read. FRET
+// keeps no separate successor/predecessor *set*, so those windows are the filtered ring walk and
+// exclusion from the walk predicate IS the "remove from S/P" the design calls for.
+describe('dead state: exclusion from ring views', () => {
+	let node: Libp2p
+	let svc: CoreFretService
+	let store: DigitreeStore
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Not started: a live stabilization loop would probe (and re-probe) the synthetic peers.
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		store = svc.getStore()
+	})
+
+	afterEach(async () => {
+		try { await svc.stop() } catch {}
+		await stopAll([node])
+	})
+
+	/** A confirmed same-network peer we still believe is alive. */
+	function live(id: string, value: number): string {
+		store.upsert(id, coordAt(value))
+		store.setMembership(id, 'member')
+		return id
+	}
+
+	/** A confirmed same-network peer a run of failed contacts has marked dead. */
+	function dead(id: string, value: number): string {
+		live(id, value)
+		store.update(id, { state: 'dead', contactFailures: 3 })
+		return id
+	}
+
+	/** Make a synthetic id pass `isDialable` so it can reach the routing-candidate walk. */
+	function dialable(...ids: string[]): void {
+		for (const id of ids) (svc as any).setAddressKnown(id, true)
+	}
+
+	it('drops a dead peer from getNeighbors, the cohort, and the routing-candidate walk', () => {
+		const key = coordAt(100)
+		// The dead peers sit *nearer* the key than the live ones, so any result that included
+		// them would prefer them.
+		dead('dead-r', 101); dead('dead-l', 99)
+		live('live-r', 110); live('live-l', 90)
+		dialable('dead-r', 'dead-l', 'live-r', 'live-l')
+
+		const right = svc.getNeighbors(key, 'right', 3)
+		expect(right).to.include('live-r')
+		expect(right).to.not.include('dead-r')
+
+		const left = svc.getNeighbors(key, 'left', 3)
+		expect(left).to.include('live-l')
+		expect(left).to.not.include('dead-l')
+
+		const cohort = svc.assembleCohort(key, 4)
+		expect(cohort).to.have.members(['live-r', 'live-l'])
+
+		const routing = (svc as any).dialableCohort(key, 4, new Set<string>()) as string[]
+		expect(routing).to.have.members(['live-r', 'live-l'])
+	})
+
+	// Same starvation property the member gate already relies on: the ring walk skips a filter
+	// miss and keeps advancing, so a run of dead peers nearest the key must not shrink the cohort
+	// while live members exist further out.
+	it('still returns `wants` live members when dead peers cluster nearest the key', () => {
+		const key = coordAt(100)
+		dead('d1', 98); dead('d2', 99); dead('d3', 101); dead('d4', 102)
+		live('mL1', 80); live('mL2', 70); live('mL3', 60); live('mL4', 50)
+		live('mR1', 120); live('mR2', 130); live('mR3', 140); live('mR4', 150)
+
+		const cohort = svc.assembleCohort(key, 4)
+		expect(cohort).to.have.length(4)
+		for (const id of cohort) expect(store.getById(id)?.state).to.not.equal('dead')
+	})
+
+	it('excludes dead peers from the outgoing snapshot: neighbors, sample, and size estimate', async () => {
+		for (let i = 1; i <= 24; i++) live(`m${i}`, i * 10)
+		const deadIds = [dead('d-a', 5), dead('d-b', 7), dead('d-c', 245), dead('d-d', 250)]
+
+		const snap = await (svc as any).snapshot() as {
+			successors: string[]; predecessors: string[]
+			sample: Array<{ id: string }>; size_estimate: number
+		}
+		const advertised = [...snap.successors, ...snap.predecessors, ...snap.sample.map((s) => s.id)]
+		for (const id of deadIds) expect(advertised).to.not.include(id)
+		// Non-vacuous: the sample really did have slots left over after the S/P windows.
+		expect(snap.sample.length).to.be.greaterThan(0)
+
+		// The member-scoped size estimate counts live members only, so killing most of the ring
+		// widens the sampled gaps and the estimate falls.
+		const before = svc.getNetworkSizeEstimate().size_estimate
+		for (let i = 1; i <= 12; i++) store.update(`m${i * 2}`, { state: 'dead' })
+		const after = svc.getNetworkSizeEstimate().size_estimate
+		expect(after).to.be.lessThan(before)
+	})
+
+	// `enforceCapacity` protects only the peers the live-member predicate returns around self, so
+	// the dead peer loses its protected slot and its decayed relevance puts it at the front of the
+	// victim list. No eviction-specific handling is needed — this test is what pins that down.
+	it('evicts a dead peer before a live member neighbor at capacity', async () => {
+		const small = new CoreFretService(node, { profile: 'core', networkName: 'net-test', capacity: 3 })
+		const st = small.getStore()
+		const selfId = node.peerId.toString()
+		st.upsert(selfId, await hashPeerId(node.peerId))
+		st.setMembership(selfId, 'member')
+
+		st.upsert('live-neighbor', coordAt(10)); st.setMembership('live-neighbor', 'member')
+		st.update('live-neighbor', { relevance: 0 })
+		st.upsert('dead-neighbor', coordAt(20)); st.setMembership('dead-neighbor', 'member')
+		st.update('dead-neighbor', { state: 'dead', relevance: 0 })
+		// Unclassified, so it is unprotected too — but its relevance is higher, so the dead peer
+		// is still the first victim.
+		st.upsert('filler', coordAt(30))
+		st.update('filler', { relevance: 5 })
+
+		await (small as any).enforceCapacity()
+
+		expect(st.getById('dead-neighbor'), 'dead peer evicted').to.equal(undefined)
+		expect(st.getById('live-neighbor'), 'live member neighbor protected').to.not.equal(undefined)
+		expect(st.getById(selfId), 'self protected').to.not.equal(undefined)
+	})
+
+	it('re-admits a resurrected peer to the ring views', () => {
+		const key = coordAt(100)
+		dead('back', 101)
+		live('other', 110)
+		expect(svc.getNeighbors(key, 'right', 3)).to.not.include('back')
+
+		;(svc as any).noteProofOfLife('back')
+
+		expect(svc.getNeighbors(key, 'right', 3)).to.include('back')
+		expect(svc.assembleCohort(key, 3)).to.include('back')
+	})
+
+	// The exported standalones take the predicate as a parameter and default to no filter, which
+	// is what keeps the design simulator byte-for-byte unaffected by ring-view gating.
+	it('leaves the unfiltered standalone exports seeing dead entries', () => {
+		const bare = new DigitreeStore()
+		for (const [id, value] of [['x', 90], ['y', 110]] as Array<[string, number]>) {
+			bare.upsert(id, coordAt(value))
+			bare.setMembership(id, 'member')
+		}
+		bare.upsert('gone', coordAt(100))
+		bare.setMembership('gone', 'member')
+		bare.update('gone', { state: 'dead' })
+
+		expect(assembleCohort(bare, coordAt(100), 3)).to.include('gone')
+		expect(bare.neighborsRight(coordAt(99), 3)).to.include('gone')
+		expect(estimateSizeAndConfidence(bare, 8).n).to.equal(
+			estimateSizeAndConfidence(bare, 8, { filter: () => true }).n
+		)
+		const sampled = selectDiverseSample(bare, coordAt(0), createSparsityModel(), new Set(), 10)
+		expect(sampled.map((s) => s.id)).to.include('gone')
+	})
+})
+
+// Phase 5: exclusion must not be a one-way door. Once a peer is out of every ring view nothing
+// pings it again — `stabilizeOnce` draws its probe targets from `getNeighbors` — so a peer that
+// recovers but never dials us would stay dead until evicted at capacity. The dead arm of the
+// re-probe pass is the only path back on a ring where nobody else calls.
+describe('dead state: recovery through the re-probe pass', () => {
+	let node: Libp2p
+	let svc: CoreFretService
+	let store: DigitreeStore
+	const spares: Libp2p[] = []
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Not started: `stabilizeOnce` is driven explicitly so the ping counts stay deterministic.
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		store = svc.getStore()
+	})
+
+	afterEach(async () => {
+		try { await svc.stop() } catch {}
+		await stopAll([node, ...spares.splice(0)])
+	})
+
+	it('re-probes a dead peer on a stabilization tick and restores it to live + member', async () => {
+		const other = await createMemNode()
+		spares.push(other)
+		await other.start()
+		const otherSvc = new CoreFretService(other, { profile: 'core', networkName: 'net-test' })
+		try {
+			await otherSvc.start() // registers this network's ping handler on the remote
+			await node.dial(other.getMultiaddrs()[0]!)
+			const id = other.peerId.toString()
+			store.upsert(id, await hashPeerId(other.peerId))
+			// Dead *and* still unclassified: the recovery arm has to fix both labels, and it is the
+			// only pass that will look at this peer — `classifyUnknownPeers` skips dead candidates
+			// so the two arms never probe the same peer in one tick.
+			store.update(id, { state: 'dead', contactFailures: 3, lastContactFailureAt: Date.now() })
+			expect(store.getById(id)?.membership).to.equal('unknown')
+			// Nothing in the ring views can reach it, so a tick's ordinary probe targets are empty.
+			expect(svc.getNeighbors(await hashPeerId(node.peerId), 'both', 8)).to.not.include(id)
+
+			const pingsBefore = svc.getDiagnostics().pingsSent
+			await (svc as any).stabilizeOnce()
+
+			expect(svc.getDiagnostics().pingsSent).to.be.greaterThan(pingsBefore, 'the dead arm pinged it')
+			expect(store.getById(id)?.state).to.equal('connected')
+			expect(store.getById(id)?.contactFailures).to.equal(0)
+			expect(store.getById(id)?.membership).to.equal('member')
+		} finally {
+			await otherSvc.stop()
+		}
+	})
+
+	// Separate budgets, not one merged candidate list: the foreign arm is already near saturation
+	// around ~42 foreign peers, and a merged list would put every dead peer behind that queue.
+	it('does not let a large foreign population starve the dead arm', async () => {
+		const probed: string[] = []
+		;(svc as any).probeMembership = async (id: string) => { probed.push(id) }
+		for (let i = 0; i < 40; i++) {
+			const id = `foreign-${i}`
+			store.upsert(id, coordAt(i))
+			store.setMembership(id, 'foreign')
+			;(svc as any).setAddressKnown(id, true)
+		}
+		store.upsert('gone', coordAt(200))
+		store.setMembership('gone', 'member')
+		store.update('gone', { state: 'dead' })
+		;(svc as any).setAddressKnown('gone', true)
+
+		await (svc as any).reprobeExcludedPeers()
+
+		expect(probed).to.include('gone')
+		// Core budget is 2 per arm, so the foreign flood cannot consume the dead arm's slots.
+		expect(probed.filter((id) => id.startsWith('foreign-'))).to.have.length(2)
+	})
+
+	// A peer that is both foreign and dead belongs to the dead arm alone — otherwise one tick
+	// would spend two probes on the same peer, and a successful one fixes both labels anyway.
+	it('probes a foreign+dead peer exactly once per tick', async () => {
+		const probed: string[] = []
+		;(svc as any).probeMembership = async (id: string) => { probed.push(id) }
+		store.upsert('both', coordAt(42))
+		store.setMembership('both', 'foreign')
+		store.update('both', { state: 'dead' })
+		;(svc as any).setAddressKnown('both', true)
+
+		await (svc as any).reprobeExcludedPeers()
+
+		expect(probed).to.deep.equal(['both'])
+	})
+
+	// The announce and leave fan-outs walk the store unfiltered (so a freshly-connected `unknown`
+	// peer is not stalled), which means they need their own dead skip: the dial can only fail, and
+	// the leave path runs inside stop() where a stack of doomed dials also delays shutdown.
+	it('skips dead targets in the announce fan-out', async () => {
+		store.upsert('alive', coordAt(10)); store.setMembership('alive', 'member')
+		store.upsert('gone', coordAt(20)); store.setMembership('gone', 'member')
+		store.update('gone', { state: 'dead' })
+		;(svc as any).setAddressKnown('alive', true)
+		;(svc as any).setAddressKnown('gone', true)
+
+		// Neither dial can succeed against a synthetic id, so count what the choke point *attempts*
+		// instead: the announce token is taken once per target that passes the guards, so a bucket
+		// that always grants makes the take count the attempt count.
+		let takes = 0
+		;(svc as any).bucketAnnounce = { tryTake: () => { takes++; return true } }
+		await (svc as any).sendAnnouncementsRateLimited(['alive', 'gone'], await (svc as any).snapshot())
+
+		expect(takes).to.equal(1, 'only the live target was attempted')
 	})
 })
 

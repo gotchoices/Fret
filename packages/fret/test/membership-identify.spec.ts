@@ -14,7 +14,7 @@ import type { Libp2p } from 'libp2p'
 //
 // To prove classification rides identify and NOT an outbound probe, we neutralize the
 // observer's stabilization pass. Every probe-based classification (probeNeighborsLatency,
-// classifyUnknownPeers, reprobeForeignPeers) lives inside stabilizeOnce and is the ONLY code
+// classifyUnknownPeers, reprobeExcludedPeers) lives inside stabilizeOnce and is the ONLY code
 // that calls applySuccess/markForeign off an RPC — so a no-op stabilizeOnce leaves identify
 // (the event listeners + the peerStore-backed poll in seedFromPeerStore) as
 // the sole classification source. seedFromPeerStore still runs each tick, but it is itself the

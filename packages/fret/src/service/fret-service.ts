@@ -71,13 +71,23 @@ function randomToken(): string {
 }
 
 /**
- * Ring views are scoped to this network: a peer participates in the ring (neighbor set,
- * cohort, size estimate, sample, discovery) only once confirmed to serve this network's
- * FRET protocol. Self is seeded `member`, so it always passes. `unknown` peers are excluded
- * until the classification probe pass (see `classifyUnknownPeers`) resolves them — typically
- * within ~1 tick — so they are not permanently starved.
+ * Ring views are scoped to this network **and to peers we still believe are alive**: a peer
+ * participates in the ring (neighbor set, cohort, size estimate, sample, discovery) only once
+ * confirmed to serve this network's FRET protocol, and only while it is not marked `dead`.
+ *
+ * Self is seeded `member` and is never marked dead, so it always passes. `unknown` peers are
+ * excluded until the classification probe pass (see `classifyUnknownPeers`) resolves them —
+ * typically within ~1 tick — so they are not permanently starved; `dead` peers are excluded
+ * until the dead re-probe arm (see `reprobeOffRing`) finds one alive again.
+ *
+ * Both exclusions are one predicate rather than a second guard bolted onto each reader, so
+ * every ring-shaped read inherits them at once. Two consequences fall out rather than needing
+ * their own code: FRET stores no separate successor/predecessor *set* — those windows are this
+ * filtered walk — so exclusion here **is** removal from S/P; and `enforceCapacity` protects
+ * only the peers this predicate returns around self, so a dead peer loses its protected slot
+ * and, with a decayed relevance, becomes a preferred eviction victim.
  */
-const isMember = (e: PeerEntry): boolean => e.membership === 'member';
+const isLiveMember = (e: PeerEntry): boolean => e.membership === 'member' && e.state !== 'dead';
 
 /**
  * What produced a membership observation, ordered by how much it actually proves.
@@ -340,10 +350,11 @@ export class FretService implements IFretService, Startable {
 		// `cachedSelfCoord` has not been hashed yet — the two bulk-insert paths most likely
 		// to overflow the table in the first place.
 		const self = await this.selfCoord();
-		// Protect only *member* neighbors around self (member-scoped walk). A foreign peer
-		// can no longer squat in a protected slot, so with relevance ~0 it becomes a
-		// preferred eviction victim — exactly what we want.
-		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isMember);
+		// Protect only *live member* neighbors around self (see `isLiveMember`). A foreign or
+		// dead peer can no longer squat in a protected slot, so with relevance ~0 it becomes a
+		// preferred eviction victim — exactly what we want, and why the dead state needs no
+		// eviction-specific handling of its own.
+		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isLiveMember);
 		// Evict the lowest relevance non-protected entries until under cap.
 		// NOTE: lists and fully sorts the store to drop a handful of entries. Only reachable once
 		// the table is at capacity, so it is a no-op in the common case; if a ring settles at cap
@@ -1063,16 +1074,20 @@ export class FretService implements IFretService, Startable {
 	 * dials — and therefore has to be the place the dialability guard is applied. Checked
 	 * before the token bucket so an undialable target does not burn an announce token.
 	 *
-	 * Confirmed-foreign peers are skipped for the same reason: announce target lists walk the
-	 * store unfiltered (so a freshly-connected `unknown` peer is not stalled), but a peer we
-	 * already proved does not serve this network can only answer the dial with
-	 * `UnsupportedProtocolError`. `unknown` is still announced to — it may yet be a member.
+	 * Confirmed-foreign and `dead` peers are skipped for the same reason: announce target lists
+	 * walk the store unfiltered (so a freshly-connected `unknown` peer is not stalled), but a
+	 * peer we already proved does not serve this network can only answer the dial with
+	 * `UnsupportedProtocolError`, and a peer a run of failed contacts marked dead can only fail
+	 * the dial outright. Re-probing a dead peer is the dead re-probe arm's job (see
+	 * {@link reprobeOffRing}), which is budgeted for it; an announce is not. `unknown` is still
+	 * announced to — it may yet be a member.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		for (const id of ids) {
 			if (this.stopped) break;
 			if (!this.isDialable(id)) continue;
-			if (this.store.getById(id)?.membership === 'foreign') continue;
+			const entry = this.store.getById(id);
+			if (entry?.membership === 'foreign' || entry?.state === 'dead') continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
 				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
@@ -1178,10 +1193,12 @@ export class FretService implements IFretService, Startable {
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
 			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 			for (const id of ids) {
-				// Undialable neighbors are skipped, not attempted: this runs inside stop(), so a
-				// stack of dials that can only end in NoValidAddressesError also delays shutdown.
+				// Undialable and dead neighbors are skipped, not attempted: this runs inside stop(),
+				// so a stack of dials that can only fail also delays shutdown. A peer marked dead by
+				// a run of failed contacts is exactly such a dial.
 				// (`ids` itself stays unfiltered — it defines the S/P set the replacements exclude.)
 				if (!this.isDialable(id)) continue;
+				if (this.store.getById(id)?.state === 'dead') continue;
 				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
@@ -1521,7 +1538,7 @@ export class FretService implements IFretService, Startable {
 		// load-bearing, have fetchNeighbors report the skip instead of returning an empty result.
 		await this.mergeNeighborSnapshots(near.slice(0, 4));
 		await this.classifyUnknownPeers();
-		await this.reprobeForeignPeers();
+		await this.reprobeExcludedPeers();
 	}
 
 	private async probeNeighborsLatency(ids: string[]): Promise<void> {
@@ -1561,15 +1578,21 @@ export class FretService implements IFretService, Startable {
 	 * ring views), prefers connected / has-addresses ones, and sends a namespaced ping
 	 * to at most N per tick. It runs only while unknowns exist; in single-network
 	 * steady state every peer becomes member and this is a no-op (no extra traffic).
+	 *
+	 * `dead` unknowns are left to the dead arm of {@link reprobeOffRing} so the two passes never
+	 * probe the same peer in one tick; a successful probe there promotes membership anyway
+	 * (`applySuccess` applies both the `rpc-success` signal and the resurrection).
 	 */
 	private async classifyUnknownPeers(): Promise<void> {
 		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
 		// NOTE: scans the whole store (O(table size)) every tick to find unknowns, even
-		// once steady state has none. Fine at C=2048; if capacity or tick rate grows a lot,
-		// track an unknown-count or unknown-id set so a no-op tick costs O(1).
+		// once steady state has none — and the two `reprobeOffRing` arms below each scan it
+		// again, so a tick is three full walks. Fine at C=2048; if capacity or tick rate grows
+		// a lot, do one walk per tick and partition it into the three candidate sets.
 		const unknown = this.store.list().filter(
-			(e) => e.id !== selfStr && e.membership === 'unknown' && this.getBackoffPenalty(e.id) === 0
+			(e) => e.id !== selfStr && e.membership === 'unknown' && e.state !== 'dead'
+				&& this.getBackoffPenalty(e.id) === 0
 		);
 		if (unknown.length === 0) return;
 		// Only peers we can actually reach are probeable; prefer connected over has-addresses.
@@ -1583,36 +1606,62 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Occasionally re-probe a few `foreign` peers so a same-network peer that was *mislabeled*
-	 * foreign (e.g. identify completed before the peer registered our protocol handlers) is
-	 * re-admitted via a successful namespaced ping. Before ring-membership gating this self-
-	 * healed for free — `probeNeighborsLatency` pinged near ring peers regardless of label —
-	 * but gating excludes foreign peers from the ring, closing that path. The `peer:update`
-	 * identify path also re-admits, but it is not guaranteed (it depends on the remote pushing
-	 * an identify update), so this RPC path is the backstop the gating work owes (per the
-	 * `ring-membership-classification` review tripwire).
+	 * Re-probe the two kinds of peer the ring views exclude, so an exclusion can never be a
+	 * one-way door. Both arms share every mechanic below and differ only in which peers they
+	 * pick and how many per tick, so they run through {@link reprobeOffRing}.
 	 *
-	 * Bounded and self-limiting: only a couple of off-backoff foreign peers per tick, and a
-	 * confirmed-foreign probe records a growing backoff (see `probeMembership`), so a genuinely
-	 * foreign peer is re-probed at most ~once per backoff window rather than every tick.
+	 * - **`foreign`** — a same-network peer *mislabeled* foreign (e.g. identify completed before
+	 *   it registered our protocol handlers) is re-admitted by a successful namespaced ping.
+	 *   Before ring-membership gating this self-healed for free (`probeNeighborsLatency` pinged
+	 *   near ring peers regardless of label); gating closed that path. The `peer:update` identify
+	 *   path also re-admits, but only if the remote pushes an update, so this is the dependable
+	 *   backstop.
+	 * - **`dead`** — a peer marked dead by a run of failed contacts is out of every ring view, so
+	 *   `stabilizeOnce` (which draws its probe targets from `getNeighbors`) never touches it
+	 *   again. Without this arm a peer that recovers but never dials us and never forms a
+	 *   connection stays dead until it is evicted at capacity — `upsert` preserves `state`, so
+	 *   even a peerStore re-seed does not resurrect it — which is a black hole on a small ring.
+	 *   A successful ping runs `applySuccess`, which both confirms membership and resurrects.
+	 *
+	 * **Separate budgets, not one merged candidate list**, so a large foreign population cannot
+	 * starve dead recovery: the foreign arm is already near saturation at roughly 42 foreign
+	 * peers by its own arithmetic (see the re-probe discussion in `docs/fret.md`), and a merged
+	 * list would put every dead peer behind that queue.
 	 */
-	private async reprobeForeignPeers(): Promise<void> {
+	private async reprobeExcludedPeers(): Promise<void> {
 		this.pruneBackoffMap();
-		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 2 : 1;
-		const foreign = this.store.list().filter(
-			(e) => e.id !== selfStr && e.membership === 'foreign' && this.getBackoffPenalty(e.id) === 0
+		// Arms are disjoint by construction: a peer that is both foreign and dead belongs to the
+		// dead arm alone, so no peer is probed twice in one tick. Recovering it there fixes both
+		// labels at once, since `applySuccess` promotes membership and resurrects together.
+		await this.reprobeOffRing((e) => e.membership === 'foreign' && e.state !== 'dead', budget);
+		await this.reprobeOffRing((e) => e.state === 'dead', budget);
+	}
+
+	/**
+	 * One bounded re-probe pass over peers matching `isCandidate` — the shared mechanics of both
+	 * arms of {@link reprobeExcludedPeers}: off-backoff and reachable candidates only, probed
+	 * least-backed-off first, at most `budget` per tick.
+	 *
+	 * Bounded and self-limiting: every failed probe records a growing backoff (see
+	 * {@link probeMembership}), so a peer that is genuinely foreign, or genuinely gone, is
+	 * re-probed at most ~once per backoff window (doubling to a 32× cap) rather than every tick.
+	 */
+	private async reprobeOffRing(isCandidate: (e: PeerEntry) => boolean, budget: number): Promise<void> {
+		const selfStr = this.node.peerId.toString();
+		const candidates = this.store.list().filter(
+			(e) => e.id !== selfStr && this.getBackoffPenalty(e.id) === 0 && isCandidate(e)
 		);
-		if (foreign.length === 0) return;
+		if (candidates.length === 0) return;
 		// Only reachable peers are probeable; prefer connected over has-addresses.
 		// Within each group, probe the least-backed-off first: backoff factor is a proxy for
-		// "how many times we already confirmed this peer foreign", so a freshly-demoted peer
-		// (factor 0/1) — the one most likely to be mislabeled — is serviced before a
-		// long-confirmed foreign one (factor 32) rather than queueing behind it.
+		// "how many times we already confirmed this exclusion", so a freshly-excluded peer
+		// (factor 0/1) — the one most likely to be recoverable — is serviced before a
+		// long-confirmed one (factor 32) rather than queueing behind it.
 		const byBackoffFactor = (a: PeerEntry, b: PeerEntry): number =>
 			(this.backoffMap.get(a.id)?.factor ?? 0) - (this.backoffMap.get(b.id)?.factor ?? 0);
-		const connected = foreign.filter((e) => this.isConnected(e.id)).sort(byBackoffFactor);
-		const reachable = foreign.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id)).sort(byBackoffFactor);
+		const connected = candidates.filter((e) => this.isConnected(e.id)).sort(byBackoffFactor);
+		const reachable = candidates.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id)).sort(byBackoffFactor);
 		const targets = [...connected, ...reachable].slice(0, budget);
 		for (const e of targets) {
 			if (this.stopped) break;
@@ -1621,11 +1670,13 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Probe a single peer's membership with a namespaced ping. Success → member;
-	 * unsupported-protocol → one more strike toward the failure threshold (see
-	 * `applyMembershipSignal`), demoting to foreign only once the run completes;
-	 * timeout / transient → label untouched. Every failure backs off either way so we
-	 * don't hammer an unreachable-but-connected peer every tick.
+	 * Probe a single peer with a namespaced ping. Success → `applySuccess`, which confirms
+	 * membership *and* clears any contact-failure run, resurrecting a `dead` peer — which is what
+	 * makes both arms of {@link reprobeExcludedPeers} recoveries rather than mere reclassification.
+	 * Unsupported-protocol → one more strike toward the negotiate-failure threshold (see
+	 * `applyMembershipSignal`), demoting to foreign only once the run completes; any other failure
+	 * is a failed contact and counts toward the dead-state run. Every failure backs off either way
+	 * so we don't hammer an unreachable-but-connected peer every tick.
 	 */
 	private async probeMembership(id: string): Promise<void> {
 		try {
@@ -1694,10 +1745,11 @@ export class FretService implements IFretService, Startable {
 	// Snapshots
 	private async snapshot(): Promise<NeighborSnapshotV1> {
 		const selfCoord = await hashPeerId(this.node.peerId);
-		// Size estimate, neighbors, and sample are all member-scoped so the snapshot we
-		// advertise describes only this network — and never re-introduces a foreign peer to
-		// same-network neighbors via the sample (the transitive-propagation guard).
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isMember, selfCoord });
+		// Size estimate, neighbors, and sample are all live-member-scoped so the snapshot we
+		// advertise describes only this network's reachable peers — and never re-introduces a
+		// foreign peer to same-network neighbors via the sample (the transitive-propagation
+		// guard), nor advertises a peer we have already given up on as a neighbor.
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord });
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -1707,7 +1759,7 @@ export class FretService implements IFretService, Startable {
 		const predecessors = rawPred.slice(0, capPred);
 		const selfStr = this.node.peerId.toString();
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
-		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isMember);
+		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
 		return {
 			v: 1,
 			from: this.node.peerId.toString(),
@@ -1737,23 +1789,24 @@ export class FretService implements IFretService, Startable {
 		wants: number
 	): string[] {
 		const ids: string[] = [];
-		// Member-scoped: foreign / unclassified peers are never neighbors, routing
-		// candidates, or cohort members for this network. The store walk skips non-members
-		// and keeps advancing, so a foreign cluster near the coord can't starve the result.
+		// Live-member-scoped: foreign, unclassified, and dead peers are never neighbors,
+		// routing candidates, or cohort members for this network. The store walk skips
+		// non-matches and keeps advancing, so a cluster of foreign or dead peers near the
+		// coord can't starve the result.
 		if (direction === 'right' || direction === 'both')
-			ids.push(...this.store.neighborsRight(hashedCoord, wants, isMember));
+			ids.push(...this.store.neighborsRight(hashedCoord, wants, isLiveMember));
 		if (direction === 'left' || direction === 'both')
-			ids.push(...this.store.neighborsLeft(hashedCoord, wants, isMember));
+			ids.push(...this.store.neighborsLeft(hashedCoord, wants, isLiveMember));
 		return Array.from(new Set(ids)).slice(0, wants);
 	}
 
 	assembleCohort(hashedCoord: Uint8Array, wants: number, exclude?: Set<string>): string[] {
-		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude, isMember);
+		return assembleCohortOverStore(this.store, hashedCoord, wants, exclude, isLiveMember);
 	}
 
 	/**
-	 * Routing-candidate cohort: member-scoped **and** dialability-scoped, both applied as the
-	 * ring walk's own predicate.
+	 * Routing-candidate cohort: live-member-scoped **and** dialability-scoped, both applied as
+	 * the ring walk's own predicate.
 	 *
 	 * Composing the predicate is the whole point — `.filter()`ing the assembled cohort would
 	 * shrink it below `wants` (to empty, when the peers nearest the key are all unreachable)
@@ -1768,7 +1821,7 @@ export class FretService implements IFretService, Startable {
 	private dialableCohort(hashedCoord: Uint8Array, wants: number, exclude: Set<string>): string[] {
 		return assembleCohortOverStore(
 			this.store, hashedCoord, wants, exclude,
-			(e) => isMember(e) && this.isDialable(e.id)
+			(e) => isLiveMember(e) && this.isDialable(e.id)
 		);
 	}
 
@@ -1833,7 +1886,7 @@ export class FretService implements IFretService, Startable {
 		const coord = await hashKey(keyBytes);
 		const selfId = this.node.peerId.toString();
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
-			filter: isMember,
+			filter: isLiveMember,
 			selfCoord: await this.selfCoord()
 		});
 
@@ -2014,7 +2067,7 @@ export class FretService implements IFretService, Startable {
 		// This method is public and callable before `start()` has hashed the self coordinate;
 		// when it is not yet populated the estimator falls through to its whole-store path.
 		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
-			filter: isMember,
+			filter: isLiveMember,
 			selfCoord: this.cachedSelfCoord ?? undefined
 		});
 
@@ -2182,7 +2235,7 @@ export class FretService implements IFretService, Startable {
 		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isMember, selfCoord });
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord });
 
 			// Decide whether to include payload
 			const distToKey = minDistance(selfCoord, coord);
