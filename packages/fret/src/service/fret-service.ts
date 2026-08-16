@@ -25,6 +25,7 @@ import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
+import { deadline } from '../utils/deadline.js';
 import { peerIdFromString } from '@libp2p/peer-id';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
@@ -158,6 +159,17 @@ export class FretService implements IFretService, Startable {
 	 * by a stop() cannot be resurrected by the next start() (which would leave two live loops).
 	 */
 	private runGen = 0;
+	/**
+	 * Run-scoped cancellation for every *outbound maintenance* RPC: minted in `start()` right
+	 * after `runGen++`, aborted in `stop()` right after the loop timers are cleared, so background
+	 * pings / fetches / forwards die at once instead of holding teardown open behind a 5 s budget.
+	 *
+	 * Mirrors `runGen`'s placement for the same reason that counter exists: a start→stop→start
+	 * cycle must mint a **fresh** controller, because a reused, already-aborted one would silently
+	 * cancel every RPC of the new run. `null` between runs. The leave fan-out deliberately does
+	 * *not* use it — it runs after the abort, on its own budget (see `sendLeaveToNeighbors`).
+	 */
+	private runAbort: AbortController | null = null;
 	private stabilizeTimer: ReturnType<typeof setTimeout> | null = null;
 	private preconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	/** runGen the active-preconnect loop is armed for; -1 when no loop is armed. */
@@ -259,6 +271,27 @@ export class FretService implements IFretService, Startable {
 	 * diverge without one silently re-tuning the other.
 	 */
 	private static readonly CONTACT_FAILURE_MIN_SPACING_MS = 500;
+	/**
+	 * Whole-RPC budget for the single-hop maintenance RPCs — ping and announce.
+	 *
+	 * A ping is a ~50-byte round trip and an announce is a fire-and-forget push with no reply of
+	 * substance, so the default `RPC_TIMEOUT_MS` (5 s) on these paths only ever means "this peer
+	 * is gone" — and they are exactly the paths that must not hold a stabilization or warm-up tick
+	 * open. `sendMaybeAct` deliberately keeps the default: it returns only once the *whole
+	 * remaining route* has completed downstream, so its budget is a route budget, not a link one.
+	 */
+	private static readonly MAINTENANCE_RPC_TIMEOUT_MS = 2000;
+	/**
+	 * Wall-clock cap on the whole leave fan-out inside `stop()`.
+	 *
+	 * The fan-out is `announceFanout`-bounded (Core 8 / Edge 4) plus a small connected-only
+	 * extra, and `isDoomedDial`-filtered, so 3 s is generous for the reachable targets while
+	 * capping a `stop()` that would otherwise serialize several dead dials at a timeout apiece.
+	 * Cannot reuse the run signal — the fan-out runs *after* that aborts, by design.
+	 */
+	private static readonly SHUTDOWN_BUDGET_MS = 3000;
+	/** Per-notice budget inside {@link SHUTDOWN_BUDGET_MS}, so one stalled peer cannot eat it whole. */
+	private static readonly LEAVE_NOTICE_TIMEOUT_MS = 1500;
 	private firstStabilizeDone = false;
 	private readonly diag = {
 		peersDiscovered: 0,
@@ -598,6 +631,29 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	/** The current run's cancellation signal; `undefined` between runs. See {@link runAbort}. */
+	private get runSignal(): AbortSignal | undefined {
+		return this.runAbort?.signal;
+	}
+
+	/**
+	 * True when a failed RPC is (or follows) **our own** cancellation — which is not evidence about
+	 * the peer and must record nothing: no contact strike, no relevance decay, no backoff, no
+	 * `pingsFail`. Without this a `stop()` or a busy tick manufactures strikes against healthy
+	 * neighbors and can mark them `dead`, inverting the point of cancelling at all.
+	 *
+	 * The check is against the signal the *caller* passed to the sender, not the sender's own
+	 * deadline: the sender builds its deadline as a *child* of ours, so the child is aborted both
+	 * when its own budget fired (genuine unreachability — keeps today's semantics) and when we
+	 * cancelled, while ours is aborted only in the second case. Callers capture the signal in a
+	 * local **before** the loop / `try` so a mid-flight `stop()`+`start()` (which nulls and re-mints
+	 * {@link runAbort}) cannot change what is being compared. No new error type is needed for the
+	 * same reason — the caller already holds the discriminating fact.
+	 */
+	private wasCancelled(sig: AbortSignal | undefined): boolean {
+		return sig?.aborted === true;
+	}
+
 	/**
 	 * Apply one membership observation about `id`, honouring the evidence-strength ordering.
 	 *
@@ -698,6 +754,8 @@ export class FretService implements IFretService, Startable {
 		if (this.started) return;
 		this.started = true;
 		this.runGen++;
+		// Fresh controller per run, minted alongside the generation bump (see `runAbort`).
+		this.runAbort = new AbortController();
 		this.stopped = false;
 		// Run-scoped flags: a restarted service must announce again, not inherit the
 		// "already announced" state of the previous run.
@@ -799,6 +857,13 @@ export class FretService implements IFretService, Startable {
 		this.runGen++;
 		this.stopped = true;
 		this.clearLoopTimers();
+		// Cancel every in-flight maintenance RPC *before* the teardown below and the leave
+		// fan-out, so background dials die at once and do not compete with shutdown. Ordering is
+		// load-bearing on both sides: after `clearLoopTimers()` (nothing new gets armed) and
+		// before `sendLeaveToNeighbors()`, which must still go out — it carries its own budget,
+		// not this signal, which is why aborting here does not silence it.
+		this.runAbort?.abort();
+		this.runAbort = null;
 		this.removeNodeListeners();
 		// Unhandle before the leave notices: unhandle only removes *inbound* handlers,
 		// while the leave notices go out over our own outbound streams.
@@ -1156,14 +1221,22 @@ export class FretService implements IFretService, Startable {
 	 * before the token bucket so a doomed target does not burn an announce token.
 	 */
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
+		// `stopped` is set in the same tick as the run abort, so the `break` below already stops
+		// the loop; the signal is what makes the announce *in flight* at that moment die promptly.
+		const sig = this.runSignal;
 		for (const id of ids) {
 			if (this.stopped) break;
 			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, { dial: true });
+				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
+					dial: true, signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+				});
 				this.diag.announcementsSent++;
-			} catch (err) { log.error('announce failed to %s - %e', id, err); }
+			} catch (err) {
+				if (this.wasCancelled(sig)) return;
+				log.error('announce failed to %s - %e', id, err);
+			}
 		}
 	}
 
@@ -1208,9 +1281,16 @@ export class FretService implements IFretService, Startable {
 				...this.store.neighborsRight(selfCoord, Math.min(6, this.cfg.m)),
 				...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
 			])).filter((id) => id !== selfStr);
+			const sig = this.runSignal;
 			for (const id of ids) {
 				if (this.isDialable(id)) {
-					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('preconnectNeighbors ping failed for %s - %e', id, err) }
+					try {
+						await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+						this.diag.pingsSent++;
+					} catch (err) {
+						if (this.wasCancelled(sig)) return;
+						log.error('preconnectNeighbors ping failed for %s - %e', id, err);
+					}
 				}
 			}
 		} catch (err) { log.error('preconnectNeighbors outer failed - %e', err) }
@@ -1234,11 +1314,18 @@ export class FretService implements IFretService, Startable {
 					...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
 					...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
 				])).filter((id) => id !== selfStr).slice(0, budget);
+				const sig = this.runSignal;
 				for (const id of ids) {
 					if (this.isDialable(id)) {
-					try { await sendPing(this.node, id, this.protocols.PROTOCOL_PING); this.diag.pingsSent++; } catch (err) { log.error('active preconnect ping failed for %s - %e', id, err) }
+						try {
+							await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+							this.diag.pingsSent++;
+						} catch (err) {
+							if (this.wasCancelled(sig)) break;
+							log.error('active preconnect ping failed for %s - %e', id, err);
+						}
+					}
 				}
-			}
 			} catch (err) { log.error('active preconnect tick failed - %e', err) }
 			// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
 			if (this.stopped || gen !== this.runGen) { release(); return; }
@@ -1280,6 +1367,14 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async sendLeaveToNeighbors(): Promise<void> {
+		// Own budget, *not* `runSignal`: this runs after `stop()` aborted that signal, by design —
+		// the graceful-departure notices must still go out. `SHUTDOWN_BUDGET_MS` caps the whole
+		// fan-out; each notice gets `LEAVE_NOTICE_TIMEOUT_MS`; and both loops stop once the budget
+		// is spent (otherwise every remaining `sendLeave` throws immediately and only logs noise).
+		// `cancel()` in the `finally` is mandatory — an uncleared timer fails the mocha exit
+		// watchdog (see `deadline`).
+		const budget = deadline(FretService.SHUTDOWN_BUDGET_MS);
+		const sendOpts = { signal: budget.signal, timeoutMs: FretService.LEAVE_NOTICE_TIMEOUT_MS };
 		try {
 			const selfCoord = await hashPeerId(this.node.peerId);
 			const selfStr = this.node.peerId.toString();
@@ -1293,11 +1388,12 @@ export class FretService implements IFretService, Startable {
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
 			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 			for (const id of ids) {
+				if (budget.signal.aborted) break;
 				// Doomed dials are skipped, not attempted (see `isDoomedDial`): this runs inside
 				// stop(), so a stack of dials that can only fail also delays shutdown.
 				// (`ids` itself stays unfiltered — it defines the S/P set the replacements exclude.)
 				if (this.isDoomedDial(id)) continue;
-				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
+				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
 			const fanOut = this.cfg.profile === 'core' ? 4 : 2;
@@ -1306,9 +1402,14 @@ export class FretService implements IFretService, Startable {
 			// `assembleCohort` inside `expandCohort`, and `isConnected` already implies dialable.
 			const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
 			for (const id of extra) {
-				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
+				if (budget.signal.aborted) break;
+				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
 			}
-		} catch (err) { log.error('sendLeaveToNeighbors outer failed - %e', err) }
+		} catch (err) {
+			log.error('sendLeaveToNeighbors outer failed - %e', err);
+		} finally {
+			budget.cancel();
+		}
 	}
 
 	private async handleLeave(notice: { from: string; replacements?: string[]; timestamp: number }): Promise<void> {
@@ -1652,9 +1753,12 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async probeNeighborsLatency(ids: string[]): Promise<void> {
+		// Captured once, before the loop — see `wasCancelled` for why the *caller's* signal is the
+		// discriminator and why it must be a local.
+		const sig = this.runSignal;
 		for (const id of ids) {
 			try {
-				const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
+				const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
 				this.diag.pingsSent++;
 				if (res.ok) {
 					await this.applySuccess(id, await this.coordOf(id), res.rttMs);
@@ -1666,6 +1770,9 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsFail++;
 				}
 			} catch (err) {
+				// Our own cancellation says nothing about the peer: no strike, no counter, and no
+				// point continuing the pass.
+				if (this.wasCancelled(sig)) return;
 				// benign during churn - do not warn each tick
 				// console.warn('ping failed for', id, err);
 				this.diag.pingsFail++;
@@ -1797,8 +1904,9 @@ export class FretService implements IFretService, Startable {
 	 * so we don't hammer an unreachable-but-connected peer every tick.
 	 */
 	private async probeMembership(id: string): Promise<void> {
+		const sig = this.runSignal;
 		try {
-			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING);
+			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
 			this.diag.pingsSent++;
 			if (res.ok) {
 				await this.applySuccess(id, await this.coordOf(id), res.rttMs); // marks member (and clears backoff)
@@ -1810,6 +1918,9 @@ export class FretService implements IFretService, Startable {
 				this.recordBackoff(id);
 			}
 		} catch (err) {
+			// Our own cancellation: not evidence about the peer, and no backoff either — the next
+			// run should probe it fresh.
+			if (this.wasCancelled(sig)) return;
 			this.diag.pingsFail++;
 			// Unsupported protocol is evidence of absence — foreign only once a run of these
 			// accumulates (a peer that has simply not registered its handlers yet produces the
@@ -1825,9 +1936,11 @@ export class FretService implements IFretService, Startable {
 
 	private async mergeNeighborSnapshots(ids: string[]): Promise<void> {
 		const announced: string[] = [];
+		const sig = this.runSignal;
 		for (const id of ids) {
 			try {
-				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS);
+				// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
+				const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal: sig });
 				this.diag.snapshotsFetched++;
 				const caps = this.mergeSnapshotCaps();
 				const succList = (snap.successors ?? []).slice(0, caps.successors);
@@ -1853,6 +1966,8 @@ export class FretService implements IFretService, Startable {
 				// Calibrate local size estimator from snapshot's estimate
 				this.calibrateSizeFromSnapshot(snap, id);
 			} catch (err) {
+				// Cancelled by stop(): the rest of the pass would only throw the same way.
+				if (this.wasCancelled(sig)) break;
 				console.warn('fetchNeighbors failed for', id, err);
 			}
 		}
@@ -2085,9 +2200,12 @@ export class FretService implements IFretService, Startable {
 					ttl: msg.ttl - 1,
 					breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
 				};
+				// Default (route) budget — this returns only once the whole downstream route has
+				// completed — but still run-scoped, so a stop() mid-forward does not hold teardown.
+				const sig = this.runSignal;
 				try {
 					this.diag.maybeActForwarded++;
-					const result = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT);
+					const result = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
 					if (isBusy(result)) {
 						this.recordBackoff(next);
 					} else {
@@ -2102,13 +2220,17 @@ export class FretService implements IFretService, Startable {
 						return result;
 					}
 				} catch (err) {
-					log.error('forward maybeAct failed to %s - %e', next, err);
-					// A failed negotiation hints this hop belongs to another network, but `next`
-					// came from the member-gated cohort, so it is a confirmed member and a restart
-					// looks identical. Count it; only a run of them demotes. A dial/stream failure
-					// instead says the hop is unreachable and counts toward the dead-state run.
-					await this.noteRpcFailure(next, err);
-					this.recordBackoff(next);
+					// Our own cancellation is not evidence about `next` — score nothing and fall
+					// through to the NearAnchor below, which is the honest "did not forward" answer.
+					if (!this.wasCancelled(sig)) {
+						log.error('forward maybeAct failed to %s - %e', next, err);
+						// A failed negotiation hints this hop belongs to another network, but `next`
+						// came from the member-gated cohort, so it is a confirmed member and a restart
+						// looks identical. Count it; only a run of them demotes. A dial/stream failure
+						// instead says the hop is unreachable and counts toward the dead-state run.
+						await this.noteRpcFailure(next, err);
+						this.recordBackoff(next);
+					}
 				}
 			}
 		}
@@ -2400,6 +2522,9 @@ export class FretService implements IFretService, Startable {
 		// `dedupKey`).
 		const discoveryId = this.newCorrelationId('digest');
 		const activityId = this.newCorrelationId('act');
+		// One run signal for the whole walk (see `wasCancelled`): a stop() mid-lookup cancels the
+		// in-flight send, and the failure it produces is not scored against the target.
+		const sig = this.runSignal;
 
 		let hop = 0;
 		let currentActivity = options.activity;
@@ -2475,7 +2600,7 @@ export class FretService implements IFretService, Startable {
 			};
 
 			try {
-				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT);
+				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
 
 				if (isBusy(result)) {
 					// NOTE: `target` is already in `visited`, so a busy peer is retired for the rest
@@ -2537,7 +2662,7 @@ export class FretService implements IFretService, Startable {
 
 					try {
 						const actResult = await sendMaybeAct(
-							this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT
+							this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig }
 						);
 						if (isBusy(actResult)) {
 							this.recordBackoff(actTarget);
@@ -2548,6 +2673,9 @@ export class FretService implements IFretService, Startable {
 							bestAnchors = (actResult as NearAnchorV1).anchors;
 						}
 					} catch (err) {
+						// Our own cancellation: score nothing and end the walk (`exhausted` below)
+						// rather than spend the remaining attempts on sends that cannot go out.
+						if (this.wasCancelled(sig)) break;
 						log.error('activity send to anchor %s failed - %e', actTarget, err);
 						await this.noteRpcFailure(actTarget, err);
 						this.recordBackoff(actTarget);
@@ -2568,6 +2696,9 @@ export class FretService implements IFretService, Startable {
 
 				hop++;
 			} catch (err) {
+				// Same rule as the resend: a cancelled walk is `exhausted`, not a strike against
+				// `target`, and burning the remaining attempts would only re-throw the abort.
+				if (this.wasCancelled(sig)) break;
 				log.error('iterativeLookup hop %d to %s failed - %e', hop, target, err);
 				await this.noteRpcFailure(target, err);
 				this.recordBackoff(target);
