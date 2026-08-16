@@ -1,8 +1,13 @@
-import { describe, it } from 'mocha'
+import { before, describe, it } from 'mocha'
 import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
-import { openRpcStream, isLimitedConnection } from '../src/rpc/protocols.js'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import { openRpcStream, isLimitedConnection, releaseRpcStream, readAllBounded } from '../src/rpc/protocols.js'
+import { abortReasonError, DeadlineExpiredError } from '../src/utils/deadline.js'
+import { sendPing } from '../src/rpc/ping.js'
+import { fetchNeighbors } from '../src/rpc/neighbors.js'
 
 // Minimal recording stubs. openRpcStream only touches `node.getConnections`,
 // `node.dialProtocol`, and per-connection `{ status, limits, remoteAddr,
@@ -11,6 +16,7 @@ import { openRpcStream, isLimitedConnection } from '../src/rpc/protocols.js'
 interface StreamOpts {
 	runOnLimitedConnection?: unknown
 	negotiateFully?: unknown
+	signal?: AbortSignal
 }
 
 interface StubConnection {
@@ -135,6 +141,303 @@ describe('openRpcStream', () => {
 		expect(dialCalls.length, 'dialProtocol calls').to.equal(1)
 		expect(dialCalls[0].protocols).to.deep.equal(PROTOCOLS)
 		expectRunsOnLimited(dialCalls[0].opts, 'dial fallback')
+	})
+
+	// The open itself is what used to have no budget: both `newStream` and `dialProtocol` take
+	// `NewStreamOptions extends AbortOptions`, and the signal only bounds the open if it is
+	// actually handed to them. Identity (`.to.equal`) rather than mere presence, so a future
+	// refactor that substitutes some other signal fails here.
+	it('forwards the caller signal into newStream (connection path)', async () => {
+		const direct = makeConnection({ limited: false })
+		const { node } = makeNode([direct])
+		const ac = new AbortController()
+
+		await openRpcStream(node, PID, PROTOCOLS, { signal: ac.signal })
+
+		expect(direct.calls.length, 'newStream calls').to.equal(1)
+		expect(direct.calls[0].opts.signal, 'newStream signal').to.equal(ac.signal)
+	})
+
+	it('forwards the caller signal into dialProtocol (dial-fallback path)', async () => {
+		const { node, dialCalls } = makeNode([])
+		const ac = new AbortController()
+
+		await openRpcStream(node, PID, PROTOCOLS, { signal: ac.signal })
+
+		expect(dialCalls.length, 'dialProtocol calls').to.equal(1)
+		expect(dialCalls[0].opts.signal, 'dialProtocol signal').to.equal(ac.signal)
+	})
+
+	it('throws on an already-aborted signal without dialing', async () => {
+		const { node, dialCalls } = makeNode([])
+		const ac = new AbortController()
+		ac.abort(new Error('caller gave up'))
+
+		let thrown: unknown
+		try {
+			await openRpcStream(node, PID, PROTOCOLS, { signal: ac.signal })
+		} catch (err) {
+			thrown = err
+		}
+
+		expect(thrown, 'thrown').to.be.instanceOf(Error)
+		expect((thrown as Error).message, 'abort reason surfaces').to.equal('caller gave up')
+		// The point of the pre-dial check: a `stop()` racing a maintenance tick must not still
+		// put dials on the wire.
+		expect(dialCalls.length, 'dialProtocol calls').to.equal(0)
+	})
+
+	it('throws on an already-aborted signal without opening a stream on an existing connection', async () => {
+		const direct = makeConnection({ limited: false })
+		const { node } = makeNode([direct])
+		const ac = new AbortController()
+		ac.abort(new Error('caller gave up'))
+
+		let thrown: unknown
+		try {
+			await openRpcStream(node, PID, PROTOCOLS, { signal: ac.signal })
+		} catch (err) {
+			thrown = err
+		}
+
+		expect(thrown, 'thrown').to.be.instanceOf(Error)
+		expect(direct.calls.length, 'newStream calls').to.equal(0)
+	})
+})
+
+describe('releaseRpcStream', () => {
+	function makeReleasable(): { stream: Stream; calls: string[] } {
+		const calls: string[] = []
+		const stream = {
+			abort: (_err: Error) => { calls.push('abort') },
+			close: async () => { calls.push('close') },
+		}
+		return { stream: stream as unknown as Stream, calls }
+	}
+
+	it('closes the stream on the un-aborted path', async () => {
+		const { stream, calls } = makeReleasable()
+
+		await releaseRpcStream(stream, new AbortController().signal)
+
+		expect(calls, 'release calls').to.deep.equal(['close'])
+	})
+
+	it('aborts (never closes) the stream when the signal aborted', async () => {
+		const { stream, calls } = makeReleasable()
+		const ac = new AbortController()
+		ac.abort(new Error('caller gave up'))
+
+		await releaseRpcStream(stream, ac.signal)
+
+		// `close()` on a stream whose remote has stalled is itself unbounded, so cleaning up a
+		// timed-out read with it would hang *after* the read's own deadline already fired.
+		expect(calls, 'release calls').to.deep.equal(['abort'])
+	})
+
+	it('swallows a stream carrying neither close nor abort', async () => {
+		const bare = { id: 'stub-stream' } as unknown as Stream
+		const ac = new AbortController()
+		ac.abort(new Error('caller gave up'))
+
+		// Relied on by the timeout tests below, whose stub streams are bare objects: release runs
+		// from a `finally` on an already-failing path, where a second throw would mask the real error.
+		await releaseRpcStream(bare, ac.signal)
+		await releaseRpcStream(undefined, ac.signal)
+	})
+})
+
+/**
+ * A stream open that never completes on its own and settles only when the caller's signal
+ * aborts — which is libp2p's `AbortOptions` contract for both `dialProtocol` and `newStream`,
+ * and therefore the only thing that can end a stalled open. Given no signal it hangs forever,
+ * which is precisely the pre-deadline behavior these tests exist to rule out: before the signal
+ * was threaded through, every one of the assertions below would have been a mocha timeout.
+ */
+function hangsUntilAbort(opts: StreamOpts): Promise<Stream> {
+	return new Promise<Stream>((_resolve, reject) => {
+		const signal = opts.signal
+		if (signal == null) return
+		if (signal.aborted) { reject(abortReasonError(signal)); return }
+		signal.addEventListener('abort', () => { reject(abortReasonError(signal)) }, { once: true })
+	})
+}
+
+/** A node with no connections whose dial hangs — models an unresponsive / half-open transport. */
+function makeHangingDialNode(): Libp2p {
+	return {
+		getConnections: () => [],
+		dialProtocol: (_pid: PeerId, _protocols: string[], opts: StreamOpts) => hangsUntilAbort(opts),
+	} as unknown as Libp2p
+}
+
+/** A node with an open connection whose `newStream` hangs — models a peer that stops muxing. */
+function makeHangingStreamNode(): Libp2p {
+	const conn = {
+		status: 'open',
+		remoteAddr: { toString: () => '/ip4/1.2.3.4/tcp/4001' },
+		newStream: (_protocols: string[], opts: StreamOpts) => hangsUntilAbort(opts),
+	}
+	return {
+		getConnections: () => [conn] as unknown as Connection[],
+		dialProtocol: async () => { throw new Error('must not dial: a connection exists') },
+	} as unknown as Libp2p
+}
+
+/** A node whose stream opens fine and then never yields a chunk — a peer that accepted and went quiet. */
+function makeSilentStreamNode(): Libp2p {
+	const stream = {
+		id: 'silent-stream',
+		send: () => true,
+		[Symbol.asyncIterator]: () => ({
+			next: () => new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }),
+		}),
+	}
+	return {
+		getConnections: () => [],
+		dialProtocol: async () => stream as unknown as Stream,
+	} as unknown as Libp2p
+}
+
+/**
+ * The headline behavior of the deadline work: an outbound RPC is bounded end-to-end — dial,
+ * stream open and read — so a peer that never answers costs a budget rather than the caller.
+ *
+ * These assert **elapsed wall time**, not merely that the call settled: "it rejected" would pass
+ * against a call that rejected after ten minutes, which is the bug. The bounds are deliberately
+ * loose (a 100 ms budget checked against 80–1000 ms) because the property under test is "bounded
+ * at all", not scheduler precision.
+ *
+ * NOTE: these are the only wall-clock-sensitive assertions in the suite. If they ever flake on a
+ * loaded box, raise `MAX_MS` — but mocha's own 2s per-test default is the harder ceiling, so
+ * anything past ~1.5s needs a `this.timeout()` too. Do not swap the elapsed-time assertion for a
+ * bare "it rejected": that is exactly the assertion the bug would have passed.
+ */
+describe('RPC deadlines', () => {
+	const TIMEOUT_MS = 100
+	const MIN_MS = 80
+	const MAX_MS = 1000
+	// Real Ed25519 id: every sender runs `peerIdFromString` on its target before doing anything.
+	let peer: string
+
+	before(async () => {
+		peer = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString()
+	})
+
+	function expectBounded(elapsed: number): void {
+		expect(elapsed, `elapsed ${elapsed}ms must not be far under the ${TIMEOUT_MS}ms budget`).to.be.at.least(MIN_MS)
+		expect(elapsed, `elapsed ${elapsed}ms must be bounded by roughly the ${TIMEOUT_MS}ms budget`).to.be.at.most(MAX_MS)
+	}
+
+	it('sendPing gives up on a dial that never resolves', async () => {
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
+		} catch (err) {
+			thrown = err
+		}
+		const elapsed = Date.now() - t0
+
+		// The deadline specifically, not some incidental failure: this is what ended the dial.
+		expect(thrown, 'sendPing must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expectBounded(elapsed)
+	})
+
+	it('sendPing gives up on a stream that opens but never yields a chunk', async () => {
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await sendPing(makeSilentStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
+		} catch (err) {
+			thrown = err
+		}
+		const elapsed = Date.now() - t0
+
+		expect(thrown, 'sendPing must reject rather than hang').to.be.instanceOf(Error)
+		expectBounded(elapsed)
+	})
+
+	// The other half of the contract: `opts.signal` is the caller's own cancellation (a `stop()`,
+	// or a budget imposed from above) and the sender's deadline is a child of it, so cancelling
+	// must end the RPC well before its own `timeoutMs`.
+	it('sendPing rejects immediately on an already-aborted caller signal, without dialing', async () => {
+		let dialed = false
+		const node = {
+			getConnections: () => [],
+			dialProtocol: async () => { dialed = true; throw new Error('must not dial') },
+		} as unknown as Libp2p
+		const ac = new AbortController()
+		ac.abort(new Error('service stopped'))
+
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await sendPing(node, peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
+		} catch (err) {
+			thrown = err
+		}
+
+		expect((thrown as Error)?.message, 'caller reason surfaces').to.equal('service stopped')
+		expect(dialed, 'dialProtocol called').to.equal(false)
+		expect(Date.now() - t0, 'must not wait out its own budget').to.be.at.most(MAX_MS)
+	})
+
+	it('sendPing rejects promptly when the caller signal aborts mid-flight', async () => {
+		const ac = new AbortController()
+		const timer = setTimeout(() => { ac.abort(new Error('service stopped')) }, TIMEOUT_MS)
+
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			// A budget far past the abort, so only the parent signal can end this.
+			await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
+		} catch (err) {
+			thrown = err
+		} finally {
+			clearTimeout(timer)
+		}
+
+		expect((thrown as Error)?.message, 'caller reason surfaces').to.equal('service stopped')
+		expectBounded(Date.now() - t0)
+	})
+
+	it('readAllBounded rejects when its signal aborts mid-read', async () => {
+		const silent = {
+			[Symbol.asyncIterator]: () => ({
+				next: () => new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }),
+			}),
+		}
+		const ac = new AbortController()
+		const timer = setTimeout(() => { ac.abort(new Error('caller gave up')) }, TIMEOUT_MS)
+
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			// A read deadline far past the abort, so the abort arm — not the deadline — is what ends it.
+			await readAllBounded(silent, 1024, 60_000, { signal: ac.signal })
+		} catch (err) {
+			thrown = err
+		} finally {
+			clearTimeout(timer)
+		}
+
+		expect((thrown as Error)?.message, 'abort reason surfaces').to.equal('caller gave up')
+		expectBounded(Date.now() - t0)
+	})
+
+	it('fetchNeighbors gives up on a newStream that never resolves, returning its fabricated empty snapshot', async () => {
+		const t0 = Date.now()
+		// NOTE: `fetchNeighbors` swallows every failure — timeout included — into a fabricated
+		// empty snapshot, so the caller cannot tell "no neighbors" from "never answered". That is
+		// pre-existing (tracked as `8-rpc-shared-helper`'s "fetchNeighbors fabricates success"
+		// arm), so this asserts on the fabrication plus elapsed time rather than on a rejection.
+		const snap = await fetchNeighbors(makeHangingStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
+		const elapsed = Date.now() - t0
+
+		expect(snap.successors, 'successors').to.deep.equal([])
+		expect(snap.predecessors, 'predecessors').to.deep.equal([])
+		expectBounded(elapsed)
 	})
 })
 
