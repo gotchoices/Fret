@@ -1,11 +1,13 @@
 import { describe, it, afterEach } from 'mocha';
 import { expect } from 'chai';
-import { FretPeerDiscovery } from '../src/service/peer-discovery.js';
+import { FretPeerDiscovery, type DiscoverySnapshotSource } from '../src/service/peer-discovery.js';
 import { DigitreeStore } from '../src/store/digitree-store.js';
 import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
-import { hashPeerId } from '../src/ring/hash.js';
+import { hashPeerId, coordToBase64url } from '../src/ring/hash.js';
 import { createMemNode, stopAll } from './helpers/libp2p.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
+import { Libp2pFretService } from '../src/service/libp2p-fret-service.js';
+import type { SerializedPeerEntry, SerializedTable } from '../src/index.js';
 import type { Libp2p } from 'libp2p';
 
 // Discovery is now member-scoped: FretPeerDiscovery.scan only emits peers labeled `member`
@@ -194,6 +196,94 @@ describe('FretPeerDiscovery', function () {
 		expect(peers.length).to.equal(3, 'first scan should emit exactly batchSize peers');
 	});
 
+	it('never emits self when the source supplies a self id', async () => {
+		const nodes = await Promise.all([createMemNode(), createMemNode()]);
+		await Promise.all(nodes.map(n => n.start()));
+
+		const ids = nodes.map(n => n.peerId.toString());
+		const coords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)));
+		// Self is seeded `member` and lives in the store like any other peer, so only the
+		// self filter keeps it out of the emission.
+		const store = makeStore(ids, coords);
+		const source: DiscoverySnapshotSource = { store, selfId: ids[0]! };
+
+		const disc = new FretPeerDiscovery(() => source, {
+			emissionIntervalMs: 100,
+			batchSize: 10,
+			debounceMs: 60_000,
+		});
+
+		const peers = await startAndCollect(disc, 400);
+		await disc.stop();
+		await stopAll(nodes);
+
+		const emittedIds = peers.map(p => p.id.toString());
+		expect(emittedIds).to.not.include(ids[0]!, 'self must never be emitted');
+		expect(emittedIds).to.include(ids[1]!, 'the other member should still be emitted');
+	});
+
+	it('tolerates a not-yet-ready source, then emits once it resolves', async () => {
+		const nodes = [await createMemNode()];
+		await nodes[0]!.start();
+
+		const id = nodes[0]!.peerId.toString();
+		const coord = await hashPeerId(nodes[0]!.peerId);
+		const store = makeStore([id], [coord]);
+
+		// `null` is the state between libp2p node construction and Libp2pFretService.start().
+		let source: DiscoverySnapshotSource | null = null;
+
+		const peers: PeerInfo[] = [];
+		const handler = (evt: CustomEvent<PeerInfo>) => { peers.push(evt.detail); };
+		const disc = new FretPeerDiscovery(() => source, {
+			emissionIntervalMs: 100,
+			batchSize: 10,
+			debounceMs: 60_000,
+		});
+		disc.addEventListener('peer', handler);
+		await disc.start();
+		await new Promise(r => setTimeout(r, 250));
+		expect(peers.length).to.equal(0, 'no emission while the source is unresolved');
+
+		// Interval must have survived the not-ready ticks.
+		source = { store, selfId: 'not-a-peer-in-this-store' };
+		await new Promise(r => setTimeout(r, 250));
+		disc.removeEventListener('peer', handler);
+		await disc.stop();
+		await stopAll(nodes);
+
+		expect(peers.map(p => p.id.toString())).to.include(id, 'should emit once the source resolves');
+	});
+
+	it('survives a throwing source thunk', async () => {
+		const nodes = [await createMemNode()];
+		await nodes[0]!.start();
+
+		const id = nodes[0]!.peerId.toString();
+		const coord = await hashPeerId(nodes[0]!.peerId);
+		const store = makeStore([id], [coord]);
+
+		let boom = true;
+		const peers: PeerInfo[] = [];
+		const handler = (evt: CustomEvent<PeerInfo>) => { peers.push(evt.detail); };
+		const disc = new FretPeerDiscovery(() => {
+			if (boom) throw new Error('source not ready');
+			return { store, selfId: 'other' };
+		}, { emissionIntervalMs: 100, batchSize: 10, debounceMs: 60_000 });
+		disc.addEventListener('peer', handler);
+		await disc.start();
+		await new Promise(r => setTimeout(r, 250));
+		expect(peers.length).to.equal(0);
+
+		boom = false;
+		await new Promise(r => setTimeout(r, 250));
+		disc.removeEventListener('peer', handler);
+		await disc.stop();
+		await stopAll(nodes);
+
+		expect(peers.map(p => p.id.toString())).to.include(id);
+	});
+
 	it('start is idempotent', async () => {
 		const store = new DigitreeStore();
 		const disc = new FretPeerDiscovery(store, { emissionIntervalMs: 200 });
@@ -280,5 +370,85 @@ describe('FretPeerDiscovery integration with CoreFretService', function () {
 			expect(emittedIds.has(nodes[i]!.peerId.toString())).to.equal(true,
 				`should emit node ${i}`);
 		}
+	});
+});
+
+describe('Libp2pFretService discovery wiring', function () {
+	this.timeout(20000);
+
+	function serialized(id: string, coord: Uint8Array, membership: 'member' | 'foreign' | 'unknown'): SerializedPeerEntry {
+		return {
+			id,
+			coord: coordToBase64url(coord),
+			relevance: 1,
+			lastAccess: Date.now(),
+			state: 'disconnected',
+			membership,
+			accessCount: 1,
+			successCount: 1,
+			failureCount: 0,
+			avgLatencyMs: null,
+		};
+	}
+
+	// libp2p reads this symbol off each service while constructing the node — i.e. before
+	// setLibp2p can run — so reading it must not throw and must not build a second instance.
+	it('exposes a PeerDiscovery via peerDiscoverySymbol before the node is injected', async () => {
+		const svc = new Libp2pFretService({});
+		const disc = svc[peerDiscoverySymbol];
+		expect(disc).to.be.instanceOf(FretPeerDiscovery);
+		expect(typeof disc.addEventListener).to.equal('function');
+
+		const node = await createMemNode();
+		await node.start();
+		svc.setLibp2p(node);
+		expect(svc.getPeerDiscovery()).to.equal(disc, 'getPeerDiscovery must return the same instance');
+		await stopAll([node]);
+	});
+
+	it('never leaks a foreign or dead peer from a restored routing table', async () => {
+		const host = await createMemNode();
+		await host.start();
+		const others = await Promise.all([createMemNode(), createMemNode(), createMemNode()]);
+		const [memberId, foreignId, deadId] = others.map(n => n.peerId.toString()) as [string, string, string];
+		const coords = await Promise.all(others.map(n => hashPeerId(n.peerId)));
+
+		const svc = new Libp2pFretService({}, { profile: 'edge', k: 7 }, {
+			emissionIntervalMs: 100,
+			batchSize: 20,
+			debounceMs: 60_000,
+		});
+		svc.setLibp2p(host);
+
+		const table: SerializedTable = {
+			v: 1,
+			peerId: host.peerId.toString(),
+			timestamp: Date.now(),
+			entries: [
+				serialized(memberId, coords[0]!, 'member'),
+				serialized(foreignId, coords[1]!, 'foreign'),
+				serialized(deadId, coords[2]!, 'member'),
+			],
+		};
+		await svc.importTable(table);
+		// importTable forces every restored entry to `disconnected` (liveness cannot survive a
+		// restart), so the dead arm is applied to the store after import rather than through
+		// the snapshot.
+		(svc as unknown as { inner: CoreFretService }).inner.getStore().setState(deadId, 'dead');
+
+		const emitted: string[] = [];
+		const handler = (evt: CustomEvent<PeerInfo>) => { emitted.push(evt.detail.id.toString()); };
+		const disc = svc[peerDiscoverySymbol];
+		disc.addEventListener('peer', handler);
+		await svc.start();
+		await new Promise(r => setTimeout(r, 400));
+		disc.removeEventListener('peer', handler);
+		await svc.stop();
+		await stopAll([...others, host]);
+
+		expect(emitted).to.include(memberId, 'restored member should be emitted');
+		expect(emitted).to.not.include(foreignId, 'restored foreign peer must never be emitted');
+		expect(emitted).to.not.include(deadId, 'dead peer must never be emitted');
+		expect(emitted).to.not.include(host.peerId.toString(), 'self must never be emitted');
 	});
 });

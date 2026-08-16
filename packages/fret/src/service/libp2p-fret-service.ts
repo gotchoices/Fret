@@ -1,20 +1,24 @@
 import type { PeerDiscovery, Startable } from '@libp2p/interface';
+import { peerDiscoverySymbol } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
 import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
-import { FretPeerDiscovery, type FretPeerDiscoveryConfig } from './peer-discovery.js';
-import { seedDiscovery } from './discovery.js';
+import { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryConfig } from './peer-discovery.js';
 
 type Components = { libp2p?: Libp2p };
 
 export class Libp2pFretService implements Startable {
 	private inner: FretService | null = null;
 	private nodeRef: Libp2p | null = null;
-	private discovery: FretPeerDiscovery | null = null;
-	private readonly discoveryCfg?: FretPeerDiscoveryConfig;
+	/**
+	 * Built here rather than on demand: libp2p reads `peerDiscoverySymbol` off each service while
+	 * constructing the node, which is before {@link setLibp2p} can run. The store it scans is
+	 * therefore resolved per tick (see {@link discoverySource}), not captured now.
+	 */
+	private readonly discovery: FretPeerDiscovery;
 
 	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>, discoveryCfg?: FretPeerDiscoveryConfig) {
-		this.discoveryCfg = discoveryCfg;
+		this.discovery = new FretPeerDiscovery(() => this.discoverySource(), discoveryCfg);
 	}
 
 	get [Symbol.toStringTag](): string {
@@ -40,28 +44,43 @@ export class Libp2pFretService implements Startable {
 		return this.inner as CoreFretService;
 	}
 
-	/** Returns a libp2p-compatible PeerDiscovery backed by the Digitree store. */
+	/**
+	 * What one discovery scan needs, or `null` while the node has not been injected or the core
+	 * service has not been built yet. Deliberately does not call {@link ensure} — that throws
+	 * pre-injection, and this runs on a timer that must survive the not-ready window.
+	 */
+	private discoverySource(): DiscoverySnapshotSource | null {
+		const core = this.inner as CoreFretService | null;
+		if (!core || !this.nodeRef) return null;
+		return { store: core.getStore(), selfId: this.nodeRef.peerId.toString() };
+	}
+
+	/**
+	 * How libp2p itself picks up FRET's discovery: it reads this symbol off each configured
+	 * service during node construction and subscribes to the returned object's `peer` events,
+	 * merging them into its peerStore. Must stay side-effect free and callable pre-injection.
+	 */
+	get [peerDiscoverySymbol](): PeerDiscovery {
+		return this.discovery;
+	}
+
+	/** The same instance libp2p reaches via `peerDiscoverySymbol`, for applications that want to listen directly. */
 	getPeerDiscovery(): PeerDiscovery {
-		const core = this.ensure();
-		if (!this.discovery) {
-			this.discovery = new FretPeerDiscovery(core.getStore(), this.discoveryCfg);
-		}
 		return this.discovery;
 	}
 
 	async start(): Promise<void> {
 		const core = this.ensure();
 		if (!this.nodeRef) throw new Error('Libp2pFretService.start: libp2p node not injected');
-		seedDiscovery(this.nodeRef, core.getStore());
 		await core.start();
-		if (!this.discovery) {
-			this.discovery = new FretPeerDiscovery(core.getStore(), this.discoveryCfg);
-		}
+		// After core.start(), so the first scan runs against a peerStore-seeded table. libp2p
+		// registers a listener for symbol-provided discovery but does not start it, so the
+		// explicit start/stop stay ours.
 		await this.discovery.start();
 	}
 
 	async stop(): Promise<void> {
-		await this.discovery?.stop();
+		await this.discovery.stop();
 		await this.inner?.stop();
 	}
 

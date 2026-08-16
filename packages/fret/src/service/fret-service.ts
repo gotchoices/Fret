@@ -1,4 +1,4 @@
-import type { Startable, PeerId, PeerInfo } from '@libp2p/interface';
+import type { Startable, PeerId } from '@libp2p/interface';
 import type {
 	FretService as IFretService,
 	FretMode,
@@ -158,8 +158,6 @@ export class FretService implements IFretService, Startable {
 	private inflightAct = 0;
 	private readonly bucketNeighbors: TokenBucket;
 	private readonly bucketMaybeAct: TokenBucket;
-	private readonly bucketDiscovery: TokenBucket;
-	private readonly announcedIds = new Map<string, number>();
 	private postBootstrapAnnounced = false;
 	private readonly sparsity: SparsityModel = createSparsityModel();
 	private cachedSelfCoord: Uint8Array | null = null;
@@ -251,11 +249,6 @@ export class FretService implements IFretService, Startable {
 		};
 		// Create network-specific protocols
 		this.protocols = makeProtocols(this.cfg.networkName);
-		// Discovery rate differs by profile
-		this.bucketDiscovery = new TokenBucket(
-			this.cfg.profile === 'core' ? 50 : 10,
-			this.cfg.profile === 'core' ? 25 : 3
-		);
 		this.bucketNeighbors = new TokenBucket(
 			this.cfg.profile === 'core' ? 20 : 8,
 			this.cfg.profile === 'core' ? 10 : 4
@@ -1235,7 +1228,6 @@ export class FretService implements IFretService, Startable {
 			// Calibrate local size estimator from snapshot's estimate
 			this.calibrateSizeFromSnapshot(snap, from);
 			await this.enforceCapacity();
-			this.emitDiscovered(discovered);
 			if (discovered.length > 0) this.detach(this.announceToNewPeers(discovered), 'announceToNewPeers');
 		} catch (err) {
 			log.error('mergeAnnounceSnapshot failed for %s - %e', from, err);
@@ -1251,7 +1243,6 @@ export class FretService implements IFretService, Startable {
 			// grows large or the tick cadence tightens, gate re-seed on a peerStore change/epoch or
 			// skip hashing for ids already in the store (reuse the stored coord).
 			const peers = await this.node.peerStore.all();
-			const discovered: string[] = [];
 			// Rebuilt wholesale rather than merged, so a peer whose addresses the peerStore
 			// dropped stops reading as dialable (see `addressKnown`).
 			const addressKnown = new Set<string>();
@@ -1260,7 +1251,6 @@ export class FretService implements IFretService, Startable {
 					const pidStr = p.id.toString();
 					if (p.addresses.length > 0) addressKnown.add(pidStr);
 					const coord = await hashPeerId(p.id);
-					if (!this.store.getById(pidStr)) discovered.push(pidStr);
 					this.store.upsert(pidStr, coord);
 					// If identify has populated the peerStore, classify off its protocol
 					// list now rather than waiting for an outbound probe. No `unknown`-only
@@ -1281,7 +1271,6 @@ export class FretService implements IFretService, Startable {
 			try {
 				const coord = await hashPeerId(this.node.peerId);
 				const selfStr = this.node.peerId.toString();
-				if (!this.store.getById(selfStr)) discovered.push(selfStr);
 				this.store.upsert(selfStr, coord);
 				// Self always serves its own network.
 				this.store.setMembership(selfStr, 'member');
@@ -1289,7 +1278,6 @@ export class FretService implements IFretService, Startable {
 				console.error('failed to add self to store', err);
 			}
 			await this.enforceCapacity();
-			this.emitDiscovered(discovered);
 		} catch (err) {
 			console.error('seedFromPeerStore failed:', err);
 		}
@@ -1324,7 +1312,6 @@ export class FretService implements IFretService, Startable {
 
 	private async seedFromBootstraps(): Promise<void> {
 		if (!this.cfg.bootstraps || this.cfg.bootstraps.length === 0) return;
-		const discovered: string[] = [];
 		for (const bootstrapEntry of this.cfg.bootstraps.slice(0, 8)) {
 			try {
 				let id = bootstrapEntry;
@@ -1340,7 +1327,6 @@ export class FretService implements IFretService, Startable {
 				}
 				const pid = peerIdFromString(id);
 				const coord = await hashPeerId(pid);
-				if (!this.store.getById(id)) discovered.push(id);
 				this.store.upsert(id, coord);
 				await this.applyTouch(id, coord);
 			} catch (err) {
@@ -1348,7 +1334,6 @@ export class FretService implements IFretService, Startable {
 			}
 		}
 		await this.enforceCapacity();
-		this.emitDiscovered(discovered);
 	}
 
 	private async stabilizeOnce(): Promise<void> {
@@ -1539,7 +1524,6 @@ export class FretService implements IFretService, Startable {
 			}
 		}
 		await this.enforceCapacity();
-		this.emitDiscovered(announced);
 		if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 	}
 
@@ -1662,39 +1646,6 @@ export class FretService implements IFretService, Startable {
 			estimated_cluster_size: this.cfg.k,
 			confidence: 0.5,
 		};
-	}
-
-	// Discovery event emission
-	private emitDiscovered(ids: string[]): void {
-		if (ids.length === 0) return;
-		const now = Date.now();
-		const ttl = this.cfg.profile === 'core' ? 10 * 60_000 : 30 * 60_000;
-		const target = this.node as unknown as { dispatchEvent?: (evt: Event) => void };
-		let emitted = 0;
-		for (const id of Array.from(new Set(ids))) {
-			// Member-scoped: never surface a foreign / unclassified peer to libp2p's discovery
-			// pipeline, which would re-seed it into selection upstream.
-			// NOTE: callers pass freshly-learned id deltas, so a same-network peer is usually
-			// still `unknown` here and is skipped on first sight; the durable emission path is
-			// FretPeerDiscovery.scan, which re-scans the whole store each tick and emits the
-			// peer once the classification probe promotes it to `member` (~1 tick later).
-			if (this.store.getById(id)?.membership !== 'member') continue;
-			const exp = this.announcedIds.get(id) ?? 0;
-			if (exp > now) continue;
-			if (!this.bucketDiscovery.tryTake()) break;
-			try {
-				const pid = peerIdFromString(id);
-				target.dispatchEvent?.(new CustomEvent('peer:discovery', { detail: { id: pid, multiaddrs: [] } as PeerInfo }));
-				this.announcedIds.set(id, now + ttl);
-				emitted++;
-			} catch (err) {
-				console.warn('emitDiscovered failed for', id, err);
-			}
-		}
-		// Optionally prune old entries to cap memory
-		if (emitted > 0 && this.announcedIds.size > 4096) {
-			for (const [k, v] of this.announcedIds) { if (v <= now) this.announcedIds.delete(k); }
-		}
 	}
 
 	/**

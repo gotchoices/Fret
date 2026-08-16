@@ -51,7 +51,8 @@ describe('Profile behavior tests', function () {
 			coreRefill: number;
 			edgeRefill: number;
 		}> = [
-			{ name: 'Discovery', field: 'bucketDiscovery', coreCap: 50, edgeCap: 10, coreRefill: 25, edgeRefill: 3 },
+			// No Discovery bucket: FretService no longer emits discovery events at all. The single
+			// emission path is FretPeerDiscovery, rate-bounded by batchSize / emissionIntervalMs.
 			{ name: 'Neighbors', field: 'bucketNeighbors', coreCap: 20, edgeCap: 8, coreRefill: 10, edgeRefill: 4 },
 			{ name: 'MaybeAct', field: 'bucketMaybeAct', coreCap: 32, edgeCap: 8, coreRefill: 16, edgeRefill: 4 },
 			{ name: 'Ping', field: 'bucketPing', coreCap: 30, edgeCap: 10, coreRefill: 15, edgeRefill: 5 },

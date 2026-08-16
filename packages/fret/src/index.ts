@@ -122,8 +122,7 @@ export interface FretService {
 export type { SerializedPeerEntry, SerializedTable };
 export { FretService as FretServiceImpl } from './service/fret-service.js';
 import { FretService as FretServiceClass } from './service/fret-service.js';
-export { seedDiscovery } from './service/discovery.js';
-export { FretPeerDiscovery, type FretPeerDiscoveryConfig } from './service/peer-discovery.js';
+export { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryInput, type FretPeerDiscoveryConfig } from './service/peer-discovery.js';
 export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js';
 export { hashKey, hashPeerId } from './ring/hash.js';
 export type { RingCoord } from './ring/hash.js';
