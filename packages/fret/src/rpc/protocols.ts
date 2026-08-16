@@ -1,5 +1,18 @@
 import type { Libp2p } from 'libp2p';
-import type { Connection, PeerId, Stream } from '@libp2p/interface';
+import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
+import { abortReasonError } from '../utils/deadline.js';
+
+/**
+ * Default budget for one whole outbound RPC — dial + stream open + write + read.
+ *
+ * Historically this was `readAllBounded`'s own default and bounded the *read* alone, so a peer
+ * that accepted a connection but never answered, or was slow to connect in the first place,
+ * held the caller open indefinitely. The magnitude is unchanged; what changed is its scope.
+ *
+ * Exported so the four outbound RPC families cannot drift apart. Per-call-site overrides are
+ * stated at the call site (see the maintenance-ping and announce budgets in `FretService`).
+ */
+export const RPC_TIMEOUT_MS = 5000;
 
 export function makeProtocols(networkName = 'default') {
 	const prefix = `/optimystic/${networkName}/fret/1.0.0`;
@@ -70,6 +83,13 @@ type StreamChunk = Uint8Array | { subarray(): Uint8Array };
 const POLL_TICK = Symbol('readAllBounded.poll');
 
 /**
+ * Race sentinel for the caller's abort signal. The abort arm **resolves** with this rather than
+ * rejecting, so an abort that loses the race can never surface as an unhandled rejection; the
+ * loop turns the sentinel into a throw itself.
+ */
+const ABORTED = Symbol('readAllBounded.aborted');
+
+/**
  * How often to re-check the stream's own end-of-read state; see {@link remoteFinishedWriting}.
  *
  * NOTE: this adds up to one poll interval to every RPC that hits the lost-event case,
@@ -129,14 +149,18 @@ function remoteFinishedWriting(stream: unknown): boolean {
  * If slow-loris pressure ever shows up, give handlers a shorter read deadline — do
  * not reintroduce an idle timer.
  *
- * @throws if the deadline expires or `maxBytes` is exceeded — a partial read is an
- * error, never a short-but-valid result, so callers report a timeout instead of the
+ * `opts.signal` cancels the read from outside, on exactly the same contract as the deadline —
+ * so a caller that gave up never mistakes what it had already buffered for a whole message.
+ *
+ * @throws if the deadline expires, `opts.signal` aborts, or `maxBytes` is exceeded — a partial
+ * read is an error, never a short-but-valid result, so callers report a timeout instead of the
  * malformed-JSON error a truncated buffer would produce downstream.
  */
 export async function readAllBounded(
 	stream: AsyncIterable<StreamChunk>,
 	maxBytes: number,
-	timeoutMs = 5000
+	timeoutMs = RPC_TIMEOUT_MS,
+	opts: { signal?: AbortSignal } = {}
 ): Promise<Uint8Array> {
 	const parts: Uint8Array[] = [];
 	let len = 0;
@@ -146,33 +170,53 @@ export async function readAllBounded(
 	// Held across poll ticks: re-calling `iter.next()` would queue a second read and
 	// silently drop whichever chunk the abandoned one consumes.
 	let pending: Promise<IteratorResult<StreamChunk>> | undefined;
-
-	while (true) {
-		const remaining = deadline - Date.now();
-		if (remaining <= 0) throw timedOut();
-
-		let timer: ReturnType<typeof setTimeout> | undefined;
-		const poll = new Promise<typeof POLL_TICK>(r => {
-			timer = setTimeout(() => r(POLL_TICK), Math.min(remaining, EOF_POLL_MS));
+	const signal = opts.signal;
+	let onAbort: (() => void) | undefined;
+	// Armed only for a signal that is live *now*: an already-aborted one is caught by the loop's
+	// own check on its first pass, before any read is queued.
+	const abortWait = signal == null || signal.aborted
+		? undefined
+		: new Promise<typeof ABORTED>((resolve) => {
+			onAbort = () => resolve(ABORTED);
+			signal.addEventListener('abort', onAbort, { once: true });
 		});
-		if (pending == null) {
-			pending = iter.next();
-			pending.catch(() => {}); // Prevent unhandled rejection if the poll wins
-		}
-		const result = await Promise.race<IteratorResult<StreamChunk> | typeof POLL_TICK>([pending, poll]);
-		clearTimeout(timer);
 
-		if (result === POLL_TICK) {
-			if (remoteFinishedWriting(stream)) break;
-			continue; // still open — keep waiting on `pending`, bounded only by the deadline
-		}
-		pending = undefined;
-		if (result.done) break;
+	try {
+		while (true) {
+			if (signal?.aborted === true) throw abortReasonError(signal);
+			const remaining = deadline - Date.now();
+			if (remaining <= 0) throw timedOut();
 
-		const bytes = toBytes(result.value);
-		len += bytes.length;
-		if (len > maxBytes) throw new Error(`payload too large: ${len} exceeds ${maxBytes} byte limit`);
-		parts.push(bytes);
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const poll = new Promise<typeof POLL_TICK>(r => {
+				timer = setTimeout(() => r(POLL_TICK), Math.min(remaining, EOF_POLL_MS));
+			});
+			if (pending == null) {
+				pending = iter.next();
+				pending.catch(() => {}); // Prevent unhandled rejection if the poll wins
+			}
+			type RaceResult = IteratorResult<StreamChunk> | typeof POLL_TICK | typeof ABORTED;
+			const racers: Array<Promise<RaceResult>> = [pending, poll];
+			if (abortWait != null) racers.push(abortWait);
+			const result = await Promise.race<RaceResult>(racers);
+			clearTimeout(timer);
+
+			if (result === ABORTED) throw abortReasonError(signal!);
+			if (result === POLL_TICK) {
+				if (remoteFinishedWriting(stream)) break;
+				continue; // still open — keep waiting on `pending`, bounded only by the deadline
+			}
+			pending = undefined;
+			if (result.done) break;
+
+			const bytes = toBytes(result.value);
+			len += bytes.length;
+			if (len > maxBytes) throw new Error(`payload too large: ${len} exceeds ${maxBytes} byte limit`);
+			parts.push(bytes);
+		}
+	} finally {
+		// One listener per read; without this a long-lived run signal accumulates one per RPC.
+		if (onAbort != null && signal != null) signal.removeEventListener('abort', onAbort);
 	}
 
 	const out = new Uint8Array(len);
@@ -223,20 +267,52 @@ export function isLimitedConnection(c: Connection): boolean {
  * When `requireExisting` is set the caller skips dialing if no connection
  * exists (neighbors fetch/announce reduce churn this way) and `undefined` is
  * returned; otherwise we `dialProtocol`.
+ *
+ * `opts.signal` bounds the open itself. Both `newStream` and `dialProtocol` take
+ * `NewStreamOptions extends AbortOptions`; without it a dial that hangs — no address,
+ * unresponsive transport, half-open TCP — hangs the caller with no budget at all. An
+ * already-aborted signal throws here rather than dialing, so a `stop()` racing a
+ * maintenance tick cannot still issue dials.
  */
 export async function openRpcStream(
 	node: Libp2p,
 	pid: PeerId,
 	protocols: string[],
-	opts: { requireExisting?: boolean } = {}
+	opts: { requireExisting?: boolean; signal?: AbortSignal } = {}
 ): Promise<Stream | undefined> {
+	if (opts.signal?.aborted === true) throw abortReasonError(opts.signal);
 	const open = node.getConnections(pid)
 		.filter(c => c?.status === 'open' && typeof c?.newStream === 'function');
 	// Prefer a direct connection; fall back to the limited one only when it is
 	// the only open path (the steady state for browsers and NATed peers).
 	const chosen = open.find(c => !isLimitedConnection(c)) ?? open[0];
-	const streamOpts = { runOnLimitedConnection: true, negotiateFully: false } as const;
+	const streamOpts: NewStreamOptions = {
+		runOnLimitedConnection: true,
+		negotiateFully: false,
+		signal: opts.signal,
+	};
 	if (chosen) return chosen.newStream(protocols, streamOpts);
 	if (opts.requireExisting) return undefined;
 	return node.dialProtocol(pid, protocols, streamOpts);
+}
+
+/**
+ * Release an outbound RPC stream on the way out of a sender.
+ *
+ * On the success path `close()` is the right call and is awaited. On the failure path it is
+ * not: `close()` on a stream whose remote has stalled is itself unbounded, so the *cleanup*
+ * of a timed-out read would hang after the read's own deadline had already fired. `abort()`
+ * is synchronous and releases the stream at once — which matters because outbound stream caps
+ * are finite (64 Edge / 256 Core), so a leaked stream is a real ceiling rather than mere waste.
+ *
+ * Both arms are best-effort: this runs from a `finally` on an already-failing path, where a
+ * second throw would mask the real error.
+ */
+export async function releaseRpcStream(stream: Stream | undefined, signal: AbortSignal): Promise<void> {
+	if (stream == null) return;
+	if (signal.aborted) {
+		try { stream.abort(abortReasonError(signal)); } catch { /* best effort */ }
+		return;
+	}
+	try { await stream.close(); } catch { /* best effort */ }
 }

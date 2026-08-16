@@ -1,7 +1,16 @@
 import type { Libp2p } from 'libp2p';
 import type { Connection, Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
-import { PROTOCOL_LEAVE, encodeJson, decodeJson, readAllBounded, openRpcStream } from './protocols.js';
+import {
+	PROTOCOL_LEAVE,
+	RPC_TIMEOUT_MS,
+	encodeJson,
+	decodeJson,
+	readAllBounded,
+	openRpcStream,
+	releaseRpcStream,
+} from './protocols.js';
+import { deadline } from '../utils/deadline.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:leave');
@@ -60,17 +69,20 @@ export async function sendLeave(
 	node: Libp2p,
 	peerIdStr: string,
 	notice: LeaveNoticeV1,
-	protocol = PROTOCOL_LEAVE
+	protocol = PROTOCOL_LEAVE,
+	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
 ): Promise<void> {
 	const pid = peerIdFromString(peerIdStr);
+	const d = deadline(opts.timeoutMs ?? RPC_TIMEOUT_MS, opts.signal);
 	let stream: Stream | undefined;
 	try {
-		stream = await openRpcStream(node, pid, [protocol]);
+		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
 		stream!.send(await encodeJson(notice));
-		await stream!.close();
 	} finally {
-		if (stream != null) {
-			try { await stream.close(); } catch {}
-		}
+		// The close *is* the flush for this write-only RPC; on the aborted path
+		// `releaseRpcStream` swaps it for a synchronous `abort` so a stalled remote cannot
+		// hold `stop()` open past its shutdown budget.
+		await releaseRpcStream(stream, d.signal);
+		d.cancel();
 	}
 }

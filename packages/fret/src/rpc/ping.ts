@@ -1,7 +1,16 @@
 import type { Libp2p } from 'libp2p';
 import type { Connection, Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
-import { PROTOCOL_PING, encodeJson, decodeJson, readAllBounded, openRpcStream } from './protocols.js';
+import {
+	PROTOCOL_PING,
+	RPC_TIMEOUT_MS,
+	encodeJson,
+	decodeJson,
+	readAllBounded,
+	openRpcStream,
+	releaseRpcStream,
+} from './protocols.js';
+import { deadline } from '../utils/deadline.js';
 import type { BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
 
@@ -57,13 +66,30 @@ export async function registerPing(
 	});
 }
 
-export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_PING): Promise<{ ok: boolean; rttMs: number; size_estimate?: number; confidence?: number }> {
-	const start = Date.now();
+/**
+ * Ping `peer` over this network's namespaced protocol.
+ *
+ * `opts.timeoutMs` is the budget for the *whole* RPC — dial, stream open, and read — not the
+ * read alone. `opts.signal` cancels it from outside (a `stop()`, or a caller-imposed budget);
+ * the sender's own deadline is a child of it, so a caller can tell its own cancellation from a
+ * genuine timeout by checking the signal it passed.
+ */
+export async function sendPing(
+	node: Libp2p,
+	peer: string,
+	protocol = PROTOCOL_PING,
+	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
+): Promise<{ ok: boolean; rttMs: number; size_estimate?: number; confidence?: number }> {
 	const pid = peerIdFromString(peer);
+	const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS;
+	const d = deadline(timeoutMs, opts.signal);
 	let stream: Stream | undefined;
 	try {
-		stream = await openRpcStream(node, pid, [protocol]);
-		const bytes = await readAllBounded(stream!, 1024);
+		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
+		// RTT is measured from *after* the open: a dial is not round-trip time, and counting it
+		// inflated first-contact latency into peer health scoring.
+		const start = Date.now();
+		const bytes = await readAllBounded(stream!, 1024, timeoutMs, { signal: d.signal });
 		const rttMs = Math.max(0, Date.now() - start);
 		if (bytes.length === 0) return { ok: false, rttMs };
 		try {
@@ -80,9 +106,8 @@ export async function sendPing(node: Libp2p, peer: string, protocol = PROTOCOL_P
 			return { ok: false, rttMs };
 		}
 	} finally {
-		if (stream != null) {
-			try { await stream.close(); } catch { }
-		}
+		await releaseRpcStream(stream, d.signal);
+		d.cancel();
 	}
 }
 
