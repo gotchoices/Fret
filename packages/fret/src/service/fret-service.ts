@@ -1902,6 +1902,27 @@ export class FretService implements IFretService, Startable {
 		return [first, second].filter((x): x is string => Boolean(x));
 	}
 
+	/**
+	 * The doc's local membership test: self is in-cluster for a message when it appears among the
+	 * first `window` entries of the key's alternating two-sided cohort.
+	 *
+	 * `wants` is the caller's staged/partial-cohort ask and is capped at `want_k`, per the wire
+	 * contract (`wants ≤ k`), so a malformed message cannot widen the window past the cluster the
+	 * sender asked for.
+	 *
+	 * The floor of 2 keeps both key-adjacent anchors acting even for a degenerate `want_k` of 0 or
+	 * 1; without it nobody would consider itself in-cluster and the message would forward until TTL
+	 * ran out.
+	 *
+	 * NOTE: want_k is caller-supplied and sizes this walk; bounded today only by the store size
+	 * (C = 2048). If inbound maybeAct ever needs a tighter per-message cost bound, clamp want_k to
+	 * a profile maximum here.
+	 */
+	private inClusterWindow(msg: RouteAndMaybeActV1): number {
+		const k = msg.want_k ?? this.cfg.k;
+		return Math.max(2, Math.min(msg.wants ?? k, k));
+	}
+
 	async routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }> {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 		const coord = await hashKey(keyBytes);
@@ -1911,13 +1932,20 @@ export class FretService implements IFretService, Startable {
 			selfCoord: await this.selfCoord()
 		});
 
-		// In-cluster test
-		const distIdx = this.neighborDistance(selfId, coord, Math.max(2, msg.want_k ?? this.cfg.k));
-		const inCluster = distIdx <= 1;
+		// In-cluster test: `neighborDistance` returns Infinity when self is absent from a cohort of
+		// that size, so `< window` is exactly "self appears among the first `window` entries".
+		// Deliberately wider than the two key-adjacent anchors: `shouldIncludePayload` attaches an
+		// activity because the sender judged us near enough to act, so a cluster member that
+		// forwards spends a hop the sender never budgeted for.
+		const window = this.inClusterWindow(msg);
+		const inCluster = this.neighborDistance(selfId, coord, window) < window;
 
 		if (inCluster) {
 			// In-cluster with activity → perform via callback
 			if (msg.activity && this.activityHandler) {
+				// Deliberately `want_k`-wide, not `window`-wide: the cohort exists to gather
+				// `min_sigs` signatures and `min_sigs` derives from the full k, so `wants` narrows
+				// *who acts*, not *how many peers the actor gathers*.
 				const cohort = this.assembleCohort(coord, msg.want_k ?? this.cfg.k);
 				const result = await this.activityHandler(
 					msg.activity, cohort, msg.min_sigs, msg.correlation_id
