@@ -60,6 +60,7 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
     - **Removal from S/P is ring-view exclusion, not a separate step.** FRET keeps no standalone successor/predecessor *set* — those windows **are** the filtered ring walk (see *Network-scoped admission*), whose predicate is `membership === 'member' && state !== 'dead'`. So marking a peer `dead` removes it from the successor/predecessor windows, cohorts, routing candidates, the size estimate, and the outgoing snapshot's neighbor lists and sample, all at once. It also drops out of capacity protection — `enforceCapacity` protects only the peers that same predicate returns around self — so a dead peer with a decayed relevance becomes a preferred eviction victim with no eviction-specific code. The maintenance fan-outs that walk the store *unfiltered* (announce targets, leave notices) carry their own dead skip for the same reason they skip `foreign` and undialable peers: the dial can only fail, and the leave fan-out runs inside `stop()`, where a stack of doomed dials also delays shutdown. That skip is **one shared predicate** (`isDoomedDial` — undialable, `foreign`, or `dead`; `unknown` is deliberately still a target), not a guard restated per fan-out, because restating it is how the two drifted apart in the first place. Re-probing a dead peer belongs to the budgeted dead arm below, which backs off; a fan-out would retry every dead peer every tick.
   - Recovery: any proof of life clears the run and restores a `dead` peer to `connected` (if a connection exists) or `disconnected` — a completed outbound RPC, an inbound RPC (which is what re-admits a peer we struggle to dial but that reaches us), or a fresh `peer:connect`. Relevance is deliberately **not** reset to a baseline: the ordinary success scoring already up-ranks the peer, and wiping the health counters would erase the record of one that flaps. Conversely a `peer:disconnect` never clears `dead` — a closing connection is not proof of life, and it is precisely the event that follows a run of failed contacts, so clearing the label there would re-admit the peer with its counter still clamped at the threshold and have the next failure re-kill it.
     - Proof of life has to be able to *arrive*, and once excluded from the ring nothing dials the peer: stabilization draws its probe targets from the successor/predecessor windows. The dead arm of the re-probe pass (see *Re-probe passes* under Ring membership) is therefore the path back for a peer that recovers but never dials us and never forms a connection — without it such a peer stays dead until evicted at capacity, since `upsert` preserves `state` and a peerStore re-seed does not resurrect it either.
+- **Our own cancellation is not evidence about the peer.** A run-signal abort (`stop()`, or a future per-tick budget) records no contact failure, no backoff, and no ping-failure diagnostic; only the RPC's own timeout does. The caller's signal is the discriminator because the sender builds its deadline as a *child* of the caller's signal, so the child fires in both cases while the caller's own signal fires only on a cancellation — which is also why no new error type was needed: the caller already holds the discriminating fact. Enforced at seven of the eight guarded call sites; not at `fetchNeighbors` behind `mergeNeighborSnapshots`, whose sender swallows its own errors and returns an empty snapshot rather than rethrowing — see the `NOTE:` at `fret-service.ts:1770` for the accepted-tradeoff write-up (harmless today because the aborted signal stops `openRpcStream` from dialing before the swallow is ever reached).
 - Symmetry: maintain |S(p)| = |P(p)| = m by filling gaps from Digitree candidates
 
 ## Leave
@@ -187,7 +188,7 @@ confidence = clamp(0.5*sizeFactor + 0.5*dispersion, 0.05, 1)
 - Stream management:
   - Max inbound: 32 (Edge) / 128 (Core)
   - Max outbound: 64 (Edge) / 256 (Core)
-  - Stream read deadline: one overall budget per read (`readAllBounded`, 5s default, uniform across the four RPCs today). There is deliberately **no** per-chunk idle timer — a gap between chunks is a slow link, not end-of-stream, and an idle timer truncated healthy transfers into malformed JSON and failure-scored the (healthy) sender. libp2p v3's `close()` half-closes, so `iter.next()` resolves `{ done: true }` on genuine EOF; the overall deadline is what bounds a peer that stalls mid-payload. Exceeding it throws a read-timeout error rather than returning the partial buffer, so a timeout is never mistaken for a short-but-valid message.
+  - Stream read deadline: one overall budget per **whole outbound RPC** — dial + stream open + write + read, not the read alone (`RPC_TIMEOUT_MS`, 5s default, exported from `src/rpc/protocols.ts` so the four outbound RPC families cannot drift apart). Per-call-site overrides: `MAINTENANCE_RPC_TIMEOUT_MS` (2000ms, `fret-service.ts`) on maintenance pings and announces; `sendMaybeAct` is deliberately left at the 5s default because it is a *route* budget rather than a link one — the call returns only once the entire remaining route has completed downstream, so tightening it truncates healthy long routes (`src/rpc/maybe-act.ts`); `SHUTDOWN_BUDGET_MS` (3000ms, `fret-service.ts`) bounds the whole leave fan-out, with `LEAVE_NOTICE_TIMEOUT_MS` (1500ms) per notice so one stalled peer cannot eat it whole — that fan-out cannot reuse the run signal, since it runs *after* that aborts, by design. There is deliberately **no** per-chunk idle timer — a gap between chunks is a slow link, not end-of-stream, and an idle timer truncated healthy transfers into malformed JSON and failure-scored the (healthy) sender. libp2p v3's `close()` half-closes, so `iter.next()` resolves `{ done: true }` on genuine EOF; the overall deadline is what bounds a peer that stalls mid-payload. Exceeding it throws a read-timeout error rather than returning the partial buffer, so a timeout is never mistaken for a short-but-valid message.
   - Multiplexing: reuse streams for multiple requests where possible
   - Snapshot caps: successors/predecessors/sample are profile-bounded (Edge ≤ 6/6/6, Core ≤ 12/12/8)
 
@@ -372,6 +373,11 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     already pending, and the next `start()` sets it back to true, so the stale tick resurrects
     itself and the service ends up with two live loops. Both loops also store their timer handle
     so `stop()` can cancel them outright.
+  - The run-scoped `AbortController` (`runAbort`) is minted alongside `runGen` on `start()` and
+    aborted on `stop()` right after the loop timers are cleared and before the leave fan-out —
+    which carries its own budget (`SHUTDOWN_BUDGET_MS`), which is why aborting `runAbort` does not
+    silence it. The aborted controller is deliberately kept rather than nulled, so a late read from
+    an interrupted tick still reports "cancelled" instead of "no signal at all".
   - Intentionally-detached async work goes through `FretService.detach(promise, label)`, which
     attaches a logging catch. Under Node's default `--unhandled-rejections=throw`, a bare
     `void somePromise()` whose body can throw is a process-fatal rejection.
@@ -418,6 +424,14 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Payload inclusion heuristic: `shouldIncludePayload` based on distance to key vs cluster span and confidence.
   - Correlation-ID + phase dedup cache; breadcrumb loop rejection.
   - Activity callback interface (`setActivityHandler`) for threshold signature tracking (minSigs).
+  - **`exhausted` covers cancellation, not only a used-up ring.** `RouteProgress` (`src/index.ts`)
+    has no `cancelled` variant — it is part of the public `FretService` interface, and adding one
+    is an API change every consumer would have to learn — so a lookup whose run signal aborted
+    mid-walk yields the same `{ type: 'exhausted' }` as one that genuinely ran out of hops. On the
+    activity-resend arm this means the activity was never delivered. A caller cannot tell the two
+    apart from the event alone and must re-check service state before concluding the ring was
+    exhausted; in particular, an undelivered activity is a possible outcome of `exhausted`, not
+    only of an explicit error.
 - Stabilization & health (A6)
   - Periodic S/P verification, finger probes; jitter; skip if recent traffic.
   - Failure pruning and decay; reinsert on recovery.
