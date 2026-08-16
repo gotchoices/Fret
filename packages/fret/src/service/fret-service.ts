@@ -1330,19 +1330,25 @@ export class FretService implements IFretService, Startable {
 	 * - **Against the run signal, not a tick deadline.** Neither pass runs inside `stabilizeOnce`,
 	 *   so there is no tick budget to inherit; the per-ping {@link MAINTENANCE_RPC_TIMEOUT_MS}
 	 *   bounds each task and `stop()` collapses the whole fan-out at once.
-	 * - **`isDialable` is filtered before the task list is built**, not inside the task, so every
-	 *   pool slot goes to a peer that can actually be dialed rather than to a no-op.
+	 * - **`isDialable` is filtered before `budget` is applied**, not inside the task, so neither a
+	 *   pool slot nor a slot of the caller's per-pass budget goes to a peer that can only fail to
+	 *   dial. Filtering after the slice would let a run of undialable near peers consume the whole
+	 *   budget and warm nobody, which is the opposite of what a warm-up pass is for.
 	 *
 	 * `pingsSent` counts only a ping that completed, as it did serially. Cancellation is not
 	 * evidence: a task that fails under an aborted run logs nothing — these paths never scored
 	 * anything, so the guard suppresses only the log line — and a task the pool never started is
 	 * `skipped`, so an aborted run issues no dial at all.
+	 *
+	 * @param budget optional cap on how many peers this pass may target (the active tick's Core 6 /
+	 *   Edge 3 per second). Distinct from the concurrency cap, which is how many may be in flight.
 	 */
-	private async pingWarmupTargets(ids: readonly string[], label: string): Promise<void> {
+	private async pingWarmupTargets(ids: readonly string[], label: string, budget?: number): Promise<void> {
 		// Captured before the tasks are built, so a mid-flight stop()+start() cannot change what
 		// `wasCancelled` compares against — see `wasCancelled`.
 		const sig = this.runSignal;
-		const targets = ids.filter((id) => this.isDialable(id));
+		const dialable = ids.filter((id) => this.isDialable(id));
+		const targets = budget === undefined ? dialable : dialable.slice(0, budget);
 		const results = await runPooled(targets.map((id) => async () => {
 			try {
 				await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
@@ -1378,22 +1384,34 @@ export class FretService implements IFretService, Startable {
 		const release = (): void => { if (gen === this.runGen) this.preconnectGen = -1; };
 		const tick = async () => {
 			if (this.stopped || gen !== this.runGen || this.mode !== 'active') { release(); return; }
-			try {
-				const selfCoord = await this.selfCoord();
-				const selfStr = this.node.peerId.toString();
-				const budget = this.cfg.profile === 'core' ? 6 : 3;
-				// Unfiltered store walk (warm-up must reach unclassified peers; ring reads use getNeighbors).
-				const ids = Array.from(new Set([
-					...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
-					...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
-				])).filter((id) => id !== selfStr).slice(0, budget);
-				await this.pingWarmupTargets(ids, 'active preconnect');
-			} catch (err) { log.error('active preconnect tick failed - %e', err) }
+			await this.activePreconnectTick();
 			// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
 			if (this.stopped || gen !== this.runGen) { release(); return; }
 			this.preconnectTimer = setTimeout(tick, 1000);
 		};
 		this.detach(tick(), 'active preconnect loop');
+	}
+
+	/**
+	 * One active-mode warm-up pass: this profile's per-second budget of near peers, pooled through
+	 * {@link pingWarmupTargets}. Separated from the loop that arms it so the pass is drivable on its
+	 * own — the scheduling (generation guard, timer re-arm) and the work are different concerns, and
+	 * the work is the part with behavior to pin.
+	 *
+	 * Never throws: the loop must re-arm even after a bad tick.
+	 */
+	private async activePreconnectTick(): Promise<void> {
+		try {
+			const selfCoord = await this.selfCoord();
+			const selfStr = this.node.peerId.toString();
+			const budget = this.cfg.profile === 'core' ? 6 : 3;
+			// Unfiltered store walk (warm-up must reach unclassified peers; ring reads use getNeighbors).
+			const ids = Array.from(new Set([
+				...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
+				...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
+			])).filter((id) => id !== selfStr);
+			await this.pingWarmupTargets(ids, 'active preconnect', budget);
+		} catch (err) { log.error('active preconnect tick failed - %e', err) }
 	}
 
 	/**

@@ -6,7 +6,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 ├── packages/fret/                 # Only package — workspace name: "p2p-fret"
 │   ├── register.mjs              # ESM loader hook for running TS directly
 │   ├── src/
-│   │   ├── service/fret-service.ts  # Main service (~1400 lines)
+│   │   ├── service/fret-service.ts  # Main service (~2960 lines)
 │   │   ├── service/libp2p-fret-service.ts
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
 │   │   ├── store/{digitree-store,relevance}.ts
@@ -17,6 +17,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   └── utils/{token-bucket,expiring-map,deadline,pool}.ts
 │   └── test/
 │       ├── helpers/libp2p.ts      # In-memory libp2p node factory
+│       ├── helpers/maintenance-rig.ts # Stub-connection rig for pooled maintenance passes
 │       ├── simulation/            # Deterministic simulation harness
 │       └── *.spec.ts              # Mocha + Chai
 ├── tess/                          # Git submodule — ticket tooling
@@ -73,12 +74,15 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 
 - **Read this file first** — layout + quickstart above answer most structural questions. Don't explore to find what already documented here.
 - Spawning sub-agents: pass them relevant file paths from tree above, not let them `find`/`ls`/`Glob` to discovery.
-- `fret-service.ts` large (~1400 lines). Read targeted line ranges, not full file repeatedly. Key regions:
-  - Constructor + profile config: lines ~1–150
-  - RPC handlers: lines ~300–600
-  - Stabilization: lines ~680–790
-  - Neighbor snapshot: lines ~790–950
-  - Iterative lookup: lines ~1200+
+- `fret-service.ts` large (~2960 lines). Read targeted line ranges, not full file repeatedly. Key
+  regions (approximate — grep the named symbol rather than trusting the number):
+  - Config defaults + constructor: `constructor(` ~365
+  - Lifecycle (`start` / `stop` / `setMode`): ~780–950
+  - Inbound RPC registration + handlers: `registerRpcHandlers` ~955, `handleMaybeAct` ~1100
+  - Maintenance fan-outs (announce, warm-up, leave): ~1280–1500
+  - Stabilization tick: `stabilizeOnce` ~1850
+  - Outgoing neighbor snapshot: `snapshot()` ~2160
+  - Routing: `routeAct` ~2320, `iterativeLookup` ~2690
 - Run tests directly — don't guess invocations. See quickstart table above.
 
 ## General
