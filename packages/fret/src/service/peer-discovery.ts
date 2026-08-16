@@ -3,6 +3,7 @@ import { peerDiscoverySymbol } from '@libp2p/interface';
 import { TypedEventEmitter } from 'main-event';
 import { peerIdFromString } from '@libp2p/peer-id';
 import type { DigitreeStore } from '../store/digitree-store.js';
+import { ExpiringMap } from '../utils/expiring-map.js';
 import { isLiveMember } from './live-member.js';
 import { createLogger } from '../logger.js';
 
@@ -38,6 +39,13 @@ export interface FretPeerDiscoveryConfig {
 	batchSize?: number;
 	/** Time (ms) before a previously emitted peer can be re-emitted. Default: 600_000 (10 min). */
 	debounceMs?: number;
+	/**
+	 * Hard maximum peers held in the re-emission debounce map. Default: 4096.
+	 *
+	 * `Libp2pFretService` supplies a profile-tuned value (Core 4096 / Edge 1024); this default is
+	 * for a `FretPeerDiscovery` constructed directly.
+	 */
+	maxTracked?: number;
 }
 
 /**
@@ -56,7 +64,12 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 	private readonly emissionIntervalMs: number;
 	private readonly batchSize: number;
 	private readonly debounceMs: number;
-	private readonly emitted = new Map<string, number>();
+	/**
+	 * Peers debounced against re-emission. **Presence alone means "recently emitted"** — the value
+	 * is the emission timestamp, kept for diagnostics only. Both bounds are stated at
+	 * construction: capacity `maxTracked`, lifetime `debounceMs`.
+	 */
+	private readonly emitted: ExpiringMap<number>;
 	private timer: ReturnType<typeof setInterval> | null = null;
 	private running = false;
 
@@ -74,6 +87,13 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 		this.emissionIntervalMs = cfg?.emissionIntervalMs ?? 5000;
 		this.batchSize = cfg?.batchSize ?? 20;
 		this.debounceMs = cfg?.debounceMs ?? 600_000;
+		// The cap can bind before the debounce lapses, and that is intended — see the profile
+		// sizing note in `Libp2pFretService`. A wrong eviction costs one extra emission of that
+		// peer, which is idempotent in libp2p's peerStore and already capped at `batchSize`/tick.
+		this.emitted = new ExpiringMap<number>({
+			capacity: cfg?.maxTracked ?? 4096,
+			ttlMs: this.debounceMs,
+		});
 	}
 
 	async start(): Promise<void> {
@@ -126,8 +146,9 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 			// Self is seeded `member` and lives in the store, so without this every debounce
 			// window would produce one "discovery mechanism discovered self" error from libp2p.
 			if (selfId !== null && entry.id === selfId) continue;
-			const prev = this.emitted.get(entry.id);
-			if (prev !== undefined && prev > now) continue;
+			// Presence *is* the debounce: the map's TTL is `debounceMs`, so an entry still present
+			// is still inside its window.
+			if (this.emitted.has(entry.id)) continue;
 			try {
 				const id = peerIdFromString(entry.id);
 				// NOTE: multiaddrs are deliberately empty — FRET discovery is peerStore-relative
@@ -138,19 +159,15 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 				// ticket `feat-address-hints-in-neighbor-exchange`.
 				const info: PeerInfo = { id, multiaddrs: [] };
 				this.safeDispatchEvent('peer', { detail: info });
-				this.emitted.set(entry.id, now + this.debounceMs);
+				this.emitted.set(entry.id, now);
 				count++;
 			} catch (err) {
 				log.error('scan emit failed for %s - %e', entry.id, err);
 			}
 		}
-		this.pruneExpired(now);
-	}
-
-	private pruneExpired(now: number): void {
-		if (this.emitted.size <= 4096) return;
-		for (const [id, exp] of this.emitted) {
-			if (exp <= now) this.emitted.delete(id);
-		}
+		// Unconditional: the old `size > 4096` early return meant that after any burst the map held
+		// up to 4096 mostly-expired entries forever and never shrank. Sweeping on this tick — the
+		// map's own 5 s cadence — is what keeps it bounded by live population rather than by peak.
+		this.emitted.sweep();
 	}
 }

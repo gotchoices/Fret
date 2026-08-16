@@ -1,3 +1,5 @@
+import { ExpiringMap, type Clock as ExpiringMapClock } from '../utils/expiring-map.js';
+
 /**
  * How long a deduplicated answer is remembered.
  *
@@ -7,61 +9,33 @@
  */
 export const DEDUP_TTL_MS = 30_000;
 
-/**
- * Source of "now" in unix ms.
- *
- * Injectable so expiry can be driven from a caller-controlled clock. The wall clock is the
- * only default a production caller wants, but a *test* that steps it explicitly is testing
- * the expiry rule rather than the host's scheduler accuracy — a sleep-based test asserts on
- * `setTimeout` overshoot, which is unbounded under load and is not a property of this class.
- */
-export type Clock = () => number;
+/** Re-exported so existing importers of the dedup cache's clock type keep working. */
+export type Clock = ExpiringMapClock;
 
-/** Bounded TTL cache for correlation-ID deduplication. */
+/**
+ * Bounded TTL cache for correlation-ID deduplication.
+ *
+ * A named, single-purpose face on {@link ExpiringMap} — the TTL/capacity rules and the O(1)
+ * nearest-expiry eviction live there, shared with the other capacity-bounded bookkeeping maps.
+ * That eviction property matters most here: this is the one such map an attacker can churn at
+ * their own rate, so an O(n) eviction would be a CPU denial-of-service.
+ */
 export class DedupCache<T> {
-	private readonly entries = new Map<string, { result: T; expires: number }>();
-	private readonly ttlMs: number;
-	private readonly maxSize: number;
-	private readonly now: Clock;
+	private readonly entries: ExpiringMap<T>;
 
 	constructor(ttlMs = DEDUP_TTL_MS, maxSize = 1024, now: Clock = Date.now) {
-		this.ttlMs = ttlMs;
-		this.maxSize = maxSize;
-		this.now = now;
+		this.entries = new ExpiringMap<T>({ capacity: maxSize, ttlMs, now });
 	}
 
 	get(key: string): T | undefined {
-		const e = this.entries.get(key);
-		if (!e) return undefined;
-		if (e.expires < this.now()) {
-			this.entries.delete(key);
-			return undefined;
-		}
-		return e.result;
+		return this.entries.get(key);
 	}
 
 	has(key: string): boolean {
-		return this.get(key) !== undefined;
+		return this.entries.has(key);
 	}
 
 	set(key: string, result: T): void {
-		// Refreshing an existing key never grows the map, so it must never trigger eviction.
-		// Deleting first also moves the re-`set` key to the newest Map-iteration-order slot,
-		// so a just-refreshed entry is never mistaken for the oldest.
-		if (this.entries.has(key)) this.entries.delete(key);
-		else if (this.entries.size >= this.maxSize) this.evictOldest();
-		this.entries.set(key, { result, expires: this.now() + this.ttlMs });
-	}
-
-	private evictOldest(): void {
-		// Insertion order and expiry order agree (constant ttlMs, and `set` re-inserts a refreshed
-		// key at the newest slot with a fresh expiry), so the first (oldest-inserted) entry is also
-		// the one nearest to expiry — evicting it needs no O(n) scan of the map.
-		// NOTE: that agreement assumes the clock is non-decreasing. A backwards step can leave a
-		// live entry ahead of an expired one, so one eviction picks the wrong victim; it
-		// self-corrects on the next insert. If wall-clock steps ever matter here, construct with
-		// a monotonic `Clock` rather than reintroducing a scan.
-		const first = this.entries.keys().next();
-		if (!first.done) this.entries.delete(first.value);
+		this.entries.set(key, result);
 	}
 }

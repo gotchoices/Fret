@@ -18,7 +18,17 @@ export class Libp2pFretService implements Startable {
 	private readonly discovery: FretPeerDiscovery;
 
 	constructor(private readonly components: Components, private readonly cfg?: Partial<FretConfig>, discoveryCfg?: FretPeerDiscoveryConfig) {
-		this.discovery = new FretPeerDiscovery(() => this.discoverySource(), discoveryCfg);
+		// Profile-tuned debounce-map capacity, merged so an explicit caller value still wins.
+		// Core 4096 / Edge 1024. At the default emission rate (batchSize 20 per 5 s = 4/s) the live
+		// population under a 600 s debounce is ~2400, so **Edge's cap binds before its TTL does and
+		// that is intended**: it effectively shortens the debounce to ≈ maxTracked / (batchSize /
+		// emissionIntervalMs) ≈ 256 s. The cost of a wrong eviction is one extra emission of that
+		// peer, which is idempotent in libp2p's peerStore and already capped at `batchSize`/tick.
+		const profile = cfg?.profile ?? 'core';
+		this.discovery = new FretPeerDiscovery(() => this.discoverySource(), {
+			...discoveryCfg,
+			maxTracked: discoveryCfg?.maxTracked ?? (profile === 'core' ? 4096 : 1024),
+		});
 	}
 
 	get [Symbol.toStringTag](): string {
