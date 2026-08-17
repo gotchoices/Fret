@@ -1,6 +1,5 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import type { Libp2p } from 'libp2p'
 import { createMemNode } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../src/index.js'
@@ -41,14 +40,24 @@ const isCertificate = (r: ActResult): r is { commitCertificate: string } => 'com
 
 /**
  * Reading the private counter is the observation this spec is about; *writing* it is what the
- * spec replaces. Narrow structural casts rather than `any` so a rename fails to compile here.
+ * spec replaces. Both accessors go through `as unknown as`, which erases structural checking
+ * entirely — so a rename does **not** fail to compile here, and the explicit shape guards are
+ * what turn one into "the field this spec reads is gone" rather than "expected undefined to
+ * equal 4" several assertions later.
  */
 function inflight(svc: CoreFretService): number {
-	return (svc as unknown as { inflightAct: number }).inflightAct
+	const count = (svc as unknown as { inflightAct?: unknown }).inflightAct
+	if (typeof count !== 'number') {
+		throw new Error('FretService.inflightAct is no longer a number — this spec reads that private field')
+	}
+	return count
 }
 
 function dispatch(svc: CoreFretService, msg: RouteAndMaybeActV1): Promise<ActResult> {
-	const handler = svc as unknown as { handleMaybeAct(m: RouteAndMaybeActV1): Promise<ActResult> }
+	const handler = svc as unknown as { handleMaybeAct?: (m: RouteAndMaybeActV1) => Promise<ActResult> }
+	if (typeof handler.handleMaybeAct !== 'function') {
+		throw new Error('FretService.handleMaybeAct is no longer a method — this spec calls that private method')
+	}
 	return handler.handleMaybeAct(msg)
 }
 
@@ -76,7 +85,6 @@ function makeActMsg(): RouteAndMaybeActV1 {
 
 interface Rig {
 	svc: CoreFretService
-	node: Libp2p
 	/** Resolves when {@link Rig.openGate} is called; the activity handler awaits it. */
 	gate: Promise<void>
 	openGate: () => void
@@ -113,7 +121,7 @@ async function buildRig(profile: 'core' | 'edge'): Promise<Rig> {
 		await node.stop()
 	}
 
-	return { svc, node, gate, openGate, fanOut, teardown }
+	return { svc, gate, openGate, fanOut, teardown }
 }
 
 interface HandlerLog {
@@ -176,6 +184,15 @@ describe('inbound maybeAct inflight cap', function () {
 				// handler rather than serialized. This also guards the single-node in-cluster
 				// premise the whole spec rests on — if a lone node ever stopped acting for its
 				// own keys, every case here would go green-but-vacuous with zero entries.
+				// NOTE: the gate is already open by the time the first handler entry runs, so this
+				// equality rests on the admitted calls advancing through `handleMaybeAct`'s awaits
+				// in lockstep — a call entering several microtasks ahead of another would exit
+				// before it arrived and `peak` would read low. Lockstep holds because every call
+				// walks an identical path (`hashKey`, then a `selfCoord` cached since `start()`)
+				// and multiformats' `sha256.encode` is synchronous under Node, so each await costs
+				// every call the same one tick. If that path ever becomes non-uniform, or this spec
+				// is run where the hash resolves off a macrotask (the browser WebCrypto path), the
+				// fix is an explicit "all handlers entered" barrier before `openGate` — not a sleep.
 				expect(seen.peak).to.equal(p.limit)
 				// Attributable to the inflight cap because the fan-out stayed inside the bucket.
 				expect(rig.svc.getDiagnostics().rejected.rateLimited - rateLimitedBefore)

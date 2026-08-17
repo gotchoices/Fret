@@ -324,7 +324,9 @@ Notes:
   - Aggressive pre-dial (e.g., 6–12 peers/sec; max 4–6 concurrent) during active
   - Faster stabilization cadence; more probes to heal topology quickly
   - Larger payload caps; earlier inclusion of activity to reduce RTTs
-  - Higher inbound concurrency; buffered backpressure with bounded queues
+  - Higher inbound concurrency; an over-cap message is refused outright with `busy` — buffered
+    backpressure with bounded queues was stated intent here and is not implemented (there is no
+    queue anywhere in the service), so the concurrency cap below is the whole mechanism
 - **The inbound `maybeAct` concurrency cap is a stated number: Core 16 / Edge 4.** `handleMaybeAct`
   counts the messages it is working on at once and answers `{busy: true, retry_after_ms: 500}` —
   the fixed inflight sentinel, distinct from the token bucket's own computed `retry_after_ms` —
