@@ -16,6 +16,13 @@ Accumulated test-suite cleanup called out by the review:
     pattern that has stayed current is the one `docs/fret.md` uses — describe the behavior and name
     the spec that pins it, inline, at the place the behavior is described. Deleting the readme in
     favour of that is a legitimate outcome of this arm.
+  - Re-measured during the `rpc-codec-property-tests` review, and it has drifted further:
+    `ls packages/fret/test/*.spec.ts | wc -l` is now **57 spec files**, of which the readme's
+    coverage index names **13** — and one of those 13, `test/rpc.fuzz.spec.ts`, no longer exists
+    (it became `rpc.handler-fuzz.spec.ts`). The "67 passing" line is now ~813. That review
+    deliberately did *not* add its new spec to the index, because doing so works against this
+    arm's stated preferred shape; the doc facts it needed to record went into `docs/fret.md`
+    (wire formats / stream management) instead, which is the pattern this arm recommends.
 - Ring-coordinate arithmetic is hand-rolled once per spec. `test/helpers/ring.ts` now exists and
   owns two of these (`ringOffset`, `toBigInt`), but the conversion from a bigint to a 32-byte
   coordinate is still written out five separate times under four different names, and one of

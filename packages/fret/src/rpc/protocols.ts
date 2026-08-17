@@ -101,6 +101,21 @@ export async function registerRpcHandler(
 	});
 }
 
+/**
+ * Encode a message as UTF-8 JSON.
+ *
+ * NOTE: three values do not survive the round trip, and each is pinned as today's contract by
+ * `test/rpc.codec-properties.spec.ts` rather than worked around here — a codec that preserved
+ * them would have to stop being JSON:
+ *   - `-0` arrives as `0`. No FRET field distinguishes them (relevance, latency and estimates are
+ *     all magnitudes); revisit only if a field ever needs signed zero.
+ *   - `NaN` / `±Infinity` arrive as `null`. Unreachable from routing logic, which rejects a
+ *     non-finite `ttl` / `want_k` / `min_sigs` / `timestamp` in `validateRouteAndMaybeAct`.
+ *   - An own property whose value is `undefined` is dropped, so `undefined` can only ever mean
+ *     "absent" on the wire. `null` is the value that round-trips.
+ * Everything else the wire formats admit is lossless, lone surrogates included (`JSON.stringify`
+ * is well-formed since ES2019, so an unpaired code unit is escaped rather than mangled by UTF-8).
+ */
 export async function encodeJson(obj: unknown): Promise<Uint8Array> {
 	const text = JSON.stringify(obj);
 	return new TextEncoder().encode(text);
