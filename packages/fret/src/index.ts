@@ -142,7 +142,8 @@ export type { SizeEstimate, SizeEstimateOptions } from './estimate/size-estimato
 export { assembleCohort } from './service/cohort.js';
 export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
 export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
-export { validateTimestamp, readAllBounded } from './rpc/protocols.js';
+export { validateTimestamp, readAllBounded, openRpcStream } from './rpc/protocols.js';
+export type { Stream } from '@libp2p/interface';
 
 export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg) as FretService;
