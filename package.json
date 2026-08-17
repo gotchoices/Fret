@@ -22,7 +22,7 @@
     "pub": "yarn pub:fret",
     "pub:fret": "node scripts/publish-package.js fret",
     "gh-release": "node scripts/gh-release.js",
-    "release": "node -e \"console.log('\\n*** Releasing: typecheck + build + test, then bump, publish, GitHub release. Ctrl+C within 5s to abort. ***\\n');setTimeout(()=>{},5000)\" && yarn check && yarn bump && yarn pub && yarn gh-release"
+    "release": "node scripts/release-preflight.js && yarn bump && yarn pub && yarn gh-release"
   },
   "devDependencies": {
     "@types/node": "^22.13.10",

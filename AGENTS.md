@@ -59,11 +59,18 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 
 ### Releasing
 
-`yarn release` (from root) runs full flow: 5s abort window → `yarn check`
-(typecheck + build + test) → `yarn bump` (bumpp: pick version, commit, tag
-`v<version>`, push) → `yarn pub` (clean, build, `yarn npm publish`) →
-`yarn gh-release` (GitHub release for new tag).
+`yarn release` (from root) runs full flow: preflight prompt →
+`yarn bump` (bumpp: pick version, commit, tag `v<version>`, push) →
+`yarn pub` (clean, build, `yarn npm publish`) → `yarn gh-release`
+(GitHub release for new tag).
 
+- **Preflight** (`scripts/release-preflight.js`) does **not** run
+  `yarn check` — it asks whether you already did, the same gate
+  `../quereus` and `../optimystic` use. It reports branch / dirty tree /
+  upstream drift / pending-notes state, then requires typing `release`.
+  Bypass with `--yes` / `-y` / `CI=1`; without a TTY and without a bypass
+  it aborts rather than assuming consent. **Run `yarn check` yourself
+  before releasing** — nothing else does.
 - **Release notes**: drop untracked `.release-notes.pending.md` at repo
   root for release body; else GitHub auto-generates. Pending file
   consumed (deleted) on success.
