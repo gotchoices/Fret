@@ -74,7 +74,7 @@ function emptySnapshot(from: string): NeighborSnapshotV1 {
  *
  * NOTE: every failure — including a timeout and a cancellation — is swallowed into a fabricated
  * empty snapshot, so the caller cannot tell "this peer has no neighbors" from "this call never
- * completed". That predates the deadline work and is `8-rpc-shared-helper`'s "fetchNeighbors
+ * completed". That predates the deadline work and is `15-rpc-shared-helper`'s "fetchNeighbors
  * fabricates success" arm; the deadline is cancelled and the stream released on that path either
  * way, so the fabrication leaks neither a timer nor a stream.
  */

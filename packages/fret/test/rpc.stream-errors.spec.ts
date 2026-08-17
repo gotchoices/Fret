@@ -641,8 +641,8 @@ describe('RPC stream failures', function () {
 	})
 
 	// Announce and leave have no read to fail, so their arm is the write-side reset — and the point
-	// is that they release the stream either way, since outbound stream caps are finite (64 Edge /
-	// 256 Core) and a leaked stream is a real ceiling.
+	// is that they release the stream either way, since outbound stream caps are finite
+	// (libp2p's default 64 per protocol per connection) and a leaked stream is a real ceiling.
 	describe('the write-only RPCs', () => {
 		const snapshot = (): NeighborSnapshotV1 => ({
 			v: 1, from: peer, timestamp: Date.now(), successors: [], predecessors: [], sig: '',

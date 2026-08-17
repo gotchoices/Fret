@@ -43,31 +43,35 @@ export async function registerPing(
 	// sit outside any try at all, so a reset stream rejected the handler promise unlogged.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
-		if (getSizeEstimate) {
-			try {
-				const sizeInfo = await getSizeEstimate();
-				if (isBusy(sizeInfo)) {
-					stream.send(await encodeJson(sizeInfo));
-					await stream.close();
-					return;
-				}
-				const response: PingResponseV1 = { ok: true, ts: Date.now() };
-				if (sizeInfo.size_estimate !== undefined) {
-					response.size_estimate = sizeInfo.size_estimate;
-					response.confidence = sizeInfo.confidence;
-				}
-				stream.send(await encodeJson(response));
-				await stream.close();
-				return;
-			} catch (err) {
-				// Fall through to the plain reply: a failed estimate is not a failed ping.
-				log.error('getSizeEstimate failed - %e', err);
-			}
-		}
-
-		stream.send(await encodeJson({ ok: true, ts: Date.now() } satisfies PingResponseV1));
+		stream.send(await encodeJson(await pingReply(getSizeEstimate)));
 		await stream.close();
 	});
+}
+
+/**
+ * The body of a ping answer. Split out so the estimate's `try` covers the *provider* alone: while
+ * it also wrapped the send-and-close tail, a stream that failed mid-reply was logged as a failed
+ * estimate and then answered a second time on the same broken stream.
+ *
+ * A failed estimate is not a failed ping — it degrades to a plain pong.
+ */
+async function pingReply(getSizeEstimate?: SizeEstimateProvider): Promise<PingResponseV1 | BusyResponseV1> {
+	const pong = (): PingResponseV1 => ({ ok: true, ts: Date.now() });
+	if (!getSizeEstimate) return pong();
+	let sizeInfo: Awaited<ReturnType<SizeEstimateProvider>>;
+	try {
+		sizeInfo = await getSizeEstimate();
+	} catch (err) {
+		log.error('getSizeEstimate failed - %e', err);
+		return pong();
+	}
+	if (isBusy(sizeInfo)) return sizeInfo;
+	const response = pong();
+	if (sizeInfo.size_estimate !== undefined) {
+		response.size_estimate = sizeInfo.size_estimate;
+		response.confidence = sizeInfo.confidence;
+	}
+	return response;
 }
 
 /**

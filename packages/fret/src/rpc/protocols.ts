@@ -68,11 +68,15 @@ export function isUnsupportedProtocolError(err: unknown): boolean {
  * that connection. Releasing here means a handler added later cannot forget to release, because
  * releasing is no longer the handler's job.
  *
- * Success path: `serve` normally closes on its own; the wrapper closes only a stream still
- * `open`, so a completed reply is never turned into an abort. Error path: `abort()`, which is
- * synchronous and safe against a stalled remote (same reasoning as `releaseRpcStream`) — and
- * skipped when the stream already left `open` (closed by `serve`, or reset by the remote, which
- * is how the error usually arrived).
+ * Success path: `serve` normally closes on its own, and `close()` early-returns once our write
+ * end is closing/closed, so calling it again is a no-op rather than a second release. `status`
+ * cannot stand in for that test: a half-closed stream stays `'open'` until the *remote* also
+ * closes its write end, which for every FRET sender happens only after it has read the reply.
+ *
+ * Error path: `abort()`, which is synchronous and safe against a stalled remote (same reasoning
+ * as `releaseRpcStream`). It is skipped in two cases — a stream that already left `'open'`
+ * (reset by the remote, which is usually how the error arrived), and one whose write end
+ * `serve` already closed, because that reply is committed and a reset would destroy it.
  */
 export async function registerRpcHandler(
 	node: Libp2p,
@@ -82,10 +86,15 @@ export async function registerRpcHandler(
 	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
 		try {
 			await serve(stream, connection);
-			if (stream.status === 'open') await stream.close();
+			// NOTE: `close()` waits for the write queue to drain, so a remote that stops reading
+			// holds this handler (and its stream slot) open with no budget of its own — the
+			// write-side twin of the read-side slow-loris note on `readAllBounded`. Replies are
+			// small enough to fit a muxer window today, so the wait is not reachable in practice;
+			// if it ever is, pass an `AbortOptions` deadline here rather than skipping the close.
+			await stream.close();
 		} catch (err) {
 			log.error('%s handler error - %e', protocol, err);
-			if (stream.status === 'open') {
+			if (stream.status === 'open' && stream.writeStatus !== 'closed') {
 				try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* best effort */ }
 			}
 		}
@@ -141,7 +150,7 @@ const ABORTED = Symbol('readAllBounded.aborted');
  * NOTE: this adds up to one poll interval to every RPC that hits the lost-event case,
  * which is a floor under the measured ping RTT that feeds peer health scoring. The
  * durable fix is to subscribe before writing so the event is never missed at all (see
- * the framing/iterator-priming arm on `tickets/plan/8-rpc-shared-helper`); revisit this
+ * the framing/iterator-priming arm on `tickets/plan/15-rpc-shared-helper`); revisit this
  * constant if RTT-derived scoring ever needs finer resolution than this floor allows.
  */
 const EOF_POLL_MS = 20;
@@ -355,7 +364,8 @@ export async function openRpcStream(
  * not: `close()` on a stream whose remote has stalled is itself unbounded, so the *cleanup*
  * of a timed-out read would hang after the read's own deadline had already fired. `abort()`
  * is synchronous and releases the stream at once — which matters because outbound stream caps
- * are finite (64 Edge / 256 Core), so a leaked stream is a real ceiling rather than mere waste.
+ * are finite (libp2p's default 64 per protocol per connection; FRET passes no override), so a
+ * leaked stream is a real ceiling rather than mere waste.
  *
  * Both arms are best-effort: this runs from a `finally` on an already-failing path, where a
  * second throw would mask the real error.

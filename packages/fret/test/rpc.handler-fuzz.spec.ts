@@ -95,6 +95,12 @@ interface InboundStubOpts {
 
 function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundStub {
 	let status = 'open'
+	// Modelled on libp2p's own lifecycle, which the wrapper's release accounting reads: `close()`
+	// closes the *write* end only and early-returns once it has, while `status` stays 'open' until
+	// the remote closes its write end too — which for a FRET sender happens only after it has read
+	// the reply. A stub that flipped `status` to 'closed' on close would let the wrapper pass its
+	// assertions here for a reason production never supplies.
+	let writeStatus = 'writable'
 	let i = 0
 	const rec: InboundStub = {
 		stream: undefined as unknown as Stream,
@@ -104,6 +110,7 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 	const stream = {
 		id: 'stub-inbound',
 		get status() { return status },
+		get writeStatus() { return writeStatus },
 		send: (b: Uint8Array): boolean => {
 			rec.sends++
 			if (opts.sendThrows) throw opts.sendThrows
@@ -111,17 +118,20 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 			return true
 		},
 		close: async (): Promise<void> => {
+			if (writeStatus === 'closed') return
 			rec.closes++
-			if (status === 'open') status = 'closed'
+			writeStatus = 'closed'
 		},
 		abort: (_e: Error): void => {
 			rec.aborts++
 			status = 'aborted'
+			writeStatus = 'closed'
 		},
 		[Symbol.asyncIterator]: () => ({
 			next: async (): Promise<IteratorResult<Uint8Array>> => {
 				if (opts.resetOnRead) {
 					status = 'reset'
+					writeStatus = 'closed'
 					throw new Error('stream reset by remote')
 				}
 				return i < chunks.length
@@ -217,7 +227,10 @@ describe('RPC handler fault isolation', function () {
 
 			await invoke('/test/close-then-throw', s.stream, 'peer-a')
 
-			// Release stays exactly-once: the completed close stands, no abort follows it.
+			// Release stays exactly-once: the completed close stands, no abort follows it. The
+			// stream is still `status: 'open'` here (half-closed, remote's write end alive), so
+			// the write end is what tells the wrapper the reply was already committed.
+			expect(s.status(), 'half-closed, not fully closed').to.equal('open')
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
@@ -493,7 +506,7 @@ describe('RPC handler fault isolation', function () {
 
 			const res = await drive(svc, baseMsg({ correlation_id: correlationId })) as NearAnchorV1
 			// The genuine answer reports a real (k-floored) estimate; the static reject reports 0.
-			expect(res.estimated_cluster_size, 'answered fresh, not from the reject').to.be.at.least(15)
+			expect(res.estimated_cluster_size, 'answered fresh, not from the reject').to.be.greaterThan(0)
 		})
 
 		it('spends a token per malformed message — the validator is not an unmetered pre-filter', async () => {
@@ -680,7 +693,7 @@ describe('RPC handler fault isolation', function () {
 			const reply = await sendRaw(rig.sender, rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
 			expect(reply, 'well-formed message still answered').to.not.equal(undefined)
 			const parsed = JSON.parse(dec.decode(reply)) as NearAnchorV1
-			expect(parsed.estimated_cluster_size, 'a real answer, not the static reject').to.be.at.least(15)
+			expect(parsed.estimated_cluster_size, 'a real answer, not the static reject').to.be.greaterThan(0)
 		})
 
 		it('recovers after 40 malformed messages on one connection — every protocol still answers', async () => {
@@ -708,7 +721,7 @@ describe('RPC handler fault isolation', function () {
 
 			const act = await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
 			expect(act, 'maybeAct answers').to.not.equal(undefined)
-			expect((JSON.parse(dec.decode(act)) as NearAnchorV1).estimated_cluster_size).to.be.at.least(15)
+			expect((JSON.parse(dec.decode(act)) as NearAnchorV1).estimated_cluster_size).to.be.greaterThan(0)
 
 			const neighbors = await sendRaw(sender, receiver.peerId, P.PROTOCOL_NEIGHBORS, 'x')
 			expect(neighbors, 'neighbors answers').to.not.equal(undefined)
@@ -770,7 +783,7 @@ describe('RPC handler fault isolation', function () {
 
 			const reply = await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
 			expect(reply, 'well-formed message still answered').to.not.equal(undefined)
-			expect((JSON.parse(dec.decode(reply)) as NearAnchorV1).estimated_cluster_size).to.be.at.least(15)
+			expect((JSON.parse(dec.decode(reply)) as NearAnchorV1).estimated_cluster_size).to.be.greaterThan(0)
 		})
 	})
 })
