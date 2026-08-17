@@ -1,3 +1,10 @@
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-08-17T05:24:04.921Z (agent: claude)
+  Log file: C:\projects\Fret\tickets\.logs\1-export-openrpcstream.implement.2026-08-17T05-24-04-921Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 description: The correct libp2p stream-open helper exists inside FRET but no import path reaches it, so the one downstream consumer has hand-copied it three times and one copy is wrong.
 files: packages/fret/src/index.ts, packages/fret/src/rpc/protocols.ts, packages/fret/package.json, packages/fret/test/package-exports.spec.ts
 difficulty: easy
