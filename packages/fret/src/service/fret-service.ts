@@ -789,6 +789,18 @@ export class FretService implements IFretService, Startable {
 	 * run). Member if any of our namespaced protocols appears; foreign if the list is
 	 * non-empty but contains none of them; left unknown if empty (identify pending).
 	 * The demotion arm is deliberately weak — see `applyMembershipSignal`.
+	 *
+	 * NOTE: `seedFromPeerStore` calls this every tick, and the positive arm resets the
+	 * negotiate-failure run (identify listing one of our protocols is strong evidence). That is
+	 * correct while the list can go stale-*negative*, which is what `identifyPush` delivers when a
+	 * peer unhandles our protocols. A deployment that configures `identify` **without**
+	 * `identifyPush` never gets that update, so a peer that stops serving this network has its
+	 * negotiate run reset on every tick and can never demote to `foreign` — it stays a cohort
+	 * member and routing candidate that can only fail. Liveness is unaffected (a peer whose node
+	 * goes away still reaches `dead`). If FRET ever ships a recommended libp2p config, require
+	 * `identifyPush`; if that is not possible, this arm needs a freshness bound on the list rather
+	 * than trusting it unconditionally. `test/failure-recovery.spec.ts` documents the same fact
+	 * from the test side — its service-only-outage block needs identify nodes for this reason.
 	 */
 	private classifyByProtocols(id: string, protocols: string[] | undefined): void {
 		if (!protocols || protocols.length === 0) return; // identify not complete → stay unknown
