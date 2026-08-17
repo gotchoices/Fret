@@ -689,7 +689,7 @@ After import, the normal stabilization loop probes restored peers to update conn
 #### Testing strategy
 - Unit tests: Digitree operations, cohort assembly, relevance scoring
 - Integration tests: Join/leave scenarios, stabilization convergence
-- Simulation: Large-scale churn patterns, partition/merge behavior
+- Simulation: Large-scale churn patterns, partition/merge behavior. The deterministic harness (`test/simulation/fret-sim.ts`) can split the ring into mutually unreachable groups (`partition(groups)` / `heal()`): every cross-peer contact consults one reachability predicate, an unreachable neighbor escalates through `contactFailures` to `dead` and drops out of every ring-shaped read, a bounded re-probe pass (ascending `lastAccess`, mirroring the production dead arm) brings it back after the heal, and coverage is measured against each peer's *reachable* alive population so a healed ring reads as healed rather than as half of one — pinned by `test/simulation.partition.spec.ts` (two-way, singleton and three-way splits; in-flight drops at the cut; mid-split joins; deterministic replay of a partition/heal schedule)
 - Benchmarks: Routing latency, memory usage, message overhead
 
 ### Open questions / next steps
