@@ -48,6 +48,10 @@ import { createLogger } from '../logger.js';
 
 const log = createLogger('service:fret');
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 function isBusy(res: unknown): res is BusyResponseV1 {
 	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
 }
@@ -192,7 +196,7 @@ export class FretService implements IFretService, Startable {
 	private readonly sparsity: SparsityModel = createSparsityModel();
 	private cachedSelfCoord: Uint8Array | null = null;
 	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
-	private metadata?: Record<string, any>;
+	private metadata?: Record<string, unknown>;
 	private activityHandler?: ActivityHandler;
 	/** Sized in the constructor, where the profile is known — see the sizing note there. */
 	private readonly dedupCache: DedupCache<NearAnchorV1 | { commitCertificate: string }>;
@@ -1671,7 +1675,13 @@ export class FretService implements IFretService, Startable {
 			// our namespaced announce protocol — strongest possible membership proof.
 			this.applyMembershipSignal(from, 'rpc-inbound');
 
-			if (snap.metadata) {
+			// Wire JSON is untrusted, so the declared `Record<string, unknown>` is a claim until
+			// checked: a crafted announce can carry a string or an array here, and storing that
+			// would hand `getMetadata` a value of a shape its type says is impossible.
+			// NOTE: the accepted object is otherwise unbounded (one per authenticated sender,
+			// capped only by the 128 KB message limit and the routing-table capacity); if
+			// per-peer metadata ever shows up in memory profiles, cap its serialized size here.
+			if (isPlainObject(snap.metadata)) {
 				// Update metadata via store.update to avoid mutating frozen entries
 				this.store.update(from, { metadata: snap.metadata });
 			}
@@ -2901,16 +2911,16 @@ export class FretService implements IFretService, Startable {
 		yield { type: 'exhausted', hop };
 	}
 
-	setMetadata(metadata: Record<string, any>): void {
+	setMetadata(metadata: Record<string, unknown>): void {
 		this.metadata = metadata;
 	}
 
-	getMetadata(peerId: string): Record<string, any> | undefined {
+	getMetadata(peerId: string): Record<string, unknown> | undefined {
 		const entry = this.store.getById(peerId);
 		return entry?.metadata;
 	}
 
-	listPeers(): Array<{ id: string; metadata?: Record<string, any> }> {
+	listPeers(): Array<{ id: string; metadata?: Record<string, unknown> }> {
 		return this.store.list().map(entry => ({
 			id: entry.id,
 			metadata: entry.metadata

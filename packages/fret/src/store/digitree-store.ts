@@ -79,7 +79,7 @@ export interface PeerEntry {
 	 * measurements away. Neither mistake is expressible now.
 	 */
 	avgLatencyMs: number | null;
-	metadata?: Record<string, any>;
+	metadata?: Record<string, unknown>;
 }
 
 /**
@@ -127,7 +127,7 @@ export interface SerializedPeerEntry {
 	successCount: number;
 	failureCount: number;
 	avgLatencyMs: number | null; // null = never measured; absent in pre-nullable snapshots → null
-	metadata?: Record<string, any>;
+	metadata?: Record<string, unknown>;
 }
 
 export interface SerializedTable {

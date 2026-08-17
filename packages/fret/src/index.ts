@@ -147,5 +147,5 @@ export { validateTimestamp, readAllBounded, openRpcStream } from './rpc/protocol
 export type { Stream } from '@libp2p/interface';
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {
-	return new FretServiceClass(node, cfg) as FretService;
+	return new FretServiceClass(node, cfg);
 }

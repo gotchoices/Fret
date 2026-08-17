@@ -7,7 +7,22 @@ import { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscovery
 
 type Components = { libp2p?: Libp2p };
 
-export class Libp2pFretService implements Startable {
+/**
+ * The subset of the public {@link FretService} surface this libp2p wrapper re-exposes.
+ *
+ * Declared as a `Pick` rather than left implicit because every method below is a hand-written
+ * pass-through: without a structural tie the two surfaces drift silently, which is how the
+ * wrapper ended up handing callers `Record<string, any>` metadata after the interface had been
+ * tightened. Widening the wrapper means adding a name here, and a signature that no longer
+ * matches the interface is now a compile error rather than a difference nobody notices.
+ */
+type FretServiceFacade = Pick<FretService,
+	| 'start' | 'stop' | 'ready' | 'setMode'
+	| 'routeAct' | 'neighborDistance' | 'getNeighbors' | 'assembleCohort' | 'expandCohort'
+	| 'report' | 'setMetadata' | 'getMetadata' | 'listPeers'
+	| 'exportTable' | 'importTable'>;
+
+export class Libp2pFretService implements Startable, FretServiceFacade {
 	private inner: FretService | null = null;
 	private nodeRef: Libp2p | null = null;
 	/**
@@ -49,12 +64,24 @@ export class Libp2pFretService implements Startable {
 		this.nodeRef = node;
 	}
 
+	/**
+	 * The node this service runs on: the injected one, else the `libp2p` component if the host
+	 * supplied one. The injection wins because it is the explicit, always-available path; the
+	 * component is a fallback rather than the primary source precisely because it is absent in
+	 * some environments. Reading it here is what keeps the constructor's `components` a used
+	 * field instead of a stored-and-ignored one.
+	 */
+	private get node(): Libp2p | null {
+		return this.nodeRef ?? this.components.libp2p ?? null;
+	}
+
 	private ensure(): CoreFretService {
 		if (!this.inner) {
-			if (!this.nodeRef) {
+			const node = this.node;
+			if (!node) {
 				throw new Error('Libp2pFretService: libp2p node not injected');
 			}
-			this.inner = new CoreFretService(this.nodeRef, this.cfg);
+			this.inner = new CoreFretService(node, this.cfg);
 		}
 		return this.inner as CoreFretService;
 	}
@@ -66,8 +93,9 @@ export class Libp2pFretService implements Startable {
 	 */
 	private discoverySource(): DiscoverySnapshotSource | null {
 		const core = this.inner as CoreFretService | null;
-		if (!core || !this.nodeRef) return null;
-		return { store: core.getStore(), selfId: this.nodeRef.peerId.toString() };
+		const node = this.node;
+		if (!core || !node) return null;
+		return { store: core.getStore(), selfId: node.peerId.toString() };
 	}
 
 	/**
@@ -85,8 +113,8 @@ export class Libp2pFretService implements Startable {
 	}
 
 	async start(): Promise<void> {
+		// `ensure()` throws the not-injected error itself, so no second check is needed here.
 		const core = this.ensure();
-		if (!this.nodeRef) throw new Error('Libp2pFretService.start: libp2p node not injected');
 		await core.start();
 		// After core.start(), so the first scan runs against a peerStore-seeded table. libp2p
 		// registers a listener for symbol-provided discovery but does not start it, so the
@@ -144,7 +172,7 @@ export class Libp2pFretService implements Startable {
 	}
 
 	// Metadata pass-throughs for Arachnode adapter
-	setMetadata(metadata: Record<string, any>): void {
+	setMetadata(metadata: Record<string, unknown>): void {
 		this.ensure().setMetadata(metadata);
 	}
 
@@ -152,11 +180,11 @@ export class Libp2pFretService implements Startable {
 		this.ensure().report(evt);
 	}
 
-	getMetadata(peerId: string): Record<string, any> | undefined {
+	getMetadata(peerId: string): Record<string, unknown> | undefined {
 		return this.ensure().getMetadata(peerId);
 	}
 
-	listPeers(): Array<{ id: string; metadata?: Record<string, any> }> {
+	listPeers(): Array<{ id: string; metadata?: Record<string, unknown> }> {
 		return this.ensure().listPeers();
 	}
 

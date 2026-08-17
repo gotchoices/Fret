@@ -179,6 +179,8 @@ confidence = clamp(0.5*sizeFactor + 0.5*dispersion, 0.05, 1)
   - Near-radius r_near = β * cluster_span where β ∈ [1.5, 3]
 
 ### libp2p integration
+- **`Libp2pFretService` is a thin facade over the core service, and it takes its node from either of two places**: the explicit `setLibp2p(node)` injection (which wins, because it is always available) or the `libp2p` component the host passes to the constructor. Only the injection used to be read, so a service registered the ordinary libp2p way — `libp2p({ services: { fret: fretService() } })` — threw "node not injected" on `start()` despite having been handed a node. Neither source present is still a loud throw, from `ensure()` alone rather than restated at `start()`.
+  - The facade re-exposes a **subset** of the public `FretService` surface as hand-written pass-throughs, so the two are tied structurally (`implements Pick<FretService, …>`) rather than by convention. Without the tie they drift silently — which is how the facade kept handing callers `Record<string, any>` metadata after the interface itself had been tightened to `unknown`. Widening the facade means naming the method in that `Pick`; a signature that no longer matches is a compile error.
 - Discovery: implement a libp2p peerDiscovery-compatible interface backed by FRET's Digitree. Emits peers from S/P/F (pruned, debounced).
   - **`FretPeerDiscovery` is the single emission path.** It is built once by `Libp2pFretService` and exposed through `peerDiscoverySymbol`, which is how libp2p itself picks a discovery mechanism up: the node reads that symbol off each configured service during construction and subscribes to the returned object's `peer` event, merging what it hears into its own peerStore. Dispatching a `peer:discovery` event straight at the node object instead — which two now-deleted paths did (`seedDiscovery`, `FretService.emitDiscovered`) — only reaches application code that added a listener to the node; libp2p's event forwarding runs internal → node, never node → internal, so the peerStore never saw those announcements at all.
     - **What the peerStore merge actually buys, precisely.** libp2p v3 has no auto-dialer (only a reconnect queue for peers tagged `KEEP_ALIVE`), and the emitted `PeerInfo` carries no multiaddrs, so a discovery emission does *not* cause a dial. What it does: creates the peerStore entry for a peer libp2p had never heard of, and — because a first-time `peerStore.merge` fires `peer:update` with no previous value — makes libp2p re-dispatch `peer:discovery` on the node, so application listeners still see it. The gain over the deleted paths is the peerStore entry plus the member/non-dead/non-self filtering, not reachability; reachability needs address hints on the wire.
@@ -565,6 +567,10 @@ interface NeighborSnapshotV1 {
   size_estimate?: number;       // n_est
   confidence?: number;          // [0, 1]
   sig: string;                  // base64url signature over canonical JSON
+  metadata?: Record<string, unknown>;  // sender's own application metadata (setMetadata); the
+                                       // receiver stores it against the sender's routing-table
+                                       // entry only after checking it is a non-array object,
+                                       // since wire JSON cannot be trusted to match the type
 }
 ```
 
@@ -625,7 +631,7 @@ interface SerializedPeerEntry {
   failureCount: number;
   avgLatencyMs: number | null;  // EMA of measured RTT; null = never measured. A field absent
                                 // in a pre-nullable snapshot reads back as null.
-  metadata?: Record<string, any>;
+  metadata?: Record<string, unknown>;
 }
 
 interface SerializedTable {
