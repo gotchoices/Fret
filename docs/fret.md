@@ -325,6 +325,18 @@ Notes:
   - Faster stabilization cadence; more probes to heal topology quickly
   - Larger payload caps; earlier inclusion of activity to reduce RTTs
   - Higher inbound concurrency; buffered backpressure with bounded queues
+- **The inbound `maybeAct` concurrency cap is a stated number: Core 16 / Edge 4.** `handleMaybeAct`
+  counts the messages it is working on at once and answers `{busy: true, retry_after_ms: 500}` —
+  the fixed inflight sentinel, distinct from the token bucket's own computed `retry_after_ms` —
+  once the count reaches the cap; a refused message returns *before* the increment, so a busy
+  reply never occupies a slot. The counter is decremented in a `finally`, so it returns to zero on
+  the error path too: an activity handler that throws propagates out of `routeAct`, is caught, and
+  is answered with a `NearAnchor` from `nearAnchorOnly` — the slot is released either way, which is
+  what stops the counter drifting upward until the service answers busy forever. Note the cap sits
+  *behind* the per-protocol token bucket (Core 32 / Edge 8), so a bucket rejection and an inflight
+  rejection both increment `diag.rejected.rateLimited` and differ only in `retry_after_ms`. Pinned
+  by `test/inflight-concurrency.spec.ts`, which drives real calls into a gated activity handler and
+  asserts the high-water mark *equals* the cap rather than writing the counter.
 - **The pre-dial concurrency above (Core 6 / Edge 2) is one number, and it governs every pooled outbound maintenance RPC, not only warm-up dialing**: the stabilization tick's two phases, the start-up warm-up pass, and the active-mode warm-up tick all draw from the same cap (`maintenanceConcurrency`). It was reused rather than re-invented because these are the same resource — a burst of outbound streams from one node — and a second knob would only drift from this one. Edge's 2 is deliberately conservative: an Edge tick truncates on its budget more often, which is this profile's stated "fewer probes per window" posture rather than an oversight. The per-pass *budgets* stay separate and profile-tuned (how many peers a pass may target); the cap is only how many of them may be in flight at once.
 
 ### Security and abuse considerations

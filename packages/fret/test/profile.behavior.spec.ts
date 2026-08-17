@@ -245,40 +245,15 @@ describe('Profile behavior tests', function () {
 	// ----- Phase 3: Concurrent act limit & busy responses -----
 
 	describe('Concurrent act limits', () => {
-		it('Edge allows handleMaybeAct when inflightAct < 4, rejects at 4', async () => {
-			const { node, svc } = await createService('edge')
-			// At limit - 1, request should NOT be rejected for inflight (may still proceed or fail for other reasons)
-			;(svc as any).inflightAct = 3
-			const msg = makeMaybeActMsg('test-edge-under-limit')
-			const result = await (svc as any).handleMaybeAct(msg)
-			// Under the limit: should not be a busy response from inflight check
-			expect(result?.retry_after_ms).to.not.equal(500)
-
-			// At exactly the limit, should get busy with retry_after_ms=500
-			;(svc as any).inflightAct = 4
-			const busyResult = await (svc as any).handleMaybeAct(makeMaybeActMsg('test-edge-at-limit'))
-			expect(busyResult).to.have.property('busy', true)
-			expect(busyResult).to.have.property('retry_after_ms', 500)
-
-			await svc.stop()
-			await node.stop()
-		})
-
-		it('Core allows handleMaybeAct when inflightAct < 16, rejects at 16', async () => {
-			const { node, svc } = await createService('core')
-			;(svc as any).inflightAct = 15
-			const msg = makeMaybeActMsg('test-core-under-limit')
-			const result = await (svc as any).handleMaybeAct(msg)
-			expect(result?.retry_after_ms).to.not.equal(500)
-
-			;(svc as any).inflightAct = 16
-			const busyResult = await (svc as any).handleMaybeAct(makeMaybeActMsg('test-core-at-limit'))
-			expect(busyResult).to.have.property('busy', true)
-			expect(busyResult).to.have.property('retry_after_ms', 500)
-
-			await svc.stop()
-			await node.stop()
-		})
+		// The inbound maybeAct concurrency cap (Core 16 / Edge 4) is pinned by
+		// `inflight-concurrency.spec.ts`, which fans out real calls into a gated activity handler
+		// and asserts the high-water mark *equals* the cap, that the surplus is refused with the
+		// 500 ms inflight sentinel, and that the counter returns to zero — including when the
+		// handler throws. The two cases that used to live here **assigned** `inflightAct` and
+		// then fired a single request, which proved only that the comparison reads the field: it
+		// could not observe the increment/decrement pairing at all, and its healthy-arm assertion
+		// (`retry_after_ms !== 500`) passed because the field is `undefined` on a non-busy reply.
+		// The three bucket-exhaustion cases below are unaffected — they test the token bucket.
 
 		it('handleMaybeAct returns BusyResponseV1 when bucketMaybeAct exhausted', async () => {
 			const { node, svc } = await createService('edge')
