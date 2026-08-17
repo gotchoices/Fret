@@ -349,6 +349,14 @@ export function isLimitedConnection(c: Connection): boolean {
  * unresponsive transport, half-open TCP — hangs the caller with no budget at all. An
  * already-aborted signal throws here rather than dialing, so a `stop()` racing a
  * maintenance tick cannot still issue dials.
+ *
+ * `negotiateFully: false` is not optional here, and it is the one caveat for a consumer using
+ * this from the package root: it saves a round trip but defers an unsupported-protocol failure
+ * from stream-open to the first read, so a *fire-and-forget* send that never reads is a silent
+ * no-op against a peer lacking the protocol. Every FRET sender reads a reply, so the deferred
+ * failure always surfaces; a caller that does not read must treat "opened" as "not yet
+ * negotiated". Pair every successful open with {@link releaseRpcStream}, which is exported
+ * alongside this function — `close()` alone is unbounded against a stalled remote.
  */
 export async function openRpcStream(
 	node: Libp2p,

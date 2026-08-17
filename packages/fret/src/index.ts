@@ -143,7 +143,11 @@ export type { SizeEstimate, SizeEstimateOptions } from './estimate/size-estimato
 export { assembleCohort } from './service/cohort.js';
 export { shouldIncludePayload, computeNearRadius } from './service/payload-heuristic.js';
 export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
-export { validateTimestamp, readAllBounded, openRpcStream } from './rpc/protocols.js';
+// `openRpcStream` and `releaseRpcStream` are one seam: an opened stream must be released, and the
+// release rule (abort once the caller's signal has fired, close otherwise) is the half a consumer
+// gets wrong — a bare `close()` is unbounded against a stalled remote. Exporting only the opener
+// invites a hand-rolled releaser, which is the class of bug this export exists to retire.
+export { validateTimestamp, readAllBounded, openRpcStream, releaseRpcStream } from './rpc/protocols.js';
 export type { Stream } from '@libp2p/interface';
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {
