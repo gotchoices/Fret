@@ -17,6 +17,18 @@ import { COORD_BYTES } from '../src/ring/hash.js'
 const arbCoord = fc.uint8Array({ minLength: COORD_BYTES, maxLength: COORD_BYTES })
 const arbX = fc.double({ min: 0, max: 1, noNaN: true })
 
+// Every scoring call blends in a recency term, so any test asserting a *value* has to pin the
+// clock — otherwise `lastAccess` and `now` drift apart by however long the test took and the
+// expected constant moves under it. Passing the same instant as both is what makes recency
+// exactly 1 and the measured numbers below reproducible.
+const FIXED_NOW = 1_700_000_000_000
+
+// `avgLatencyMs: NaN` is deliberately untested. It would poison `healthScore` and therefore
+// every relevance value derived from the entry, but latency only ever originates from a local
+// `Date.now()` difference in the ping paths — never from the wire, and never from a snapshot
+// (`SerializedPeerEntry.avgLatencyMs` is only ever read back as a number or null). There is no
+// caller that can produce it, so guarding against it here would pin behavior no code can reach.
+
 function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 	return {
 		id: 'test-peer',
@@ -62,6 +74,51 @@ describe('Relevance scoring properties', function () {
 					return bonus >= model.sMin && bonus <= model.sMax
 				}
 			), opts)
+		})
+
+		// The bonus is what makes the routing table favor under-represented ring distances, so
+		// "a heavily-observed band scores below an untouched one" is the whole point of the
+		// model — but it is invisible for the first ~25 observations of a band, because the
+		// occupancy EMA (α = 0.03) has not yet climbed far enough to pull the ratio under
+		// `sMax`. Measured on a fresh model, observing x = 0.2 repeatedly:
+		//
+		//   observations |  bonus(0.2)  |  bonus(0.8)
+		//        5       |    1.8000    |    1.8000   (both clamped — proves nothing)
+		//       20       |    1.8000    |    1.8000
+		//       30       |    1.6698    |    1.8000
+		//       50       |    1.4230    |    1.8000
+		//      150       |    1.2355    |    1.8000
+		//
+		// Hence 50 and not 5: at 5 both bands read `sMax` and the assertion passes vacuously.
+		// Do not trim the loop.
+		it('scores a heavily-observed band below an unobserved one, once off the sMax clamp', () => {
+			const model = createSparsityModel()
+			for (let i = 0; i < 50; i++) observeDistance(model, 0.2)
+
+			const busy = sparsityBonus(model, 0.2)
+			const untouched = sparsityBonus(model, 0.8)
+
+			expect(busy, 'busy band has come off the clamp').to.be.closeTo(1.4230, 1e-4)
+			expect(untouched, 'untouched band is still at sMax').to.equal(model.sMax)
+			expect(busy).to.be.lessThan(untouched)
+		})
+
+		// Deliberately a property over *repeated observation of one band*, not over an arbitrary
+		// observation sequence: occupancy is an EMA toward each centre's kernel value, so
+		// observing somewhere else lets a centre near `x` decay and the bonus at `x` *rise*.
+		// Monotonicity is only true when every observation lands on the band being queried.
+		it('never raises a band\'s own bonus by observing that same band', () => {
+			fc.assert(fc.property(arbX, fc.integer({ min: 1, max: 60 }), (x, n) => {
+				const model = createSparsityModel()
+				let prev = sparsityBonus(model, x)
+				for (let i = 0; i < n; i++) {
+					observeDistance(model, x)
+					const cur = sparsityBonus(model, x)
+					if (cur > prev + 1e-12) return false
+					prev = cur
+				}
+				return true
+			}), opts)
 		})
 	})
 
@@ -146,6 +203,28 @@ describe('Relevance scoring properties', function () {
 				return updated.relevance >= 0
 			}), opts)
 		})
+
+		// No counter value can push relevance out of a small range: the frequency term is
+		// log1p(n)/5 and the health term is a ratio in [0,1], so the base is bounded whatever
+		// the counters hold, and the bonus is clamped at sMax. Asserted as "finite and small"
+		// rather than against the measured 4.0850, because the point is the bound, not the
+		// constant — an entry that has been touched 2^53 times is not a state to tune against.
+		it('stays finite with counters at MAX_SAFE_INTEGER', () => {
+			const now = FIXED_NOW
+			const model = createSparsityModel()
+			const entry = makeEntry({
+				lastAccess: now,
+				accessCount: Number.MAX_SAFE_INTEGER,
+				successCount: Number.MAX_SAFE_INTEGER,
+				avgLatencyMs: 0,
+			})
+
+			const updated = touch(entry, 0.5, model, now)
+
+			expect(Number.isFinite(updated.relevance)).to.equal(true)
+			expect(updated.relevance).to.be.greaterThan(0)
+			expect(updated.relevance, 'measured 4.0850').to.be.lessThan(10)
+		})
 	})
 
 	describe('recordSuccess', () => {
@@ -217,6 +296,32 @@ describe('Relevance scoring properties', function () {
 			for (let i = 0; i < 20; i++) entry = recordSuccess(entry, undefined, 0.5, model)
 			expect(entry.avgLatencyMs).to.equal(200)
 		})
+
+		// The uncontroversial half of "success up-ranks a peer": from one starting entry, at one
+		// instant and one ring position, a success outranks a failure. Measured 1.2600 vs 0.6300.
+		//
+		// The *other* half — that repeated success keeps up-ranking — is NOT asserted, in either
+		// direction, because the code does not do it: `successCount` only feeds the
+		// success/failure ratio, which saturates after the first success, so ten successes score
+		// exactly what one does, and `recordSuccess` never touches `accessCount` (only `touch`
+		// does), so a peer merely named in inbound snapshots outscores one we have actually
+		// called. See the NOTE at `recordSuccess` and
+		// `tickets/backlog/bug-frequency-credit-only-from-gossip`, which owns that question.
+		//
+		// Separate models so the two calls are scored against identical occupancy — the sparsity
+		// bonus is service-wide state and every scoring call moves it, so reusing one model here
+		// would compare two different bonuses and confuse the comparison it is making.
+		it('scores a success above a failure from the same starting entry', () => {
+			const now = FIXED_NOW
+			const entry = makeEntry({ lastAccess: now })
+
+			const succeeded = recordSuccess(entry, undefined, 0.5, createSparsityModel(), now)
+			const failed = recordFailure(entry, 0.5, createSparsityModel(), now)
+
+			expect(succeeded.relevance).to.be.greaterThan(failed.relevance)
+			expect(succeeded.relevance, 'measured').to.be.closeTo(1.26, 1e-4)
+			expect(failed.relevance, 'measured').to.be.closeTo(0.63, 1e-4)
+		})
 	})
 
 	describe('recordFailure', () => {
@@ -252,6 +357,51 @@ describe('Relevance scoring properties', function () {
 				const updated = recordFailure(entry, x, model)
 				return updated.relevance >= 0
 			}), opts)
+		})
+
+		// Sustained failure must down-rank without ever running away: relevance drives both
+		// next-hop preference and capacity eviction, so a score that decayed to 0 (or below)
+		// would make a temporarily unreachable peer indistinguishable from a worthless one and
+		// evict it before the re-probe passes could recover it. The floor is structural rather
+		// than clamped — `base` is a sum of non-negative terms and the bonus is at least
+		// `sMin` (0.7) — so this pins the property, and the endpoints pin the magnitude.
+		//
+		// Measured at a fixed clock, one shared model, x = 0.5, from a fresh unmeasured entry:
+		// 0.6300 after the first failure, falling monotonically to 0.5861 after 30. The decline
+		// across the run is the sparsity bonus tapering as the band fills, not the 0.7 decay
+		// factor compounding — each call re-derives the score from the entry's counters rather
+		// than scaling the previous relevance.
+		it('stays positive and non-increasing under 30 consecutive failures', () => {
+			const now = FIXED_NOW
+			const model = createSparsityModel()
+
+			let entry = recordFailure(makeEntry({ lastAccess: now }), 0.5, model, now)
+			const first = entry.relevance
+			expect(first, 'measured').to.be.closeTo(0.63, 1e-4)
+
+			for (let i = 1; i < 30; i++) {
+				const next = recordFailure(entry, 0.5, model, now)
+				expect(next.relevance, `failure ${i + 1} did not raise relevance`).to.be.at.most(entry.relevance)
+				expect(next.relevance, `failure ${i + 1} stayed above zero`).to.be.greaterThan(0)
+				entry = next
+			}
+
+			expect(entry.failureCount).to.equal(30)
+			expect(entry.relevance, 'measured').to.be.closeTo(0.5861, 1e-4)
+			expect(entry.relevance).to.be.lessThan(first)
+		})
+
+		// Surprising but deliberate: failing to reach a peer counts as *recent access*, so the
+		// recency clock is reset by the very event that down-ranks the peer. The 0.7 decay
+		// factor still makes the net effect a down-rank (see the test above), but a peer that
+		// keeps failing never ages out through recency — it is the `dead` marking and eviction
+		// that remove it, not decay.
+		it('advances lastAccess to now', () => {
+			const now = FIXED_NOW
+			const model = createSparsityModel()
+			const stale = makeEntry({ lastAccess: now - 600_000 })
+
+			expect(recordFailure(stale, 0.5, model, now).lastAccess).to.equal(now)
 		})
 	})
 })

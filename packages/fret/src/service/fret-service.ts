@@ -465,6 +465,14 @@ export class FretService implements IFretService, Startable {
 		// dead peer can no longer squat in a protected slot, so with relevance ~0 it becomes a
 		// preferred eviction victim — exactly what we want, and why the dead state needs no
 		// eviction-specific handling of its own.
+		// NOTE: protection wins over the cap, so a table whose protected set is already at least
+		// `capacity` stays over capacity — the loop below finds nothing evictable and exits with
+		// `size() > cap`. The protected set is self plus up to `max(2, m) - 1` live members on
+		// each side, i.e. up to `2m - 1` ids, so this needs `capacity < 2m - 1`: unreachable with
+		// the shipped numbers (m 8, capacity 2048) and only reachable by misconfiguration.
+		// Pinned by `test/relevance.eviction.spec.ts`. If a profile ever ships a capacity that
+		// small, capacity stops being a bound and this needs a floor at construction (or
+		// protection needs to yield past some multiple of the cap).
 		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isLiveMember);
 		// Evict the lowest relevance non-protected entries until under cap.
 		// NOTE: lists and fully sorts the store to drop a handful of entries. Only reachable once

@@ -3,8 +3,9 @@ import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
 import { createMemNode } from './helpers/libp2p.js'
 import { FretService } from '../src/service/fret-service.js'
-import type { SerializedPeerEntry, SerializedTable } from '../src/store/digitree-store.js'
+import type { SerializedPeerEntry } from '../src/store/digitree-store.js'
 import { coordToBase64url } from '../src/ring/hash.js'
+import { serializedPeer, tableOf } from './helpers/serialized-table.js'
 
 // `DigitreeStore.importEntries` replaces by id, which is what keeps a coordinate move from
 // stranding a second tree entry for the same peer. That semantic has one consequence the
@@ -12,30 +13,13 @@ import { coordToBase64url } from '../src/ring/hash.js'
 // self's entry is the one entry the local node knows better than any snapshot does. These
 // tests pin the service-level rule that drops it — the store-level seam is covered by
 // `digitree.invariants.spec.ts`.
+//
+// Import also runs capacity enforcement, and this file covers only the coarse arm of that
+// (an oversized bulk import is trimmed to the cap). *Which* peers survive — neighbor
+// protection around self, dead/foreign/unknown peers losing it, self never being a victim —
+// lives in `relevance.eviction.spec.ts`; add victim-selection cases there, not here.
 
 const NETWORK = 'table-persistence-test'
-
-function serializedPeer(id: string, coordByte: number, over: Partial<SerializedPeerEntry> = {}): SerializedPeerEntry {
-	const coord = new Uint8Array(32)
-	coord[0] = coordByte
-	return {
-		id,
-		coord: coordToBase64url(coord),
-		relevance: 1,
-		lastAccess: 0,
-		state: 'connected',
-		membership: 'member',
-		accessCount: 0,
-		successCount: 0,
-		failureCount: 0,
-		avgLatencyMs: null,
-		...over,
-	}
-}
-
-function tableOf(entries: SerializedPeerEntry[]): SerializedTable {
-	return { v: 1, peerId: 'exporter', timestamp: Date.now(), entries }
-}
 
 function entryFor(svc: FretService, id: string): SerializedPeerEntry {
 	const found = svc.exportTable().entries.find((e) => e.id === id)

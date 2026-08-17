@@ -138,6 +138,18 @@ function blendLatency(avg: number | null, sample: number | undefined): number | 
  * it. Such callers omit the argument and the peer's `avgLatencyMs` is left exactly as it was —
  * still `null` if it has never been pinged. Callers must likewise omit `avgLatencyMs` from any
  * patch they derive from the result when they supplied no sample.
+ *
+ * NOTE: a *repeated* success does not raise relevance, and successful contact earns no frequency
+ * credit at all. `successCount` feeds only the success/failure ratio in {@link healthScore},
+ * which saturates the moment the first success lands — measured at a fixed clock, ten successive
+ * calls score an identical 1.2600, and an entry with 500 recorded successes scores exactly what
+ * one with a single success does. Meanwhile `accessCount`, the only input to the frequency term,
+ * is incremented by {@link touch} alone, and `touch` is what an *inbound* snapshot naming a peer
+ * runs — so a peer we merely heard about 500 times scores 1.5276, above a peer we successfully
+ * called 500 times. Whether that is the intended ranking is an open question owned by
+ * `tickets/backlog/bug-frequency-credit-only-from-gossip`; `test/relevance.properties.spec.ts`
+ * therefore asserts only that a success outranks a failure, and pins no direction on either
+ * behavior described here.
  */
 export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
 	observeDistance(model, x);
