@@ -25,7 +25,7 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 - Successor set S(p): the next m peers clockwise after p (m = ceil(k/2) by default).
 - Predecessor set P(p): the previous m peers counterclockwise before p (m = ceil(k/2)).
 - Finger cache: Ordered B+Tree which maintains all known peers in a single ordered index keyed by ring coordinate.  Approximates a finger-table. Secondary index by relevance score (see below) for bounded capacity and victim selection.
-- Maybe these are all part of the same cache set, and the successor and predecessor sets just have infinite relevance.
+- These are all one cache set. There is no separate S/P container and no "infinite relevance" score — the successor/predecessor windows *are* the filtered ring walk (see *Network-scoped admission*), and their protection from eviction is a **protection set** computed at eviction time (see *Relevance scoring and table management*), not a score.
 
 ### Relevance scoring and table management
 - The routing table has a hard capacity C. When over capacity, evict the lowest-relevance entries.
@@ -37,8 +37,12 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
     - Maintain a tiny KDE over x with m fixed centers and EMA occupancy.
     - Sparsity bonus S(x) = clamp(((ideal(x)+ε)/(density(x)+ε))^β, sMin, sMax).
     - This increases score for underrepresented distances and tapers overrepresented ones.
-  - Neighbors: entries in S(p) ∪ P(p) are always retained unless explicitly dead.
-- Victim selection: lowest score first.
+  - Neighbors: entries in S(p) ∪ P(p) are retained regardless of score, unless excluded from the ring view.
+- Victim selection: lowest score first, **skipping a protection set** — `FretService.enforceCapacity` asks the store for the live members immediately around self (`protectedIdsAround(self, max(2, m), isLiveMember)`) and never evicts one, however low it scores. Two consequences that are behavior, not wording:
+  - **The protected set is `2·max(2, m) − 1` ids, not `2m + 1`.** Both walks start *on* self, so self consumes one slot per side and only `m − 1` live members are protected on each side — the m-th successor and m-th predecessor are evictable despite being genuine S(p)/P(p) members. Self-anchored ring walks elsewhere in the service share this off-by-one (they ask for `m` and then filter self out); the size estimator is the one site that compensates, asking each side for `m + 1`. Reconciling them onto one helper is `plan/23-fret-service-decomposition` item (a).
+  - **Protection outranks the cap.** With `capacity < 2m − 1` the eviction loop runs out of unprotected candidates and the table stays over capacity. Unreachable at the shipped numbers (m 8, capacity 2048) and only reachable by misconfiguration; see the `NOTE:` at `enforceCapacity`.
+  - Scores are compared as *stored*, not recomputed: `PeerEntry.relevance` is whatever the last scoring call wrote, and the sparsity bonus that multiplied it came from the service-wide model's occupancy at that moment. Eviction therefore ranks snapshots taken under different model states.
+  - Pinned by `test/relevance.eviction.spec.ts`.
 
 ### Join and bootstrap
 1. New node chooses any reachable bootstrap peer(s).
@@ -420,7 +424,7 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     which coerces to `0` when assigned into a `Uint8Array`, so garbage decoded to a plausible
     near-zero coordinate), so a malformed wire value is rejected at the boundary it entered by
     and the seam is the backstop.
-  - Bounded capacity with victim selection; infinite relevance for S/P.
+  - Bounded capacity with victim selection; S/P protected by the protection set described under *Relevance scoring and table management*, not by a score.
   - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
   - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
 - Neighbor management & snapshots (A3)

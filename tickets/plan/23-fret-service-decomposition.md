@@ -24,3 +24,29 @@ dead-state liveness seam, ring exclusion, and the two-armed re-probe pass landed
 one extraction that same review performed — `isLiveMember` into `src/service/live-member.ts`, so
 `FretPeerDiscovery` shares the predicate rather than copying it — is 20 lines of the god class, not
 a dent; the three candidates above still stand.
+
+Size re-measured during the `relevance-scoring-tests` review: `wc -l
+packages/fret/src/service/fret-service.ts` reports **2980** lines.
+
+**New arm on (a): the walk sites are off by one against the configured `m`, and they disagree with
+each other.** A ring walk anchored at self returns self as its own first result on *both* sides
+(`neighborsRight` seeks `hex(coord)|\x00` and lands on self's own key; `neighborsLeft` mirrors it).
+So `neighborsRight(selfCoord, m)` yields self plus only `m − 1` other peers, and the ubiquitous
+`.filter(id => id !== selfStr)` that follows is the tell — the count was already spent on self.
+Consequences, all present today:
+
+- Capacity protection (`enforceCapacity` → `protectedIdsAround(self, max(2, m), isLiveMember)`)
+  protects `2·max(2, m) − 1` ids, so the m-th successor and m-th predecessor are evictable at
+  capacity even though `docs/fret.md` describes the whole of S(p) ∪ P(p) as retained.
+- The self-anchored maintenance walks (leave-notice targets, `isNearNeighbor`, warm-up target
+  lists) likewise cover `m − 1` real neighbors per side rather than `m`.
+- `windowGaps` in `src/estimate/size-estimator.ts` is the one site that compensates, asking each
+  side for `m + 1` with a comment explaining why. That local fix is the evidence this is a class
+  rather than an instance.
+
+Verified statically by reading the walk implementations and pinned as current behavior (not as
+correct behavior) by `packages/fret/test/relevance.eviction.spec.ts`. The helper this ticket
+already proposes is the right place to settle it: decide once whether `count` means "peers besides
+self" or "results including self", state it in the signature, and let every call site inherit the
+answer. Whether the outermost S/P member *should* be protected is part of that decision, not a
+separate ticket.

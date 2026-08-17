@@ -146,6 +146,11 @@ describe('FretService capacity enforcement and victim selection', function () {
 	it('protects the ring neighbors around self even though they score lowest in the table', async () => {
 		// m 3 → protection breadth 3 → each walk starts *on* self, so self plus 2 live members
 		// clockwise and 2 counter-clockwise: 5 protected ids.
+		//
+		// Note that this is one *fewer* live member per side than the configured m: the walks
+		// spend a slot on self, so the m-th successor and m-th predecessor are not protected even
+		// though `docs/fret.md` calls the whole of S(p) ∪ P(p) retained. Pinned here as current
+		// behavior; reconciling the self-anchored walks is `plan/23-fret-service-decomposition`.
 		const service = await seededService({ m: 3, capacity: 6 })
 
 		const stored = await service.importTable(tableOf(records(standardLayout(self))))
@@ -159,6 +164,30 @@ describe('FretService capacity enforcement and victim selection', function () {
 			...NEAR_IDS,
 			'far-6',
 		])
+	})
+
+	// `standardLayout` gives the far peers ascending relevance in ascending ring order, so
+	// relevance order, ring order and insertion order all coincide there — an implementation that
+	// evicted in `list()` (ring) order would satisfy the case above. This one breaks the tie:
+	// the far peers score *descending* with ring distance, so only a relevance-ordered eviction
+	// keeps the ring-nearest far peer.
+	it('picks victims by relevance, not by ring position or insertion order', async () => {
+		const service = await seededService({ m: 3, capacity: 6 })
+		const layout: Placed[] = [
+			...standardLayout(self).filter((p) => NEAR_IDS.includes(p.id)),
+			...Array.from({ length: 6 }, (_, i) => ({
+				id: `far-${i + 1}`,
+				coord: ringOffset(self, (i + 1) * 1000),
+				relevance: 6 - i,
+			})),
+		]
+
+		await service.importTable(tableOf(records(layout)))
+
+		// Protection is unchanged (self plus the four near peers), so the one surviving far peer
+		// is whichever scores highest — `far-1` at 6.0, which is also the *first* far peer in
+		// ring order and would therefore be the first evicted by a ring-ordered loop.
+		expect(survivors(service)).to.have.members([selfId, ...NEAR_IDS, 'far-1'])
 	})
 
 	it('drops a dead neighbor from protection and shifts the window outward rather than shrinking it', async () => {
