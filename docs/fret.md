@@ -689,7 +689,24 @@ After import, the normal stabilization loop probes restored peers to update conn
 #### Testing strategy
 - Unit tests: Digitree operations, cohort assembly, relevance scoring
 - Integration tests: Join/leave scenarios, stabilization convergence
-- Simulation: Large-scale churn patterns, partition/merge behavior. The deterministic harness (`test/simulation/fret-sim.ts`) can split the ring into mutually unreachable groups (`partition(groups)` / `heal()`): every cross-peer contact consults one reachability predicate, an unreachable neighbor escalates through `contactFailures` to `dead` and drops out of every ring-shaped read, a bounded re-probe pass (ascending `lastAccess`, mirroring the production dead arm) brings it back after the heal, and coverage is measured against each peer's *reachable* alive population so a healed ring reads as healed rather than as half of one — pinned by `test/simulation.partition.spec.ts` (two-way, singleton and three-way splits; in-flight drops at the cut; mid-split joins; deterministic replay of a partition/heal schedule)
+- Simulation: Large-scale churn patterns, partition/merge behavior. The deterministic harness
+  (`test/simulation/fret-sim.ts`) splits the ring into mutually unreachable groups with
+  `partition(groups)` and rejoins them with `heal()`:
+  - Every cross-peer contact consults one reachability predicate. Pool-filtering sites (candidate
+    lists, coverage math) use it silently; sites that model a real contact attempt count the
+    refusal, so `crossPartitionBlocked()` reads as "contacts refused", not "ids filtered".
+  - A peer learns about the cut only from its own failed contacts: an unreachable entry escalates
+    through `contactFailures` to `dead` and then drops out of every ring-shaped read. Nothing
+    consults the partition map on a peer's behalf, so "the neighbor sets went side-pure" is
+    evidence of escalation rather than of the oracle.
+  - A bounded dead-entry re-probe (ascending `lastAccess`, mirroring production's dead arm) is the
+    path back after the heal; a merge never resurrects a locally-dead entry.
+  - Coverage is measured against each peer's *reachable* alive population, so a healed ring reads
+    as healed rather than as half of one. With no partition active the arithmetic is unchanged.
+  - Pinned by `test/simulation.partition.spec.ts`: two-way, singleton and three-way splits;
+    a leave during a cut reaching only the leaver's own side; in-flight messages dropped at the
+    cut; a bus-mode run of the whole cut/escalate/heal lifecycle; mid-split joins; and
+    deterministic replay of a full partition/heal schedule.
 - Benchmarks: Routing latency, memory usage, message overhead
 
 ### Open questions / next steps

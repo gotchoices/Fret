@@ -14,10 +14,19 @@ import type { SimMetrics } from './simulation/sim-metrics.js'
 /** Baseline coverage threshold — the same bar the churn-recovery suite calibrates against. */
 const COVERAGE_THRESHOLD = 0.8
 
+/**
+ * Drive every event scheduled up to `uptoMs`, one at a time, then park the clock there.
+ *
+ * Deliberately not `for (const evt of scheduler.advanceTo(uptoMs))`: that shifts the whole
+ * batch first and leaves the clock at `uptoMs`, so every tick in the window is processed at
+ * the *window's* timestamp rather than its own — which the dead-entry re-probe reads when it
+ * stamps and orders candidates.
+ */
 function pump(sim: FretSimulation, uptoMs: number): void {
-	for (const evt of sim.scheduler.advanceTo(uptoMs)) {
-		sim.processEvent(evt)
+	while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
+		sim.processEvent(sim.scheduler.nextEvent()!)
 	}
+	sim.scheduler.advanceTo(uptoMs)
 }
 
 function compareCoords(a: Uint8Array, b: Uint8Array): number {
@@ -244,6 +253,50 @@ describe('Partition and merge simulation', function () {
 		expect(sim.snapshotCoverage()).to.be.at.least(COVERAGE_THRESHOLD)
 	})
 
+	it('a leave during a cut notifies only the leaver own side', () => {
+		const sim = new FretSimulation({
+			seed: 5150,
+			n: 24,
+			k: 10,
+			m: 6,
+			churnRatePerSec: 0,
+			stabilizationIntervalMs: 500,
+			durationMs: 10000,
+		})
+		sim.initialize()
+		pump(sim, 3000)
+
+		const [groupA, groupB] = contiguousHalves(sim)
+		sim.partition([groupA, groupB])
+		const blockedBeforeLeave = sim.crossPartitionBlocked()
+
+		// Depart between ticks, before any escalation has run: both sides still hold a live
+		// entry for the leaver, so what removes it on the A side can only be the notice.
+		const leaver = groupA[1]!
+		sim.scheduler.scheduleAt({ type: 'leave', peerId: leaver }, 3100)
+		pump(sim, 3200)
+
+		// The notice fan-out walks every alive peer once, so the refusals it books are exactly
+		// the far side's population — nothing else ran in this window to add to the count.
+		expect(sim.crossPartitionBlocked() - blockedBeforeLeave, 'refusals booked by the leave fan-out')
+			.to.equal(groupB.length)
+
+		for (const aId of groupA) {
+			if (aId === leaver) continue
+			expect(sim.getStores().get(aId)!.getById(leaver), `${aId} should have taken the notice`)
+				.to.equal(undefined)
+		}
+		const bStillHolding = groupB.filter((bId) => sim.getStores().get(bId)!.getById(leaver))
+		expect(bStillHolding.length, 'the far side must not have been told').to.be.greaterThan(0)
+
+		// The far side finds out on its own, without a notice.
+		pump(sim, 5000)
+		for (const bId of groupB) {
+			expect(sim.getStores().get(bId)!.getById(leaver), `${bId} should have swept the departed peer`)
+				.to.equal(undefined)
+		}
+	})
+
 	it('messages in flight at the cut are dropped at delivery, not delivered late', () => {
 		const sim = new FretSimulation({
 			seed: 606,
@@ -276,6 +329,43 @@ describe('Partition and merge simulation', function () {
 		expect(sim.crossPartitionBlocked()).to.be.greaterThan(0)
 	})
 
+	it('bus mode runs the whole cut/escalate/heal lifecycle, not just the in-flight drop', () => {
+		const sim = new FretSimulation({
+			seed: 8080,
+			n: 24,
+			k: 10,
+			m: 6,
+			churnRatePerSec: 0,
+			stabilizationIntervalMs: 500,
+			durationMs: 24000,
+			deadReprobePerTick: 6,
+			messageBus: {
+				defaultLatencyMs: 50,
+				defaultLossRate: 0,
+				defaultQueueCapacity: 10000,
+				latencyDistribution: 'constant',
+				latencyJitter: 0,
+			},
+		})
+		sim.initialize()
+		pump(sim, 5000)
+		expect(sim.snapshotCoverage(), 'bus-mode baseline').to.be.at.least(COVERAGE_THRESHOLD)
+
+		const [groupA, groupB] = contiguousHalves(sim)
+		sim.partition([groupA, groupB])
+
+		pump(sim, 11000)
+		expect(sim.crossPartitionBlocked()).to.be.greaterThan(0)
+		assertNoLiveCross(sim, groupA, groupB, 'bus A-side after escalation')
+		assertNoLiveCross(sim, groupB, groupA, 'bus B-side after escalation')
+		expect(sim.snapshotCoverage(), 'bus-mode coverage during cut').to.be.at.least(COVERAGE_THRESHOLD)
+
+		sim.heal()
+		pump(sim, 20000)
+		assertNoDeadEntries(sim, 'bus post-heal')
+		expect(sim.snapshotCoverage(), 'bus-mode coverage after heal').to.be.at.least(COVERAGE_THRESHOLD)
+	})
+
 	it('heal without partition, single-group partition, and duplicate listing are all benign', () => {
 		const sim = new FretSimulation({
 			seed: 11,
@@ -294,6 +384,12 @@ describe('Partition and merge simulation', function () {
 		expect(sim.crossPartitionBlocked()).to.equal(0)
 
 		const ids = aliveByCoord(sim)
+
+		// An id naming no peer is rejected: it reads back identically to a mid-split joiner, so
+		// accepting one would sort every real peer into a single group and make the split a
+		// silent no-op the calling test would still pass.
+		expect(() => sim.partition([['peer-nope'], ids])).to.throw(/unknown peer id/)
+		expect(sim.crossPartitionBlocked()).to.equal(0)
 
 		// A single group blocks nothing (everyone resolves to group 0, absent ids included).
 		sim.partition([ids])

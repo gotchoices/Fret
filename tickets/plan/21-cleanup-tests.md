@@ -44,4 +44,19 @@ Accumulated test-suite cleanup called out by the review:
   that a shared `withMesh(n, fn)`-shaped helper makes the leak *unwritable* rather than fixed once
   per spec. Prefer that shape over asking each spec to remember a `finally`.
 
-References: review.html:454-456 "Test housekeeping"; helpers/libp2p.ts:64 (stopAll reverse), cohort.assembly.spec.ts, selector.connected-first.spec.ts, test/README.md. Coordinate-arithmetic arm added by the `dialability-spec-self-position-premise` review.
+- **The simulation harness has outgrown one file and one class.** Measured after the
+  `sim-partition-merge-tests` review: `packages/fret/test/simulation/fret-sim.ts` is 889 lines
+  (`(Get-Content -LiteralPath packages\fret\test\simulation\fret-sim.ts).Count`), all of it one
+  `FretSimulation` class that owns coordinate placement, event scheduling and dispatch, the
+  stabilization tick, the partition/reachability model, contact-failure escalation and dead-entry
+  re-probe, a routing model, and the coverage/dead-ratio metrics. The natural seams are visible
+  in the code already — placement (`generateCoord` and its three strategies plus `bigintToCoord`,
+  which the coordinate-arithmetic arm above also wants moved), the reachability model
+  (`partition`/`heal`/`reachable`/`contactAllowed`), the liveness model (`contactSweep` /
+  `reprobeDeadEntries`), and the measurement functions (`snapshotCoverage`,
+  `deadNeighborRatio`). This is prevention rather than a bug: the file is correct today, but two
+  planned tickets (`24-sim-router-realism`, and the simulator-invariants doc in `backlog/plan/`)
+  both edit it next, and both would land cleaner against separated modules. Sequence this arm
+  *before* `24-sim-router-realism` or accept that it rewrites the routing seam first.
+
+References: review.html:454-456 "Test housekeeping"; helpers/libp2p.ts:64 (stopAll reverse), cohort.assembly.spec.ts, selector.connected-first.spec.ts, test/README.md. Coordinate-arithmetic arm added by the `dialability-spec-self-position-premise` review; harness-size arm added by the `sim-partition-merge-tests` review.

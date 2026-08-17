@@ -141,8 +141,17 @@ export class FretSimulation {
 	 * in the first group — the harness's stand-in for "the side the bootstrap list points at".
 	 * Calling again replaces the whole assignment (no throw); a peer listed in more than one
 	 * group keeps its last listing (last write wins — the map cannot be corrupted by a dup).
+	 *
+	 * An id that names no peer throws. It cannot be distinguished from a mid-split joiner at
+	 * read time (both are "absent from the map"), so a typo'd or stale id would silently sort
+	 * every *real* peer into one group and leave the split a no-op that a test still passes.
 	 */
 	partition(groups: ReadonlyArray<ReadonlyArray<string>>): void {
+		for (const group of groups) {
+			for (const id of group) {
+				if (!this.peers.has(id)) throw new Error(`partition(): unknown peer id ${id}`)
+			}
+		}
 		this.partitionOf.clear()
 		for (let g = 0; g < groups.length; g++) {
 			for (const id of groups[g]!) this.partitionOf.set(id, g)
@@ -495,13 +504,17 @@ export class FretSimulation {
 
 			// Compute this peer's neighbors from its store. The walk skips entries this peer
 			// has marked dead — that skip is what lets the window advance past a partitioned-away
-			// peer instead of pinning on it forever.
+			// peer instead of pinning on it forever, and it is the *only* partition-awareness
+			// here: `reachable` is deliberately NOT consulted, because a peer cannot know a
+			// neighbor became unreachable until its own contact attempts say so. Consulting it
+			// would empty the set the instant a cut is applied and make "the neighbor sets went
+			// side-pure" true by oracle rather than by escalation. The outbound exchange below
+			// is still gated, so nothing crosses the cut in the meantime.
 			const right = store.neighborsRight(peer.coord, this.config.m, notDead)
 			const left = store.neighborsLeft(peer.coord, this.config.m, notDead)
 			const neighbors = new Set(
 				[...right, ...left].filter((id) => {
 					if (id === peer.id) return false
-					if (!this.reachable(peer.id, id)) return false
 					const p = this.peers.get(id)
 					return p && p.alive
 				})
@@ -542,9 +555,11 @@ export class FretSimulation {
 	 * At `deadAfterFailures` strikes the entry is marked `dead` and drops out of every
 	 * ring-shaped read via the `notDead` filter.
 	 *
-	 * Production spaces strikes ≥ 500 ms apart so concurrent failures count once
-	 * (docs/fret.md — Ring membership); tick spacing here is ≥ the stabilization interval,
-	 * so that independence rule holds by construction — no spacing check is re-implemented.
+	 * Production spaces strikes ≥ 500 ms apart so a burst of concurrent failures counts once
+	 * (docs/fret.md — Ring membership). Here one strike is one *tick*, so the independence the
+	 * spacing rule buys holds by construction and no spacing check is re-implemented — note
+	 * that this is a property of the tick, not of the clock: a driver that processes several
+	 * ticks at one simulated timestamp still strikes once per tick.
 	 * Production also spreads its contacts across budgeted passes (near / classify /
 	 * re-probe) rather than touching every entry each tick; the sim collapses those into one
 	 * per-tick sweep, so a fully unreachable population escalates in `deadAfterFailures`
@@ -728,6 +743,12 @@ export class FretSimulation {
 			// coordinate must not crown itself anchor while its store still names a (dead)
 			// entry closer to the key — that is what makes a cross-cut route fail by
 			// exhaustion instead of succeeding against the wrong half.
+			// NOTE: that outcome therefore rests on dead entries *staying in the store*. Nothing
+			// evicts them today (only a departed peer is pruned, and capacity is unset in the
+			// partition specs), but if dead entries ever start being pruned or evicted, a
+			// boundary peer would crown itself anchor for a far-side coordinate and the
+			// "A→B route fails during the cut" assertion would silently invert into a pass on
+			// the wrong reason. Re-derive the anchor rule here before allowing that.
 			const succ = store.successorOfCoord(targetCoord)
 			const pred = store.predecessorOfCoord(targetCoord)
 			if (!succ && !pred) break
@@ -766,6 +787,17 @@ export class FretSimulation {
 		this.metrics.recordRoute(false, hops)
 	}
 
+	/**
+	 * Mean fraction of each peer's ideal neighbor window that it actually holds.
+	 *
+	 * NOTE: 1.0 is not reachable. Both walks are anchored *on* the peer's own coordinate, so each
+	 * returns self plus m−1 others, while the denominator asks for 2m — a fully converged ring
+	 * therefore reports exactly (2m−2)/2m (87.5% at the usual m = 8), which is why every suite's
+	 * threshold sits below that and why the partition specs log 87.5% at all three phases. Same
+	 * self-anchored off-by-one docs/fret.md describes for the eviction protection set. Harmless
+	 * as a *relative* measure, which is all any caller uses it for; fix it only alongside
+	 * re-calibrating every threshold that was set against today's numbers.
+	 */
 	snapshotCoverage(): number {
 		const alivePeers = Array.from(this.peers.values()).filter((p) => p.alive)
 		if (alivePeers.length <= 1) return 1
@@ -790,8 +822,9 @@ export class FretSimulation {
 			const store = this.stores.get(peer.id)
 			if (!store) continue
 
+			// `aliveByGroup` was built from this same list, so the lookup always hits.
 			const reachableAlive = partitionActive
-				? (aliveByGroup.get(this.partitionOf.get(peer.id) ?? 0) ?? 1)
+				? aliveByGroup.get(this.partitionOf.get(peer.id) ?? 0)!
 				: alivePeers.length
 			const reachableOthers = reachableAlive - 1
 
