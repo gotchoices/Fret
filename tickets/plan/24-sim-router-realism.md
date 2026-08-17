@@ -24,3 +24,25 @@ Added by the review of `consolidate-ring-distance`, as evidence for the "oracle-
 That change replaced the distance function behind *every* next-hop decision, the payload-inclusion heuristic, and the relevance model. The full suite stayed green and the churn scenario still reported 90% routing success over 20 attempts — but neither result is evidence, because nothing under `packages/fret/test/simulation/` imports the production distance function or the production hop selector (`grep -L` for `minDistance|chooseNextHop|clockwiseDistance` over that directory returns every file). The simulator reimplements hop choice against its own global view, so it would have reported the same success rate had the metric been left broken.
 
 What this means for the direction already sketched above: the "restrict routing to local store knowledge" work should route through the *shipped* `chooseNextHop` rather than a sim-local equivalent, otherwise the harness can be made realistic and still not guard the code it exists to guard. Concretely, the property worth having is a routing-success and hop-count measurement over a seeded ring that a metric or selector regression would visibly move — today no such number exists at any scale.
+
+### Arm: the partition/merge work lands in this file first
+
+Added while planning `test-coverage-gaps`, which split off `implement/6-sim-partition-merge-tests`.
+That ticket has a lower sequence and touches the same file, so assume its changes are already in
+the tree when this one is planned. It adds, to `test/simulation/fret-sim.ts`:
+
+- a private `reachable(a, b)` predicate plus `partition(groups)` / `heal()`, consulted by every
+  cross-peer site (connect sampling, both neighbor-exchange arms, leave fan-out, routing, message
+  delivery);
+- per-peer contact-failure escalation recorded in the store's own `contactFailures` / `state`
+  fields, with a `state !== 'dead'` filter passed into every ring-shaped read;
+- a bounded dead-entry re-probe so a healed split can actually merge;
+- a per-peer reachable population as the coverage denominator (identical result when no partition
+  is active).
+
+Two consequences for the direction sketched above. First, the local-knowledge routing model must
+honour `reachable` — a hop is only a hop if the two peers can contact each other — so route it
+through that one predicate rather than adding a second copy. Second, the `state !== 'dead'` filter
+is **not** the global `alive` oracle this ticket objects to: it reads only what the probing peer's
+own store recorded, and it is the mechanism that makes a partition observable. The global-`alive`
+prune loop is still there and still oracle-assisted; retiring it remains this ticket's work.

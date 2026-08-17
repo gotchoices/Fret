@@ -79,3 +79,18 @@ failure) is a correctness rule the shared helper must preserve, and it is the na
 for the `unreachable` / `decode-error` / `timeout` distinction this ticket already wants.
 
 References: review RPC-section findings "Handler error paths leak streams", "fetchNeighbors fabricates success on every failure", "Zero shape validation of decoded messages", and "RPC boilerplate duplicated 4-5x with three error contracts" (neighbors.ts:24/29-44/60-70, maybe-act.ts:16/19/23-25, leave.ts:32/40-42, ping.ts:28/50-51, protocols.ts:59/78-83). This consolidation deletes roughly half of the rpc directory.
+
+Arm resolved elsewhere (added while planning `test-coverage-gaps`): the two arms above about
+inconsistent failure reporting — *"fetchNeighbors fabricates success on every failure"* and *"the
+liveness seam now has to guess whether a peer was reached"* — are about to acquire a regression net
+in `implement/6.1-rpc-stream-error-tests`, a new `test/rpc.stream-errors.spec.ts` that drives each
+sender against a reply that resets mid-stream, that ends cleanly mid-JSON, and that stalls after a
+partial payload. That spec deliberately **pins today's inconsistent contract** (ping collapses an
+undecodable reply into `ok: false` and records no strike; maybeAct throws on the same evidence and
+the service books a contact failure; fetchNeighbors fabricates an empty snapshot), with each such
+assertion commented as belonging to this ticket. So expect to *update* those assertions here rather
+than discover them as failures: when the discriminated result type lands, the decode-error cases
+become `decode-error` outcomes and the contact strike on the maybeAct path goes away. The
+invariants in that spec — a partial payload is never parsed as a whole message, the stream is
+released exactly once, no unhandled rejection escapes, our own cancellation scores nothing — must
+survive the refactor unchanged.
