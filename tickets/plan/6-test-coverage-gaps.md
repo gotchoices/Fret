@@ -5,7 +5,7 @@ difficulty: medium
 ----
 Named coverage gaps from the review:
 
-- Table persistence: exporting and re-importing the routing table is untested, including the doc-promised behavior that importing a table larger than capacity evicts the lowest-relevance entries.
+- Table persistence: exporting and re-importing the routing table is untested. **The capacity arm of this — "importing a table larger than capacity evicts the lowest-relevance entries" — now belongs to `relevance-scoring-tests`**, which owns eviction victim selection end to end (neighbor protection, dead/foreign/unknown exclusion, tie handling) in a new `test/relevance.eviction.spec.ts`. What is left here is round-trip *fidelity*: that every field survives export → import unchanged, that older snapshots missing newer fields read back with the documented defaults, and that a malformed coordinate rejects the whole snapshot without writing anything. Do not re-derive the capacity assertions.
 - Token bucket refill: only the configured rate is echoed back; the actual refill-over-time behavior is never exercised. This needs an injectable clock so time can be advanced deterministically.
 - Partition/merge: no scenario splits the network and rejoins it, despite the doc's testing strategy naming it. The simulation message bus can already model link cuts, so this is buildable today.
 - Stream errors: no client-side tests for a peer that aborts mid-stream or goes unresponsive partway through a response.
