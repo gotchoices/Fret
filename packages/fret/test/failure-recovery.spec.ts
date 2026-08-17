@@ -1,6 +1,8 @@
 import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
+import { waitFor } from './helpers/wait-for.js'
+import { sendPing } from '../src/rpc/ping.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { DigitreeStore } from '../src/store/digitree-store.js'
 import { ExpiringMap } from '../src/utils/expiring-map.js'
@@ -216,6 +218,13 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		// No rewind: three hand-driven ticks land well inside the 500 ms spacing window, so they are
 		// one observation. This is what stops a live service under mass failure from killing every
 		// neighbor in a single burst.
+		//
+		// NOTE: the only wall-clock-shaped assertion in this file. Three failing ticks against a
+		// stopped memory node measure ~50 ms, so the margin against the 500 ms window is ~10× — but
+		// it is a margin, not a guarantee, and there is no fake clock here. If this ever flakes,
+		// stamp `Date.now()` around the three ticks and assert the elapsed span is under
+		// `NEGOTIATE_FAILURE_MIN_SPACING_MS` as a precondition, so a slow machine reports "the
+		// premise did not hold" instead of "the spacing guard is broken".
 		await tick()
 		await tick()
 		await tick()
@@ -305,6 +314,38 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		expect(svcA.assembleCohort(selfCoord, 4)).to.include(bId)
 	})
 
+	// The dead arm is the path back for a peer that never dials us. The other one — and the one a
+	// restarted peer with bootstraps actually takes — is the peer reaching *us*, which costs no
+	// probe budget at all. `dead-state.spec.ts` pins that at the seam (`noteInboundRpc`); here it
+	// rides a real ping over a real connection, so a handler that stopped applying proof of life
+	// fails here rather than passing every seam-level call.
+	//
+	// This is the one test in the block that needs A's inbound handlers: the observer is
+	// deliberately never started, so nothing else in this file registers them — and by the same
+	// token, no `peer:connect` listener is attached either, which is what leaves the inbound RPC
+	// as the only thing that could have resurrected B.
+	it('re-admits a dead peer that dials us, without a probe of our own', async () => {
+		await tick()
+		await stopRemote()
+		await driveToDead()
+		await (svcA as any).registerRpcHandlers()
+
+		await startRemote()
+		const pingsBefore = svcA.getDiagnostics().pingsSent
+		await b.dial(a.getMultiaddrs()[0]!)
+		const res = await sendPing(b, a.peerId.toString(), makeProtocols('net-test').PROTOCOL_PING)
+		expect(res.ok, 'the inbound ping really reached A').to.equal(true)
+
+		const after = entry()!
+		expect(after.state, 'proof of life clears the verdict').to.not.equal('dead')
+		expect(after.contactFailures, 'and the run behind it').to.equal(0)
+		expect(after.membership).to.equal('member')
+		expect(svcA.getDiagnostics().pingsSent, 'A sent nothing; B came to us').to.equal(pingsBefore)
+
+		const selfCoord = await hashPeerId(a.peerId)
+		expect(svcA.getNeighbors(selfCoord, 'both', 8), 'back in the ring').to.include(bId)
+	})
+
 	it('keeps the failure history across recovery', async () => {
 		await tick()
 		await stopRemote()
@@ -375,7 +416,7 @@ describe('failure recovery: a service-only outage is membership evidence, not a 
 		}
 
 		await observer.dial(remote.getMultiaddrs()[0]!)
-		await waitForAsync(serving, 'identify reports the remote serving this network')
+		await waitFor(serving, 8000, 25, 'identify reports the remote serving this network')
 		await (svcObserver as any).seedFromPeerStore()
 		store.setMembership(id, 'member')
 		await tick()
@@ -383,7 +424,7 @@ describe('failure recovery: a service-only outage is membership evidence, not a 
 
 		// Node stays up, connection stays open; only this network's five handlers go away.
 		await svcRemote.stop()
-		await waitForAsync(async () => !(await serving()), 'identifyPush propagates the shortened protocol list')
+		await waitFor(async () => !(await serving()), 8000, 25, 'identifyPush propagates the shortened protocol list')
 
 		for (let i = 0; i < 3; i++) {
 			store.update(id, { lastNegotiateFailureAt: 0, lastContactFailureAt: 0 })
@@ -397,13 +438,3 @@ describe('failure recovery: a service-only outage is membership evidence, not a 
 		expect(after.state, 'never dead').to.not.equal('dead')
 	})
 })
-
-/** `waitFor` for a predicate that has to await the peerStore. */
-async function waitForAsync(predicate: () => Promise<boolean>, label: string, timeoutMs = 8000): Promise<void> {
-	const deadline = Date.now() + timeoutMs
-	while (Date.now() < deadline) {
-		if (await predicate()) return
-		await new Promise((r) => setTimeout(r, 25))
-	}
-	throw new Error(`waitForAsync timed out after ${timeoutMs}ms: ${label}`)
-}

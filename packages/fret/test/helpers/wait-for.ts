@@ -12,22 +12,25 @@ const DEFAULT_STEP_MS = 25
  * sides — so `listPeers().length >= 2` and `getNeighbors(selfCoord, …).length > 0` are already
  * true before a single stabilization tick and wait on nothing. Count remote peers only.
  *
+ * The predicate may be async — a condition read through an async API (the libp2p peerStore, say)
+ * waits here rather than growing a second copy of this loop next to the test that needs it.
+ *
  * NOTE: `label` is last, behind two timing parameters most callers do not want to restate, so
  * most call sites omit it and their timeout reads only `waitFor timed out after 12000ms`. The
  * stack trace still names the line; if that stops being enough, move `label` to the second
  * parameter and push `timeoutMs` / `stepMs` into an options bag.
  */
 export async function waitFor(
-	predicate: () => boolean,
+	predicate: () => boolean | Promise<boolean>,
 	timeoutMs: number = DEFAULT_TIMEOUT_MS,
 	stepMs: number = DEFAULT_STEP_MS,
 	label?: string
 ): Promise<void> {
 	const deadline = Date.now() + timeoutMs
 	while (Date.now() < deadline) {
-		if (predicate()) return
+		if (await predicate()) return
 		await new Promise((r) => setTimeout(r, stepMs))
 	}
-	if (predicate()) return
+	if (await predicate()) return
 	throw new Error(`waitFor timed out after ${timeoutMs}ms${label ? `: ${label}` : ''}`)
 }

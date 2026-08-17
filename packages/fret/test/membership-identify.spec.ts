@@ -84,8 +84,13 @@ describe('Ring membership classification (identify-driven)', function () {
 	// identify-push, and A's peer:update listener promotes it foreign → member. C joins WITHOUT
 	// serving net-a (so A labels it foreign off its identify protocols only), then registers a
 	// net-a protocol handler — which updates C's self record and, via identify-push, reaches A
-	// as a peer:update. With the probe pass disabled and seedFromPeerStore only re-classifying
-	// `unknown` peers (never `foreign`), peer:update is the sole path that can re-admit C.
+	// as a peer:update. With the probe pass disabled, identify is the only remaining classification
+	// source, so the re-admission cannot have come from an RPC — asserted directly via `pingsSent`.
+	//
+	// It is *identify*, not specifically the `peer:update` listener: `seedFromPeerStore` re-reads
+	// the same peerStore list every tick and its positive arm promotes from any label (the
+	// `unknown`-only guard applies to the negative arm alone — see `applyMembershipSignal`), so
+	// whichever of the two observes the pushed list first re-admits C. Both are the identify path.
 	it('re-admits foreign → member on peer:update when a peer begins serving this network', async () => {
 		const nodeA = await createIdentifyNode(); await nodeA.start()
 		const nodeC = await createIdentifyNode(); await nodeC.start()

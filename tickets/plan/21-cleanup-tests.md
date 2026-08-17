@@ -9,6 +9,13 @@ Accumulated test-suite cleanup called out by the review:
 - The shared stop-all teardown helper mutates the caller's array in place by reversing it, which can surprise callers that reuse the list; make it non-mutating.
 - The standalone cohort-assembly spec and the connected-first selector spec are subsumed by stronger suites; fold their unique cases in and delete them.
 - The test readme is stale (claims a fixed passing count and lists already-shipped features as future work); update it.
+  - Measured during the `failure-recovery-tests` review: it says "67 passing" against an actual 693,
+    its coverage index names about 15 of the ~50 spec files (none added in the last several months),
+    and its "Fixes Applied" section cites source line numbers that have long since moved. Decide the
+    *shape* before rewriting: a hand-maintained index of every spec is what went stale, whereas the
+    pattern that has stayed current is the one `docs/fret.md` uses — describe the behavior and name
+    the spec that pins it, inline, at the place the behavior is described. Deleting the readme in
+    favour of that is a legitimate outcome of this arm.
 - Ring-coordinate arithmetic is hand-rolled once per spec. `test/helpers/ring.ts` now exists and
   owns two of these (`ringOffset`, `toBigInt`), but the conversion from a bigint to a 32-byte
   coordinate is still written out five separate times under four different names, and one of
