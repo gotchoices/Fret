@@ -1,9 +1,20 @@
 import { describe, it } from 'mocha'
+import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
+import type { RouteProgress } from '../src/index.js'
 import { hashKey, hashPeerId } from '../src/ring/hash.js'
 import { lexLess, minDistance } from '../src/ring/distance.js'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
+
+// This file covers the *client-side* driver, `iterativeLookup`. Two neighbouring behaviours used
+// to be tested here through `routeAct`, which is the wrong entry point for both — the guards they
+// name live in `handleMaybeAct`, one layer above `routeAct`. They are pinned properly elsewhere,
+// so do not re-add them here:
+//   - breadcrumb-loop rejection → `pick-anchors.spec.ts` ("the breadcrumb-loop reply is a static
+//     rejection, not a ring walk"), which drives `handleMaybeAct` and asserts the empty static shape.
+//   - correlation-id dedup → the whole of `maybeact-dedup-phases.spec.ts`, which sends over the
+//     wire because `routeAct` alone never touches the dedup cache.
 
 async function makeMesh(n: number) {
 	const nodes = [] as any[]
@@ -31,12 +42,17 @@ async function makeMesh(n: number) {
 describe('Iterative lookup', function () {
 	this.timeout(25000)
 
-	it('yields near_anchor or exhausted for a digest-only probe', async () => {
+	// `exhausted` is the *unconditional* terminal event: only `complete` returns early from the
+	// attempt loop, every other path falls out of it and yields `exhausted`. And a digest-only
+	// lookup can never yield `complete`, which needs a commit certificate. So the terminal event is
+	// deterministic here, not a three-way choice.
+	it('a digest-only probe ends exhausted, never completes, and collects real anchors', async () => {
 		const { nodes, services } = await makeMesh(3)
 		await new Promise(r => setTimeout(r, 2000))
 
+		const otherIds = nodes.slice(1).map((n: any) => n.peerId.toString())
 		const key = u8FromString('test-key')
-		const events = []
+		const events: RouteProgress[] = []
 		for await (const evt of services[0]!.iterativeLookup(key, {
 			wantK: 7,
 			minSigs: 3,
@@ -46,51 +62,66 @@ describe('Iterative lookup', function () {
 			events.push(evt)
 		}
 
-		if (events.length === 0) throw new Error('expected at least one progress event')
 		const types = events.map(e => e.type)
-		if (!types.includes('probing')) throw new Error('expected at least one probing event')
+		const trail = types.join(' -> ')
+		expect(types[types.length - 1], `terminal event; trail: ${trail}`).to.equal('exhausted')
+		expect(types, `no activity to complete; trail: ${trail}`).to.not.include('complete')
 
-		// Should end with either near_anchor or exhausted
-		const last = events[events.length - 1]!
-		if (last.type !== 'near_anchor' && last.type !== 'exhausted' && last.type !== 'complete') {
-			throw new Error(`unexpected final event type: ${last.type}`)
+		const probing = events.filter(e => e.type === 'probing')
+		expect(probing.length, `the lookup actually probed someone; trail: ${trail}`).to.be.greaterThan(0)
+		for (const p of probing) {
+			expect(otherIds, 'a probe only ever targets another node').to.include(p.peerId!)
 		}
+
+		// Each responder is in-cluster on a three-node ring (k=7 > n=3), so it answers with real
+		// hints rather than the empty `staticReject` shape.
+		const anchored = events.filter(e => e.type === 'near_anchor')
+		expect(anchored.length, `expected a near_anchor; trail: ${trail}`).to.be.greaterThan(0)
+		const substantive = anchored.filter(
+			e => (e.nearAnchor?.anchors.length ?? 0) > 0 && (e.nearAnchor?.cohort_hint.length ?? 0) > 0
+		)
+		expect(substantive.length, 'an in-cluster responder returns real anchors and a cohort hint').to.be.greaterThan(0)
 
 		await Promise.all(services.map(s => s.stop()))
 		await stopAll(nodes)
 	})
 
-	it('returns complete when activity handler is set and in-cluster', async () => {
+	// The payload-inclusion heuristic may put the activity on the very first probe, in which case
+	// the lookup completes at hop 0 with no `activity_sent` event at all. So this asserts the
+	// invocation count and the returned certificate, never a specific event sequence.
+	it('runs the activity on exactly one peer, and never on the initiator', async () => {
 		const { nodes, services } = await makeMesh(3)
 		await new Promise(r => setTimeout(r, 2000))
 
-		// Set activity handler on all nodes
-		for (const svc of services) {
+		const fired = services.map(() => 0)
+		services.forEach((svc, i) => {
 			svc.setActivityHandler(async (_activity, _cohort, _minSigs, _corrId) => {
+				fired[i]!++
 				return { commitCertificate: 'cert-ok' }
 			})
-		}
+		})
 
 		const key = u8FromString('act-key')
-		const events = []
+		const events: string[] = []
+		let completed: { commitCertificate: string } | undefined
 		for await (const evt of services[0]!.iterativeLookup(key, {
 			wantK: 7,
 			minSigs: 3,
 			activity: 'payload-data',
 			ttl: 4,
 		})) {
-			events.push(evt)
+			events.push(evt.type)
+			if (evt.type === 'complete') completed = evt.result
 		}
 
-		const types = events.map(e => e.type)
-		// Should have probing and eventually complete or activity_sent
-		if (events.length === 0) throw new Error('expected progress events')
-
-		// The pipeline should attempt activity delivery
-		const hasActivity = types.includes('complete') || types.includes('activity_sent') || types.includes('near_anchor')
-		if (!hasActivity) {
-			throw new Error(`expected activity-related events, got: ${types.join(', ')}`)
-		}
+		const trail = events.join(' -> ')
+		expect(completed?.commitCertificate, `lookup did not complete; trail: ${trail}`).to.equal('cert-ok')
+		// One peer performs the work and the certificate travels back; a forwarding hop must not
+		// re-run it, and a replayed activity is answered from that peer's dedup cache.
+		expect(fired.reduce((a, b) => a + b, 0), `total handler invocations; trail: ${trail}`).to.equal(1)
+		// `iterativeLookup` never performs the activity locally — it seeds `visited` with self and
+		// always sends.
+		expect(fired[0], 'the initiator never runs the activity itself').to.equal(0)
 
 		await Promise.all(services.map(s => s.stop()))
 		await stopAll(nodes)
@@ -142,68 +173,6 @@ describe('Iterative lookup', function () {
 		if (fired !== 1) throw new Error(`expected the activity to run once, ran ${fired} times`)
 
 		await Promise.all(services.map(s => s.stop()))
-		await stopAll(nodes)
-	})
-})
-
-describe('Breadcrumb rejection', function () {
-	this.timeout(20000)
-
-	it('rejects requests where self is in breadcrumbs', async () => {
-		const { nodes, services } = await makeMesh(3)
-		await new Promise(r => setTimeout(r, 1500))
-
-		const selfId = nodes[1]!.peerId.toString()
-		const msg = {
-			v: 1 as const,
-			key: 'aWQ',
-			want_k: 7,
-			ttl: 3,
-			min_sigs: 3,
-			breadcrumbs: [selfId], // self already in breadcrumbs
-			correlation_id: 'test-loop',
-			timestamp: Date.now(),
-			signature: ''
-		}
-
-		const res = await services[1]!.routeAct(msg)
-		// Should return NearAnchor (not forward recursively)
-		if (!('anchors' in res)) throw new Error('expected NearAnchor response for loop detection')
-
-		await Promise.all(services.map((s: any) => s.stop()))
-		await stopAll(nodes)
-	})
-})
-
-describe('Correlation ID dedup', function () {
-	this.timeout(20000)
-
-	it('returns cached result for duplicate correlation_id', async () => {
-		const { nodes, services } = await makeMesh(3)
-		await new Promise(r => setTimeout(r, 1500))
-
-		const msg = {
-			v: 1 as const,
-			key: 'aWQ',
-			want_k: 7,
-			ttl: 3,
-			min_sigs: 3,
-			breadcrumbs: [] as string[],
-			correlation_id: 'dedup-test-123',
-			timestamp: Date.now(),
-			signature: ''
-		}
-
-		// First call populates cache
-		const res1 = await services[1]!.routeAct(msg)
-		// Second call with same correlation_id should return same result
-		const res2 = await services[1]!.routeAct(msg)
-
-		if (!('anchors' in res1) || !('anchors' in res2)) {
-			throw new Error('expected NearAnchor responses')
-		}
-
-		await Promise.all(services.map((s: any) => s.stop()))
 		await stopAll(nodes)
 	})
 })

@@ -357,33 +357,13 @@ describe('Profile behavior tests', function () {
 	})
 
 	// ----- Phase 5: Preconnect budget -----
-
-	describe('Preconnect budget', () => {
-		it('Core preconnect loop slices peers to budget of 6', async () => {
-			const { node, svc } = await createService('core')
-			// Verify by triggering active mode and checking pingsSent is bounded
-			// With no connected peers, the loop has nothing to ping; verify config indirectly
-			// by confirming the budget constant through source introspection
-			const budget = 6
-			svc.setMode('active')
-			// Allow one tick of the preconnect loop
-			await new Promise((r) => setTimeout(r, 100))
-			// With an empty store, diag.pingsSent should be 0 (no peers to ping, bounded by budget)
-			expect(svc.getDiagnostics().pingsSent).to.be.at.most(budget)
-			await svc.stop()
-			await node.stop()
-		})
-
-		it('Edge preconnect loop slices peers to budget of 3', async () => {
-			const { node, svc } = await createService('edge')
-			const budget = 3
-			svc.setMode('active')
-			await new Promise((r) => setTimeout(r, 100))
-			expect(svc.getDiagnostics().pingsSent).to.be.at.most(budget)
-			await svc.stop()
-			await node.stop()
-		})
-	})
+	//
+	// The per-second active-mode preconnect budget (Core 6 / Edge 3) is pinned by
+	// `preconnect-concurrency.spec.ts:173-216`, which seeds 16 peers through the shared maintenance
+	// rig so the budget actually saturates and asserts `pingsSent` equals it *exactly*, plus that
+	// the budget is spent on dialable peers rather than wasted on undialable leaders. The block that
+	// used to live here put an empty-store service into active mode and asserted `pingsSent <= budget`,
+	// which holds for any budget when the count is 0.
 
 	// ----- Profile config defaults -----
 

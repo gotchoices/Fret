@@ -1,23 +1,17 @@
-<!-- resume-note -->
-RESUME: A prior agent run on this ticket did not complete.
-  Prior run: 2026-08-17T05:24:04.921Z (agent: claude)
-  Log file: C:\projects\Fret\tickets\.logs\1-export-openrpcstream.implement.2026-08-17T05-24-04-921Z.log
-Read the log to see what was done. Resume where it left off.
-If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
-<!-- /resume-note -->
 description: The correct libp2p stream-open helper exists inside FRET but no import path reaches it, so the one downstream consumer has hand-copied it three times and one copy is wrong.
 files: packages/fret/src/index.ts, packages/fret/src/rpc/protocols.ts, packages/fret/package.json, packages/fret/test/package-exports.spec.ts
 difficulty: easy
 ----
-## Status: implemented during planning
+## Status: implemented during planning; verified during implement stage
 
-The design in this ticket had no open questions (single additive export, tradeoff already
-weighed in the header above), so the change was made directly rather than deferred to a
-separate implement run. What follows is the handoff a reviewer needs.
+The design had no open questions (single additive export, tradeoff already weighed in the
+original ticket header), so the change was made directly at plan stage rather than deferred.
+This implement-stage pass re-verified the landed change end-to-end (see *Verification* below) —
+no code changes were needed.
 
 ## What changed
 
-`packages/fret/src/index.ts` (~line 145): added `openRpcStream` to the existing
+`packages/fret/src/index.ts` (~line 146): added `openRpcStream` to the existing
 `export { validateTimestamp, readAllBounded } from './rpc/protocols.js'` line, and added
 `export type { Stream } from '@libp2p/interface'` alongside it — `openRpcStream`'s return type
 is `Stream | undefined` and `Stream` was not previously part of the public surface, so a consumer
@@ -25,16 +19,15 @@ importing the function without the type would have no way to name its return typ
 
 No changes to `src/rpc/protocols.ts` itself (`openRpcStream` already existed there, unchanged)
 or to `package.json` — the existing `exports["."]` entry already covers the whole root barrel
-`src/index.ts`, so nothing needed to change there once the re-export was added. Internal call
-sites (`fret-service.ts` et al.) already import `openRpcStream` from `../rpc/protocols.js`
-directly and are untouched, per the ticket's non-goal.
+`src/index.ts`. Internal call sites (`fret-service.ts` et al.) already import `openRpcStream`
+from `../rpc/protocols.js` directly and are untouched, per the ticket's non-goal.
 
-## Verification
+## Verification (this stage)
 
-- `npx tsc --noEmit` — clean.
-- `yarn build` — clean; confirmed `dist/src/index.d.ts` and `dist/src/index.js` both carry
-  `openRpcStream` in their `export { ... } from './rpc/protocols.js'` line.
-- `yarn test` (full suite, from `packages/fret/`) — 657 passing, 0 failing.
+- `npx tsc --noEmit` (from `packages/fret/`) — clean.
+- `yarn build` — clean.
+- `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/package-exports.spec.ts" --timeout 30000` — 2 passing.
+- `yarn test` (full suite) — 690 passing, 0 failing.
 
 ### New test: `packages/fret/test/package-exports.spec.ts`
 
@@ -44,7 +37,7 @@ self-name `import ... from 'p2p-fret'` in a test file was considered and rejecte
 resolve through the gitignored `dist/` build output, and the root `check` script runs
 `typecheck` *before* `build` (`yarn typecheck && yarn build && yarn test`), so on a fresh clone
 (no `dist/` yet) that import would fail `tsc --noEmit` before `dist/` ever gets built — breaking
-the standard pre-release gate ordering documented in `AGENTS.md`. Instead the new spec asserts,
+the standard pre-release gate ordering documented in `AGENTS.md`. Instead the spec asserts,
 without touching `dist/`:
 1. `package.json`'s `exports` map has exactly one key (`"."`) with `types`/`import` both pointing
    at the root entry (`./dist/src/index.d.ts` / `./dist/src/index.js`) — i.e. there is no
@@ -55,8 +48,7 @@ without touching `dist/`:
 Together these pin "the exports map resolves to the file that has the export" without a
 build-order hazard. If a self-name import is ever wanted despite the ordering cost (e.g. once
 `dist/` is committed or the `check` order changes), that is a follow-up, not a gap in this
-ticket's verification — the two assertions above already cover the reachability claim the ticket
-asked for.
+ticket's verification.
 
 ## Non-goals confirmed untouched
 
@@ -70,15 +62,23 @@ the original ticket — this only unblocks that repo's own fix.
   `dist/`-independent so it doesn't regress `yarn check`'s stated order.
 - **Type-only vs value export split.** `Stream` needed a separate `export type` (not bundled into
   the value-export line) since it's a type-only re-export from a different source module
-  (`@libp2p/interface` directly, not `./rpc/protocols.js`); verified by `tsc --noEmit` succeeding
-  with `isolatedModules`-style type/value separation intact (no `verbatimModuleSyntax` issue).
-  Nothing else in FRET's public surface imports `Stream`, so this is a genuinely new re-export
-  rather than a duplicate of an existing one.
-- **Internal call sites must not start importing through the root barrel** — checked: `grep -rn
-  "from '\.\./\.\./index"` / `"from '\.\./index"` inside `src/` finds no such import; all internal
-  usages still go through `./rpc/protocols.js` (or relative equivalents) directly.
+  (`@libp2p/interface` directly, not `./rpc/protocols.js`); confirmed by `tsc --noEmit` succeeding
+  with type/value separation intact. Nothing else in FRET's public surface imports `Stream`, so
+  this is a genuinely new re-export rather than a duplicate of an existing one.
+- **Internal call sites must not start importing through the root barrel** — checked: no
+  `from '../../index'` / `from '../index'` import inside `src/`; all internal usages still go
+  through `./rpc/protocols.js` (or relative equivalents) directly.
 - **No behavior change** — `openRpcStream`'s body is untouched; this is purely a re-export.
 
-## TODO
+## Suggested review focus
 
-(none — implementation complete; ready for review stage)
+- Confirm the two re-exports at `src/index.ts:146-147` are the only diff against the prior public
+  surface (i.e. no accidental widening beyond `openRpcStream` + `Stream`).
+- Spot-check that `package-exports.spec.ts`'s assumption ("exports map has exactly one key, `.`")
+  still matches `package.json` if a reviewer is also touching that file in a sibling ticket.
+- No known gaps or deferred edge cases beyond what's stated above; this is a small, fully-tested
+  additive change.
+
+## Review findings
+
+(none yet — pending review pass)
