@@ -358,8 +358,8 @@ describe('Profile behavior tests', function () {
 
 	// ----- Phase 5: Preconnect budget -----
 	//
-	// The per-second active-mode preconnect budget (Core 6 / Edge 3) is pinned by
-	// `preconnect-concurrency.spec.ts:173-216`, which seeds 16 peers through the shared maintenance
+	// The per-second active-mode preconnect budget (Core 6 / Edge 3) is pinned by the two
+	// "active tick:" cases in `preconnect-concurrency.spec.ts`, which seed 16 peers through the shared maintenance
 	// rig so the budget actually saturates and asserts `pingsSent` equals it *exactly*, plus that
 	// the budget is spent on dialable peers rather than wasted on undialable leaders. The block that
 	// used to live here put an empty-store service into active mode and asserted `pingsSent <= budget`,

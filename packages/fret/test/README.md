@@ -49,8 +49,9 @@ Bootstrap peer ID extraction now uses proper `@multiformats/multiaddr` parsing i
 
 ### Integration Tests
 - **Basic mesh** (`test/fret.mesh.spec.ts`)
-  - 3-node mesh with TCP transport
-  - Validates discovery and stabilization
+  - The only spec on a real TCP transport (everything else is in-memory)
+  - Two FRET nodes classify each other `member` through completed namespaced RPCs (`pingsOk > 0`)
+  - A third libp2p node hosting no FRET service is the negative control: known to the ring, never `member`
 
 - **RouteAndMaybeAct** (`test/route.maybeact.integration.spec.ts`)
   - 3-node routing verification

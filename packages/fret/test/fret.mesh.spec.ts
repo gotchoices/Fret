@@ -87,11 +87,11 @@ describe('FRET basic mesh', function () {
 			expect(membership(serviceA, cId), 'a knows about c, which is connected to it').to.not.equal(undefined)
 			expect(membership(serviceA, cId), 'a service-less peer is never a member').to.not.equal('member')
 		} finally {
-			await serviceB.stop()
-			await serviceA.stop()
-			await c.stop()
-			await b.stop()
-			await a.stop()
+			// Settled, not sequential-await: one rejecting stop must not strand the services and
+			// TCP listeners behind it, which the exit watchdog would then report instead of the
+			// assertion that actually failed.
+			await Promise.allSettled([serviceB.stop(), serviceA.stop()])
+			await Promise.allSettled([c.stop(), b.stop(), a.stop()])
 		}
 	})
 })

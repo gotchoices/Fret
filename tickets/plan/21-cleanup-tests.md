@@ -29,4 +29,19 @@ Accumulated test-suite cleanup called out by the review:
   say they are, which is exactly how the `dialability-spec-self-position-premise` flake happened.
   The five sites above are all correct today, so this is prevention, not a bug fix.
 
+- **The consolidated setup helper must own teardown too, and teardown must survive a failed
+  assertion.** Today most multi-node specs stop their nodes on the *last line of the test body*,
+  outside any `try`/`finally` and outside an `afterEach`. A failing assertion therefore skips the
+  teardown entirely: the libp2p nodes and their stabilization timers stay live, and the mocha exit
+  watchdog fails the run a second time with an open-handle dump that buries the assertion message
+  the developer actually needs. Several also teardown via `await Promise.all(services.map(s =>
+  s.stop()))`, where one rejecting stop strands every other service and the nodes underneath them.
+  Measured by grepping for spec files that call `stopAll` with no `afterEach` anywhere in the file:
+  `maybeact-dedup-phases.spec.ts` (7 teardown sites), `proactive-announce.spec.ts` (5),
+  `network.isolation.spec.ts` (3), `route.maybeact.integration.spec.ts` (2), plus
+  `profile.behavior.spec.ts`. The `lookup-profile-test-assertions` review fixed the three cases in
+  `iterative-lookup.spec.ts` and the one in `fret.mesh.spec.ts` by hand; the point of this arm is
+  that a shared `withMesh(n, fn)`-shaped helper makes the leak *unwritable* rather than fixed once
+  per spec. Prefer that shape over asking each spec to remember a `finally`.
+
 References: review.html:454-456 "Test housekeeping"; helpers/libp2p.ts:64 (stopAll reverse), cohort.assembly.spec.ts, selector.connected-first.spec.ts, test/README.md. Coordinate-arithmetic arm added by the `dialability-spec-self-position-premise` review.
