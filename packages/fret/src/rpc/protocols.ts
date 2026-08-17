@@ -1,6 +1,9 @@
 import type { Libp2p } from 'libp2p';
 import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
 import { abortReasonError } from '../utils/deadline.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:handler');
 
 /**
  * Default budget for one whole outbound RPC — dial + stream open + write + read.
@@ -54,6 +57,41 @@ export function isUnsupportedProtocolError(err: unknown): boolean {
 	return false;
 }
 
+/**
+ * Register an inbound RPC handler whose stream is released on every path — the receive-side
+ * mirror of the sender-side rule enforced by {@link releaseRpcStream}.
+ *
+ * Before this seam each handler carried its own `try/catch` that logged and returned, leaving
+ * the inbound stream open forever on any throw (malformed JSON, a bad field deep in the body).
+ * libp2p counts inbound streams *per protocol per connection* and FRET passes no
+ * `maxInboundStreams`, so ~32 unparseable messages permanently consumed one protocol's slots on
+ * that connection. Releasing here means a handler added later cannot forget to release, because
+ * releasing is no longer the handler's job.
+ *
+ * Success path: `serve` normally closes on its own; the wrapper closes only a stream still
+ * `open`, so a completed reply is never turned into an abort. Error path: `abort()`, which is
+ * synchronous and safe against a stalled remote (same reasoning as `releaseRpcStream`) — and
+ * skipped when the stream already left `open` (closed by `serve`, or reset by the remote, which
+ * is how the error usually arrived).
+ */
+export async function registerRpcHandler(
+	node: Libp2p,
+	protocol: string,
+	serve: (stream: Stream, connection: Connection) => Promise<void>
+): Promise<void> {
+	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
+		try {
+			await serve(stream, connection);
+			if (stream.status === 'open') await stream.close();
+		} catch (err) {
+			log.error('%s handler error - %e', protocol, err);
+			if (stream.status === 'open') {
+				try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* best effort */ }
+			}
+		}
+	});
+}
+
 export async function encodeJson(obj: unknown): Promise<Uint8Array> {
 	const text = JSON.stringify(obj);
 	return new TextEncoder().encode(text);
@@ -69,7 +107,15 @@ export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
 	while (end > start && (bytes[end - 1] === 0 || bytes[end - 1] === 9 || bytes[end - 1] === 10 || bytes[end - 1] === 13 || bytes[end - 1] === 32)) end--;
 	if (end <= start) throw new Error('whitespace response');
 	const text = new TextDecoder().decode(bytes.subarray(start, end));
-	return JSON.parse(text) as T;
+	const parsed = JSON.parse(text) as unknown;
+	// Every FRET wire message and reply is a JSON object, so a non-object top level (the
+	// literal null, an array, a number, a string, a boolean) is malformed by definition.
+	// Rejecting once here kills that whole class for every body-reading handler, instead of
+	// asking each one to null-check what it decoded.
+	if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)) {
+		throw new Error('non-object JSON payload');
+	}
+	return parsed as T;
 }
 
 export function toBytes(chunk: Uint8Array | { subarray(): Uint8Array }): Uint8Array {

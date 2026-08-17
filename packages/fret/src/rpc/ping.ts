@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Connection, Stream } from '@libp2p/interface';
+import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_PING,
@@ -8,6 +8,7 @@ import {
 	decodeJson,
 	readAllBounded,
 	openRpcStream,
+	registerRpcHandler,
 	releaseRpcStream,
 } from './protocols.js';
 import { deadline } from '../utils/deadline.js';
@@ -38,7 +39,9 @@ export async function registerPing(
 	// Ping carries no `from`, but the connection's remote peer is transport-authenticated —
 	// and reaching this handler at all means the remote dialed *this network's* namespaced
 	// protocol. `onInbound` hands that proof to the caller.
-	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
+	// Errors and stream release belong to `registerRpcHandler` — the reply tail below used to
+	// sit outside any try at all, so a reset stream rejected the handler promise unlogged.
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
 		if (getSizeEstimate) {
 			try {
@@ -57,6 +60,7 @@ export async function registerPing(
 				await stream.close();
 				return;
 			} catch (err) {
+				// Fall through to the plain reply: a failed estimate is not a failed ping.
 				log.error('getSizeEstimate failed - %e', err);
 			}
 		}

@@ -18,7 +18,7 @@ import { hashKey, hashPeerId, coordToBase64url, base64urlToCoord } from '../ring
 import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp, isUnsupportedProtocolError } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
-import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
+import { registerMaybeAct, sendMaybeAct, validateRouteAndMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
@@ -353,6 +353,8 @@ export class FretService implements IFretService, Startable {
 			ttlExpired: 0,
 			rateLimited: 0,
 			identityMismatch: 0,
+			/** Inbound maybeAct messages that failed `validateRouteAndMaybeAct` (structure/type). */
+			malformed: 0,
 		},
 	};
 
@@ -1136,6 +1138,16 @@ export class FretService implements IFretService, Startable {
 		// cheaper dedup-only pre-check, not moving the bucket back behind the guards.
 		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
 
+		// Structural validation immediately after the bucket (so malformed floods are metered
+		// too, never an unmetered pre-filter) and before every guard below — each of which reads
+		// fields the validator vouches for (`breadcrumbs?.includes` on a number was a throw that
+		// leaked the inbound stream). O(message size): no hashing, no ring walks.
+		if (!validateRouteAndMaybeAct(msg)) { this.diag.rejected.malformed++; return this.staticReject(); }
+		// The one decode of `key`. Handed down to `routeAct` / `nearAnchorOnly` so neither can
+		// throw on the field the validator just vetted — the double-throw that used to make the
+		// fallback as fragile as the path it backstopped.
+		const keyBytes = u8FromString(msg.key, 'base64url');
+
 		// Breadcrumb loop detection: reject if self already visited
 		const selfId = this.node.peerId.toString();
 		if (msg.breadcrumbs?.includes(selfId)) return this.staticReject();
@@ -1163,12 +1175,12 @@ export class FretService implements IFretService, Startable {
 		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 		this.inflightAct++;
 		try {
-			const result = await this.routeAct(msg);
+			const result = await this.routeAct(msg, keyBytes);
 			this.cacheResponse(msg, result);
 			return result;
 		} catch (err) {
 			log.error('routeAct failed - %e', err);
-			return await this.nearAnchorOnly(msg);
+			return await this.nearAnchorOnly(msg, keyBytes);
 		} finally {
 			this.inflightAct--;
 		}
@@ -2294,9 +2306,10 @@ export class FretService implements IFretService, Startable {
 	 * either field today. If one starts to, this must report the real estimate
 	 * (`estimateSizeAndConfidence`) rather than the configured k and a flat 0.5.
 	 */
-	private async nearAnchorOnly(msg: RouteAndMaybeActV1): Promise<NearAnchorV1> {
-		const keyBytes = u8FromString(msg.key, 'base64url');
-		const coord = await hashKey(keyBytes);
+	private async nearAnchorOnly(msg: RouteAndMaybeActV1, keyBytes?: Uint8Array): Promise<NearAnchorV1> {
+		// `keyBytes` is supplied on the inbound-handler path, which validated and decoded the
+		// key once; decoding here covers direct callers only.
+		const coord = await hashKey(keyBytes ?? u8FromString(msg.key, 'base64url'));
 		const right = this.getNeighbors(coord, 'right', this.cfg.m);
 		const left = this.getNeighbors(coord, 'left', this.cfg.m);
 		const anchors = this.pickAnchors([...right.slice(0, 3), ...left.slice(0, 3)], coord);
@@ -2346,9 +2359,10 @@ export class FretService implements IFretService, Startable {
 		return Math.max(2, Math.min(msg.wants ?? k, k));
 	}
 
-	async routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }> {
-		const keyBytes = u8FromString(msg.key, 'base64url');
-		const coord = await hashKey(keyBytes);
+	async routeAct(msg: RouteAndMaybeActV1, keyBytes?: Uint8Array): Promise<NearAnchorV1 | { commitCertificate: string }> {
+		// `keyBytes` is supplied on the inbound-handler path, which validated and decoded the
+		// key once; decoding here covers direct callers (public API, tests).
+		const coord = await hashKey(keyBytes ?? u8FromString(msg.key, 'base64url'));
 		const selfId = this.node.peerId.toString();
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,

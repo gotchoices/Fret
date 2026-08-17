@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Connection, Stream } from '@libp2p/interface';
+import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_NEIGHBORS,
@@ -9,6 +9,7 @@ import {
 	decodeJson,
 	readAllBounded,
 	openRpcStream,
+	registerRpcHandler,
 	releaseRpcStream,
 } from './protocols.js';
 import { deadline } from '../utils/deadline.js';
@@ -29,40 +30,34 @@ export async function registerNeighbors(
 	// The request carries no inbound `from`, but the connection's remote peer is
 	// transport-authenticated — and reaching this handler at all means the remote dialed
 	// *this network's* namespaced protocol. `onInbound` hands that proof to the caller.
-	await node.handle(protocols.PROTOCOL_NEIGHBORS, async (stream: Stream, connection: Connection) => {
+	// Errors and stream release belong to `registerRpcHandler`, not these bodies.
+	await registerRpcHandler(node, protocols.PROTOCOL_NEIGHBORS, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
-		try {
-			const snap = await getSnapshot();
-			stream.send(await encodeJson(snap));
-			await stream.close();
-		} catch (err) {
-			log.error('neighbors handler error - %e', err);
-		}
+		const snap = await getSnapshot();
+		stream.send(await encodeJson(snap));
+		await stream.close();
 	});
 
 	if (onAnnounce) {
-		await node.handle(protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream: Stream, connection: Connection) => {
-			try {
-				const bytes = await readAllBounded(stream, maxBytes);
-				const snap = await decodeJson<NeighborSnapshotV1>(bytes);
-				// The snapshot's self-reported `from` must match the transport-authenticated
-				// remote peer — otherwise a connected peer can impersonate another and poison
-				// the routing table via a forged sample/successor set.
-				const actual = connection.remotePeer.toString();
-				if (snap.from !== actual) {
-					onIdentityMismatch?.(snap.from, actual);
-					// NOTE: debug-gated (@libp2p/logger emits only under DEBUG). If mismatch logging
-					// is ever routed to an always-on sink, a hostile peer can spam it — rate-limit then.
-					log.error('announce identity mismatch: claimed %s actual %s - dropping', snap.from, actual);
-					await stream.close();
-					return;
-				}
-				onAnnounce(snap.from, snap);
-				stream.send(await encodeJson({ ok: true }));
+		await registerRpcHandler(node, protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream, connection) => {
+			const bytes = await readAllBounded(stream, maxBytes);
+			const snap = await decodeJson<NeighborSnapshotV1>(bytes);
+			// The snapshot's self-reported `from` must match the transport-authenticated
+			// remote peer — otherwise a connected peer can impersonate another and poison
+			// the routing table via a forged sample/successor set. The drop is a normal
+			// outcome, not a failure — it closes, never aborts.
+			const actual = connection.remotePeer.toString();
+			if (snap.from !== actual) {
+				onIdentityMismatch?.(snap.from, actual);
+				// NOTE: debug-gated (@libp2p/logger emits only under DEBUG). If mismatch logging
+				// is ever routed to an always-on sink, a hostile peer can spam it — rate-limit then.
+				log.error('announce identity mismatch: claimed %s actual %s - dropping', snap.from, actual);
 				await stream.close();
-			} catch (err) {
-				log.error('neighbors announce handler error - %e', err);
+				return;
 			}
+			onAnnounce(snap.from, snap);
+			stream.send(await encodeJson({ ok: true }));
+			await stream.close();
 		});
 	}
 }
