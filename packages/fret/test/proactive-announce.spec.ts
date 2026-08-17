@@ -123,55 +123,26 @@ describe('Proactive announcements', function () {
 		const edgeTotal = servicesEdge.reduce((sum, s) => sum + s.getDiagnostics().announcementsSent, 0)
 		const coreTotal = servicesCore.reduce((sum, s) => sum + s.getDiagnostics().announcementsSent, 0)
 
-		// Core should send at least as many announcements as edge
-		// (Core has larger fanout and higher rate limits)
+		// Premise first: `coreTotal >= edgeTotal` holds when both are 0, so a total announce
+		// outage on both clusters used to pass this test.
+		expect(edgeTotal, 'premise: the edge cluster announced at all').to.be.greaterThan(0)
+		expect(coreTotal, 'premise: the core cluster announced at all').to.be.greaterThan(0)
+
+		// Core should send at least as many announcements as edge (larger fanout, higher rate
+		// limits). Deliberately not strict `>`: fan-out is a *ceiling*, and on a six-node mesh
+		// both profiles can legitimately saturate below it and tie.
 		expect(coreTotal).to.be.greaterThanOrEqual(edgeTotal)
 
 		await Promise.all([...servicesEdge, ...servicesCore].map(s => s.stop()))
 		await stopAll([...nodesEdge, ...nodesCore])
 	})
 
-	it('rate limiting prevents announcement storms', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 4; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
-		// Use edge profile (tighter rate limits: 6 capacity, 2/sec refill)
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'edge',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-
-		// Full mesh
-		for (let i = 0; i < nodes.length; i++) {
-			for (let j = i + 1; j < nodes.length; j++) {
-				await nodes[i]!.dial(nodes[j]!.getMultiaddrs()[0]!)
-			}
-		}
-
-		await new Promise(r => setTimeout(r, 4000))
-
-		// With edge profile and 4 nodes, rate limiting should kick in at some point
-		let totalSkipped = 0
-		let totalSent = 0
-		for (const svc of services) {
-			const diag = svc.getDiagnostics()
-			totalSkipped += diag.announcementsSkipped
-			totalSent += diag.announcementsSent
-		}
-
-		// Should have sent some announcements (system is working)
-		expect(totalSent).to.be.greaterThan(0)
-		// The combination of sent + skipped shows the rate limiter is active
-		// (With tight edge limits and discovery-triggered announcements, some should be skipped)
-
-		await Promise.all(services.map(s => s.stop()))
-		await stopAll(nodes)
-	})
+	// NOTE: `rate limiting prevents announcement storms` used to sit here. It computed a
+	// `totalSkipped` it never asserted on, leaving `totalSent > 0` as its only claim — which the
+	// three tests around it already make. The announce bucket's actual contract (a burst stops at
+	// the first skip, so one call adds at most +1 to `announcementsSkipped`) is pinned
+	// deterministically by `stops the departure burst at the first empty-bucket skip` in
+	// `churn.leave.spec.ts`.
 
 	it('new peer discovery via gossip triggers announcement to non-connected peers', async () => {
 		// Topology: A-B-C where A learns about C via B's snapshot (without direct connection)
@@ -213,34 +184,8 @@ describe('Proactive announcements', function () {
 		await stopAll(nodes)
 	})
 
-	it('diagnostics track announcementsSkipped counter', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 3; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'core',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-
-		for (let i = 1; i < nodes.length; i++) {
-			await nodes[i]!.dial(nodes[i - 1]!.getMultiaddrs()[0]!)
-		}
-
-		await new Promise(r => setTimeout(r, 2000))
-
-		// Verify announcementsSkipped is tracked in diagnostics
-		for (const svc of services) {
-			const diag = svc.getDiagnostics()
-			expect(diag).to.have.property('announcementsSkipped')
-			expect(typeof diag.announcementsSkipped).to.equal('number')
-		}
-
-		await Promise.all(services.map(s => s.stop()))
-		await stopAll(nodes)
-	})
+	// NOTE: `diagnostics track announcementsSkipped counter` used to sit here. It stood up three
+	// nodes and slept 2 s to assert that a diagnostics field exists and holds a number, which the
+	// type system already states. The counter's behavior is pinned in `churn.leave.spec.ts` — see
+	// the note above.
 })

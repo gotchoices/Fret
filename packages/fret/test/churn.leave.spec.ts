@@ -8,6 +8,7 @@ import { registerLeave, sendLeave, type LeaveNoticeV1 } from '../src/rpc/leave.j
 import { registerNeighbors } from '../src/rpc/neighbors.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
 import { hashPeerId } from '../src/ring/hash.js'
+import { TokenBucket } from '../src/utils/token-bucket.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id'
 import type { NeighborSnapshotV1 } from '../src/index.js'
@@ -84,59 +85,13 @@ describe('Churn leave handling', function () {
 		await stopAll([nodes[0], nodes[1], nodes[3]].filter(Boolean) as any)
 	})
 
-	it('leave notice includes replacement suggestions', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 6; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
-
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'core',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-		// Full mesh so ALL nodes receive the leave notice
-		for (let i = 0; i < nodes.length; i++) {
-			for (let j = i + 1; j < nodes.length; j++) {
-				await nodes[i]!.dial(nodes[j]!.getMultiaddrs()[0]!)
-			}
-		}
-
-		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
-			CONVERGE_MS, 25, 'mesh of 6 converges before the leave')
-
-		const diagsBefore = services.map(s => ({ ...s.getDiagnostics() }))
-
-		// Stop node 2 (the middle node) — it should send leave with replacements
-		await services[2].stop()
-		await nodes[2].stop()
-		await waitFor(anyProgressed(services, diagsBefore, 2),
-			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
-
-		// All remaining services should continue to function after the leave. The departing peer
-		// may be re-added by the `peer:disconnect` scoring path (see
-		// `backlog/debt-scoring-resurrects-removed-peers`), so we verify system health rather than
-		// exact store contents.
-		for (const [idx, svc] of services.entries()) {
-			if (idx === 2) continue
-			const diag = svc.getDiagnostics()
-			expect(diag).to.have.property('pingsSent')
-			expect(svc.listPeers().length).to.be.greaterThan(0,
-				`service ${idx} should still have peers after leave`)
-		}
-
-		// At least one neighbor should have received and processed the leave, evidenced by continued
-		// stabilization (more pings sent after leave). Same predicate the gate above waited on, so
-		// the wait and the assertion cannot drift apart.
-		expect(anyProgressed(services, diagsBefore, 2)()).to.equal(true,
-			'at least one service should show stabilization progress after leave')
-
-		await Promise.all(services.map((s, i) => i === 2 ? Promise.resolve() : s.stop()))
-		await stopAll(nodes.filter((_: any, i: number) => i !== 2))
-	})
+	// NOTE: a `leave notice includes replacement suggestions` mesh test used to sit here. It spent
+	// ~7 s converging six nodes to assert that `getDiagnostics()` has a `pingsSent` property and
+	// that `listPeers()` is non-empty — neither of which is about replacements, and both of which
+	// the deterministic specs below cover properly. What a six-node mesh at `k: 7` could never
+	// observe is the replacement list itself: every remote peer sits inside the departing node's
+	// own S/P window, so the pool is empty and the notice ships `replacements: undefined`. See
+	// `Leave notice replacements (sender side)` at the bottom of this file.
 
 	it('fan-out notifies peers beyond immediate S/P', async () => {
 		const nodes = [] as any[]
@@ -413,6 +368,40 @@ describe('Leave amplification cap', function () {
 		} finally { await rig.stop() }
 	})
 
+	// `handleLeave` calls `store.remove(notice.from)`, and until now nothing asserted it. The mesh
+	// test that used to try could not: a graceful stop is followed by the `peer:disconnect` whose
+	// `applyFailure` re-creates the entry (`backlog/debt-scoring-resurrects-removed-peers`). This
+	// rig's receiver service is never started, so no disconnect listener exists to resurrect it and
+	// the removal is observable on its own.
+	it('removes the departing peer from the id map and from the ring window', async () => {
+		const rig = await makeLeaveRig()
+		try {
+			const store = rig.svc.getStore()
+			const departingId = rig.departing.peerId.toString()
+			// Seeded at its true coordinate as a live member, so it genuinely occupies a ring slot
+			// rather than merely an id-map slot.
+			store.upsert(departingId, rig.departingCoord)
+			store.setMembership(departingId, 'member')
+
+			const selfCoord = await hashPeerId(rig.receiver.peerId)
+			// Window width from `cfg.m` (= ceil(k / 2)), not a literal: a changed default k must
+			// re-derive it rather than silently stop this assertion binding.
+			const spWindow = () =>
+				rig.svc.getNeighbors(selfCoord, 'both', Math.max(2, (rig.svc as any).cfg.m as number))
+			expect(spWindow(), 'premise: the departing peer is in the S/P window before the notice')
+				.to.include(departingId)
+
+			await rig.leave()
+
+			expect(store.getById(departingId), 'gone from the id index').to.equal(undefined)
+			// The tree and the id index are separate views of one population; a removal that
+			// updated only one is silently corrupting (see *Routing store* in `docs/fret.md`), and
+			// the id-map check above cannot see it.
+			expect(spWindow(), 'gone from the ring walk too, not only from the id map')
+				.to.not.include(departingId)
+		} finally { await rig.stop() }
+	})
+
 	// The 12-id cap bounds the work only if repeats are free: twelve copies of one id must cost
 	// one hash and one upsert.
 	it('collapses duplicate replacement ids to a single entry', async () => {
@@ -492,6 +481,35 @@ describe('Leave amplification cap', function () {
 		} finally { await rig.stop() }
 	})
 
+	// `sendAnnouncementsRateLimited` increments `announcementsSkipped` **once** and then `break`s,
+	// so a burst that outruns the bucket costs at most +1 skip however many targets are left. That
+	// was stated nowhere: the two `proactive-announce.spec.ts` tests that reached for the counter
+	// asserted only that the field existed and was a number.
+	it('stops the departure burst at the first empty-bucket skip', async () => {
+		const rig = await makeLeaveRig('edge')
+		try {
+			const fanout = (rig.svc as any).announceFanout as number
+			const targets = await seedAnnounceTargets(rig, fanout + 2)
+			expect(targets.length, 'premise: more eligible neighbors than tokens').to.be.greaterThan(2)
+			// Exactly two tokens. Replacing the bucket rather than draining the profile's own is
+			// what makes the level exact — `TokenBucket` can be emptied but not drained *to* a
+			// level, and an emptied bucket then races its own refill. The rate stays at edge's
+			// 2/s (one token per 500 ms) while the burst below completes in milliseconds, so no
+			// token returns mid-burst; the 500 ms settle after it only refills a bucket nobody
+			// reads again.
+			;(rig.svc as any).bucketAnnounce = new TokenBucket(2, 2)
+			const before = { ...rig.svc.getDiagnostics() }
+
+			await rig.leave(undefined, 500)
+
+			const after = rig.svc.getDiagnostics()
+			expect(after.announcementsSent - before.announcementsSent,
+				'exactly the two tokens the bucket held, not the whole fan-out').to.equal(2)
+			expect(after.announcementsSkipped - before.announcementsSkipped,
+				'one skip for the whole burst, not one per remaining target').to.equal(1)
+		} finally { await rig.stop() }
+	})
+
 	// The hand-off the whole redesign rests on: recording a replacement as `unknown` is not a
 	// dead end, because `classifyTargets` selects exactly that set on the next tick.
 	it('the classification pass probes and promotes a replacement recorded by a leave', async () => {
@@ -518,5 +536,136 @@ describe('Leave amplification cap', function () {
 			await replacementSvc?.stop()
 			await rig.stop()
 		}
+	})
+})
+
+/**
+ * The *sending* half of the leave protocol: what a departing node puts in the notice.
+ *
+ * `computeReplacements` (`src/service/fret-service.ts`) had no test at all, and a live mesh cannot
+ * give it one — at `k: 7` on six nodes every remote peer falls inside the departing node's own
+ * successor/predecessor window, so the replacement pool is empty and the notice ships
+ * `replacements: undefined`. These specs seed the ring by hand instead, at a small `k` so the two
+ * windows are separable and every expected set is derivable from the offsets.
+ */
+describe('Leave notice replacements (sender side)', function () {
+	this.timeout(30000)
+
+	interface SenderRig {
+		/** The departing node's service — deliberately never started; its store is seeded by hand. */
+		svc: CoreFretService
+		/** The peer id seeded at `ringOffset(selfCoord, offset)`. */
+		idAt(offset: number): string
+		/** Run one real `sendLeaveToNeighbors` and return the notice the real receiver got. */
+		send(): Promise<LeaveNoticeV1>
+		stop(): Promise<void>
+	}
+
+	/** The one seeded peer that is a real, dialable node — so it is a notice target that can answer. */
+	const RECEIVER_OFFSET = 1
+
+	/**
+	 * A departing node whose routing table holds exactly `count` live members, at ring offsets
+	 * `+1 … +count` from its own coordinate.
+	 *
+	 * Two properties the specs below read off those offsets:
+	 *
+	 * - Every seeded coordinate is *above* self's, so the clockwise walk from self runs
+	 *   `+1, +2, …` in order and the counter-clockwise walk finds nothing at or below self, wraps,
+	 *   and runs `+count, +count-1, …`. Both windows are therefore stated by offset alone.
+	 * - Only the peer at {@link RECEIVER_OFFSET} is a real node. The rest are bare keys libp2p
+	 *   holds no address for, so `isDoomedDial` skips them as notice *targets* — which is fine and
+	 *   intended: they are still live members, so they remain replacement candidates, and the
+	 *   assertions are about what the notice carries rather than about who received it.
+	 */
+	async function makeSenderRig(k: number, count: number): Promise<SenderRig> {
+		const nodes: Libp2p[] = []
+		const departing = await createMemNode(); await departing.start(); nodes.push(departing)
+		const receiver = await createMemNode(); await receiver.start(); nodes.push(receiver)
+
+		let captured: LeaveNoticeV1 | undefined
+		await registerLeave(receiver, (notice) => { captured = notice }, protocols.PROTOCOL_LEAVE)
+		// The dial is what makes the receiver `isConnected`, and therefore dialable. It also makes
+		// the notice's `from` match the transport-authenticated sender, so `registerLeave`'s
+		// identity gate passes rather than being what the spec accidentally exercises.
+		await departing.dial(receiver.getMultiaddrs()[0]!)
+
+		const svc = new CoreFretService(departing, { profile: 'core', k })
+		const selfCoord = await hashPeerId(departing.peerId)
+		const store = svc.getStore()
+		const byOffset = new Map<number, string>()
+		for (let offset = 1; offset <= count; offset++) {
+			const id = offset === RECEIVER_OFFSET ? receiver.peerId.toString() : await ghostPeerId()
+			byOffset.set(offset, id)
+			store.upsert(id, ringOffset(selfCoord, offset))
+			store.setMembership(id, 'member')
+		}
+		return {
+			svc,
+			idAt: (offset: number) => byOffset.get(offset)!,
+			async send(): Promise<LeaveNoticeV1> {
+				await (svc as any).sendLeaveToNeighbors()
+				// `sendLeave` is write-only — it closes the stream rather than awaiting a reply —
+				// so the receiver's handler runs after the send resolves.
+				await waitFor(() => captured !== undefined, 5000, 10, 'the real receiver got a leave notice')
+				return captured!
+			},
+			async stop(): Promise<void> { await stopAll(nodes) }
+		}
+	}
+
+	// The three rules `computeReplacements` encodes: the pool is the 2m-per-side walk, the notice's
+	// own targets are excluded from it, and the walk is live-member-scoped (the
+	// transitive-propagation guard documented under *Leave* in `docs/fret.md`).
+	it('advertises the live members just outside the S/P window, and only those', async () => {
+		const rig = await makeSenderRig(3, 9)
+		try {
+			const m = (rig.svc as any).cfg.m as number
+			expect(m, 'premise: m = ceil(k / 2), so k of 3 gives a two-wide window per side').to.equal(2)
+
+			const store = rig.svc.getStore()
+			// A live-member walk *skips and keeps advancing*, so excluding +3 and +4 pulls the
+			// clockwise 2m-walk out to +5 and +6 rather than shortening it to two ids.
+			store.setMembership(rig.idAt(3), 'foreign')
+			store.setState(rig.idAt(4), 'dead')
+
+			const notice = await rig.send()
+
+			// Targets: clockwise {+1, +2}, counter-clockwise {+9, +8}.
+			// Replacement pool: clockwise 2m = {+1, +2, +5, +6}, counter-clockwise 2m =
+			// {+9, +8, +7, +6}; minus the targets, that leaves {+5, +6, +7}.
+			const expected = [5, 6, 7].map((o) => rig.idAt(o))
+			expect([...notice.replacements!].sort(),
+				'the 2m-per-side live-member walk minus the notice targets')
+				.to.deep.equal([...expected].sort())
+			expect(notice.replacements, 'a peer we know serves another network is never advertised')
+				.to.not.include(rig.idAt(3))
+			expect(notice.replacements, 'a peer a run of failed contacts killed is never advertised')
+				.to.not.include(rig.idAt(4))
+			for (const offset of [1, 2, 9, 8]) {
+				expect(notice.replacements, `+${offset} is a notice target, so never its own replacement`)
+					.to.not.include(rig.idAt(offset))
+			}
+		} finally { await rig.stop() }
+	})
+
+	// `maxReplacements` in `computeReplacements`. The spec above cannot reach it — at m = 2 the
+	// pool tops out at 2m = 4 candidates — so the cap needs a wider ring.
+	it('caps the replacement list at six ids', async () => {
+		const rig = await makeSenderRig(7, 20)
+		try {
+			const m = (rig.svc as any).cfg.m as number
+			expect(m, 'premise: k of 7 gives a four-wide window per side').to.equal(4)
+
+			const notice = await rig.send()
+
+			// Targets: {+1..+4} and {+20..+17}. Pool: clockwise 2m = {+1..+8}, counter-clockwise
+			// 2m = {+20..+13}; minus the targets that is eight eligible ids for six slots.
+			const eligible = [5, 6, 7, 8, 13, 14, 15, 16].map((o) => rig.idAt(o))
+			expect(notice.replacements!.length, 'maxReplacements, not one per eligible peer').to.equal(6)
+			for (const id of notice.replacements!) {
+				expect(eligible, 'every advertised id comes from the eligible pool').to.include(id)
+			}
+		} finally { await rig.stop() }
 	})
 })
