@@ -6,6 +6,14 @@ import { FretService as CoreFretService } from '../src/service/fret-service.js'
 describe('Proactive announcements', function () {
 	this.timeout(30000)
 
+	// NOTE: every test here still gates on a fixed 2-4 s sleep rather than on a condition, so each
+	// one's premise ("announcements happened at all") is a wall-clock bet, not an observation. That
+	// is tolerable today — announces fire on the first stabilization tick, so the sleeps carry
+	// several ticks of headroom — but these are now the file's *load-bearing* assertions rather
+	// than the throwaway `> 0` checks they replaced. If any of them starts flaking on slower CI,
+	// the fix is a `waitFor` on the announce counters (see `helpers/wait-for.ts` and the converge
+	// gates in `churn.leave.spec.ts`), not a longer sleep.
+
 	it('on-start announce fires after first stabilization tick', async () => {
 		const nodes = [] as any[]
 		for (let i = 0; i < 3; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }

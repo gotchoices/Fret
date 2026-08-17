@@ -489,8 +489,14 @@ describe('Leave amplification cap', function () {
 		const rig = await makeLeaveRig('edge')
 		try {
 			const fanout = (rig.svc as any).announceFanout as number
+			// The burst is clamped to `announceFanout` before the bucket ever sees it, so the
+			// premise that produces a skip is `fanout > tokens` — not the seeded count. Asserting
+			// the seeded count instead would let a profile whose fan-out dropped to 2 spend both
+			// tokens, skip nothing, and fail at the `announcementsSkipped` assertion with no hint
+			// that the fan-out was what changed.
+			expect(fanout, 'premise: the fan-out outruns the two tokens seeded below').to.be.greaterThan(2)
 			const targets = await seedAnnounceTargets(rig, fanout + 2)
-			expect(targets.length, 'premise: more eligible neighbors than tokens').to.be.greaterThan(2)
+			expect(targets.length, 'premise: more eligible neighbors than the fan-out').to.be.greaterThan(fanout)
 			// Exactly two tokens. Replacing the bucket rather than draining the profile's own is
 			// what makes the level exact — `TokenBucket` can be emptied but not drained *to* a
 			// level, and an emptied bucket then races its own refill. The rate stays at edge's
