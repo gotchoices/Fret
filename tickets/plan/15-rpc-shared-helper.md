@@ -66,6 +66,35 @@ the class unrepresentable: when one helper owns every await in the open/write/re
 no call site can perform an unsignalled one. Threading the signal into both sites above is the
 interim fix if this consolidation is deferred.
 
+Additional arm (added by the `6.1-rpc-stream-error-tests` review): **one budget is measured by two
+independent clocks, so how an outbound RPC fails is a race rather than a fact.** Each sender arms
+`deadline(timeoutMs, opts.signal)` and then hands `readAllBounded` *the same* `timeoutMs` a second
+time alongside that deadline's signal (`ping.ts:92`, `neighbors.ts:102`, `maybe-act.ts:65`). The
+read therefore starts its own countdown after the dial, while the deadline's `setTimeout` is
+already running — and the two expire within a timer tick of each other. Two observable outcomes
+depend on which lands first, and neither is stable:
+
+- **The error.** The deadline arm throws `DeadlineExpiredError` (no byte count); the read arm
+  throws `read timed out after Xms (N bytes read)`. The byte-count message is the more useful
+  diagnostic and is, at a sender, essentially unreachable.
+- **How the stream is released.** `releaseRpcStream` takes its synchronous `abort()` arm only if
+  the signal has already fired; when the read's own clock wins, the signal is still un-aborted and
+  release goes through the `close()` that the abort arm exists to avoid on a stalled remote.
+
+Measured, not inferred: a review run of `test/rpc.stream-errors.spec.ts` failed on a fixed
+`{ closes: 0, aborts: 1 }` assertion having taken the `close()` arm; the spec now asserts
+release-*exactly-once* for budget-driven reads and pins the arm only where a caller's signal is
+the sole clock. Both spec helpers (`expectStallRejection`, `expectReleasedOnce`) carry the
+reasoning, and both collapse to a single deterministic expectation once this arm lands — so treat
+them as evidence of the wart, not as the contract.
+
+The fix is representational rather than a re-tuning: the read should be bounded by the deadline
+that is *already armed* — its remaining time, or simply its signal — never by a second copy of the
+budget. That means `readAllBounded` needs a way to express "no independent clock; the signal is the
+budget", which its current `timeoutMs = RPC_TIMEOUT_MS` default cannot. The shared `rpcRequest`
+helper is the natural place: when one helper owns the deadline and the read, there is no second
+call site to hand the budget to twice.
+
 Arm resolved elsewhere (added while planning `7-stabilization-concurrency`): two of the
 requirements above — **thread an AbortSignal through send and read**, and **start the ping
 round-trip clock after the stream opens** — are landed by

@@ -193,7 +193,13 @@ export async function readAllBounded(
 			});
 			if (pending == null) {
 				pending = iter.next();
-				pending.catch(() => {}); // Prevent unhandled rejection if the poll wins
+				// Belt-and-braces against an unhandled rejection when the poll wins and `pending` is
+				// abandoned. NOTE: not load-bearing today — the `Promise.race` below attaches its own
+				// reject reaction to `pending` in this same iteration, so removing this line changes
+				// nothing (measured: deleting it leaves `rpc.stream-errors.spec.ts` green). It is kept
+				// because it stops mattering only for as long as every read promise is raced; keep it
+				// if that race is ever restructured to skip an iteration.
+				pending.catch(() => {});
 			}
 			type RaceResult = IteratorResult<StreamChunk> | typeof POLL_TICK | typeof ABORTED;
 			const racers: Array<Promise<RaceResult>> = [pending, poll];

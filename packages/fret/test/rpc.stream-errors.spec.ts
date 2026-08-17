@@ -5,8 +5,9 @@ import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { createMemNode, createMemoryNode, stopAll } from './helpers/libp2p.js'
+import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { PROTOCOL_NEIGHBORS, RPC_TIMEOUT_MS } from '../src/rpc/protocols.js'
+import { PROTOCOL_NEIGHBORS, PROTOCOL_PING, RPC_TIMEOUT_MS } from '../src/rpc/protocols.js'
 import { DeadlineExpiredError } from '../src/utils/deadline.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
@@ -35,7 +36,7 @@ import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 //   - The stream is released exactly once — `close()` on the un-aborted path, `abort()` on the
 //     aborted one (`releaseRpcStream`) — even when the read threw.
 //   - No unhandled rejection escapes, including from the abandoned `iter.next()` the poll loop
-//     holds (`protocols.ts:196`).
+//     holds across ticks.
 //   - Our own cancellation is never evidence about the peer: no contact strike, no backoff, no
 //     relevance decay.
 //   - A reset mid-stream is a failed contact; an answered-but-undecodable reply never demotes a
@@ -82,9 +83,12 @@ function reset(): Error {
 // ---------------------------------------------------------------------------------------------
 // Stub streams
 //
-// The existing stubs in `rpc.protocols.spec.ts` deliberately omit `close`/`abort`; these implement
-// both with call counters, because release-exactly-once is one of the invariants above. A single
-// scripted factory covers all three failure shapes so the shapes stay comparable.
+// `rpc.protocols.spec.ts` splits these concerns across two stub families: a bare `close`/`abort`
+// recorder with no read side (`makeReleasable`, for `releaseRpcStream` alone) and read-side stubs
+// with no release side at all. A failure *partway through a read* needs both at once — the shape of
+// the read is what decides which release happens — so these implement the read script and the
+// release counters in one stub. A single scripted factory covers all three failure shapes so the
+// shapes stay comparable.
 // ---------------------------------------------------------------------------------------------
 
 type ReadStep =
@@ -225,6 +229,32 @@ function expectStallRejection(thrown: unknown, bytesRead: number): void {
 	expect(message, 'the partial buffer is reported, never returned').to.include(`${bytesRead} bytes read`)
 }
 
+/**
+ * Release accounting for a read that ended on the RPC's **own budget** rather than on a caller's
+ * signal — where *which* release arm runs is subject to the same two-clock race as
+ * {@link expectStallRejection}, and for the same reason.
+ *
+ * `releaseRpcStream` picks the synchronous `abort()` only if the deadline signal has already
+ * fired by the time the `finally` runs. When the loop's own `remaining <= 0` check wins instead,
+ * the read throws while that signal is still un-aborted and release goes through `close()`. Both
+ * are one release of one stream; neither is a leak. Asserting a fixed `{ closes, aborts }` pair
+ * here is a flake, not a stronger test — it failed in review against the *un*expected arm.
+ *
+ * `flushCloses` is the sender's own pre-read half-close, which is not a release: 1 for
+ * `sendMaybeAct` (`maybe-act.ts:64`), 0 for every other sender.
+ *
+ * The arm itself *is* pinned deterministically, in two places where only one clock exists: the
+ * caller-cancellation cases below (the caller's signal is aborted before the `finally`, so
+ * `abort()` is guaranteed) and `rpc.protocols.spec.ts`'s direct `releaseRpcStream` cases.
+ */
+function expectReleasedOnce(s: StubStream, flushCloses = 0): void {
+	const releases = (s.closes - flushCloses) + s.aborts
+	expect(
+		releases,
+		`released exactly once — closes ${s.closes} (${flushCloses} of them the request flush), aborts ${s.aborts}`
+	).to.equal(1)
+}
+
 /** Poll `predicate` until true, or fail after `limitMs`. */
 async function waitUntil(predicate: () => boolean, limitMs: number, what: string): Promise<void> {
 	const until = Date.now() + limitMs
@@ -240,10 +270,14 @@ describe('RPC stream failures', function () {
 	 * Invariant guard: no unhandled rejection escapes any case in this file.
 	 *
 	 * The repo's exit watchdog (`test/mocha-exit-watchdog.ts`) catches leaked *handles*, not leaked
-	 * rejections, and the poll loop deliberately holds an abandoned `iter.next()` — so a regression
-	 * that dropped `protocols.ts:196`'s `pending.catch()` would otherwise be invisible here (Node's
-	 * default `--unhandled-rejections=throw` would kill the run rather than fail a test, and only
-	 * if the rejection happened to land inside the run at all).
+	 * rejections, and the poll loop deliberately holds an abandoned `iter.next()` past the end of the
+	 * read. Without this hook such a rejection would surface as Node's default
+	 * `--unhandled-rejections=throw` killing the run rather than as a named test failing — and only
+	 * when the rejection happened to land inside the run at all.
+	 *
+	 * NOTE: no case here currently *arms* it — see the NOTE on "no rejection escapes the abandoned read" for
+	 * why the one sequence that abandons a read promise cannot produce an unhandled rejection today.
+	 * It is kept as a cheap net over every case in the file, not as coverage of a specific line.
 	 *
 	 * Registered on this describe rather than at file top level: a top-level mocha hook is a *root*
 	 * hook and would run against every test in the whole suite run.
@@ -426,8 +460,11 @@ describe('RPC stream failures', function () {
 		})
 	})
 
+	// These three end on the RPC's own budget, so they assert release-exactly-once rather than a
+	// fixed arm — see {@link expectReleasedOnce}. The "released by abort" half of the invariant is
+	// pinned deterministically in "the caller cancels mid-stream" below.
 	describe('partial then stall', () => {
-		it('sendPing rejects within its budget and releases by abort', async () => {
+		it('sendPing rejects within its budget and releases the stream', async () => {
 			const s = partialThenStall(HALF_PING)
 
 			const t0 = Date.now()
@@ -442,12 +479,10 @@ describe('RPC stream failures', function () {
 			expectStallRejection(thrown, HALF_PING.length)
 			// Bounded, not merely eventual: "it rejected" would pass at ten minutes.
 			elapsedBounded(elapsed)
-			// Invariant: the deadline aborted, so release is the synchronous `abort()` — `close()` on a
-			// stalled remote is itself unbounded and would hang cleanup past the budget that just fired.
-			expect(release(s), 'released once, by abort').to.deep.equal({ closes: 0, aborts: 1 })
+			expectReleasedOnce(s)
 		})
 
-		it('fetchNeighbors gives up within its budget, releasing by abort', async () => {
+		it('fetchNeighbors gives up within its budget and releases the stream', async () => {
 			const s = partialThenStall(HALF_SNAPSHOT)
 
 			const t0 = Date.now()
@@ -457,10 +492,10 @@ describe('RPC stream failures', function () {
 			expect(snap.successors).to.deep.equal([])
 			expect(JSON.stringify(snap)).to.not.include('ghost')
 			elapsedBounded(elapsed)
-			expect(release(s)).to.deep.equal({ closes: 0, aborts: 1 })
+			expectReleasedOnce(s)
 		})
 
-		it('sendMaybeAct rejects within its budget, releasing by abort after its flush close', async () => {
+		it('sendMaybeAct rejects within its budget and releases the stream after its flush close', async () => {
 			const s = partialThenStall(HALF_NEAR_ANCHOR)
 
 			const t0 = Date.now()
@@ -474,11 +509,17 @@ describe('RPC stream failures', function () {
 
 			expectStallRejection(thrown, HALF_NEAR_ANCHOR.length)
 			elapsedBounded(elapsed)
-			// The one `close()` is the request flush inside the `try`; the release itself aborted.
-			expect(release(s)).to.deep.equal({ closes: 1, aborts: 1 })
+			// One of the `close()` calls is always the request flush inside the `try`; exactly one
+			// release follows it, by whichever arm the budget race selected.
+			expectReleasedOnce(s, 1)
+			expect(s.sends, 'the request was written before the reply stalled').to.equal(1)
 		})
 	})
 
+	// Unlike the budget-driven cases above, the caller's signal is the *only* clock here — it is
+	// aborted well before either deadline could fire — so `releaseRpcStream` provably takes its
+	// `abort()` arm and these cases pin it exactly. This is where "a stalled remote is released by
+	// the synchronous abort, never by the unbounded close" is actually asserted.
 	describe('the caller cancels mid-stream', () => {
 		/** Abort `ac` at the start of the read that follows the first chunk — bytes in, then a cancel. */
 		function cancelAfterFirstChunk(ac: AbortController, bytes: Uint8Array): StubStream {
@@ -543,12 +584,19 @@ describe('RPC stream failures', function () {
 	})
 
 	describe('no rejection escapes the abandoned read', () => {
-		// `readAllBounded` holds one outstanding `iter.next()` across poll ticks (`protocols.ts:196`)
-		// because re-calling it would queue a second read and silently drop a chunk. When the read
-		// ends via the stream's own end state that promise is abandoned *unsettled* — so a muxer that
-		// rejects it a moment later has no consumer, and only the pre-attached `.catch()` keeps it
-		// from becoming an unhandled rejection. This drives exactly that sequence; the suite-wide
-		// `unhandledRejection` guard is the assertion.
+		// `readAllBounded` holds one outstanding `iter.next()` across poll ticks because re-calling it
+		// would queue a second read and silently drop a chunk. When the read ends via the stream's own
+		// end state that promise is abandoned *unsettled*, so a muxer that rejects it a moment later
+		// has no consumer of its own. This drives exactly that sequence and asserts the read still
+		// answers normally; the suite-wide `unhandledRejection` guard covers the rejection itself.
+		//
+		// NOTE: this case does **not** pin `protocols.ts`'s `pending.catch(() => {})` — verified by
+		// deleting that line, which leaves this test passing. `Promise.race` attaches its own
+		// reject reaction to `pending` in the same iteration, so the abandoned promise is already
+		// "handled" and the explicit catch is belt-and-braces rather than load-bearing. Arming the
+		// guard for real needs a path that creates a read promise it never races, which the current
+		// loop has none of; the guard is kept because a future restructuring of that race (or of
+		// `abortWait`) could introduce one, and it costs one `afterEach`.
 		it('answers normally when the abandoned iter.next() rejects after the reply was read', async () => {
 			const s = makeStubStream(
 				[
@@ -675,17 +723,6 @@ describe('RPC stream failures', function () {
 			return s
 		}
 
-		/** `coord` shifted by one in ring arithmetic, so a seeded peer sits immediately beside a key. */
-		function offsetCoord(coord: Uint8Array, delta: 1 | -1): Uint8Array {
-			const out = new Uint8Array(coord)
-			for (let i = out.length - 1; i >= 0; i--) {
-				const v = out[i]! + delta
-				out[i] = (v + 256) % 256
-				if (v >= 0 && v <= 255) break
-			}
-			return out
-		}
-
 		/**
 		 * One live member sitting immediately clockwise of `keyBytes`'s coordinate — the only
 		 * routing candidate, so `routeAct`'s forward hop is deterministic. Self is not in the store,
@@ -694,7 +731,7 @@ describe('RPC stream failures', function () {
 		async function seedHopBesideKey(keyBytes: Uint8Array): Promise<string> {
 			const pid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'))
 			const id = pid.toString()
-			store.upsert(id, offsetCoord(await hashKey(keyBytes), 1))
+			store.upsert(id, ringOffset(await hashKey(keyBytes), 1))
 			store.setMembership(id, 'member')
 			;(svc as unknown as { setAddressKnown(id: string, known: boolean): void }).setAddressKnown(id, true)
 			return id
@@ -843,39 +880,123 @@ describe('RPC stream failures', function () {
 
 	// The stub shapes above are only worth what they share with the real transport. The missed-EOF
 	// bug (`protocols.ts:130-135`) is the precedent: a stub-only suite agreed with itself and not
-	// with libp2p. This is the one case driven over a real connection.
+	// with libp2p. Both stub-only shapes that a live peer *can* be made to produce are re-driven here
+	// over TCP + noise + yamux: a clean EOF mid-JSON, and a reset mid-reply (the responder calls
+	// `Stream.abort()` after a partial write, which is what a handler throwing mid-reply would do if
+	// it released its stream at all — see `15-rpc-shared-helper`'s "handler error paths leak
+	// streams"). The stall shape has no real-transport counterpart worth the wall time: it is a
+	// responder doing nothing, and asserting it means spending a full RPC budget per case.
 	describe('over a real transport', () => {
+		let a: Libp2p
+		let b: Libp2p
+
+		beforeEach(async () => {
+			a = await createMemoryNode(); await a.start()
+			b = await createMemoryNode(); await b.start()
+		})
+
+		afterEach(async () => { await stopAll([a, b]) })
+
+		/** Register `reply` on `a` for `protocol`, then connect `b` to it. */
+		async function serving(protocol: string, reply: (stream: Stream) => void | Promise<void>): Promise<string> {
+			await a.handle(protocol, reply)
+			await b.dial(a.getMultiaddrs()[0]!)
+			return a.peerId.toString()
+		}
+
+		/** Half a reply, then a tidy half-close. */
+		const halfThenClose = (bytes: Uint8Array) => async (stream: Stream): Promise<void> => {
+			stream.send(bytes)
+			await stream.close()
+		}
+
+		/** Half a reply, then a muxer-level reset — the live analogue of `resetsAfter`. */
+		const halfThenReset = (bytes: Uint8Array) => (stream: Stream): void => {
+			stream.send(bytes)
+			stream.abort(new Error('handler failed mid-reply'))
+		}
+
+		/** The outbound stream must be released rather than held until the muxer times it out. */
+		async function expectStreamReleased(protocol: string): Promise<void> {
+			const conn = b.getConnections(a.peerId)[0]!
+			await waitUntil(
+				() => conn.streams.every((s) => s.protocol !== protocol),
+				1000, `the outbound ${protocol} stream is released`
+			)
+		}
+
+		/** Neither shape is a stall, so neither may run to the RPC budget. */
+		function expectPrompt(elapsed: number): void {
+			expect(elapsed, `took ${elapsed}ms of a ${RPC_TIMEOUT_MS}ms budget`).to.be.lessThan(RPC_TIMEOUT_MS / 2)
+		}
+
 		it('fetchNeighbors answers promptly, and empty, for a peer that writes half a snapshot and closes', async () => {
-			const a = await createMemoryNode(); await a.start()
-			const b = await createMemoryNode(); await b.start()
+			const id = await serving(PROTOCOL_NEIGHBORS, halfThenClose(HALF_SNAPSHOT))
+
+			const t0 = Date.now()
+			const snap = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
+
+			expect(snap.successors, 'nothing parsed out of the truncated document').to.deep.equal([])
+			expect(snap.predecessors).to.deep.equal([])
+			expect(snap.sample).to.equal(undefined)
+			expect(JSON.stringify(snap)).to.not.include('ghost')
+			expectPrompt(Date.now() - t0)
+			await expectStreamReleased(PROTOCOL_NEIGHBORS)
+		})
+
+		// The reset shape otherwise rests entirely on stubs, which is exactly the arrangement the
+		// missed-EOF bug got wrong. Over a live muxer the reset surfaces as a *read* failure rather
+		// than as EOF, so `fetchNeighbors` reaches its `catch` instead of its decode — a different
+		// path to the same fabricated empty snapshot.
+		it('fetchNeighbors answers promptly, and empty, for a peer that resets mid-reply', async () => {
+			const id = await serving(PROTOCOL_NEIGHBORS, halfThenReset(HALF_SNAPSHOT))
+
+			const t0 = Date.now()
+			const snap = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
+
+			expect(snap.successors).to.deep.equal([])
+			expect(JSON.stringify(snap), 'no field parsed out of the partial document').to.not.include('ghost')
+			expectPrompt(Date.now() - t0)
+			await expectStreamReleased(PROTOCOL_NEIGHBORS)
+		})
+
+		// Ping is the other sender a live peer can be driven against, and it is the one whose contract
+		// is "collapse anything unusable into `ok: false`" — the arm the service leans on to decide a
+		// badly-answering peer is alive rather than unreachable. Both shapes must reach it.
+		it('sendPing collapses a real half-reply and a real reset into ok: false', async () => {
+			const halfId = await serving(PROTOCOL_PING, halfThenClose(HALF_PING))
+			const half = await sendPing(b, halfId, PROTOCOL_PING)
+
+			expect(half.ok, 'half reply: not parsed as an answer').to.equal(false)
+			expect(half.size_estimate, 'nothing salvaged from the partial document').to.equal(undefined)
+			await expectStreamReleased(PROTOCOL_PING)
+
+			await a.unhandle(PROTOCOL_PING)
+			await a.handle(PROTOCOL_PING, halfThenReset(HALF_PING))
+
+			const t0 = Date.now()
+			let thrown: unknown
+			let res: Awaited<ReturnType<typeof sendPing>> | undefined
 			try {
-				await a.handle(PROTOCOL_NEIGHBORS, async (stream: Stream) => {
-					stream.send(HALF_SNAPSHOT)
-					await stream.close()
-				})
-				await b.dial(a.getMultiaddrs()[0]!)
-
-				const t0 = Date.now()
-				const snap = await fetchNeighbors(b, a.peerId.toString(), PROTOCOL_NEIGHBORS)
-				const elapsed = Date.now() - t0
-
-				expect(snap.successors, 'nothing parsed out of the truncated document').to.deep.equal([])
-				expect(snap.predecessors).to.deep.equal([])
-				expect(snap.sample).to.equal(undefined)
-				expect(JSON.stringify(snap)).to.not.include('ghost')
-				// A clean EOF is not a stall: this must not run to the RPC budget.
-				expect(elapsed, `took ${elapsed}ms of a ${RPC_TIMEOUT_MS}ms budget`).to.be.lessThan(RPC_TIMEOUT_MS / 2)
-
-				// Release, transport-side: the outbound stream must be gone from the connection rather
-				// than held until the muxer times it out.
-				const conn = b.getConnections(a.peerId)[0]!
-				await waitUntil(
-					() => conn.streams.every((s) => s.protocol !== PROTOCOL_NEIGHBORS),
-					1000, 'the outbound neighbors stream is released'
-				)
-			} finally {
-				await stopAll([a, b])
+				res = await sendPing(b, halfId, PROTOCOL_PING)
+			} catch (err) {
+				thrown = err
 			}
+			expectPrompt(Date.now() - t0)
+
+			// A live reset surfaces as a read failure, which `sendPing` does *not* catch — its
+			// `try/catch` wraps the decode alone. So the two shapes diverge here in a way the service
+			// cares about: an undecodable reply is `ok: false` (alive, decay only) while a reset
+			// propagates and `noteRpcFailure` books it as a contact strike. Assert whichever arm the
+			// transport produced rather than pretending only one is possible — a muxer that delivers
+			// the buffered bytes before the reset yields the first, one that discards them the second.
+			if (thrown !== undefined) {
+				expect(thrown, 'reset: propagates rather than answering').to.be.instanceOf(Error)
+			} else {
+				expect(res?.ok, 'reset: never a positive answer').to.equal(false)
+				expect(res?.size_estimate, 'nothing salvaged').to.equal(undefined)
+			}
+			await expectStreamReleased(PROTOCOL_PING)
 		})
 	})
 })
