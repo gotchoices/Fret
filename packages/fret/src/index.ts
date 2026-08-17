@@ -1,4 +1,6 @@
+import type { Libp2p } from 'libp2p';
 import type { SerializedPeerEntry, SerializedTable } from './store/digitree-store.js';
+import { FretService as FretServiceClass } from './service/fret-service.js';
 
 export type FretMode = 'active' | 'passive';
 
@@ -29,7 +31,7 @@ export interface NeighborSnapshotV1 {
 	size_estimate?: number;
 	confidence?: number;
 	sig: string;
-	metadata?: Record<string, any>;
+	metadata?: Record<string, unknown>;
 }
 
 export interface RouteAndMaybeActV1 {
@@ -106,9 +108,9 @@ export interface FretService {
 	expandCohort(current: string[], key: Uint8Array, step: number, exclude?: Set<string>): string[];
 	routeAct(msg: RouteAndMaybeActV1): Promise<NearAnchorV1 | { commitCertificate: string }>;
 	report(evt: ReportEvent): void;
-	setMetadata(metadata: Record<string, any>): void;
-	getMetadata(peerId: string): Record<string, any> | undefined;
-	listPeers(): Array<{ id: string; metadata?: Record<string, any> }>;
+	setMetadata(metadata: Record<string, unknown>): void;
+	getMetadata(peerId: string): Record<string, unknown> | undefined;
+	listPeers(): Array<{ id: string; metadata?: Record<string, unknown> }>;
 
 	// Network size estimation
 	reportNetworkSize(estimate: number, confidence: number, source?: string): void;
@@ -128,8 +130,7 @@ export interface FretService {
 }
 
 export type { SerializedPeerEntry, SerializedTable };
-export { FretService as FretServiceImpl } from './service/fret-service.js';
-import { FretService as FretServiceClass } from './service/fret-service.js';
+export { FretServiceClass as FretServiceImpl };
 export { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryInput, type FretPeerDiscoveryConfig } from './service/peer-discovery.js';
 export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js';
 export { hashKey, hashPeerId } from './ring/hash.js';
@@ -145,6 +146,6 @@ export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
 export { validateTimestamp, readAllBounded, openRpcStream } from './rpc/protocols.js';
 export type { Stream } from '@libp2p/interface';
 
-export function createFret(node: any, cfg?: Partial<FretConfig>): FretService {
+export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg) as FretService;
 }
