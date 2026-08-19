@@ -1,12 +1,13 @@
-import { before, describe, it } from 'mocha'
+import { after, before, describe, it } from 'mocha'
 import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
-import { openRpcStream, isLimitedConnection, releaseRpcStream, readAllBounded } from '../src/rpc/protocols.js'
+import { openRpcStream, isLimitedConnection, releaseRpcStream, readFramed } from '../src/rpc/protocols.js'
 import { abortReasonError, DeadlineExpiredError } from '../src/utils/deadline.js'
-import { sendPing } from '../src/rpc/ping.js'
+import { registerPing, sendPing } from '../src/rpc/ping.js'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { sendLeave } from '../src/rpc/leave.js'
@@ -406,7 +407,7 @@ describe('RPC deadlines', () => {
 		expectBounded(Date.now() - t0)
 	})
 
-	it('readAllBounded rejects when its signal aborts mid-read', async () => {
+	it('readFramed rejects when its signal aborts mid-read', async () => {
 		const silent = {
 			[Symbol.asyncIterator]: () => ({
 				next: () => new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }),
@@ -419,7 +420,7 @@ describe('RPC deadlines', () => {
 		let thrown: unknown
 		try {
 			// A read deadline far past the abort, so the abort arm — not the deadline — is what ends it.
-			await readAllBounded(silent, 1024, 60_000, { signal: ac.signal })
+			await readFramed(silent, 1024, 60_000, { signal: ac.signal })
 		} catch (err) {
 			thrown = err
 		} finally {
@@ -527,5 +528,38 @@ describe('isLimitedConnection', () => {
 	it('is false (no throw) when remoteAddr is absent and limits is null', () => {
 		const c = makeConnection({ limited: false, remoteAddr: null })
 		expect(isLimitedConnection(asConn(c))).to.equal(false)
+	})
+})
+
+// The headline symptom of the framing change, measured for real: `readAllBounded` polled for EOF
+// every 20 ms, so every ping — however fast the responder — paid at least one poll interval.
+// `readFramed` returns the moment the frame completes, so on the in-memory transport the fastest
+// of a few pings lands well under 10 ms (Windows `Date.now()` granularity is ~15 ms, so a
+// measured 0 ms is routine). Real nodes rather than the stubs above, hence its own teardown.
+describe('ping RTT floor', () => {
+	let a: Libp2p
+	let b: Libp2p
+
+	before(async () => {
+		a = await createMemNode()
+		b = await createMemNode()
+		await a.start()
+		await b.start()
+		registerPing(b, PROTOCOLS[0])
+		await a.dial(b.getMultiaddrs()[0]!)
+	})
+
+	after(async () => {
+		await stopAll([a, b])
+	})
+
+	it('measures a sub-10ms RTT against a fast responder on the in-memory transport', async () => {
+		const rtts: number[] = []
+		for (let i = 0; i < 5; i++) {
+			const res = await sendPing(a, b.peerId.toString(), PROTOCOLS[0])
+			expect(res.ok, `ping ${i} succeeded`).to.equal(true)
+			rtts.push(res.rttMs)
+		}
+		expect(Math.min(...rtts), `min of ${JSON.stringify(rtts)}`).to.be.lessThan(10)
 	})
 })

@@ -321,8 +321,9 @@ describe('RPC codec properties', function () {
 	// "accepts exactly X" is only half a contract. Every body-reading handler relies on `decodeJson`
 	// refusing a non-object top level and never re-checks what it got back, so the refusal is load
 	// bearing rather than defensive. The padding rules are the other untested half — `decodeJson`
-	// trims NUL/tab/LF/CR/space from both ends before parsing, which is what keeps a muxer that pads
-	// a short frame from surfacing as a JSON syntax error deep inside a handler.
+	// trims NUL/tab/LF/CR/space from both ends before parsing. Under length-prefix framing the
+	// muxer never touches body bytes, so the trim is interop-defensive: it forgives a sender that
+	// frames padding inside the counted body, rather than a transport that pads the frame.
 	// ---------------------------------------------------------------------------------------------
 	describe('decodeJson rejects what is not a message', () => {
 		/** The error `decodeJson` threw; fails the test if it accepted the bytes instead. */
@@ -590,11 +591,12 @@ describe('RPC codec properties', function () {
 	})
 
 	// ---------------------------------------------------------------------------------------------
-	// `readAllBounded` reassembly. Driven from a plain async iterable — it accepts one — so no
-	// transport is involved. This is the property that would catch a framing regression when
-	// `plan/15-rpc-shared-helper` adds length prefixes.
+	// `readFramed` reassembly. Driven from a plain async iterable — it accepts one — so no
+	// transport is involved. This is the framing regression guard: a frame split at any chunk
+	// boundary — prefix straddled, body fragmented, zero-length chunks interleaved — must
+	// reassemble byte-identically.
 	// ---------------------------------------------------------------------------------------------
-	describe('readAllBounded reassembly', () => {
+	describe('readFramed reassembly', () => {
 		/** Cut points for `bytes`, clamped and ordered: `[0, ...cuts, length]`. */
 		function chunkEdges(bytes: Uint8Array, boundaries: number[]): number[] {
 			const cuts = boundaries.map((b) => Math.min(b, bytes.byteLength)).sort((a, b) => a - b)
@@ -609,7 +611,7 @@ describe('RPC codec properties', function () {
 			}
 		}
 
-		it('reassembles a message split at arbitrary chunk boundaries, byte-identically', async () => {
+		it('reassembles a frame split at arbitrary chunk boundaries, byte-identically', async () => {
 			const region = { multiChunk: 0, emptyChunk: 0, emptyMessage: 0 }
 
 			await fc.assert(
@@ -617,24 +619,58 @@ describe('RPC codec properties', function () {
 					fc.uint8Array({ maxLength: 2048 }),
 					fc.array(fc.nat({ max: 2048 }), { maxLength: 12 }),
 					async (bytes, boundaries) => {
-						const edges = chunkEdges(bytes, boundaries)
+						const framed = lp.encode.single(bytes).subarray()
+						const edges = chunkEdges(framed, boundaries)
 						if (edges.length > 2) region.multiChunk++
 						// Duplicate boundaries produce zero-length chunks — the case that must not be
-						// read as end-of-stream. `readAllBounded` has no idle timer precisely so a gap
-						// is never mistaken for EOF; a zero-length chunk is the degenerate form.
+						// read as end-of-stream. A gap between chunks is a slow link, not EOF; a
+						// zero-length chunk is the degenerate form.
 						if (edges.some((e, i) => i > 0 && e === edges[i - 1])) region.emptyChunk++
 						if (bytes.byteLength === 0) region.emptyMessage++
 
-						const out = await readAllBounded(chunkedSource(bytes, edges), 1024 * 1024, 5000)
+						const out = await readFramed(chunkedSource(framed, edges), 1024 * 1024, 5000)
 						expect(out).to.deep.equal(bytes)
+
+						// A zero-length frame (bare 0x00 prefix) is not an error at the framing
+						// layer; it is `decodeJson` that refuses the empty body.
+						if (bytes.byteLength === 0) {
+							let err: unknown
+							try { await decodeJson(out) } catch (e) { err = e }
+							expect((err as Error)?.message).to.equal('empty response')
+						}
 					}
 				),
 				{ numRuns: 100 }
 			)
 
-			expect(region.multiChunk, 'no multi-chunk message was generated').to.be.greaterThan(0)
+			expect(region.multiChunk, 'no multi-chunk frame was generated').to.be.greaterThan(0)
 			expect(region.emptyChunk, 'no zero-length chunk was generated').to.be.greaterThan(0)
 			expect(region.emptyMessage, 'no empty message was generated').to.be.greaterThan(0)
+		})
+
+		it('round-trips every wire type through frame → arbitrary chunking → decode', async () => {
+			const arbWireMessage = fc.oneof(
+				arbNeighborSnapshot as fc.Arbitrary<unknown>,
+				arbRouteAndMaybeAct as fc.Arbitrary<unknown>,
+				arbNearAnchor as fc.Arbitrary<unknown>,
+				arbLeaveNotice as fc.Arbitrary<unknown>,
+				arbSerializedTable as fc.Arbitrary<unknown>
+			)
+
+			await fc.assert(
+				fc.asyncProperty(
+					arbWireMessage,
+					fc.array(fc.nat({ max: 4096 }), { maxLength: 8 }),
+					async (message, boundaries) => {
+						const framed = lp.encode.single(await encodeJson(message)).subarray()
+						const edges = chunkEdges(framed, boundaries)
+
+						const out = await readFramed(chunkedSource(framed, edges), 1024 * 1024, 5000)
+						expect(await decodeJson(out)).to.deep.equal(message)
+					}
+				),
+				{ numRuns: 100 }
+			)
 		})
 	})
 
@@ -643,54 +679,45 @@ describe('RPC codec properties', function () {
 	// =============================================================================================
 
 	/**
-	 * A source that counts how many times it was pulled, so "stopped at the cap" is measured rather
-	 * than inferred from the absence of a crash.
+	 * A framed source that counts how many times it was pulled, so "stopped at the cap" is measured
+	 * rather than inferred from the absence of a crash. Pull 1 yields the bare length prefix
+	 * declaring `totalBytes`; later pulls yield body chunks of `chunkSize`.
 	 */
 	function countingSource(chunkSize: number, totalBytes: number): {
 		source: AsyncIterable<Uint8Array>
 		pulls: () => number
 	} {
+		const framed = lp.encode.single(new Uint8Array(totalBytes)).subarray()
+		const prefixLen = framed.byteLength - totalBytes
 		let pulls = 0
-		let sent = 0
+		let offset = 0
 		const source: AsyncIterable<Uint8Array> = {
 			[Symbol.asyncIterator]: () => ({
 				next: async (): Promise<IteratorResult<Uint8Array>> => {
 					pulls++
-					if (sent >= totalBytes) return { done: true, value: undefined }
-					const n = Math.min(chunkSize, totalBytes - sent)
-					sent += n
-					return { done: false, value: new Uint8Array(n) }
+					if (offset >= framed.byteLength) return { done: true, value: undefined }
+					const end = offset === 0 ? prefixLen : Math.min(offset + chunkSize, framed.byteLength)
+					const chunk = framed.subarray(offset, end)
+					offset = end
+					return { done: false, value: chunk }
 				},
 			}),
 		}
 		return { source, pulls: () => pulls }
 	}
 
-	describe('readAllBounded stops at maxBytes rather than draining the source', () => {
-		it('pulls only as far as the cap on a 4 MB source against a 256 KB cap', async () => {
-			const chunkSize = 64 * 1024
-			const maxBytes = 256 * 1024
+	describe('readFramed refuses an over-cap frame at its prefix rather than draining the source', () => {
+		it('rejects a frame declaring 4 MB against a 256 KB cap after a single pull', async () => {
 			const total = 4 * 1024 * 1024
-			const { source, pulls } = countingSource(chunkSize, total)
+			const { source, pulls } = countingSource(64 * 1024, total)
 
 			let thrown: unknown
-			try { await readAllBounded(source, maxBytes, 5000) } catch (err) { thrown = err }
+			try { await readFramed(source, 256 * 1024, 5000) } catch (err) { thrown = err }
 
 			expect((thrown as Error)?.message, 'refused, not truncated').to.include('payload too large')
-			// Exactly `ceil(maxBytes / chunkSize) + 1`: four chunks reach the cap, the fifth crosses
-			// it. The source held 64 chunks, so 59 of them were never asked for.
-			expect(pulls()).to.equal(Math.ceil(maxBytes / chunkSize) + 1)
-			expect(pulls()).to.be.lessThan(total / chunkSize)
-		})
-
-		it('trips on the first pull when one chunk is larger than the whole cap', async () => {
-			const { source, pulls } = countingSource(4 * 1024 * 1024, 4 * 1024 * 1024)
-
-			let thrown: unknown
-			try { await readAllBounded(source, 256 * 1024, 5000) } catch (err) { thrown = err }
-
-			expect((thrown as Error)?.message).to.include('payload too large')
-			expect(pulls(), 'one pull was enough to know').to.equal(1)
+			// The refusal happens at the declared length: the prefix is the first pull, and no body
+			// byte is ever asked for — the source held 64 body chunks and yielded none.
+			expect(pulls(), 'the prefix alone was enough to know').to.equal(1)
 		})
 
 		it('bounds its consumption at the cap for arbitrary chunk sizes', async () => {
@@ -706,15 +733,15 @@ describe('RPC codec properties', function () {
 
 						let thrown: unknown
 						let out: Uint8Array | undefined
-						try { out = await readAllBounded(source, maxBytes, 5000) } catch (err) { thrown = err }
+						try { out = await readFramed(source, maxBytes, 5000) } catch (err) { thrown = err }
 
 						if (total > maxBytes) {
 							region.overCap++
 							expect((thrown as Error)?.message).to.include('payload too large')
-							expect(pulls()).to.be.at.most(Math.ceil(maxBytes / chunkSize) + 1)
+							expect(pulls(), 'refused at the prefix, before any body byte').to.equal(1)
 						} else {
 							region.underCap++
-							expect(thrown, 'an under-cap source must not throw').to.equal(undefined)
+							expect(thrown, 'an under-cap frame must not throw').to.equal(undefined)
 							expect(out!.byteLength).to.equal(total)
 						}
 					}
@@ -790,8 +817,8 @@ describe('RPC codec properties', function () {
 		/**
 		 * Write in muxer-sized pieces, respecting backpressure. `send` may throw once the receiver
 		 * has aborted — which is the *expected* outcome for every over-cap row here, since
-		 * `readAllBounded` throws as soon as the cumulative length crosses the cap and the
-		 * registration seam aborts the stream — so a failed write is a result, not an error.
+		 * `readFramed` refuses a frame at its declared length and the registration seam aborts the
+		 * stream — so a failed write is a result, not an error.
 		 */
 		async function writeAll(stream: Stream, bytes: Uint8Array): Promise<void> {
 			const CHUNK = 16 * 1024
@@ -807,9 +834,9 @@ describe('RPC codec properties', function () {
 		async function sendRaw(target: PeerId, protocol: string, payload: string): Promise<Uint8Array | undefined> {
 			const stream = await rig.sender.dialProtocol(target, [protocol])
 			try {
-				await writeAll(stream, enc.encode(payload))
+				await writeAll(stream, lp.encode.single(enc.encode(payload)).subarray())
 				await stream.close()
-				return await readAllBounded(stream, 1024 * 1024, 3000)
+				return await readFramed(stream, 1024 * 1024, 3000)
 			} catch {
 				try { stream.abort(new Error('sendRaw: receiver aborted')) } catch { /* already gone */ }
 				return undefined
@@ -847,8 +874,9 @@ describe('RPC codec properties', function () {
 			expect(over, 'an over-cap message gets no reply — the stream is aborted').to.equal(undefined)
 			// The load-bearing assertion: *nothing* in the service moved. Not `payloadTooLarge` (the
 			// 128 KB activity check inside `handleMaybeAct`), not `rateLimited` (the bucket), not
-			// `malformed` (the validator). The read was refused before any of them ran, which is
-			// what "refused before a full parse" means at the handler level.
+			// `malformed` (the validator). The read was refused at the frame's declared length,
+			// before any body byte reached any of them, which is what "refused before a full parse"
+			// means at the handler level.
 			expect(rig.svc.getDiagnostics().rejected).to.deep.equal(before)
 
 			await waitUntil(
@@ -905,7 +933,7 @@ describe('RPC codec properties', function () {
 				from: senderId,
 				timestamp: Date.now(),
 				// An unknown field is exactly how a real over-cap body would arrive (version skew,
-				// a future field); `readAllBounded` caps the message regardless of its shape.
+				// a future field); `readFramed` caps the frame regardless of its shape.
 				padding: 'x'.repeat(padChars),
 			})
 
@@ -1276,9 +1304,9 @@ describe('RPC codec properties', function () {
 		async function request(protocol: string, payload: string): Promise<Uint8Array | undefined> {
 			const stream = await sender.dialProtocol(receiver.peerId, [protocol])
 			try {
-				stream.send(enc.encode(payload))
+				sendFramed(stream, enc.encode(payload))
 				await stream.close()
-				return await readAllBounded(stream, 64 * 1024, 3000)
+				return await readFramed(stream, 64 * 1024, 3000)
 			} catch {
 				try { stream.abort(new Error('request: receiver aborted')) } catch { /* already gone */ }
 				return undefined
