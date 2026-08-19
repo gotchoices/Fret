@@ -84,6 +84,20 @@ const MAX_BREADCRUMBS = 64;
 /** `digest` is a lightweight summary, not a payload — `activity` is where bulk belongs. */
 const MAX_DIGEST_CHARS = 4096;
 
+/** `handleMaybeAct`'s own activity-size refusal — the wire cap for maybeAct is derived from this
+ *  plus {@link MAYBE_ACT_OVERHEAD_BYTES}, so the two numbers can no longer disagree. Unchanged,
+ *  both profiles. */
+export const MAX_ACTIVITY_BYTES = 128 * 1024;
+/** Non-activity fields of a maybeAct message: key 1024, correlation_id 256, digest 4096, 64
+ *  breadcrumbs * 64 = 4096, signature (reserved, unimplemented) 512, punctuation ~256. Sums to
+ *  ~10.5 KiB; rounded up to 16 KiB for headroom. */
+export const MAYBE_ACT_OVERHEAD_BYTES = 16 * 1024;
+/** Fixed fields of a Core neighbor snapshot plus its metadata allowance — see docs/fret.md
+ *  *Stream management*. */
+export const MAX_SNAPSHOT_METADATA_BYTES_CORE = 8 * 1024;
+/** Same, Edge profile. */
+export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
+
 /**
  * Structural validity of an inbound `RouteAndMaybeAct` — everything downstream code touches
  * without checking, and nothing more. The caller runs it immediately after taking the rate-limit
