@@ -852,9 +852,19 @@ describe('RPC stream failures', function () {
 			)
 		}
 
-		/** Neither shape is a stall, so neither may run to the RPC budget. */
+		/**
+		 * Neither shape is a stall, so neither may run to the RPC budget — and the bound is set an
+		 * order of magnitude under it, because that is what measures the property the deleted 20 ms
+		 * EOF poll used to provide: a stream that genuinely ends without a whole frame must fail
+		 * *promptly*, which the replacement gets for free by failing at the stream's own layer. Half
+		 * the budget would not measure that — half a budget is what a *slow* answer looks like, not
+		 * what a prompt failure looks like. A ratio rather than a tight millisecond bound because the
+		 * property is "nowhere near the deadline", not scheduler precision, and a tight bound would
+		 * flake on CI. Safe at every call site: each measures over an already-established loopback
+		 * connection, since the dial happens in `serving`, outside the timed window.
+		 */
 		function expectPrompt(elapsed: number): void {
-			expect(elapsed, `took ${elapsed}ms of a ${RPC_TIMEOUT_MS}ms budget`).to.be.lessThan(RPC_TIMEOUT_MS / 2)
+			expect(elapsed, `took ${elapsed}ms of a ${RPC_TIMEOUT_MS}ms budget`).to.be.lessThan(RPC_TIMEOUT_MS / 10)
 		}
 
 		it('fetchNeighbors answers decode-error, promptly, for a peer that writes half a snapshot and closes', async () => {
@@ -867,31 +877,6 @@ describe('RPC stream failures', function () {
 			expect(JSON.stringify(res), 'nothing parsed out of the truncated document').to.not.include('ghost')
 			expectPrompt(Date.now() - t0)
 			await expectStreamReleased(PROTOCOL_NEIGHBORS)
-		})
-
-		// The converse of the framed-read guard, and the one property the deleted 20 ms EOF poll
-		// existed to provide: a stream that genuinely ends without a whole frame must fail
-		// *promptly*, not sit out the read budget. The replacement's claim is that reading at the
-		// stream's own layer gives that for free — nothing measured it, so a read that instead
-		// waited for its deadline would still have passed every case above as long as the deadline
-		// was under the mocha timeout. `expectPrompt` is not that measurement either: half the
-		// budget is what a *slow* answer looks like, not what a prompt failure looks like.
-		//
-		// Deliberately a ratio an order of magnitude under the budget rather than a tight
-		// millisecond bound: the property is "nowhere near the deadline", not scheduler precision,
-		// and a tight bound would flake on CI.
-		it('an end-of-stream read fails an order of magnitude inside its own budget', async () => {
-			const id = await serving(PROTOCOL_NEIGHBORS, halfThenClose(HALF_SNAPSHOT))
-
-			const t0 = Date.now()
-			const res = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS, { timeoutMs: RPC_TIMEOUT_MS })
-			const elapsed = Date.now() - t0
-
-			expectKind(res, 'decode-error')
-			expect(
-				elapsed,
-				`took ${elapsed}ms — an ended stream must fail promptly, not run out its ${RPC_TIMEOUT_MS}ms budget`
-			).to.be.lessThan(RPC_TIMEOUT_MS / 10)
 		})
 
 		// The reset shape otherwise rests entirely on stubs, which is exactly the arrangement the
