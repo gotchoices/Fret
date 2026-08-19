@@ -19,7 +19,7 @@ import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
-import { parseRouteAndMaybeAct } from '../rpc/validate.js';
+import { makeSnapshotParser, parseRouteAndMaybeAct } from '../rpc/validate.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
 import type { RpcOutcome } from '../rpc/outcome.js';
@@ -1027,8 +1027,17 @@ export class FretService implements IFretService, Startable {
 					this.protocols,
 					this.maxBytesNeighbors(),
 					() => { this.diag.rejected.identityMismatch++; },
-					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(neighbors)')
+					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(neighbors)'),
+					// The parser is bound to the *same* caps the announce merge slices to, supplied
+					// once here so the two cannot drift. Do not inline the numbers.
+					makeSnapshotParser(this.mergeSnapshotCaps()),
+					() => { this.diag.rejected.malformed++; }
 				),
+				// NOTE: maybeAct deliberately stays on `registerRpcHandler` while the other four
+				// protocols moved to the shared `registerJsonHandler` seam. That seam parses inside
+				// the handler body, but this protocol's rate-limit bucket must be taken before any
+				// per-message work at all — so its parser call (`parseRouteAndMaybeAct`) stays inside
+				// `handleMaybeAct`, after the bucket. The asymmetry is deliberate; do not unify it.
 				registerMaybeAct(
 					this.node,
 					async (msg, from) => {
@@ -1048,7 +1057,8 @@ export class FretService implements IFretService, Startable {
 					this.node,
 					async (notice) => this.handleLeave(notice),
 					this.protocols.PROTOCOL_LEAVE,
-					() => { this.diag.rejected.identityMismatch++; }
+					() => { this.diag.rejected.identityMismatch++; },
+					() => { this.diag.rejected.malformed++; }
 				),
 				registerPing(
 					this.node,
@@ -1587,6 +1597,11 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
+	// NOTE: `registerJsonHandler` parses before `serve` runs, so `parseLeaveNotice` now precedes
+	// this bucket — the leave parse is unmetered. Bounded on purpose: a leave body is capped at
+	// 4096 bytes and the parser is O(message size) with no hashing, so the pre-filter costs at
+	// most ~4 KB of pure parsing per message — cheaper than the `readFramed` this bucket never
+	// metered either. Keep the bucket first *inside* this method; do not move it into the seam.
 	private async handleLeave(notice: { from: string; replacements?: string[]; timestamp: number }): Promise<void> {
 		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }
 		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }

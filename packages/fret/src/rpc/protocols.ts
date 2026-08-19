@@ -5,6 +5,10 @@ import type { Uint8ArrayList } from 'uint8arraylist';
 import type { Deadline } from '../utils/deadline.js';
 import { abortReasonError, deadline } from '../utils/deadline.js';
 import { createLogger } from '../logger.js';
+// Type-only: `protocols` -> `validate` -> `leave` -> `protocols` is a compile-time cycle that
+// must not become a runtime one (`validate.ts` imports `LeaveNoticeV1` type-only for the same
+// reason).
+import type { Parser } from './validate.js';
 
 const log = createLogger('rpc:handler');
 
@@ -137,6 +141,89 @@ export async function registerRpcHandler(
 			}
 		}
 	});
+}
+
+/**
+ * Options for a JSON protocol that reads a request body: decode it, run it through a parser from
+ * `src/rpc/validate.ts`, then answer (or drop).
+ */
+export interface JsonRequestHandlerOpts<Req, Res> {
+	/** Per-message byte cap, enforced by {@link readFramed} at the length prefix. */
+	maxBytes: number;
+	parse: Parser<Req>;
+	/** Return `undefined` to drop without replying (the identity-mismatch case). */
+	serve: (msg: Req, connection: Connection) => Promise<Res | undefined> | Res | undefined;
+	/** Counter hook for a body-level drop; the service wires it to `diag.rejected.malformed`. */
+	onMalformed?: (reason: 'decode' | 'parse') => void;
+	/** Test-only pass-through to {@link registerRpcHandler}; no production caller sets it. */
+	closeBudgetMs?: number;
+}
+
+/** Options for a JSON protocol that reads no request body at all — it only answers. */
+export interface JsonReplyOnlyHandlerOpts<Res> {
+	serve: (connection: Connection) => Promise<Res> | Res;
+	closeBudgetMs?: number;
+}
+
+/**
+ * Register an inbound handler for a JSON protocol: read the framed body, decode it, hand it to a
+ * parser, and frame the reply — one seam, stacked on top of {@link registerRpcHandler}, which
+ * still owns the budgeted success close and the synchronous error `abort()`.
+ *
+ * **The drop/abort rule, stated once here instead of per handler.**
+ * - *Frame-level failure aborts.* Truncation, {@link PayloadTooLargeError}, a reset — the stream
+ *   is already broken, or the remote is misbehaving at the framing layer. These propagate out of
+ *   this seam into `registerRpcHandler`'s error arm, which aborts, exactly as before.
+ * - *Body-level failure closes.* Undecodable JSON, a non-object top level, a parser rejection, an
+ *   identity mismatch (`serve` returning `undefined`). The peer framed correctly and is alive;
+ *   the message is worthless. The handler returns normally without replying, so the seam's
+ *   budgeted `close()` runs — and `onMalformed` has already counted the drop. This is the plan's
+ *   "a validator failure must be a drop, never an abort", and it subsumes the pre-existing
+ *   identity-mismatch behavior rather than adding a second path beside it.
+ *
+ * Two overloads, because two of the five FRET protocols read no request body (ping, and the
+ * neighbors *request*): forcing a body-less protocol through a decode step would be worse than
+ * the repetition it removes. `'parse' in opts` is the discriminator — the reply-only shape has no
+ * `parse` key, so TypeScript narrows on it.
+ *
+ * maybeAct is deliberately **not** on this seam: its rate-limit bucket must be taken before any
+ * per-message work, and this seam parses inside the handler body. See the `NOTE:` at its
+ * registration in `FretService.registerRpcHandlers`.
+ */
+export function registerJsonHandler<Req, Res>(node: Libp2p, protocol: string, opts: JsonRequestHandlerOpts<Req, Res>): Promise<void>;
+export function registerJsonHandler<Res>(node: Libp2p, protocol: string, opts: JsonReplyOnlyHandlerOpts<Res>): Promise<void>;
+export function registerJsonHandler(
+	node: Libp2p,
+	protocol: string,
+	opts: JsonRequestHandlerOpts<unknown, unknown> | JsonReplyOnlyHandlerOpts<unknown>
+): Promise<void> {
+	return registerRpcHandler(node, protocol, async (stream, connection) => {
+		if (!('parse' in opts)) {
+			// Reply-only: reads no body at all, so there is nothing to decode or parse.
+			sendFramed(stream, await encodeJson(await opts.serve(connection)));
+			return;
+		}
+		// Frame-level failures propagate — see the abort half of the rule above.
+		const bytes = await readFramed(stream, opts.maxBytes);
+		let decoded: unknown;
+		try {
+			decoded = await decodeJson(bytes);
+		} catch (err) {
+			opts.onMalformed?.('decode');
+			log.error('%s: undecodable body - dropping - %e', protocol, err);
+			return;
+		}
+		const msg = opts.parse(decoded);
+		if (msg === undefined) {
+			opts.onMalformed?.('parse');
+			log.error('%s: body rejected by parser - dropping', protocol);
+			return;
+		}
+		const res = await opts.serve(msg, connection);
+		// Drop without replying; the seam still closes.
+		if (res === undefined) return;
+		sendFramed(stream, await encodeJson(res));
+	}, { closeBudgetMs: opts.closeBudgetMs });
 }
 
 /**

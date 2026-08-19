@@ -14,6 +14,7 @@ import { coordToBase64url, hashKey } from '../src/ring/hash.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { NearAnchorV1, NeighborSnapshotV1 } from '../src/index.js'
 import * as lp from 'it-length-prefixed'
+import { toString as u8ToString } from 'uint8arrays/to-string'
 import type { Uint8ArrayList } from 'uint8arraylist'
 
 // Fault isolation for the *receive* side of every FRET protocol. Before `registerRpcHandler`
@@ -40,6 +41,24 @@ const dec = new TextDecoder()
 
 const NETWORK = 'fuzz-test'
 const P = makeProtocols(NETWORK)
+
+/**
+ * A parseable Ed25519 peer id string built from `seed`: an identity multihash (0x00, len 0x24)
+ * over a protobuf-encoded public key (0x08 0x01 0x12 0x20 + 32 key bytes), base58btc-encoded.
+ * The bytes need not be a real curve point — `peerIdFromString` parses, it does not verify —
+ * but they must be *shaped* like a peer id, because the wire-shape parsers reject a `from`
+ * that will not parse before any handler-level identity check runs.
+ */
+function peerIdStr(seed: number): string {
+	const mh = new Uint8Array(38)
+	mh.set([0x00, 0x24, 0x08, 0x01, 0x12, 0x20], 0)
+	mh.fill(seed, 6)
+	return u8ToString(mh, 'base58btc')
+}
+
+/** Two distinct, parseable peer ids: 'who the message claims' vs 'who the transport says'. */
+const PEER_CLAIMED = peerIdStr(1)
+const PEER_ACTUAL = peerIdStr(2)
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
@@ -357,9 +376,9 @@ describe('RPC handler fault isolation', function () {
 			let leaveCalls = 0
 			let mismatches = 0
 			await registerLeave(node, () => { leaveCalls++ }, P.PROTOCOL_LEAVE, () => { mismatches++ })
-			const s = inboundStub([json({ v: 1, from: 'peer-impostor', timestamp: Date.now() })])
+			const s = inboundStub([json({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() })])
 
-			await invoke(P.PROTOCOL_LEAVE, s.stream, 'peer-actual')
+			await invoke(P.PROTOCOL_LEAVE, s.stream, PEER_ACTUAL)
 
 			// The drop is a normal outcome, not a failure.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
@@ -372,9 +391,9 @@ describe('RPC handler fault isolation', function () {
 			const { node, invoke } = fakeNode()
 			let notice: LeaveNoticeV1 | undefined
 			await registerLeave(node, (n) => { notice = n }, P.PROTOCOL_LEAVE)
-			const s = inboundStub([json({ v: 1, from: 'peer-a', replacements: 5, timestamp: Date.now() })])
+			const s = inboundStub([json({ v: 1, from: PEER_ACTUAL, replacements: 5, timestamp: Date.now() })])
 
-			await invoke(P.PROTOCOL_LEAVE, s.stream, 'peer-a')
+			await invoke(P.PROTOCOL_LEAVE, s.stream, PEER_ACTUAL)
 
 			// `sanitizeReplacements` used to reach `.slice` on the number and throw out of the
 			// handler; now a non-array is simply not a replacement list.
@@ -384,15 +403,19 @@ describe('RPC handler fault isolation', function () {
 			expect(reply.ok).to.equal(true)
 		})
 
-		it('aborts once on a non-JSON leave body', async () => {
+		it('closes — never aborts — a non-JSON leave body', async () => {
 			const { node, invoke } = fakeNode()
 			let leaveCalls = 0
 			await registerLeave(node, () => { leaveCalls++ }, P.PROTOCOL_LEAVE)
 			const s = inboundStub([framed('!!! definitely not json !!!')])
 
-			await invoke(P.PROTOCOL_LEAVE, s.stream, 'peer-a')
+			await invoke(P.PROTOCOL_LEAVE, s.stream, PEER_ACTUAL)
 
-			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 0, aborts: 1 })
+			// The body arrived as one well-formed *frame*, so this is a body-level failure, not a
+			// frame-level one: `registerJsonHandler` drops it and lets the seam close. Framing
+			// failures (truncation, over-cap) still abort — see the truncation cases above.
+			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
+			expect(s.sends, 'no reply for a dropped notice').to.equal(0)
 			expect(leaveCalls).to.equal(0)
 		})
 
@@ -408,10 +431,10 @@ describe('RPC handler fault isolation', function () {
 				128 * 1024,
 				() => { mismatches++ }
 			)
-			const snap = { v: 1, from: 'peer-impostor', timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
+			const snap = { v: 1, from: PEER_CLAIMED, timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
 			const s = inboundStub([json(snap)])
 
-			await invoke(P.PROTOCOL_NEIGHBORS_ANNOUNCE, s.stream, 'peer-actual')
+			await invoke(P.PROTOCOL_NEIGHBORS_ANNOUNCE, s.stream, PEER_ACTUAL)
 
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 			expect(announces, 'onAnnounce never ran').to.equal(0)
@@ -628,11 +651,22 @@ describe('RPC handler fault isolation', function () {
 	async function sendRaw(sender: Libp2p, target: PeerId, protocol: string, payload: string | Uint8Array): Promise<RawResult> {
 		const bytes = typeof payload === 'string' ? enc.encode(payload) : payload
 		const stream = await sender.dialProtocol(target, [protocol])
+		stream.send(lp.encode.single(bytes))
+		// Start the read *before* the half-close, then await both. Order matters in both
+		// directions: `readFramed` subscribes to the stream's one-shot close events when its
+		// iteration starts, so closing first can lose a reply from a handler that reads no
+		// request body (ping, the neighbors request) and therefore answers a few ticks later;
+		// while not closing at all strands the receiver, whose own budgeted close waits on our
+		// write end. FRET framing carries the body length in-band, so the close is never what
+		// delimits a message.
+		const reading = readFramed(stream, 1024 * 1024, 3000)
+		const closing = stream.close().catch(() => { /* the read outcome is what this reports */ })
 		try {
-			stream.send(lp.encode.single(bytes))
-			await stream.close()
-			return { kind: 'reply', bytes: await readFramed(stream, 1024 * 1024, 3000) }
+			const reply = await reading
+			await closing
+			return { kind: 'reply', bytes: reply }
 		} catch (err) {
+			await closing
 			if (isFrameTruncationError(err)) return { kind: 'eof' }
 			try { stream.abort(new Error('sendRaw: receiver aborted')) } catch { /* already gone */ }
 			return { kind: 'abort' }
@@ -672,12 +706,20 @@ describe('RPC handler fault isolation', function () {
 			{ name: 'maybeAct: numeric breadcrumbs', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ breadcrumbs: 5 })), expect: 'reject' },
 			{ name: 'maybeAct: string want_k', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ want_k: 'abc' })), expect: 'reject' },
 			{ name: 'maybeAct: numeric activity', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ activity: 5 })), expect: 'reject' },
-			{ name: 'leave: non-JSON', protocol: P.PROTOCOL_LEAVE, payload: () => 'total garbage', expect: 'abort' },
+			// A well-formed frame whose *body* will not decode is a body-level failure under
+			// `registerJsonHandler`, so it drops (close, no reply) rather than aborting. Framing
+			// failures still abort — see the maybeAct rows above, which are not on that seam.
+			{ name: 'leave: non-JSON', protocol: P.PROTOCOL_LEAVE, payload: () => 'total garbage', expect: 'drop' },
 			{ name: 'leave: numeric replacements', protocol: P.PROTOCOL_LEAVE, payload: (senderId) => JSON.stringify({ v: 1, from: senderId, replacements: 5, timestamp: Date.now() }), expect: 'ok' },
-			{ name: 'leave: from mismatch', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: 'someone-else', timestamp: Date.now() }), expect: 'drop' },
+			// A *parseable* peer id that is not the sender: the wire-shape parser refuses an
+			// unparseable `from` before the handler's identity check ever runs, so a placeholder
+			// here would count as `malformed` and never reach the mismatch path it is testing.
+			{ name: 'leave: from mismatch', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() }), expect: 'drop' },
 			{ name: 'leave: from absent', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, timestamp: Date.now() }), expect: 'drop' },
-			{ name: 'announce: null top level', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => 'null', expect: 'abort' },
-			{ name: 'announce: from mismatch', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => JSON.stringify({ v: 1, from: 'someone-else', timestamp: Date.now(), successors: [], predecessors: [], sig: '' }), expect: 'drop' },
+			// Same body-level rule as the leave rows: a decodable frame carrying an undecodable
+			// body drops rather than aborting.
+			{ name: 'announce: null top level', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => 'null', expect: 'drop' },
+			{ name: 'announce: from mismatch', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now(), successors: [], predecessors: [], sig: '' }), expect: 'drop' },
 			{ name: 'neighbors: garbage body ignored', protocol: P.PROTOCOL_NEIGHBORS, payload: () => 'garbage the request handler never reads', expect: 'ok' },
 			{ name: 'ping: garbage body ignored', protocol: P.PROTOCOL_PING, payload: () => 'garbage the ping handler never reads', expect: 'ok' },
 		]
@@ -747,8 +789,14 @@ describe('RPC handler fault isolation', function () {
 		const after = svc.getDiagnostics().rejected
 		const rejectRows = rows.filter((r) => r.expect === 'reject').length
 		const dropRows = rows.filter((r) => r.expect === 'drop').length
-		expect(after.malformed - before.malformed, 'every validator rejection counted').to.equal(rejectRows)
-		expect(after.identityMismatch - before.identityMismatch, 'every identity drop counted').to.equal(dropRows)
+		// Body-level drops split two ways now that leave/announce run on `registerJsonHandler`:
+		// a body the parser refuses counts `malformed` (alongside the maybeAct validator rows),
+		// while a well-formed body whose `from` is not the transport-authenticated sender still
+		// counts `identityMismatch`. Naming the identity rows keeps both sides honest.
+		const identityRows = rows.filter((r) => r.name.endsWith('from mismatch')).length
+		const parserDropRows = dropRows - identityRows
+		expect(after.malformed - before.malformed, 'every validator and parser rejection counted').to.equal(rejectRows + parserDropRows)
+		expect(after.identityMismatch - before.identityMismatch, 'every identity drop counted').to.equal(identityRows)
 	}
 
 	describe('over the memory transport', () => {

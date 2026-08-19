@@ -1,10 +1,8 @@
 import type { Libp2p } from 'libp2p';
 import {
 	PROTOCOL_PING,
-	encodeJson,
 	decodeJson,
-	sendFramed,
-	registerRpcHandler,
+	registerJsonHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
 import type { RpcOutcome } from './outcome.js';
@@ -31,13 +29,18 @@ export async function registerPing(
 	// Ping carries no `from`, but the connection's remote peer is transport-authenticated —
 	// and reaching this handler at all means the remote dialed *this network's* namespaced
 	// protocol. `onInbound` hands that proof to the caller.
-	// Errors and stream release belong to `registerRpcHandler` — the reply tail below used to
-	// sit outside any try at all, so a reset stream rejected the handler promise unlogged.
-	// The body deliberately does not close: the seam's close carries a budget, and a bare
-	// `close()` here would block on a remote that stops reading and pre-empt that budget.
-	await registerRpcHandler(node, protocol, async (stream, connection) => {
-		onInbound?.(connection.remotePeer.toString());
-		sendFramed(stream, await encodeJson(await pingReply(getSizeEstimate)));
+	// Reply-only: this protocol reads no request body, so it takes the body-less overload of
+	// `registerJsonHandler` — a decode step here would be pure ceremony. Encoding, errors and
+	// stream release (including the budgeted close) belong to the seam, not this body.
+	await registerJsonHandler(node, protocol, {
+		// Deliberately not an `async` arrow: it returns `pingReply`'s promise directly. `sendPing`
+		// writes no request body, so this reply is the first thing on the stream and every extra
+		// async hop between the handler being invoked and the frame being written is one the
+		// caller spends waiting on a stream it has not finished negotiating.
+		serve: (connection) => {
+			onInbound?.(connection.remotePeer.toString());
+			return pingReply(getSizeEstimate);
+		},
 	});
 }
 
