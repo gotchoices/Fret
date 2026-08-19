@@ -90,6 +90,12 @@ function randomToken(): string {
  *
  * A weaker or staler signal never overrides a stronger, more recent one; the ordering is
  * enforced in one place, `FretService.applyMembershipSignal`.
+ *
+ * `rpc-success` is about the *round trip*, not the reply body: a reply that says `ok: false`,
+ * `busy`, or that will not decode still reached us over `/optimystic/<network>/fret/...`, which
+ * only this network's peers serve. Those arms therefore raise the signal too, through
+ * `FretService.noteAnsweredOnProtocol` rather than through `applySuccess` — same membership
+ * proof, no relevance credit for an unusable answer.
  */
 type MembershipSignal =
 	| 'rpc-success'
@@ -632,6 +638,28 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * The remote *answered on this network's namespaced protocol* — a framed reply came back,
+	 * whatever it said: `ok: false`, `busy`, or bytes that would not decode.
+	 *
+	 * Weaker than {@link applySuccess}: no relevance credit and no latency sample, because the
+	 * reply itself was unusable. But the two facts it does carry are unambiguous, and they are
+	 * exactly the strong-evidence row of the table in docs/fret.md. Reaching the reply at all
+	 * means the peer negotiated `/optimystic/<network>/fret/...`, which only this network's peers
+	 * serve, so it is a member; and the bytes coming back prove it is reachable, which clears any
+	 * contact-failure run. Reply *contents* are evidence about the peer's load or its encoder —
+	 * never about which network it belongs to.
+	 *
+	 * Called from the passes whose job is classification and liveness bookkeeping. The passes that
+	 * deliberately score nothing at all — the warm-up fan-out, `fetchAndMergeSnapshot`'s
+	 * answered-badly arm — stay score-free; the table says a completed RPC *may* set `member`, not
+	 * that every site must.
+	 */
+	private noteAnsweredOnProtocol(id: string): void {
+		this.applyMembershipSignal(id, 'rpc-success');
+		this.noteProofOfLife(id);
+	}
+
+	/**
 	 * Record that the transport connection to `id` closed.
 	 *
 	 * `dead` is a liveness *verdict*, not a connection state, so a disconnect must never overwrite
@@ -675,7 +703,10 @@ export class FretService implements IFretService, Startable {
 					await this.applyContactFailure(id, await this.coordOf(id));
 					return;
 				case 'decode-error':
-					// Proof of life answering badly: relevance decay only, never a strike.
+					// Answering badly is still answering: relevance decays, but the reply reached us
+					// over our own namespaced protocol, so it is membership proof and proof of life
+					// alike — never a strike.
+					this.noteAnsweredOnProtocol(id);
 					await this.applyFailure(id, await this.coordOf(id));
 					return;
 				default:
@@ -1991,16 +2022,20 @@ export class FretService implements IFretService, Startable {
 						await this.applySuccess(id, await this.coordOf(id), out.rttMs);
 						this.diag.pingsOk++;
 					} else {
-						// The peer's own negative pong: alive — decay relevance only, never a strike.
+						// The peer's own negative pong: alive and on our protocol — decay relevance
+						// only, never a strike.
+						this.noteAnsweredOnProtocol(id);
 						await this.applyFailure(id, await this.coordOf(id));
 						this.diag.pingsFail++;
 					}
 					return;
 				case 'busy':
 					// Deliberate NEW behavior: the near pass records backoff for busy alone; timeout
-					// and unreachable still record none here (failure-recovery.spec pins that).
+					// and unreachable still record none here (failure-recovery.spec pins that). Busy
+					// is still an answer on our protocol, so membership and liveness are confirmed.
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
+					this.noteAnsweredOnProtocol(id);
 					this.recordBackoff(id);
 					return;
 				case 'decode-error':
@@ -2162,16 +2197,22 @@ export class FretService implements IFretService, Startable {
 						this.diag.pingsOk++;
 						this.clearBackoff(id);
 					} else {
-						// Negative pong — ambiguous; leave unknown and back off briefly (today's parity).
+						// Negative pong: the reply is not usable, but it arrived on our namespaced
+						// protocol, so it settles membership and liveness all the same. Back off
+						// briefly — a peer answering `ok: false` has nothing to tell us yet.
 						this.diag.pingsFail++;
+						this.noteAnsweredOnProtocol(id);
 						this.recordBackoff(id);
 					}
 					return;
 				case 'busy':
 				case 'decode-error':
-					// Today's ambiguous `!res.ok` branch: answered but unusable — back off, no strike.
+					// Answered but unusable — back off, no strike. Same reasoning as the negative
+					// pong: reply *contents* say nothing about which network the peer serves, and
+					// reaching a reply at all proves it serves ours.
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
+					this.noteAnsweredOnProtocol(id);
 					this.recordBackoff(id);
 					return;
 				case 'foreign-protocol':
