@@ -2,6 +2,7 @@ import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import * as lp from 'it-length-prefixed'
 import { createMemNode, stopAll } from './libp2p.js'
 import { FretService } from '../../src/service/fret-service.js'
 import { DigitreeStore, type MembershipState, type PeerPatch } from '../../src/store/digitree-store.js'
@@ -111,11 +112,13 @@ export class PeerRig {
 		)
 	}
 
-	private reply(id: string, protocol: string): Promise<Uint8Array> {
-		if (protocol === this.pingProtocol) return encodeJson({ ok: true, ts: Date.now() })
+	private async reply(id: string, protocol: string): Promise<Uint8Array> {
+		// Senders read replies with `readFramed`, so the stub must frame its body exactly like
+		// `sendFramed` does — raw JSON would have its first byte parsed as a varint length prefix.
+		if (protocol === this.pingProtocol) return lp.encode.single(await encodeJson({ ok: true, ts: Date.now() })).subarray()
 		if (protocol === this.neighborsProtocol) {
 			const snap: NeighborSnapshotV1 = { v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }
-			return encodeJson(snap)
+			return lp.encode.single(await encodeJson(snap)).subarray()
 		}
 		return Promise.reject(new Error(`unexpected protocol opened during a maintenance pass: ${protocol}`))
 	}
