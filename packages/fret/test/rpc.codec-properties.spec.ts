@@ -8,7 +8,8 @@ import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { decodeJson, encodeJson, makeProtocols, readAllBounded } from '../src/rpc/protocols.js'
+import * as lp from 'it-length-prefixed'
+import { decodeJson, encodeJson, makeProtocols, readFramed, sendFramed } from '../src/rpc/protocols.js'
 import {
 	COORD_BYTES,
 	base64urlToCoord,
@@ -29,7 +30,7 @@ import type { BusyResponseV1, NearAnchorV1, NeighborSnapshotV1 } from '../src/in
 //   1. The codec is lossless — `encodeJson` → `decodeJson` is the identity on every value the wire
 //      formats in `docs/fret.md` admit, and the coordinate codecs round-trip and reject.
 //   2. The byte caps bite *before* a full parse — measured as how much of the source
-//      `readAllBounded` consumed, not inferred from the absence of a crash.
+//      `readFramed` consumed, not inferred from the absence of a crash.
 //   3. The five inbound token buckets bound what they claim to, each in the form its own protocol
 //      makes observable.
 //
