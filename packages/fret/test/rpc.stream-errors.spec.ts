@@ -323,8 +323,9 @@ describe('RPC stream failures', function () {
 			expect(release(s), 'released once, by close').to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		// Zero bytes and some bytes take different paths through `readAllBounded` (`len` 0 vs not),
-		// and only the second has a partial buffer that *could* be mis-returned.
+		// A reset before any bytes and one mid-frame take different paths through `readFramed`
+		// (no length prefix yet vs a partially-read frame), and only the second has partial
+		// data that *could* be mis-returned.
 		it('sendPing propagates a reset that lands before any bytes', async () => {
 			const s = resetsAfter()
 

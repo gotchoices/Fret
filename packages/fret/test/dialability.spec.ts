@@ -182,7 +182,7 @@ describe('dialability guard on outbound RPC', function () {
 	// *reachable* hop instead of dead-ending on an unreachable nearest one. Ghosts sit closest
 	// to the key; B is farther but connected, and must be the hop that gets used.
 	// NOTE: the forward below is a real request/response over two libp2p nodes, bounded by
-	// `readAllBounded`'s 5s overall read deadline (src/rpc/protocols.ts) with no retry. Not
+	// `readFramed`'s 5s overall read deadline (src/rpc/protocols.ts) with no retry. Not
 	// observed to fail; this spec's success still depends on that deadline in principle.
 	it('routeAct forwards to the reachable candidate when nearer ones are undialable', async () => {
 		const nodeA = await createMemNode(); await nodeA.start()
