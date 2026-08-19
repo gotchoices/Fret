@@ -772,12 +772,12 @@ describe('RPC codec properties', function () {
 	// ---------------------------------------------------------------------------------------------
 	// Handler-level byte caps, over a real connection.
 	//
-	// NOTE: the wire cap for maybeAct (Core 512 KB / Edge 256 KB, `maxBytesMaybeAct`) and the
-	// service's own activity cap (a fixed 128 KB, checked in `handleMaybeAct` *after* the whole body
-	// is buffered) disagree by 4× on Core. That gap is deliberately pinned here, not closed: it is
-	// an open arm of `plan/15-rpc-shared-helper` ("tighten each RPC's max-bytes to the real
-	// ceiling"). The tests below use the Edge profile so the wire cap is 256 KB and the payloads
-	// stay small enough to send quickly; the arithmetic is the same on Core.
+	// The maybeAct wire cap and the service's own activity cap are now one derived number rather
+	// than two that can disagree: `maxBytesMaybeAct() = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES`
+	// (both exported from `src/rpc/validate.ts`), 144 KiB on both profiles. The neighbors wire cap
+	// is 16 KiB Core / 8 KiB Edge. The assertions below pin those current, tightened caps. The tests
+	// use the Edge profile so payloads stay small enough to send quickly; the arithmetic is the same
+	// on Core.
 	// ---------------------------------------------------------------------------------------------
 	describe('byte caps at the handler', () => {
 		interface WireRig {
