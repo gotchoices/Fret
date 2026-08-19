@@ -1,6 +1,10 @@
 import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
+import * as lp from 'it-length-prefixed'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService, selectDiverseSample } from '../src/service/fret-service.js'
 import { DigitreeStore } from '../src/store/digitree-store.js'
 import { assembleCohort } from '../src/service/cohort.js'
@@ -8,6 +12,7 @@ import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { createSparsityModel } from '../src/store/relevance.js'
 import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
+import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import type { RouteAndMaybeActV1, RouteProgress } from '../src/index.js'
 
 // A peer that repeatedly cannot be reached is marked `dead`; any proof that it is alive clears
@@ -721,6 +726,117 @@ describe('dead state: through a real outbound RPC call site', () => {
 		} finally {
 			await otherSvc.stop()
 		}
+	})
+})
+
+// The block above pins the *unreachable* arm through a real sender; this pins the *answered
+// badly* arm — the headline behavior fix of the sender migration. A peer that keeps answering,
+// however badly, is demonstrably alive: `sendMaybeAct` returns `decode-error` for a truncated
+// reply and `noteRpcFailure` books relevance decay alone, so a run of three bad answers must
+// never mark the hop dead. (Before the migration the truncation propagated as a throw, every
+// non-negotiate throw was classified as unreachability, and this exact run killed a live peer.)
+// The store-level mirror is "does not strike on a bare relevance decay" above;
+// `rpc.stream-errors.spec.ts` pins the single-reply booking. The service owns the node here, so
+// the stub reply is injected by overriding `node.getConnections` — the same per-peer device that
+// file and `test/helpers/maintenance-rig.ts` use.
+describe('dead state: a run of answered-but-undecodable replies', () => {
+	let node: Libp2p
+	let svc: CoreFretService
+	let store: DigitreeStore
+	let originalGetConnections: (pid?: PeerId) => Connection[]
+	let served: Stream | undefined
+
+	const enc = new TextEncoder()
+	/** A NearAnchor reply framed and then truncated mid-body, so the frame can never complete. */
+	const HALF_NEAR_ANCHOR = (() => {
+		const full = enc.encode(JSON.stringify({
+			v: 1, anchors: ['ghost-anchor'], cohort_hint: [], estimated_cluster_size: 1, confidence: 0.5,
+		}))
+		const framed = lp.encode.single(full).subarray()
+		const prefixLen = framed.length - full.length
+		return framed.subarray(0, prefixLen + Math.floor(full.length / 2))
+	})()
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Not started: a live stabilization loop would probe the seeded hop on its own schedule and
+		// make the counts below non-deterministic.
+		svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		store = svc.getStore()
+		served = undefined
+		originalGetConnections = node.getConnections.bind(node) as (pid?: PeerId) => Connection[]
+		;(node as unknown as { getConnections: (pid?: PeerId) => Connection[] }).getConnections =
+			(pid?: PeerId): Connection[] => {
+				if (pid == null || served == null) return []
+				return [{
+					status: 'open',
+					remoteAddr: { toString: () => '/memory/stub' },
+					newStream: async () => served!,
+				}] as unknown as Connection[]
+			}
+	})
+
+	afterEach(async () => {
+		;(node as unknown as { getConnections: (pid?: PeerId) => Connection[] }).getConnections = originalGetConnections
+		try { await svc.stop() } catch {}
+		await stopAll([node])
+	})
+
+	/** Serve a fresh reply script: half a framed NearAnchor, then a tidy EOF. */
+	function serveHalfReply(): void {
+		let step = 0
+		served = {
+			id: 'stub-stream',
+			send: (): boolean => true,
+			close: async (): Promise<void> => {},
+			abort: (): void => {},
+			[Symbol.asyncIterator]: () => ({
+				next: async (): Promise<IteratorResult<Uint8Array>> =>
+					step++ === 0 ? { done: false, value: HALF_NEAR_ANCHOR } : { done: true, value: undefined },
+			}),
+		} as unknown as Stream
+	}
+
+	it('never marks a hop dead for a run of three truncated replies', async () => {
+		const keyBytes = enc.encode('bad-reply-run-key')
+		// One live member immediately clockwise of the key — the only candidate, so the forward hop
+		// is deterministic. Self is not in the store, so the message must forward rather than act.
+		// A real Ed25519 id matters: `sendMaybeAct` parses it before the try, outside the outcome.
+		const pid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'))
+		const hop = pid.toString()
+		store.upsert(hop, ringOffset(await hashKey(keyBytes), 1))
+		store.setMembership(hop, 'member')
+		;(svc as unknown as { setAddressKnown(id: string, known: boolean): void }).setAddressKnown(hop, true)
+
+		const before = svc.getDiagnostics().maybeActForwarded
+		for (let i = 0; i < 3; i++) {
+			serveHalfReply()
+			const msg: RouteAndMaybeActV1 = {
+				v: 1,
+				key: coordToBase64url(keyBytes),
+				want_k: 2,
+				ttl: 4,
+				min_sigs: 1,
+				correlation_id: `bad-reply-run-${i}`,
+				timestamp: Date.now(),
+				signature: '',
+			}
+			await svc.routeAct(msg)
+			// Stand in for the ≥500 ms spacing interval, and clear the forward path's backoff so the
+			// selector picks the same hop again.
+			store.update(hop, { lastContactFailureAt: 0 })
+			;(svc as unknown as { clearBackoff(id: string): void }).clearBackoff(hop)
+		}
+
+		// The counter increments just before the send, so it proves all three runs really took the
+		// forward path rather than being answered in-cluster or deduped.
+		expect(svc.getDiagnostics().maybeActForwarded, 'all three runs took the forward path').to.equal(before + 3)
+		const e = store.getById(hop)!
+		expect(e.failureCount, 'each bad answer decayed relevance').to.equal(3)
+		expect(e.contactFailures, 'an answered reply is never a failed contact').to.equal(0)
+		expect(e.state, 'a peer that answers is alive').to.not.equal('dead')
+		expect(e.membership, 'a decode error never demotes to foreign').to.equal('member')
 	})
 })
 
