@@ -5,7 +5,7 @@ import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { openRpcStream, isLimitedConnection, releaseRpcStream, readFramed } from '../src/rpc/protocols.js'
-import { abortReasonError, DeadlineExpiredError } from '../src/utils/deadline.js'
+import { abortReasonError } from '../src/utils/deadline.js'
 import { registerPing, sendPing } from '../src/rpc/ping.js'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
@@ -389,16 +389,11 @@ describe('RPC deadlines', () => {
 
 	it('sendPing gives up on a dial that never resolves', async () => {
 		const t0 = Date.now()
-		let thrown: unknown
-		try {
-			await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
-		} catch (err) {
-			thrown = err
-		}
+		const res = await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
 		const elapsed = Date.now() - t0
 
 		// The deadline specifically, not some incidental failure: this is what ended the dial.
-		expect(thrown, 'sendPing must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expect(res.kind, 'sendPing must report a timeout rather than hang').to.equal('timeout')
 		expectBounded(elapsed)
 	})
 
@@ -573,26 +568,19 @@ describe('RPC deadlines', () => {
 		expectBounded(Date.now() - t0)
 	})
 
-	it('fetchNeighbors gives up on a newStream that never resolves, returning its fabricated empty snapshot', async () => {
+	it('fetchNeighbors gives up on a newStream that never resolves, reporting a timeout', async () => {
 		const t0 = Date.now()
-		// NOTE: `fetchNeighbors` swallows every failure — timeout included — into a fabricated
-		// empty snapshot, so the caller cannot tell "no neighbors" from "never answered". That is
-		// pre-existing (tracked as `8-rpc-shared-helper`'s "fetchNeighbors fabricates success"
-		// arm), so this asserts on the fabrication plus elapsed time rather than on a rejection.
-		const snap = await fetchNeighbors(makeHangingStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
+		// The stub reports an open connection, so the connection-only default never skips — the
+		// hang is in `newStream`, and the RPC deadline is what ends it.
+		const res = await fetchNeighbors(makeHangingStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
 		const elapsed = Date.now() - t0
 
-		expect(snap.successors, 'successors').to.deep.equal([])
-		expect(snap.predecessors, 'predecessors').to.deep.equal([])
+		expect(res.kind, 'fetchNeighbors must report a timeout, never a fabricated snapshot').to.equal('timeout')
 		expectBounded(elapsed)
 	})
 
-	// The remaining three senders. Each was previously argued correct only from sharing the
-	// `deadline()` + `openRpcStream` + `releaseRpcStream` shape with the two above — but a shape is
-	// not an assertion, and the shapes are not in fact identical: these three also `close()` the
-	// stream, and `close()` is the one await in the sequence that never receives the deadline
-	// signal (tracked as `8-rpc-shared-helper`'s "close() escapes the deadline" arm). What is
-	// common, and what these pin, is that a hanging *open* costs a budget rather than the caller.
+	// The remaining three senders. All ride `rpcRequest`, so a hanging open costs the shared
+	// deadline rather than the caller — asserted per sender because a shape is not an assertion.
 
 	it('sendMaybeAct gives up on a dial that never resolves', async () => {
 		const msg: RouteAndMaybeActV1 = {
@@ -600,50 +588,41 @@ describe('RPC deadlines', () => {
 			correlation_id: 'test-correlation', timestamp: Date.now(), signature: '',
 		}
 		const t0 = Date.now()
-		let thrown: unknown
-		try {
-			await sendMaybeAct(makeHangingDialNode(), peer, msg, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
-		} catch (err) {
-			thrown = err
-		}
+		const res = await sendMaybeAct(makeHangingDialNode(), peer, msg, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
 
-		expect(thrown, 'sendMaybeAct must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expect(res.kind, 'sendMaybeAct must report a timeout rather than hang').to.equal('timeout')
 		expectBounded(Date.now() - t0)
 	})
 
 	it('sendLeave gives up on a dial that never resolves', async () => {
 		const t0 = Date.now()
-		let thrown: unknown
-		try {
-			await sendLeave(
-				makeHangingDialNode(), peer,
-				{ v: 1, from: peer, timestamp: Date.now() },
-				PROTOCOLS[0], { timeoutMs: TIMEOUT_MS }
-			)
-		} catch (err) {
-			thrown = err
-		}
+		const res = await sendLeave(
+			makeHangingDialNode(), peer,
+			{ v: 1, from: peer, timestamp: Date.now() },
+			PROTOCOLS[0], { timeoutMs: TIMEOUT_MS }
+		)
 
 		// This one runs inside `stop()`, so an unbounded open would hold shutdown open per departed
 		// peer — the reason the leave fan-out gets a budget at all.
-		expect(thrown, 'sendLeave must reject rather than hang').to.be.instanceOf(DeadlineExpiredError)
+		expect(res.kind, 'sendLeave must report a timeout rather than hang').to.equal('timeout')
 		expectBounded(Date.now() - t0)
 	})
 
-	it('announceNeighbors gives up on a dial that never resolves, swallowing the timeout', async () => {
+	it('announceNeighbors gives up on a dial that never resolves, reporting the timeout', async () => {
 		const snapshot: NeighborSnapshotV1 = {
 			v: 1, from: peer, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
 		}
 		const t0 = Date.now()
 		// `dial: true` because the default is connection-only, which would return immediately
 		// against a node with no connections and never reach the open at all.
-		await announceNeighbors(
+		const res = await announceNeighbors(
 			makeHangingDialNode(), peer, snapshot, PROTOCOLS[0],
 			{ dial: true, timeoutMs: TIMEOUT_MS }
 		)
 
-		// Announce is fire-and-forget: it logs and resolves rather than throwing, so elapsed time is
-		// the whole assertion here — without the deadline this call never returns.
+		// Announce never throws for a network outcome; elapsed time plus the outcome kind is the
+		// assertion — without the deadline this call never returns.
+		expect(res.kind, 'timeout reported, not swallowed').to.equal('timeout')
 		expectBounded(Date.now() - t0)
 	})
 })
@@ -699,7 +678,8 @@ describe('ping RTT floor', () => {
 		const rtts: number[] = []
 		for (let i = 0; i < 5; i++) {
 			const res = await sendPing(a, b.peerId.toString(), PROTOCOLS[0])
-			expect(res.ok, `ping ${i} succeeded`).to.equal(true)
+			if (res.kind !== 'ok') throw new Error(`ping ${i}: expected ok, got '${res.kind}'`)
+			expect(res.value.ok, `ping ${i} succeeded`).to.equal(true)
 			rtts.push(res.rttMs)
 		}
 		expect(Math.min(...rtts), `min of ${JSON.stringify(rtts)}`).to.be.lessThan(10)
