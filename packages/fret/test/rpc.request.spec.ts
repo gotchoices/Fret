@@ -397,6 +397,21 @@ describe('rpcRequest', function () {
 			expectRelease(s, { closes: 1, aborts: 0 })
 		})
 
+		// Every other case passes an explicit `maxBytes`, so the DEFAULT_MAX_BYTES fallback is only
+		// ever proved *present*. Omitting it against a frame declaring 65537 bytes proves it is
+		// wired to the cap the reader enforces, at the 64 KiB boundary itself.
+		it('with maxBytes omitted the 64 KiB default is the cap that refuses the frame', async () => {
+			const s = serves(new Uint8Array(64 * 1024 + 1))
+
+			const out = await rpcRequest<PingReply>(countingNode(s.stream).node, peer, PROTOCOL, {
+				timeoutMs: TIMEOUT_MS, body: { ping: 1 }, decode: decodePing,
+			})
+
+			expect(expectKind(out, 'decode-error').error.message)
+				.to.equal('payload too large: 65537 exceeds 65536 byte limit')
+			expectRelease(s, { closes: 1, aborts: 0 })
+		})
+
 		it('bytes then silence is timeout, bounded by the budget', async () => {
 			const s = makeStub([
 				{ kind: 'chunk', bytes: framedPartial(REPLY_OK) },
@@ -458,6 +473,27 @@ describe('rpcRequest', function () {
 			expect(decodeCalls, 'busy is tested on the parsed value, before the validator').to.equal(0)
 			expectRelease(s, { closes: 1, aborts: 0 })
 		})
+
+		// `retry_after_ms` is optional on the wire and `decodeReply` guards it with
+		// `typeof retry === 'number'`. Both arms of that guard are `busy` with no hint — never a
+		// decode-error, and never a non-number leaking out as `retryAfterMs`.
+		for (const [label, body] of [
+			['absent', { v: 1, busy: true }],
+			['non-numeric', { v: 1, busy: true, retry_after_ms: 'soon' }],
+		] as const) {
+			it(`a busy reply with ${label} retry_after_ms is busy with no hint`, async () => {
+				const s = serves(enc.encode(JSON.stringify(body)))
+
+				const out = await rpcRequest<PingReply>(countingNode(s.stream).node, peer, PROTOCOL, {
+					timeoutMs: TIMEOUT_MS,
+					body: { ping: 1 },
+					decode: (): PingReply => { throw new Error('decode must not run for a busy reply') },
+				})
+
+				expect(expectKind(out, 'busy').retryAfterMs).to.equal(undefined)
+				expectRelease(s, { closes: 1, aborts: 0 })
+			})
+		}
 
 		it('a decode callback that throws on a good frame is decode-error, and the stream is released', async () => {
 			const s = serves(REPLY_OK)
@@ -765,6 +801,37 @@ describe('rpcRequest', function () {
 
 			expect(expectKind(out, 'unreachable').error.message).to.equal('connection reset by peer')
 			expectRelease(s, { closes: 1, aborts: 0 })
+		})
+	})
+
+	// `15.2b` puts five senders on one shared helper over one node. That is only safe because the
+	// helper keeps no per-call state on the node — every clock, stream and counter is a local of
+	// the call. Two overlapping calls over one node, each served its own stream, is the cheapest
+	// statement of it: both decode their own reply and each releases its own stream exactly once.
+	describe('concurrency', () => {
+		it('two calls over one node do not share state', async () => {
+			const a = serves(enc.encode(JSON.stringify({ ok: true, ts: 1 })))
+			const b = serves(enc.encode(JSON.stringify({ ok: true, ts: 2 })))
+			const streams = [a.stream, b.stream]
+			let issued = 0
+			const { node, calls } = countingNode(undefined, {
+				open: async (): Promise<Stream> => streams[issued++]!,
+			})
+
+			const [outA, outB] = await Promise.all([
+				rpcRequest<PingReply>(node, peer, PROTOCOL, {
+					timeoutMs: TIMEOUT_MS, body: { ping: 1 }, decode: decodePing,
+				}),
+				rpcRequest<PingReply>(node, peer, PROTOCOL, {
+					timeoutMs: TIMEOUT_MS, body: { ping: 2 }, decode: decodePing,
+				}),
+			])
+
+			expect(expectKind(outA, 'ok').value).to.deep.equal({ ok: true, ts: 1 })
+			expect(expectKind(outB, 'ok').value).to.deep.equal({ ok: true, ts: 2 })
+			expect(calls.newStream, 'one stream per call').to.equal(2)
+			expectRelease(a, { closes: 1, aborts: 0 })
+			expectRelease(b, { closes: 1, aborts: 0 })
 		})
 	})
 })

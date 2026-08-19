@@ -211,6 +211,26 @@ export class FrameTruncationError extends Error {
 }
 
 /**
+ * Thrown when a frame's declared length exceeds the caller's `maxBytes` cap — raised at the length
+ * prefix, before any body byte is pulled. Stable `name` for cross-realm matching, exactly like
+ * {@link FrameTruncationError}: without an identity, the only way to recognise this condition was
+ * to match the message text, and a classifier that matches on text is one remote-influenced
+ * message away from misclassifying.
+ */
+export class PayloadTooLargeError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'PayloadTooLargeError';
+	}
+}
+
+/** True for {@link PayloadTooLargeError}. Matches by `name`, as {@link isFrameTruncationError} does. */
+export function isPayloadTooLargeError(err: unknown): boolean {
+	if (err == null || typeof err !== 'object') return false;
+	return (err as { name?: unknown }).name === 'PayloadTooLargeError';
+}
+
+/**
  * True for {@link FrameTruncationError}, or for `it-length-prefixed`'s `UnexpectedEOFError`
  * (a partial varint or partial body still buffered at EOF). The library's error classes are not
  * importable — its `exports` map exposes only `decode`/`encode` — so this matches by `err.name`,
@@ -322,8 +342,10 @@ function remoteFinishedWriting(stream: unknown): boolean {
  * @throws at entry if `timeoutMs` is not a positive number or `Infinity` — `NaN`, `0` and
  * negatives all reach the loop as a hot spin or an instant expiry rather than a budget, and this
  * is an exported entry point a consumer can compute a timeout for.
- * @throws if the deadline expires, `opts.signal` aborts, or the declared length exceeds
- * `maxBytes` — a partial read is an error, never a short-but-valid result. An empty frame
+ * @throws {PayloadTooLargeError} when the declared length exceeds `maxBytes`, raised at the
+ * prefix before any body byte is pulled.
+ * @throws if the deadline expires or `opts.signal` aborts — a partial read is an error, never a
+ * short-but-valid result. An empty frame
  * (prefix `0x00`) is *not* an error here: it returns an empty buffer, and `decodeJson`'s own
  * `empty response` rejection covers it downstream.
  */
@@ -350,7 +372,7 @@ export async function readFramed(
 		maxDataLength: Number.MAX_SAFE_INTEGER,
 		onLength: (declared) => {
 			if (declared > maxBytes) {
-				throw new Error(`payload too large: ${declared} exceeds ${maxBytes} byte limit`);
+				throw new PayloadTooLargeError(`payload too large: ${declared} exceeds ${maxBytes} byte limit`);
 			}
 		},
 	});
@@ -393,7 +415,7 @@ export async function readFramed(
 				// Defensive: an 8-byte varint declaring past 2^53 trips the library's own check before
 				// `onLength` can see the length; report it as the same over-cap failure.
 				if ((err as { name?: unknown } | null)?.name === 'InvalidDataLengthError') {
-					throw new Error(`payload too large: declared length exceeds ${maxBytes} byte limit`);
+					throw new PayloadTooLargeError(`payload too large: declared length exceeds ${maxBytes} byte limit`);
 				}
 				// Everything else — UnexpectedEOFError, InvalidDataLengthLengthError, the `onLength`
 				// cap above, source/reset errors — propagates unchanged.

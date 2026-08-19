@@ -6,6 +6,7 @@ import {
 	decodeJson,
 	encodeJson,
 	isFrameTruncationError,
+	isPayloadTooLargeError,
 	isUnsupportedProtocolError,
 	openRpcStream,
 	readFramed,
@@ -43,7 +44,15 @@ export interface RpcRequestOptions<T> {
 	 * with `!== undefined`, matching the wire contract — `undefined` cannot travel as a value.
 	 */
 	body?: unknown;
-	/** Absent → write-only: no reply is read and `ok.value` is `undefined`. */
+	/**
+	 * Absent → write-only: no reply is read and `ok.value` is `undefined`.
+	 *
+	 * A write-only request can therefore never observe `foreign-protocol`. `openRpcStream` pins
+	 * `negotiateFully: false` (see its own caveat), so an `UnsupportedProtocolError` is deferred
+	 * from the stream open to the first read — and this path returns `ok` right after the write,
+	 * without ever reading. Sending to a peer that does not serve this network's protocol yields
+	 * `ok` and produces no membership evidence.
+	 */
 	decode?: (bytes: Uint8Array) => T | Promise<T>;
 	/** Half-close our write end before reading (the maybeAct flush). Default false. */
 	halfCloseBeforeRead?: boolean;
@@ -72,8 +81,7 @@ function classify(
 	if (callerSignal?.aborted === true) return { kind: 'cancelled' };
 	if (isUnsupportedProtocolError(err)) return { kind: 'foreign-protocol', error: toError(err) };
 	if (isFrameTruncationError(err)) return { kind: 'decode-error', error: toError(err) };
-	const message = err instanceof Error ? err.message : '';
-	if (message.startsWith('payload too large')) return { kind: 'decode-error', error: toError(err) };
+	if (isPayloadTooLargeError(err)) return { kind: 'decode-error', error: toError(err) };
 	if (deadlineSignal.aborted === true || (err as { name?: unknown } | null)?.name === 'DeadlineExpiredError') {
 		return { kind: 'timeout' };
 	}
@@ -189,7 +197,29 @@ function decodeFailure(
  * **Never throws for a network outcome** — every failure mode is an {@link RpcOutcome} variant.
  * It may still throw for a caller bug (a malformed peer id, `dial: 'if-addressed'` with no
  * `isDialable`): those are programming errors, never dressed as `unreachable`.
+ *
+ * Two overloads rather than one signature with an optional `decode`, so a forgotten validator
+ * cannot be *typed* as the reply. A single `rpcRequest<T = undefined>` accepted
+ * `rpcRequest<Snapshot>(node, peer, proto, { body })` — an explicit type argument with no
+ * `decode` — and returned `{ kind: 'ok', value: undefined as Snapshot }`, so the caller read a
+ * property off `undefined` at runtime with nothing to see at compile time.
+ *
+ * This overload is the write-only one: no `decode`, and `T` pinned to `undefined` so an explicit
+ * type argument cannot reach it.
  */
+export function rpcRequest(
+	node: Libp2p,
+	peer: string,
+	protocol: string,
+	opts?: RpcRequestOptions<undefined>
+): Promise<RpcOutcome<undefined>>;
+/** With `decode` → the reply type comes from the validator. */
+export function rpcRequest<T>(
+	node: Libp2p,
+	peer: string,
+	protocol: string,
+	opts: RpcRequestOptions<T> & { decode: (bytes: Uint8Array) => T | Promise<T> }
+): Promise<RpcOutcome<T>>;
 export async function rpcRequest<T = undefined>(
 	node: Libp2p,
 	peer: string,
