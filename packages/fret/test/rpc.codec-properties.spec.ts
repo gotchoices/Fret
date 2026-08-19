@@ -25,6 +25,9 @@ import type { PingResponseV1 } from '../src/rpc/ping.js'
 import {
 	MAX_ACTIVITY_BYTES,
 	MAYBE_ACT_OVERHEAD_BYTES,
+	MAX_NEIGHBORS_BYTES,
+	MAX_SNAPSHOT_METADATA_BYTES_CORE,
+	MAX_SNAPSHOT_METADATA_BYTES_EDGE,
 	MAX_BREADCRUMBS,
 	MAX_CORRELATION_ID_CHARS,
 	MAX_DIGEST_CHARS,
@@ -909,7 +912,8 @@ describe('RPC codec properties', function () {
 
 		it('merges an under-cap announce and refuses an over-cap one', async () => {
 			const maxBytes = (rig.svc as unknown as { maxBytesNeighbors(): number }).maxBytesNeighbors()
-			expect(maxBytes, 'edge wire cap').to.equal(8 * 1024)
+			// One acceptance number for both profiles — this rig's service is Edge.
+			expect(maxBytes, 'neighbors wire cap').to.equal(MAX_NEIGHBORS_BYTES)
 
 			const senderId = rig.sender.peerId.toString()
 			const announce = (padChars: number): string => JSON.stringify({
@@ -928,6 +932,20 @@ describe('RPC codec properties', function () {
 				() => rig.svc.getStore().getById(senderId) != null,
 				2000,
 				'the under-cap announce merged'
+			)
+
+			// Arm B of the cross-profile defect: ~11 KiB is over the *old* Edge announce cap of
+			// 8 KiB but inside a legal Core emission (worst case 11,575 bytes). This receiver is
+			// Edge, and it must accept it — its own fetch path already read 16 KiB replies, so the
+			// announce path refusing the identical snapshot was the two paths disagreeing about
+			// one question. Fails on the pre-fix code; that is the repro.
+			rig.svc.getStore().remove(senderId)
+			const coreSized = await sendRaw(rig.receiver.peerId, P.PROTOCOL_NEIGHBORS_ANNOUNCE, announce(11 * 1024))
+			expect(coreSized, 'an edge receiver acknowledges a core-sized announce').to.not.equal(undefined)
+			await waitUntil(
+				() => rig.svc.getStore().getById(senderId) != null,
+				2000,
+				'the core-sized announce merged on an edge receiver'
 			)
 
 			rig.svc.getStore().remove(senderId)
@@ -1011,7 +1029,7 @@ describe('RPC codec properties', function () {
 		// since the refusal happens inside `readFramed` itself before any body byte is pulled.
 		const cases: Array<{ label: string; cap: number }> = [
 			{ label: 'maybeAct (144 KiB, both profiles)', cap: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES },
-			{ label: 'neighbors announce (8 KiB, edge)', cap: 8 * 1024 },
+			{ label: 'neighbors announce (16 KiB, both profiles)', cap: MAX_NEIGHBORS_BYTES },
 			{ label: 'leave (fixed 4096)', cap: 4096 },
 		]
 
@@ -1038,7 +1056,28 @@ describe('RPC codec properties', function () {
 			return `Qm${String(i).padStart(4, '0')}${'x'.repeat(47)}`
 		}
 
-		it('neighbors snapshot at the core merge caps (successors/predecessors 16, sample 8) fits under 16 KiB', async () => {
+		/**
+		 * `metadata` whose `JSON.stringify` is exactly `allowance` bytes — the quantity
+		 * `FretService.snapshot` measures against the profile's metadata budget. A test that
+		 * instead sized the whole snapshot would be measuring a different number than the code.
+		 * `{"m":"xxx…"}` is 8 characters of punctuation plus the payload, all ASCII.
+		 */
+		function metadataAtAllowance(allowance: number): Record<string, unknown> {
+			const value = { m: 'x'.repeat(allowance - 8) }
+			expect(JSON.stringify(value).length, 'metadata sized to the allowance exactly').to.equal(allowance)
+			return value
+		}
+
+		// Both snapshot cases below build the id lists at the *merge* caps (Core 16/16/8, Edge
+		// 8/8/6) rather than the narrower emission caps the service actually uses today (12/12/8,
+		// 6/6/6). That is the conservative direction, and it keeps these cases valid if the
+		// emission caps are ever widened to the merge caps.
+		//
+		// Both assert against `MAX_NEIGHBORS_BYTES`, never a per-profile number: the acceptance cap
+		// bounds what a *peer* may send, and a peer may be running either profile. So the
+		// requirement is "every profile's largest legal emission fits the one cap every peer
+		// applies" — re-splitting the cap per profile fails here rather than on the wire.
+		it('neighbors snapshot at the core merge caps plus a full metadata allowance fits under MAX_NEIGHBORS_BYTES', async () => {
 			const snapshot = {
 				v: 1,
 				from: fakeId(9999),
@@ -1053,11 +1092,12 @@ describe('RPC codec properties', function () {
 				size_estimate: 123456,
 				confidence: 0.87654321,
 				sig: 'x'.repeat(256), // reserved for the unimplemented signature field
+				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_CORE),
 			}
-			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(16 * 1024)
+			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(MAX_NEIGHBORS_BYTES)
 		})
 
-		it('neighbors snapshot at the edge merge caps (successors/predecessors 8, sample 6) fits under 8 KiB', async () => {
+		it('neighbors snapshot at the edge merge caps plus a full metadata allowance fits under MAX_NEIGHBORS_BYTES', async () => {
 			const snapshot = {
 				v: 1,
 				from: fakeId(9999),
@@ -1072,8 +1112,24 @@ describe('RPC codec properties', function () {
 				size_estimate: 123456,
 				confidence: 0.87654321,
 				sig: 'x'.repeat(256),
+				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_EDGE),
 			}
-			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(8 * 1024)
+			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(MAX_NEIGHBORS_BYTES)
+		})
+
+		it('both profiles accept neighbors messages up to the same cap', async () => {
+			// The relation the two cases above rest on: there is one acceptance number, so "fits
+			// under MAX_NEIGHBORS_BYTES" really does mean "every peer will read it". Re-introducing
+			// a profile split fails here rather than silently on the wire.
+			const nodes = await Promise.all([createMemNode(), createMemNode()])
+			try {
+				const caps = (['core', 'edge'] as const).map((profile, i) =>
+					(new CoreFretService(nodes[i]!, { profile, networkName: NETWORK }) as unknown as { maxBytesNeighbors(): number }).maxBytesNeighbors()
+				)
+				expect(caps, 'core and edge apply the same neighbors acceptance cap').to.deep.equal([MAX_NEIGHBORS_BYTES, MAX_NEIGHBORS_BYTES])
+			} finally {
+				await stopAll(nodes)
+			}
 		})
 
 		it('leave notice at MAX_REPLACEMENTS (12) fits under the fixed 4096 cap', async () => {

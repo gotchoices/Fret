@@ -6,7 +6,7 @@ import {
 	registerJsonHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
-import { makeSnapshotParser, parseOrThrow } from './validate.js';
+import { makeSnapshotParser, parseOrThrow, MAX_NEIGHBORS_BYTES } from './validate.js';
 import type { Parser } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { NeighborSnapshotV1, BusyResponseV1 } from '../index.js';
@@ -19,7 +19,7 @@ export async function registerNeighbors(
 	getSnapshot: () => NeighborSnapshotV1 | BusyResponseV1 | Promise<NeighborSnapshotV1 | BusyResponseV1>,
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
-	maxBytes = 16 * 1024,
+	maxBytes = MAX_NEIGHBORS_BYTES,
 	onIdentityMismatch?: (claimed: string, actual: string) => void,
 	onInbound?: (from: string) => void,
 	// Trailing and defaulted so existing positional callers keep compiling (TypeScript forbids a
@@ -111,7 +111,7 @@ export async function fetchNeighbors(
 		signal: opts.signal,
 		timeoutMs: opts.timeoutMs,
 		dial: 'never',
-		maxBytes: 16 * 1024,
+		maxBytes: MAX_NEIGHBORS_BYTES,
 		decode: async (b) => parseOrThrow(parse, await decodeJson(b)),
 	});
 }

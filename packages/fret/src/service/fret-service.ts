@@ -24,6 +24,7 @@ import {
 	parseRouteAndMaybeAct,
 	MAX_ACTIVITY_BYTES,
 	MAYBE_ACT_OVERHEAD_BYTES,
+	MAX_NEIGHBORS_BYTES,
 	MAX_SNAPSHOT_METADATA_BYTES_CORE,
 	MAX_SNAPSHOT_METADATA_BYTES_EDGE,
 } from '../rpc/validate.js';
@@ -1020,7 +1021,10 @@ export class FretService implements IFretService, Startable {
 
 	async ready(): Promise<void> {}
 
-	private maxBytesNeighbors(): number { return this.cfg.profile === 'core' ? 16 * 1024 : 8 * 1024; }
+	// One number for both profiles: this bounds what a *peer* may send us, and Edge and Core peers
+	// talk to each other, so it must cover the largest snapshot any profile can legally emit. Kept
+	// as a method for symmetry with `maxBytesMaybeAct()` below.
+	private maxBytesNeighbors(): number { return MAX_NEIGHBORS_BYTES; }
 	private maxBytesMaybeAct(): number { return MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES; }
 
 	// RPC registration

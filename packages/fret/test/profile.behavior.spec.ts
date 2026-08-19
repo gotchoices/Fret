@@ -3,6 +3,7 @@ import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
+import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
 import { peerDiscoverySymbol } from '@libp2p/interface'
 import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
 
@@ -302,18 +303,21 @@ describe('Profile behavior tests', function () {
 	// ----- Phase 4: Payload size limits -----
 
 	describe('Payload size limits', () => {
-		it('Core maxBytesNeighbors = 16 KB (16384)', async () => {
-			const { node, svc } = await createService('core')
-			expect((svc as any).maxBytesNeighbors()).to.equal(16384)
-			await svc.stop()
-			await node.stop()
-		})
+		// One acceptance number for both profiles: the cap bounds what a *peer* may send us, and
+		// Edge and Core peers talk to each other. A profile split here made a legal Core snapshot
+		// (up to 11,575 bytes) unreadable by every Edge peer, whose cap was 8192.
+		it('maxBytesNeighbors = MAX_NEIGHBORS_BYTES (16384) on both profiles', async () => {
+			const core = await createService('core')
+			expect((core.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
+			await core.svc.stop()
+			await core.node.stop()
 
-		it('Edge maxBytesNeighbors = 8 KB (8192)', async () => {
-			const { node, svc } = await createService('edge')
-			expect((svc as any).maxBytesNeighbors()).to.equal(8192)
-			await svc.stop()
-			await node.stop()
+			const edge = await createService('edge')
+			expect((edge.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
+			await edge.svc.stop()
+			await edge.node.stop()
+
+			expect(MAX_NEIGHBORS_BYTES).to.equal(16384)
 		})
 
 		it('maxBytesMaybeAct = 144 KB (147456) on both profiles', async () => {

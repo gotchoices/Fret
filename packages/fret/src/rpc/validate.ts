@@ -92,12 +92,46 @@ export const MAX_ACTIVITY_BYTES = 128 * 1024;
  *  breadcrumbs * 64 = 4096, signature (reserved, unimplemented) 512, punctuation ~256. Sums to
  *  ~10.5 KiB; rounded up to 16 KiB for headroom. */
 export const MAYBE_ACT_OVERHEAD_BYTES = 16 * 1024;
+/**
+ * Per-message byte cap for both neighbors protocols (request/reply and announce). **One number
+ * for both profiles**, because this is an *acceptance* limit: it bounds the largest message a
+ * *peer* may send us, and Edge and Core peers talk to each other, so it has to cover the largest
+ * snapshot any profile can legitimately emit. Sizing it per-profile — as it was, Core 16 KiB /
+ * Edge 8 KiB — made a legal Core snapshot unreadable by every Edge peer.
+ *
+ * Derived, not picked. The Core worst legal emission, measured by encoding the shape
+ * `FretService.snapshot` produces (53-char peer ids, a 32-byte base64url coordinate per sample
+ * entry, `metadata` grown until `JSON.stringify(metadata)` hits
+ * {@link MAX_SNAPSHOT_METADATA_BYTES_CORE} exactly, and 256 bytes reserved for the still-empty
+ * `sig` field):
+ *
+ *   16 successors + 16 predecessors + 8 sample entries (the *merge* caps, which are wider than
+ *   today's emission caps of 12/12/8)  ....................................  3,371 bytes
+ *   + 8 KiB metadata (including the `,"metadata":` key)  ..................  8,204 bytes
+ *   = 11,575 bytes
+ *
+ * 16 KiB leaves ~4.8 KiB of headroom over that. The 256-byte `sig` reservation is already inside
+ * the number, so landing message signatures does not disturb it.
+ *
+ * The invariant this constant carries, pinned by `test/rpc.codec-properties.spec.ts`: **the
+ * largest legal emission of *any* profile encodes under this cap.** Re-splitting it per profile
+ * breaks that and fails there.
+ */
+export const MAX_NEIGHBORS_BYTES = 16 * 1024;
+
 /** Cap on the encoded size of the caller-supplied `metadata` a Core node attaches to its
- *  outgoing snapshot. Sized so the fixed fields (≤ 12 successors + 12 predecessors + 8 sample
- *  entries ≈ 2.5 KiB) plus this allowance stay under the Core neighbors wire cap. Over-cap
- *  metadata is omitted from the snapshot rather than truncated — see `FretService.snapshot`. */
+ *  outgoing snapshot. This is an **emission budget** — the Core profile's own choice of how much
+ *  application metadata it will carry — not an acceptance limit; acceptance is
+ *  {@link MAX_NEIGHBORS_BYTES}, one network-wide number. The invariant the two budgets must keep
+ *  is `largest emission of any profile <= MAX_NEIGHBORS_BYTES`: at the merge caps the Core fixed
+ *  fields cost 3,371 bytes, so this allowance plus them lands at 11,575, comfortably under.
+ *  Over-cap metadata is omitted from the snapshot rather than truncated — see
+ *  `FretService.snapshot`. */
 export const MAX_SNAPSHOT_METADATA_BYTES_CORE = 8 * 1024;
-/** Same, Edge profile — sized against the Edge neighbors wire cap. */
+/** Same, Edge profile: an emission budget, half of Core's because an edge node carries less.
+ *  Its worst legal emission is 6,301 bytes, also under {@link MAX_NEIGHBORS_BYTES} — which is the
+ *  only bound either budget has to satisfy. Deliberately *not* sized against a per-profile
+ *  acceptance cap; there is no such thing. */
 export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
 
 /**

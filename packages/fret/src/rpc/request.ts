@@ -18,11 +18,12 @@ import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
 
 /**
- * Default declared-length cap for a reply when the caller passes none: 8 KiB, matching the
- * neighbors cap on the Edge profile (`maxBytesNeighbors()`). It is not the smallest cap in the
- * system — `sendPing` passes 1024 — because a default has to be safe for a caller whose reply
- * shape we do not know, and every sender here passes its own cap explicitly. This default only
- * protects a direct consumer who forgot one.
+ * Default declared-length cap for a reply when the caller passes none: 8 KiB. It tracks no other
+ * cap in the system — every FRET sender passes its own explicitly (`sendPing` 1024, the neighbors
+ * senders {@link MAX_NEIGHBORS_BYTES}, maybeAct 144 KiB), so this value is only ever reached by a
+ * direct consumer of `rpcRequest` who forgot one. 8 KiB is chosen as a conservative floor for a
+ * reply whose shape we do not know: large enough that a small JSON reply is never truncated,
+ * small enough that a forgotten cap still bounds the read.
  */
 const DEFAULT_MAX_BYTES = 8 * 1024;
 
