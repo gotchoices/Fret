@@ -80,6 +80,15 @@ describe('package public surface', () => {
 		expect(fretIndex).to.not.have.property('boundedStringArray')
 	})
 
+	it('root entry exports the inbound handler seam', () => {
+		// The receive-side mirror of the outbound seam above, and the same argument: a consumer
+		// wrapping its own protocol over this node otherwise hand-rolls the release rule, and the
+		// hand-rolled copy is what leaks inbound streams. Both halves ship — the raw seam that
+		// owns the budgeted close / error abort, and the framed-JSON layer stacked on it.
+		expect(fretIndex.registerRpcHandler).to.be.a('function')
+		expect(fretIndex.registerJsonHandler).to.be.a('function')
+	})
+
 	it('exports the types the seam signature needs', () => {
 		// Type-level, not runtime: a consumer must be able to name `openRpcStream`'s return type
 		// without reaching past the package root. Fails `tsc --noEmit`, not mocha, if it regresses.
@@ -104,5 +113,17 @@ describe('package public surface', () => {
 		// is what says `undefined` means "rejected" rather than "no value here".
 		const parse: fretIndex.Parser<NearAnchorV1> = fretIndex.parseNearAnchor
 		expect(parse).to.equal(fretIndex.parseNearAnchor)
+		// The inbound seam's two option shapes: without them a consumer can call
+		// `registerJsonHandler` but cannot name the object it is passing, so it cannot build one
+		// in a typed helper of its own. Naming both also pins which overload each selects — the
+		// request shape carries `parse`, the reply-only shape has no `parse` key at all.
+		const jsonReq: fretIndex.JsonRequestHandlerOpts<NearAnchorV1, NearAnchorV1> = {
+			maxBytes: 1024,
+			parse: fretIndex.parseNearAnchor,
+			serve: (msg) => msg,
+		}
+		expect(jsonReq.maxBytes).to.equal(1024)
+		const jsonReplyOnly: fretIndex.JsonReplyOnlyHandlerOpts<{ ok: boolean }> = { serve: () => ({ ok: true }) }
+		expect(jsonReplyOnly).to.not.have.property('parse')
 	})
 })

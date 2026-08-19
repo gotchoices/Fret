@@ -27,6 +27,12 @@ export async function registerNeighbors(
 	// truncate nothing": the default copies no cap numbers from anywhere, and
 	// `Array.prototype.slice(0, Infinity)` is well-defined. `FretService` always supplies
 	// `makeSnapshotParser(this.mergeSnapshotCaps())`, so production truncation is unchanged.
+	// NOTE: the default is therefore reachable only from tests — a caller that omits it silently
+	// gets no truncation. Kept defaulted deliberately: making it required means reordering the
+	// signature past the optional parameters above and updating four test call sites, for a case
+	// production cannot reach. Revisit if a second production caller of `registerNeighbors`
+	// appears, or if this module ever grows an options-bag signature (which would make the
+	// parameter required at no call-site cost).
 	snapshotParser: Parser<NeighborSnapshotV1> = makeSnapshotParser({
 		successors: Number.POSITIVE_INFINITY,
 		predecessors: Number.POSITIVE_INFINITY,

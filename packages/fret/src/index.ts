@@ -160,6 +160,15 @@ export { rpcRequest } from './rpc/request.js';
 export type { RpcRequestOptions } from './rpc/request.js';
 export type { RpcOutcome } from './rpc/outcome.js';
 export type { Stream } from '@libp2p/interface';
+// The receive-side mirror of `rpcRequest`: a consumer wrapping its own protocol over the same
+// libp2p node has exactly the drop-vs-abort and stream-release problem these two solve, and the
+// hand-rolled copy is what leaks streams (a handler that throws mid-message leaves the inbound
+// stream open forever, and streams are counted per protocol per connection). `registerRpcHandler`
+// owns the budgeted success close and the synchronous error `abort()`; `registerJsonHandler`
+// stacks the framed-JSON decode + parse on top of it. Their option interfaces ship with them —
+// without those a consumer cannot name what it is passing.
+export { registerRpcHandler, registerJsonHandler } from './rpc/protocols.js';
+export type { JsonRequestHandlerOpts, JsonReplyOnlyHandlerOpts } from './rpc/protocols.js';
 // The wire-shape parsers are exported for the same reason `registerRpcHandler` / `rpcRequest` /
 // `openRpcStream` are: a consumer registering its own handler over this node otherwise re-derives
 // the shape rules by hand, and a hand-rolled copy is what drifts. They are pure functions with no
