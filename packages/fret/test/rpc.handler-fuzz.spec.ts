@@ -823,6 +823,162 @@ describe('RPC handler fault isolation', function () {
 				]
 			}
 
+			/** The cap `registerAnnounceWithHooks` supplies to `makeSnapshotParser` for `sample`. */
+			const SAMPLE_CAP = 8
+
+			/** A valid 32-byte ring coordinate for a sample entry — any repeated-byte fill decodes cleanly. */
+			function sampleCoord(byte: number): string {
+				return coordToBase64url(new Uint8Array(32).fill(byte))
+			}
+
+			/** A wrong-width "coordinate" string — built with `u8ToString` directly (not `coordToBase64url`,
+			 * which is written for exactly-32-byte input) so an off-width array encodes without complaint and
+			 * the rejection under test is `base64urlToCoord`'s decode-side length check, not an encoder throw. */
+			function wrongWidthCoord(byteLength: number): string {
+				return u8ToString(new Uint8Array(byteLength).fill(3), 'base64url')
+			}
+
+			function sampleEntry(over: Record<string, unknown> = {}): Record<string, unknown> {
+				return { id: 'sample-peer', coord: sampleCoord(9), relevance: 0.5, ...over }
+			}
+
+			const sampleRows: FieldRow[] = [
+				{ name: 'sample: non-array (number)', body: () => snapshot({ sample: 5 }), expect: 'normalize', expectSnapshot: (s) => expect(s.sample).to.deep.equal([]) },
+				{ name: 'sample: non-array (string)', body: () => snapshot({ sample: 'nope' }), expect: 'normalize', expectSnapshot: (s) => expect(s.sample).to.deep.equal([]) },
+				{ name: 'sample: non-array (object)', body: () => snapshot({ sample: { 0: sampleEntry() } }), expect: 'normalize', expectSnapshot: (s) => expect(s.sample).to.deep.equal([]) },
+				{ name: 'sample: non-array (null)', body: () => snapshot({ sample: null }), expect: 'normalize', expectSnapshot: (s) => expect(s.sample).to.deep.equal([]) },
+				{ name: 'sample: missing', body: () => withoutField('sample'), expect: 'normalize', expectSnapshot: (s) => expect(s.sample).to.deep.equal([]) },
+
+				{
+					name: 'sample: entry not a plain object (number)',
+					body: () => snapshot({ sample: [7, sampleEntry({ id: 'ok-1' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-1', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: entry not a plain object (string)',
+					body: () => snapshot({ sample: ['nope', sampleEntry({ id: 'ok-2' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-2', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: entry not a plain object (null)',
+					body: () => snapshot({ sample: [null, sampleEntry({ id: 'ok-3' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-3', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: entry not a plain object (array)',
+					body: () => snapshot({ sample: [['x'], sampleEntry({ id: 'ok-4' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-4', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: id missing',
+					body: () => {
+						const bad = sampleEntry() as Record<string, unknown>
+						delete bad.id
+						return snapshot({ sample: [bad, sampleEntry({ id: 'ok-5' })] })
+					},
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-5', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: id not a string',
+					body: () => snapshot({ sample: [sampleEntry({ id: 5 }), sampleEntry({ id: 'ok-6' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-6', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: coord missing',
+					body: () => {
+						const bad = sampleEntry({ id: 'bad' }) as Record<string, unknown>
+						delete bad.coord
+						return snapshot({ sample: [bad, sampleEntry({ id: 'ok-7' })] })
+					},
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-7', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: coord not a string',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', coord: 5 }), sampleEntry({ id: 'ok-8' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-8', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: relevance missing',
+					body: () => {
+						const bad = sampleEntry({ id: 'bad' }) as Record<string, unknown>
+						delete bad.relevance
+						return snapshot({ sample: [bad, sampleEntry({ id: 'ok-9' })] })
+					},
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-9', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: relevance a string',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', relevance: '0.5' }), sampleEntry({ id: 'ok-10' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-10', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: relevance null',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', relevance: null }), sampleEntry({ id: 'ok-11' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-11', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: coord decodes to the wrong width (too short)',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', coord: wrongWidthCoord(16) }), sampleEntry({ id: 'ok-12' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-12', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: coord decodes to the wrong width (too long)',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', coord: wrongWidthCoord(48) }), sampleEntry({ id: 'ok-13' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-13', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: `sample: over the ${SAMPLE_CAP} cap keeps exactly the first ${SAMPLE_CAP}, in order`,
+					body: () => snapshot({ sample: Array.from({ length: 10 }, (_, i) => sampleEntry({ id: `over-${i}`, coord: sampleCoord(i + 1) })) }),
+					expect: 'normalize',
+					expectSnapshot: (s) =>
+						expect(s.sample).to.deep.equal(Array.from({ length: SAMPLE_CAP }, (_, i) => ({ id: `over-${i}`, coord: sampleCoord(i + 1), relevance: 0.5 }))),
+				},
+			]
+
+			function advisoryNumberRows(field: 'size_estimate' | 'confidence'): FieldRow[] {
+				const expectAbsent = (s: NeighborSnapshotV1): void => {
+					expect(field in s, `${field}: key absent, not present-and-zero`).to.equal(false)
+				}
+				return [
+					{ name: `${field}: wrong type (string)`, body: () => snapshot({ [field]: 'nope' }), expect: 'normalize', expectSnapshot: expectAbsent },
+					{ name: `${field}: null`, body: () => snapshot({ [field]: null }), expect: 'normalize', expectSnapshot: expectAbsent },
+					{ name: `${field}: missing`, body: () => withoutField(field), expect: 'normalize', expectSnapshot: expectAbsent },
+					{
+						name: `${field}: valid finite value survives unchanged`,
+						body: () => snapshot({ [field]: 0.42 }),
+						expect: 'normalize',
+						expectSnapshot: (s) => expect((s as unknown as Record<string, unknown>)[field]).to.equal(0.42),
+					},
+				]
+			}
+
+			const metadataRows: FieldRow[] = [
+				{ name: 'metadata: array', body: () => snapshot({ metadata: ['a'] }), expect: 'normalize', expectSnapshot: (s) => expect('metadata' in s).to.equal(false) },
+				{ name: 'metadata: null', body: () => snapshot({ metadata: null }), expect: 'normalize', expectSnapshot: (s) => expect('metadata' in s).to.equal(false) },
+				{ name: 'metadata: number', body: () => snapshot({ metadata: 5 }), expect: 'normalize', expectSnapshot: (s) => expect('metadata' in s).to.equal(false) },
+				{ name: 'metadata: string', body: () => snapshot({ metadata: 'nope' }), expect: 'normalize', expectSnapshot: (s) => expect('metadata' in s).to.equal(false) },
+				{ name: 'metadata: missing', body: () => withoutField('metadata'), expect: 'normalize', expectSnapshot: (s) => expect('metadata' in s).to.equal(false) },
+				{
+					name: 'metadata: plain object survives unchanged',
+					body: () => snapshot({ metadata: { app: 'test', n: 1 } }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.metadata).to.deep.equal({ app: 'test', n: 1 }),
+				},
+			]
+
 			const rows: FieldRow[] = [
 				{ name: 'from: unparseable string', body: () => snapshot({ from: 'not-a-parseable-peer-id' }), expect: 'reject' },
 				{ name: 'from: empty string', body: () => snapshot({ from: '' }), expect: 'reject' },
@@ -840,6 +996,11 @@ describe('RPC handler fault isolation', function () {
 
 				...succPredRows('successors'),
 				...succPredRows('predecessors'),
+
+				...sampleRows,
+				...advisoryNumberRows('size_estimate'),
+				...advisoryNumberRows('confidence'),
+				...metadataRows,
 
 				// `sig` is deliberately unchecked — message signing is unimplemented, so nothing
 				// reads it. These rows make that decision testable rather than implicit: whatever
