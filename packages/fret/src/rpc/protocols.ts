@@ -371,6 +371,22 @@ function isMessageStream(
  * is raised without waiting for more. The cap is still enforced at the prefix, before any body
  * byte is pulled.
  */
+/**
+ * NOTE: this hand-rolls the varint prefix loop that `@libp2p/utils`'s `lpStream` also implements,
+ * and that duplication is deliberate. Three reasons, in order of weight: (1) the over-cap error
+ * text is pinned by tests and names the *declared* length, which `lpStream` discards — it raises
+ * `InvalidDataLengthError` carrying only its own wording, so using it means a `lengthDecoder` hook
+ * to capture the length plus a catch-and-rewrite of its error; (2) `lpStream`'s prefix loop breaks
+ * out on a null read leaving `dataLength` at −1 and then reads −1 bytes, so its clean-EOF-at-the-
+ * prefix path is not one we want to depend on, where ours raises {@link FrameTruncationError}
+ * there explicitly; (3) the 9-byte prefix short-circuit below is ours. Revisit if `lpStream` ever
+ * surfaces the declared length on its error.
+ *
+ * NOTE: the prefix is read one byte per `await`, up to 9 awaits per frame. Unmeasured, and
+ * `lpStream` reads the prefix the same way, so it is the library's shape too — the cost is
+ * microtask turns against a network round trip. Revisit only if a profile shows framed reads
+ * themselves as hot.
+ */
 async function readFramedFromStream(stream: Stream, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
 	const bs = byteStream(stream);
 	try {
@@ -561,6 +577,15 @@ export async function readFramed(
 		// The caller's own signal wins the attribution; only the deadline's solo expiry is a
 		// read timeout. Read through a call so TS does not carry the entry check's narrowing of
 		// the readonly `aborted` here — it flips mid-read, which flow analysis cannot see.
+		// NOTE: this rewrites *every* error, `PayloadTooLargeError` and `FrameTruncationError`
+		// included, when a signal has fired. Reaching that needs the abort to land between the
+		// throw and this catch — a window spanning microtasks only, while a signal fires from a
+		// macrotask (timer or external abort), so a read that is decoding a prefix cannot be
+		// interrupted there; a signal firing while a read is genuinely pending rejects that read
+		// instead, and lands here as an abort with nothing to overwrite. Where it is reachable at
+		// all, cancellation-wins is the intended semantic: a cancelled caller does not care what
+		// size the frame declared. Revisit if a signal is ever aborted from inside this call's
+		// own microtask chain.
 		if (signalFired(signal)) throw abortReasonError(signal!);
 		if (signalFired(d?.signal)) throw new Error(`read timed out after ${timeoutMs}ms`);
 		throw err;
