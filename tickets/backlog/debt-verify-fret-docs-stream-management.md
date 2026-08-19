@@ -12,8 +12,7 @@ network-sender rewrite and have not since been read back against the code.
 Three separate inaccuracies were found and fixed elsewhere in the same document during that
 rewrite's review, which is why the remainder is treated as unverified rather than assumed correct.
 The constants those bullets name (the 5-second whole-request budget, the 2-second maintenance
-timeout, the 3-second shutdown budget, the 1.5-second per-leave-notice budget, the 20 ms
-end-of-stream poll) were each confirmed against the code and are correct; what is unchecked is the
+timeout, the 3-second shutdown budget, the 1.5-second per-leave-notice budget) were each confirmed against the code and are correct; what is unchecked is the
 prose around them — the described sequencing, the stated stream-release rules, and the claims about
 what each sender does and does not guarantee.
 
