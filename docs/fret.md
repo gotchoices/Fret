@@ -605,7 +605,7 @@ peers that have not upgraded yet.
 | Parser | Rejects the message when | Normalizes |
 |---|---|---|
 | `parseRouteAndMaybeAct` | any of the checks under *Cheap-guard rejections*, plus `digest` over 4096 chars | nothing |
-| `parseLeaveNotice` | `from` is not a parseable peer id, or `timestamp` is not finite | `replacements` → `sanitizeReplacements` (≤ 12, parse-checked, `undefined` when empty) |
+| `parseLeaveNotice` | `from` is not a parseable peer id, or `timestamp` is not finite | `replacements` → `sanitizeReplacements` (≤ 12, parse-checked, `undefined` when empty). The cap is applied **before** the parse check, so a parseable id sitting past the 12th entry is dropped along with the entries that displaced it — an over-long list of junk cannot smuggle real ids in behind it. |
 | `makeSnapshotParser(caps)` | `from` is not a parseable peer id, or `timestamp` is not finite | `successors` / `predecessors` truncated to `caps` then non-strings dropped; `sample` truncated then vetted per entry (id string, `coord` decodes to exactly 32 bytes, `relevance` finite) with a skip-and-log per drop; `size_estimate` / `confidence` / `metadata` dropped individually when the wrong type |
 | `parsePingResponse` | `ok` is not a boolean | projects to `{ ok, size_estimate?, confidence? }`, dropping either numeric when not finite |
 | `parseNearAnchor` | `estimated_cluster_size` or `confidence` is not finite | `anchors` ≤ 8, `cohort_hint` ≤ 16, missing → `[]` |
