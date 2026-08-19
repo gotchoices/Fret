@@ -623,7 +623,10 @@ Three rules in that table are decisions rather than mechanics:
   parsers exist to stop. (`importTable`'s all-or-nothing rule is the other case and is untouched: a
   corrupt persisted table is better refused whole.)
 - **`ok` must be a boolean** on a ping reply. A legal value always encodes as one, so the
-  `Boolean(r.ok)` coercion this replaces could only ever have hidden a malformed peer.
+  `Boolean(r.ok)` coercion it will replace could only ever have hidden a malformed peer. The
+  parser exists but is **not yet wired**: `sendPing` still passes a bare `decodeJson` cast and
+  still performs that coercion (`src/rpc/ping.ts`), as do `fetchNeighbors` and `sendMaybeAct`.
+  Wiring every reply decoder onto its parser is `tickets/implement/15.33-rpc-reply-parsers-and-caps`.
 
 The reply caps are set so a cap can never refuse this node's own legal output: `pickAnchors` yields
 at most 2 anchors and the cohort hint is built from at most 8 ids, so 8 / 16 are 4× and 2× the

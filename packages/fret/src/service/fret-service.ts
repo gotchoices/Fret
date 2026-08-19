@@ -2859,6 +2859,14 @@ export class FretService implements IFretService, Startable {
 			// `visited` goes *into* the local walk rather than filtering its result, for the same
 			// reason the breadcrumb trail does (see `dialableCohort`): post-filtering a sized
 			// cohort shrinks it below the requested count.
+			// NOTE: `isDialable` is also what makes the bare `await sendMaybeAct` below unable to
+			// throw. `rpcRequest` throws for one caller bug — `peerIdFromString` on a malformed id
+			// — and these ids are remote-supplied (`NearAnchorV1.anchors`), parse-unchecked by
+			// `parseNearAnchor`. They survive only via `addressKnown` (built from real peerStore
+			// ids) or `isConnected` (which swallows the parse error), so an unparseable anchor id
+			// never reaches the send. If `isDialable` ever gains the peer-routing fallback its own
+			// NOTE contemplates, restore a `try`/`catch` here and at the activity resend, or
+			// parse-check anchor ids in `parseNearAnchor`.
 			const anchorCandidates = bestAnchors.filter((id) => !visited.has(id) && this.isDialable(id));
 			const candidates = anchorCandidates.length > 0
 				? anchorCandidates
