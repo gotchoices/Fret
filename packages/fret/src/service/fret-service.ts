@@ -1028,8 +1028,8 @@ export class FretService implements IFretService, Startable {
 					this.maxBytesNeighbors(),
 					() => { this.diag.rejected.identityMismatch++; },
 					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(neighbors)'),
-					// The parser is bound to the *same* caps the announce merge slices to, supplied
-					// once here so the two cannot drift. Do not inline the numbers.
+					// The announce path's single cap enforcement point — `mergeAnnounceSnapshot`
+					// does not slice. Numbers come from `mergeSnapshotCaps()`; do not inline them.
 					makeSnapshotParser(this.mergeSnapshotCaps()),
 					() => { this.diag.rejected.malformed++; }
 				),
@@ -1814,8 +1814,9 @@ export class FretService implements IFretService, Startable {
 					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
 				}
 			}
-			// merge sample if present — truncated and per-entry vetted by the parser above; the
-			// try/catch stays for the bypassed-parser path, where `base64urlToCoord` can throw.
+			// merge sample if present — truncated and per-entry coord-vetted by the parser above,
+			// so `base64urlToCoord` throws only on a parser-bypassed body; the try/catch also
+			// covers `upsert` / `applyTouch`, which the parser says nothing about.
 			for (const s of snap.sample ?? []) {
 				try {
 					const coord = base64urlToCoord(s.coord);
@@ -2284,8 +2285,8 @@ export class FretService implements IFretService, Startable {
 		// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
 		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, {
 			signal,
-			// Same caps the merge loop below slices to, supplied once — the parser truncates ahead
-			// of the parse-and-hash loop instead of after it, and the two cannot drift.
+			// The fetch path's single cap enforcement point — the merge loop below does not slice.
+			// Truncating here puts the bound ahead of the parse-and-hash loop instead of inside it.
 			parse: makeSnapshotParser(this.mergeSnapshotCaps()),
 		});
 		switch (out.kind) {

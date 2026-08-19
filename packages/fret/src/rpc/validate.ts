@@ -168,13 +168,15 @@ export interface SnapshotCaps {
 }
 
 /**
- * A snapshot parser bound to the receiver's own merge caps, so the parser's truncation and the
- * merge loop's `slice` cannot drift apart — they are the same numbers, supplied once.
+ * A snapshot parser bound to the receiver's own merge caps. This is the **single enforcement
+ * point** for those caps: neither merge loop in `FretService` slices, so a message is already
+ * truncated by the time either one sees it. Both call sites take the numbers from
+ * `FretService.mergeSnapshotCaps()` — see the `NOTE:` there.
  *
- * Over-long id lists are **truncated, not rejected**: the merge loops already sliced to exactly
- * these caps, so truncating here changes no behavior — it only moves the cost ahead of the
- * parse-and-hash loop instead of after it. Rejecting the whole message would be new behavior that
- * punishes an honest peer running a larger profile.
+ * Over-long id lists are **truncated, not rejected**: truncating costs an honest peer running a
+ * larger profile only the entries past the cap, where rejecting the whole message would cost it
+ * every entry — and the receiver's bound is met either way, because truncation happens before
+ * the parse-and-hash loop rather than inside it.
  *
  * `sample` keeps today's **skip-and-log per entry** rule: one unusable entry drops that entry, not
  * the message. (`importTable`'s all-or-nothing rule is the other case, and is deliberately not
@@ -223,6 +225,15 @@ function parseSample(value: unknown, cap: number, from: string): SampleEntry[] {
 	for (const entry of value.slice(0, cap)) {
 		if (!isPlainObject(entry)) continue;
 		if (typeof entry.id !== 'string' || typeof entry.coord !== 'string') continue;
+		// NOTE: accepted tradeoff — a non-finite `relevance` drops the whole entry rather than the
+		// field, unlike the advisory `size_estimate` / `confidence` above, which are dropped
+		// individually. The line is required-vs-optional: the wire type declares `relevance:
+		// number` as required, so a sender emitting `null` (a `NaN` at its end) is malformed, and
+		// admitting it would put a value of an impossible shape into `SampleEntry`. Weighed in the
+		// `15.32` and `15.332` reviews and kept; the declined alternative was relaxing it to
+		// `finiteNumberOr`. Cost: the merge loops read only `id` and `coord`, so such an entry
+		// used to merge fine and now does not. Revisit if a real sender is ever observed emitting
+		// a non-finite relevance, or if the wire type makes the field optional.
 		if (!isFiniteNumber(entry.relevance)) continue;
 		try {
 			base64urlToCoord(entry.coord);
