@@ -56,6 +56,23 @@ function peerIdStr(seed: number): string {
 	return u8ToString(mh, 'base58btc')
 }
 
+/**
+ * A valid 32-byte ring coordinate for a sample entry — any repeated-byte fill decodes cleanly.
+ * Module scope rather than per-describe: the wrong-width rule below is exactly what the snapshot
+ * parser and the merge loop must agree on, and a second copy of it is the drift these tests exist
+ * to catch.
+ */
+function sampleCoord(byte: number): string {
+	return coordToBase64url(new Uint8Array(32).fill(byte))
+}
+
+/** A wrong-width "coordinate" string — built with `u8ToString` directly (not `coordToBase64url`,
+ * which is written for exactly-32-byte input) so an off-width array encodes without complaint and
+ * the rejection under test is `base64urlToCoord`'s decode-side length check, not an encoder throw. */
+function wrongWidthCoord(byteLength: number): string {
+	return u8ToString(new Uint8Array(byteLength).fill(3), 'base64url')
+}
+
 /** Two distinct, parseable peer ids: 'who the message claims' vs 'who the transport says'. */
 const PEER_CLAIMED = peerIdStr(1)
 const PEER_ACTUAL = peerIdStr(2)
@@ -826,18 +843,6 @@ describe('RPC handler fault isolation', function () {
 			/** The cap `registerAnnounceWithHooks` supplies to `makeSnapshotParser` for `sample`. */
 			const SAMPLE_CAP = 8
 
-			/** A valid 32-byte ring coordinate for a sample entry — any repeated-byte fill decodes cleanly. */
-			function sampleCoord(byte: number): string {
-				return coordToBase64url(new Uint8Array(32).fill(byte))
-			}
-
-			/** A wrong-width "coordinate" string — built with `u8ToString` directly (not `coordToBase64url`,
-			 * which is written for exactly-32-byte input) so an off-width array encodes without complaint and
-			 * the rejection under test is `base64urlToCoord`'s decode-side length check, not an encoder throw. */
-			function wrongWidthCoord(byteLength: number): string {
-				return u8ToString(new Uint8Array(byteLength).fill(3), 'base64url')
-			}
-
 			function sampleEntry(over: Record<string, unknown> = {}): Record<string, unknown> {
 				return { id: 'sample-peer', coord: sampleCoord(9), relevance: 0.5, ...over }
 			}
@@ -1532,6 +1537,180 @@ describe('RPC handler fault isolation', function () {
 			if (r.expect === 'reject' || r.expect === 'drop') expect(r.counts, `${r.name}: states which counter it increments`).to.not.equal(undefined)
 		}
 	}
+
+	// -----------------------------------------------------------------------------------------
+	// Service tier: what an over-long announce actually costs the receiver.
+	//
+	// `onAnnounce` is handed an *already-parsed* snapshot, so the parse + hash + upsert loop a
+	// crafted announce drives is `FretService.mergeAnnounceSnapshot`, and its bound is
+	// `FretService.mergeSnapshotCaps()`. That same object is handed to `makeSnapshotParser` at the
+	// single registration site, so the parser truncates before the merge loop ever runs — and the
+	// point of these tests is that the two routes cost the receiver the *same*: an over-long list
+	// buys the sender no extra work either way.
+	//
+	// The work is **counted** (`store.upsert` calls, by id and in order) rather than inferred from
+	// "nothing crashed" — a cap that silently stopped applying would leave a passing no-crash test
+	// and an unbounded per-message cost. Driven on unstarted services against
+	// `mergeAnnounceSnapshot` directly, because `handleAnnounce` `detach`es the merge and a
+	// detached merge cannot be counted deterministically.
+	// -----------------------------------------------------------------------------------------
+	describe('announce snapshot merge caps', () => {
+		interface Caps { successors: number; predecessors: number; sample: number }
+		interface DrivableMerge {
+			mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void>
+			mergeSnapshotCaps(): Caps
+		}
+		/** Only the one method the counter replaces — this spec never imports `DigitreeStore`. */
+		interface CountableStore { upsert(id: string, coord: Uint8Array): unknown }
+
+		/** `from` plus three lists of distinct, parseable ids (seeds stay under 256 to stay distinct). */
+		const FROM = peerIdStr(60)
+		const OVER_SUCC = Array.from({ length: 40 }, (_, i) => peerIdStr(61 + i))
+		const OVER_PRED = Array.from({ length: 40 }, (_, i) => peerIdStr(101 + i))
+		const OVER_SAMPLE = Array.from({ length: 20 }, (_, i) => ({ id: peerIdStr(141 + i), coord: sampleCoord(i + 1), relevance: 0.5 }))
+
+		/** The raw announce body: every list far past any profile's cap. */
+		function overCapBody(): Record<string, unknown> {
+			return { v: 1, from: FROM, timestamp: Date.now(), successors: OVER_SUCC, predecessors: OVER_PRED, sample: OVER_SAMPLE, sig: '' }
+		}
+
+		/** A three-entry sample whose middle coord decodes to 16 bytes instead of 32. */
+		function shortCoordSample(): Array<Record<string, unknown>> {
+			return [
+				{ id: 'good-1', coord: sampleCoord(4), relevance: 0.5 },
+				{ id: 'short-coord', coord: wrongWidthCoord(16), relevance: 0.5 },
+				{ id: 'good-2', coord: sampleCoord(5), relevance: 0.5 },
+			]
+		}
+
+		const merge = (s: CoreFretService, from: string, snap: NeighborSnapshotV1): Promise<void> =>
+			(s as unknown as DrivableMerge).mergeAnnounceSnapshot(from, snap)
+		const capsOf = (s: CoreFretService): Caps => (s as unknown as DrivableMerge).mergeSnapshotCaps()
+
+		/**
+		 * Record every id the merge loop upserts, in order.
+		 *
+		 * `applyTouch` opens with `getById(id) ?? upsert(id, coord)` and the loop has always just
+		 * upserted that id, so it does not double-count — a doubled count is the first assumption
+		 * to re-check if these numbers ever drift.
+		 */
+		function countUpserts(s: CoreFretService): string[] {
+			const store = s.getStore()
+			const holder = store as unknown as CountableStore
+			const inner = holder.upsert.bind(store)
+			const ids: string[] = []
+			holder.upsert = (id: string, coord: Uint8Array): unknown => { ids.push(id); return inner(id, coord) }
+			return ids
+		}
+
+		// Pinned literally rather than read back out of `mergeSnapshotCaps()`, so the expectation
+		// is not derived from the thing under test.
+		const profiles: Array<{ profile: 'core' | 'edge'; caps: Caps }> = [
+			{ profile: 'core', caps: { successors: 16, predecessors: 16, sample: 8 } },
+			{ profile: 'edge', caps: { successors: 8, predecessors: 8, sample: 6 } },
+		]
+
+		for (const { profile, caps: expected } of profiles) {
+			describe(profile, () => {
+				let node: Libp2p
+				let svc: CoreFretService
+
+				beforeEach(async () => {
+					node = await createMemNode()
+					await node.start()
+					// Deliberately left unstarted: no stabilization loops, no registered handlers,
+					// and the merge's own detached tail is quiet — `announceToNewPeers` filters
+					// targets by `hasAddresses` (empty on an unstarted service, so it dials
+					// nothing) and `enforceCapacity` early-returns far below the 2048 capacity.
+					svc = new CoreFretService(node, { profile, networkName: NETWORK })
+				})
+
+				afterEach(async () => { await stopAll([node]) })
+
+				it('states its merge caps as the pinned per-profile literals', () => {
+					expect(capsOf(svc)).to.deep.equal(expected)
+				})
+
+				it('merges exactly 1 + successors + predecessors + sample ids, however long the lists', async () => {
+					const ids = countUpserts(svc)
+
+					await merge(svc, FROM, overCapBody() as unknown as NeighborSnapshotV1)
+
+					expect(ids.length, 'one upsert for `from`, then one per capped id').to.equal(
+						1 + expected.successors + expected.predecessors + expected.sample
+					)
+					expect(ids, 'the first N of each list, in merge order').to.deep.equal([
+						FROM,
+						...OVER_SUCC.slice(0, expected.successors),
+						...OVER_PRED.slice(0, expected.predecessors),
+						...OVER_SAMPLE.slice(0, expected.sample).map((e) => e.id),
+					])
+				})
+
+				it('never stores an id past the cap', async () => {
+					await merge(svc, FROM, overCapBody() as unknown as NeighborSnapshotV1)
+					const store = svc.getStore()
+
+					for (const id of OVER_SUCC.slice(expected.successors)) expect(store.getById(id), `successor past the cap: ${id}`).to.equal(undefined)
+					for (const id of OVER_PRED.slice(expected.predecessors)) expect(store.getById(id), `predecessor past the cap: ${id}`).to.equal(undefined)
+					for (const e of OVER_SAMPLE.slice(expected.sample)) expect(store.getById(e.id), `sample entry past the cap: ${e.id}`).to.equal(undefined)
+
+					// ...and the last *admitted* id of each list is present, so the absences above
+					// are the cap doing its job rather than nothing having been stored at all.
+					expect(store.getById(OVER_SUCC[expected.successors - 1]!), 'last admitted successor').to.not.equal(undefined)
+					expect(store.getById(OVER_PRED[expected.predecessors - 1]!), 'last admitted predecessor').to.not.equal(undefined)
+					expect(store.getById(OVER_SAMPLE[expected.sample - 1]!.id), 'last admitted sample entry').to.not.equal(undefined)
+				})
+
+				it('costs the same whether the parser truncated first or the merge loop did', async () => {
+					const raw = overCapBody()
+
+					const direct = countUpserts(svc)
+					await merge(svc, FROM, raw as unknown as NeighborSnapshotV1)
+
+					const parsed = makeSnapshotParser(capsOf(svc))(raw)
+					expect(parsed, 'an over-long message is truncated, not rejected').to.not.equal(undefined)
+					// A second unstarted service on the same node: nothing is registered until
+					// `start()`, so the two cannot collide.
+					const other = new CoreFretService(node, { profile, networkName: NETWORK })
+					const viaParser = countUpserts(other)
+
+					await merge(other, FROM, parsed!)
+
+					expect(viaParser, 'an over-long list buys the sender no extra work either way').to.deep.equal(direct)
+				})
+
+				it('drops a wrong-width sample coord at the parser, so it never reaches onAnnounce', () => {
+					const parsed = makeSnapshotParser(capsOf(svc))({
+						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
+						sample: shortCoordSample(),
+					})
+
+					expect(parsed?.sample, 'the unusable entry is gone; the good ones survive, in order').to.deep.equal([
+						{ id: 'good-1', coord: sampleCoord(4), relevance: 0.5 },
+						{ id: 'good-2', coord: sampleCoord(5), relevance: 0.5 },
+					])
+				})
+
+				it('skips a wrong-width sample coord in the merge loop when the parser is bypassed', async () => {
+					// The arm the merge loop's own per-entry try/catch exists for: `base64urlToCoord`
+					// throws on a 16-byte coordinate, and that entry must drop without costing the
+					// message its remaining ids or failing the merge.
+					const snap = {
+						v: 1, from: FROM, timestamp: Date.now(), sig: '',
+						successors: [OVER_SUCC[0]!], predecessors: [OVER_PRED[0]!],
+						sample: shortCoordSample(),
+					}
+					const ids = countUpserts(svc)
+
+					await merge(svc, FROM, snap as unknown as NeighborSnapshotV1)
+
+					expect(ids, 'only the unusable entry is skipped').to.deep.equal([FROM, OVER_SUCC[0]!, OVER_PRED[0]!, 'good-1', 'good-2'])
+					expect(svc.getStore().getById('short-coord'), 'never reached the store write seam').to.equal(undefined)
+				})
+			})
+		}
+	})
 
 	describe('over the memory transport', () => {
 		let rig: WireRig
