@@ -66,4 +66,15 @@ Accumulated test-suite cleanup called out by the review:
   both edit it next, and both would land cleaner against separated modules. Sequence this arm
   *before* `24-sim-router-realism` or accept that it rewrites the routing seam first.
 
+- **`rpc.handler-fuzz.spec.ts` has outgrown one file, the same way the simulation harness above
+  has.** Measured during the `rpc-snapshot-cap-announce-path-test` review: `wc -l
+  packages/fret/test/rpc.handler-fuzz.spec.ts` is **1939 lines**. Despite the name it is no longer
+  only fault-isolation fuzzing — it now also owns the announce snapshot merge-cap block (~250
+  lines, its own fixtures and helpers) and a two-transport integration block that stands up real
+  memory and TCP nodes. The seams are already visible as top-level `describe`s. Prevention rather
+  than a bug: two queued tickets add to it next (`15.3325-rpc-snapshot-cap-fetch-path-test` adds
+  the fetch-path sibling of the merge-cap block, `15.4-rpc-byte-cap-tightening` edits the byte-cap
+  cases), and both land cleaner against a split. Splitting the merge-cap block out first is the
+  cheapest arm and is what the fetch-path ticket would extend.
+
 References: review.html:454-456 "Test housekeeping"; helpers/libp2p.ts:64 (stopAll reverse), cohort.assembly.spec.ts, selector.connected-first.spec.ts, test/README.md. Coordinate-arithmetic arm added by the `dialability-spec-self-position-premise` review; harness-size arm added by the `sim-partition-merge-tests` review.

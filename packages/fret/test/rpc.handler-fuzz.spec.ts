@@ -1554,7 +1554,9 @@ describe('RPC handler fault isolation', function () {
 	// "nothing crashed" — a cap that silently stopped applying would leave a passing no-crash test
 	// and an unbounded per-message cost. Driven on unstarted services against
 	// `mergeAnnounceSnapshot` directly, because `handleAnnounce` `detach`es the merge and a
-	// detached merge cannot be counted deterministically.
+	// detached merge cannot be counted deterministically. The one exception is the wiring test
+	// that closes the block: it drives the *registered* handler, and buys determinism back by
+	// wrapping `mergeAnnounceSnapshot` on the instance to capture and await the detached promise.
 	// -----------------------------------------------------------------------------------------
 	describe('announce snapshot merge caps', () => {
 		interface Caps { successors: number; predecessors: number; sample: number }
@@ -1641,8 +1643,9 @@ describe('RPC handler fault isolation', function () {
 				beforeEach(async () => {
 					node = await createMemNode()
 					await node.start()
-					// Deliberately left unstarted: no stabilization loops, no registered handlers,
-					// and the merge's own detached tail is quiet — `announceToNewPeers` filters
+					// Deliberately left unstarted: no stabilization loops, no handlers registered
+					// unless a test asks for them (only the wiring test does, by calling
+					// `registerRpcHandlers` directly), and the merge's own detached tail is quiet — `announceToNewPeers` filters
 					// targets by `hasAddresses` (empty on an unstarted service, so it dials
 					// nothing) and `enforceCapacity` early-returns far below the 2048 capacity.
 					svc = new CoreFretService(node, { profile, networkName: NETWORK })
