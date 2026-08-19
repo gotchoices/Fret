@@ -42,7 +42,7 @@ export async function registerNeighbors(
 	// bodies — including the close, which it performs under its own budget so a remote that stops
 	// reading cannot hold the handler open.
 	await registerJsonHandler(node, protocols.PROTOCOL_NEIGHBORS, {
-		// Not an `async` arrow: it hands back `getSnapshot()`'s own promise. Same reasoning as
+		// NOTE: not an `async` arrow — it hands back `getSnapshot()`'s own promise. Same reasoning as
 		// ping — this protocol reads no request body, so the reply is the first thing on the
 		// stream and an extra async hop is pure latency before the caller's first read.
 		serve: (connection) => {

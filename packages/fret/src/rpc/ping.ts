@@ -33,7 +33,7 @@ export async function registerPing(
 	// `registerJsonHandler` — a decode step here would be pure ceremony. Encoding, errors and
 	// stream release (including the budgeted close) belong to the seam, not this body.
 	await registerJsonHandler(node, protocol, {
-		// Deliberately not an `async` arrow: it returns `pingReply`'s promise directly. `sendPing`
+		// NOTE: deliberately not an `async` arrow — it returns `pingReply`'s promise directly. `sendPing`
 		// writes no request body, so this reply is the first thing on the stream and every extra
 		// async hop between the handler being invoked and the frame being written is one the
 		// caller spends waiting on a stream it has not finished negotiating.
