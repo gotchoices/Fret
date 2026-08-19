@@ -10,7 +10,7 @@ import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { FretPeerDiscovery } from '../src/service/peer-discovery.js'
 import { createSparsityModel } from '../src/store/relevance.js'
 import { hashPeerId } from '../src/ring/hash.js'
-import { isUnsupportedProtocolError, makeProtocols } from '../src/rpc/protocols.js'
+import { encodeJson, isUnsupportedProtocolError, makeProtocols, registerRpcHandler, sendFramed } from '../src/rpc/protocols.js'
 import { registerPing, sendPing } from '../src/rpc/ping.js'
 import { fetchNeighbors } from '../src/rpc/neighbors.js'
 import type { Libp2p } from 'libp2p'
@@ -667,6 +667,56 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		await waitFor(() => store.getById(idC)?.membership === 'member')
 		expect(store.getById(idC)?.membership).to.equal('member', 'mislabeled member should be re-admitted via foreign re-probe')
 	})
+
+	// The same foreign re-probe path, but the reply is one the probe cannot *use*. A completed
+	// round trip over `/optimystic/net-a/fret/...` is membership evidence whatever the body says
+	// — reaching a reply at all means the remote negotiated a protocol only this network's peers
+	// serve, so the body is evidence about the peer's load or its encoder, never about which
+	// network it belongs to. What such a reply has NOT earned is relevance credit or a latency
+	// sample, which is what separates `noteAnsweredOnProtocol` from `applySuccess`.
+	//
+	// Topology and reasoning are the foreign-re-probe test's above, with one change: C registers
+	// a raw handler that writes a body of its own instead of `registerPing`'s well-formed reply.
+	// C still runs no FretService, so nothing inbound can promote it and A's own outbound
+	// re-probe is the only path — `probeMembership`'s `busy` / `decode-error` arms are the code
+	// under test. The stream close belongs to `registerRpcHandler`, so the handler body only writes.
+	//
+	// `contactFailures: 2` is below `deadAfterFailures` (3), so C stays out of `dead` and is
+	// selected by the *foreign* arm of the re-probe pass; the assertion that it reaches 0 pins
+	// the proof-of-life half of the seam.
+	for (const [label, body] of [
+		['busy', async () => await encodeJson({ busy: true, retry_after_ms: 500 })],
+		['undecodable', async () => new TextEncoder().encode('{not json')]
+	] as Array<[string, () => Promise<Uint8Array>]>) {
+		it(`re-admits a mislabeled-foreign peer whose reply is ${label}, without crediting relevance`, async () => {
+			const nodeA = await createMemNode(); await nodeA.start()
+			const nodeC = await createMemNode(); await nodeC.start()
+			nodes = [nodeA, nodeC]
+
+			const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
+			services = [svcA]
+			await svcA.start()
+			await registerRpcHandler(nodeC, makeProtocols('net-a').PROTOCOL_PING, async (stream) => {
+				sendFramed(stream, await body())
+			})
+
+			const store = svcA.getStore()
+			const idC = nodeC.peerId.toString()
+
+			await nodeC.dial(nodeA.getMultiaddrs()[0]!)
+			await waitFor(() => store.getById(idC) != null, 4000, 20)
+			store.setMembership(idC, 'foreign')
+			store.update(idC, { contactFailures: 2, lastContactFailureAt: Date.now() })
+
+			await waitFor(() => store.getById(idC)?.membership === 'member')
+
+			const entry = store.getById(idC)
+			expect(entry?.membership).to.equal('member', 'a completed round trip is membership evidence whatever the reply says')
+			expect(entry?.contactFailures).to.equal(0, 'an answered probe is proof of life and clears the contact-failure run')
+			expect(entry?.successCount).to.equal(0, `a ${label} reply must earn no relevance credit`)
+			expect(entry?.avgLatencyMs).to.equal(null, `a ${label} reply must contribute no latency sample`)
+		})
+	}
 
 	// Arm 1: a single failed protocol negotiation is evidence, not a verdict.
 	//
