@@ -16,7 +16,7 @@ import type {
 import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url, base64urlToCoord } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
-import { makeProtocols, validateTimestamp, isUnsupportedProtocolError } from '../rpc/protocols.js';
+import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct, validateRouteAndMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
@@ -51,10 +51,6 @@ const log = createLogger('service:fret');
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
-}
-
-function isBusy(res: unknown): res is BusyResponseV1 {
-	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
 }
 
 /**
@@ -1527,7 +1523,13 @@ export class FretService implements IFretService, Startable {
 				// stop(), so a stack of dials that can only fail also delays shutdown.
 				// (`ids` itself stays unfiltered — it defines the S/P set the replacements exclude.)
 				if (this.isDoomedDial(id)) continue;
-				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts); } catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
+				// `ok` for a write-only send means only "reached the transport", not receipt; a
+				// non-ok, non-cancelled outcome is worth a log line even though nothing is scored
+				// during shutdown.
+				try {
+					const out = await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts);
+					if (out.kind !== 'ok' && out.kind !== 'cancelled') log.error('sendLeave to %s: %s', id, out.kind);
+				} catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
 			const fanOut = this.cfg.profile === 'core' ? 4 : 2;
@@ -1537,7 +1539,10 @@ export class FretService implements IFretService, Startable {
 			const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
 			for (const id of extra) {
 				if (budget.signal.aborted) break;
-				try { await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts); } catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
+				try {
+					const out = await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts);
+					if (out.kind !== 'ok' && out.kind !== 'cancelled') log.error('sendLeave fan-out to %s: %s', id, out.kind);
+				} catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
 			}
 		} catch (err) {
 			log.error('sendLeaveToNeighbors outer failed - %e', err);
@@ -2190,16 +2195,12 @@ export class FretService implements IFretService, Startable {
 	 * for the first time; the caller (`stabilizeOnce`) does the one `enforceCapacity` and the one
 	 * announce for the whole tick — neither belongs in a pooled task (see `stabilizeOnce`).
 	 *
-	 * NOTE: `fetchNeighbors` is connection-only (`requireExisting`), so for an address-known but
-	 * non-connected peer it returns an empty snapshot while `snapshotsFetched` still counts it — a
-	 * diagnostics overcount, not a correctness problem, and the preceding ping in `probeAndFetch`
-	 * usually opens the connection anyway. The same swallow covers *cancellation*: `fetchNeighbors`
-	 * catches an abort and returns an empty snapshot rather than rethrowing, so the `wasCancelled`
-	 * check in the catch below never fires for a fetch cancelled mid-flight and that fetch is
-	 * counted too. Harmless — `openRpcStream` throws on an aborted signal before dialing, so nothing
-	 * is merged and no strike is recorded; each fetch is its own pooled task, so nothing "walks on"
-	 * past it. If snapshot counts are ever used for anything load-bearing, have `fetchNeighbors`
-	 * distinguish "skipped" from "empty" rather than adding a check here.
+	 * NOTE: `fetchNeighbors` is connection-only (dial `'never'`), so for an address-known but
+	 * non-connected peer it returns `skipped` — nothing attempted, nothing counted — and the
+	 * preceding ping in `probeAndFetch` usually opens the connection anyway. Cancellation (stop()
+	 * or the tick budget) surfaces as the `cancelled` outcome and likewise counts and scores
+	 * nothing: our own cancellation is not evidence about the peer. `snapshotsFetched` counts only
+	 * `ok` replies.
 	 *
 	 * NOTE: pooling makes concurrent scoring of one peer genuinely possible, in two ways — two near
 	 * peers' snapshots naming the **same** third peer (`applyTouch` against `applyTouch`), and a
@@ -2211,38 +2212,50 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		const announced: string[] = [];
-		try {
-			// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
-			const snap: NeighborSnapshotV1 = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal });
-			this.diag.snapshotsFetched++;
-			const caps = this.mergeSnapshotCaps();
-			const succList = (snap.successors ?? []).slice(0, caps.successors);
-			const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
-			for (const pid of [...succList, ...predList]) {
-				try {
-					const coord = await hashPeerId(peerIdFromString(pid));
-					if (!this.store.getById(pid)) announced.push(pid);
-					this.store.upsert(pid, coord);
-					await this.applyTouch(pid, coord);
-				} catch (err) {
-					console.warn('failed to merge neighbor', pid, err);
-				}
-			}
-			for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
-				try {
-					const coord = base64urlToCoord(s.coord);
-					if (!this.store.getById(s.id)) announced.push(s.id);
-					this.store.upsert(s.id, coord);
-					await this.applyTouch(s.id, coord);
-				} catch (err) { log.error('fetchAndMergeSnapshot sample upsert failed for %s - %e', s.id, err) }
-			}
-			// Calibrate local size estimator from snapshot's estimate
-			this.calibrateSizeFromSnapshot(snap, id);
-		} catch (err) {
-			// Our own cancellation (stop() or the tick budget) is not evidence about the peer.
-			if (this.wasCancelled(signal)) return announced;
-			console.warn('fetchNeighbors failed for', id, err);
+		// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
+		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal });
+		switch (out.kind) {
+			case 'skipped':      // no connection — nothing attempted, count nothing
+			case 'cancelled':    // our own cancellation — not evidence about the peer
+				return announced;
+			case 'busy':
+			case 'decode-error':
+				// Answered badly / refused: alive. Today's empty-snapshot path scored nothing — preserved.
+				log.error('fetchNeighbors %s from %s', out.kind, id);
+				return announced;
+			case 'foreign-protocol': // reaches this path for the first time — classification now works here
+			case 'unreachable':
+			case 'timeout':
+				await this.noteRpcFailure(id, out);
+				return announced;
+			case 'ok':
+				break;
 		}
+		this.diag.snapshotsFetched++;
+		const snap = out.value;
+		const caps = this.mergeSnapshotCaps();
+		const succList = (snap.successors ?? []).slice(0, caps.successors);
+		const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
+		for (const pid of [...succList, ...predList]) {
+			try {
+				const coord = await hashPeerId(peerIdFromString(pid));
+				if (!this.store.getById(pid)) announced.push(pid);
+				this.store.upsert(pid, coord);
+				await this.applyTouch(pid, coord);
+			} catch (err) {
+				console.warn('failed to merge neighbor', pid, err);
+			}
+		}
+		for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
+			try {
+				const coord = base64urlToCoord(s.coord);
+				if (!this.store.getById(s.id)) announced.push(s.id);
+				this.store.upsert(s.id, coord);
+				await this.applyTouch(s.id, coord);
+			} catch (err) { log.error('fetchAndMergeSnapshot sample upsert failed for %s - %e', s.id, err) }
+		}
+		// Calibrate local size estimator from snapshot's estimate
+		this.calibrateSizeFromSnapshot(snap, id);
 		return announced;
 	}
 
@@ -2478,32 +2491,45 @@ export class FretService implements IFretService, Startable {
 				const sig = this.runSignal;
 				try {
 					this.diag.maybeActForwarded++;
-					const result = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
-					if (isBusy(result)) {
-						this.recordBackoff(next);
-					} else {
-						const nextCoord = await this.coordOf(next);
-						// No latency sample: `sendMaybeAct` on the forward path returns only once
-						// the *entire remaining route* has completed downstream, so its wall time
-						// is the cost of the whole subtree, not of the link to `next`. Recording
-						// it would penalize a perfectly healthy adjacent hop for a long path
-						// behind it. Latency belongs to the ping paths, which measure one hop.
-						await this.applySuccess(next, nextCoord);
-						this.clearBackoff(next);
-						return result;
+					const out = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
+					switch (out.kind) {
+						case 'ok': {
+							const nextCoord = await this.coordOf(next);
+							// No latency sample: `sendMaybeAct` on the forward path returns only once
+							// the *entire remaining route* has completed downstream, so its wall time
+							// is the cost of the whole subtree, not of the link to `next`. Recording
+							// it would penalize a perfectly healthy adjacent hop for a long path
+							// behind it. Latency belongs to the ping paths, which measure one hop.
+							await this.applySuccess(next, nextCoord);
+							this.clearBackoff(next);
+							return out.value;
+						}
+						case 'busy':
+							this.recordBackoff(next);
+							break;
+						case 'cancelled':
+						case 'skipped':
+							// Our own cancellation is not evidence about `next` — score nothing and
+							// fall through to the NearAnchor below, the honest "did not forward"
+							// answer. (`skipped` is unreachable here — maybeAct dials — and scores
+							// the same nothing.)
+							break;
+						case 'foreign-protocol':
+						case 'unreachable':
+						case 'timeout':
+						case 'decode-error':
+							// A failed negotiation hints this hop belongs to another network, but
+							// `next` came from the member-gated cohort, so it is a confirmed member
+							// and a restart looks identical. Count the evidence; only a run of them
+							// demotes, and only unreachable/timeout count toward the dead-state run.
+							log.error('forward maybeAct to %s: %s', next, out.kind);
+							await this.noteRpcFailure(next, out);
+							this.recordBackoff(next);
+							break;
 					}
 				} catch (err) {
-					// Our own cancellation is not evidence about `next` — score nothing and fall
-					// through to the NearAnchor below, which is the honest "did not forward" answer.
-					if (!this.wasCancelled(sig)) {
-						log.error('forward maybeAct failed to %s - %e', next, err);
-						// A failed negotiation hints this hop belongs to another network, but `next`
-						// came from the member-gated cohort, so it is a confirmed member and a restart
-						// looks identical. Count it; only a run of them demotes. A dial/stream failure
-						// instead says the hop is unreachable and counts toward the dead-state run.
-						await this.noteRpcFailure(next, err);
-						this.recordBackoff(next);
-					}
+					// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
+					log.error('forward maybeAct failed to %s - %e', next, err);
 				}
 			}
 		}
@@ -2872,26 +2898,44 @@ export class FretService implements IFretService, Startable {
 				signature: '',
 			};
 
-			try {
-				const result = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
+			const out = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
 
-				if (isBusy(result)) {
-					// NOTE: `target` is already in `visited`, so a busy peer is retired for the rest
-					// of this lookup rather than retried. Free today — the attempt loop has no delay,
-					// so an immediate retry would meet the same empty token bucket. If the walk ever
-					// honours `retry_after_ms` with a real wait, keep busy responders out of
-					// `visited` so the wait can pay off.
-					this.recordBackoff(target);
-					continue;
-				}
+			if (out.kind === 'busy') {
+				// NOTE: `target` is already in `visited`, so a busy peer is retired for the rest
+				// of this lookup rather than retried. Free today — the attempt loop has no delay,
+				// so an immediate retry would meet the same empty token bucket. If the walk ever
+				// honours `retry_after_ms` with a real wait, keep busy responders out of
+				// `visited` so the wait can pay off.
+				this.recordBackoff(target);
+				continue;
+			}
+			if (out.kind === 'cancelled' || out.kind === 'skipped') {
+				// A cancelled walk is `exhausted`, not a strike against `target`; burning the
+				// remaining attempts would only meet the same aborted signal. (`skipped` is
+				// unreachable here — maybeAct dials — and scores the same nothing.)
+				break;
+			}
+			if (out.kind !== 'ok') {
+				// foreign-protocol / unreachable / timeout / decode-error: route the evidence.
+				// decode-error is proof of life — `noteRpcFailure` decays only, no contact strike.
+				log.error('iterativeLookup hop %d to %s: %s', hop, target, out.kind);
+				await this.noteRpcFailure(target, out);
+				this.recordBackoff(target);
+				// No need to drop `target` from `bestAnchors` — it is in `visited`, which every
+				// candidate path filters against.
+				hop++;
+				continue;
+			}
 
+			{
+				const result = out.value;
 				if ('commitCertificate' in result) {
 					yield { type: 'complete', hop, result, peerId: target };
 					return;
 				}
 
-				// NearAnchor response
-				const anchor = result as NearAnchorV1;
+				// NearAnchor response — `out.value` narrows the union; no cast.
+				const anchor = result;
 				yield { type: 'near_anchor', hop, nearAnchor: anchor, peerId: target };
 
 				// If we have activity but didn't include it, resend with activity to the anchor.
@@ -2933,25 +2977,26 @@ export class FretService implements IFretService, Startable {
 						breadcrumbs: [selfId, target].filter((id) => id !== actTarget),
 					};
 
-					try {
-						const actResult = await sendMaybeAct(
-							this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig }
-						);
-						if (isBusy(actResult)) {
-							this.recordBackoff(actTarget);
-						} else if ('commitCertificate' in actResult) {
-							yield { type: 'complete', hop: hop + 1, result: actResult, peerId: actTarget };
-							return;
-						} else {
-							bestAnchors = (actResult as NearAnchorV1).anchors;
-						}
-					} catch (err) {
+					const actOut = await sendMaybeAct(
+						this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig }
+					);
+					if (actOut.kind === 'busy') {
+						this.recordBackoff(actTarget);
+					} else if (actOut.kind === 'cancelled' || actOut.kind === 'skipped') {
 						// Our own cancellation: score nothing and end the walk (`exhausted` below)
 						// rather than spend the remaining attempts on sends that cannot go out.
-						if (this.wasCancelled(sig)) break;
-						log.error('activity send to anchor %s failed - %e', actTarget, err);
-						await this.noteRpcFailure(actTarget, err);
+						break;
+					} else if (actOut.kind !== 'ok') {
+						// foreign-protocol / unreachable / timeout / decode-error: route the
+						// evidence; decode-error decays only, no contact strike.
+						log.error('activity send to anchor %s: %s', actTarget, actOut.kind);
+						await this.noteRpcFailure(actTarget, actOut);
 						this.recordBackoff(actTarget);
+					} else if ('commitCertificate' in actOut.value) {
+						yield { type: 'complete', hop: hop + 1, result: actOut.value, peerId: actTarget };
+						return;
+					} else {
+						bestAnchors = actOut.value.anchors;
 					}
 				} else {
 					bestAnchors = anchor.anchors;
@@ -2968,21 +3013,11 @@ export class FretService implements IFretService, Startable {
 				}
 
 				hop++;
-			} catch (err) {
-				// Same rule as the resend: a cancelled walk is `exhausted`, not a strike against
-				// `target`, and burning the remaining attempts would only re-throw the abort.
-				if (this.wasCancelled(sig)) break;
-				log.error('iterativeLookup hop %d to %s failed - %e', hop, target, err);
-				await this.noteRpcFailure(target, err);
-				this.recordBackoff(target);
-				// No need to drop `target` from `bestAnchors` — it is in `visited`, which every
-				// candidate path filters against.
-				hop++;
 			}
 		}
 
 		// NOTE: `exhausted` conflates two different outcomes — "the ring offered no further hop" and
-		// "our own run was cancelled under the walk" (the two `wasCancelled` breaks above land here).
+		// "our own run was cancelled under the walk" (the two `cancelled`-outcome breaks above land here).
 		// A caller therefore cannot tell a genuinely exhausted lookup from one whose activity was
 		// never delivered because `stop()` landed mid-walk. Deliberate: `RouteProgress` is part of
 		// the public `FretService` interface, so a `{ type: 'cancelled' }` variant is an API change
