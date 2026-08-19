@@ -1,52 +1,40 @@
-description: The message-framing change to the peer-to-peer layer has now been reviewed line by line and the security docs corrected; all that is left is to run the type-check and the test suite and write the archive summary.
-files: packages/fret/src/rpc/protocols.ts, packages/fret/test/rpc.protocols.spec.ts, packages/fret/test/rpc.handler-fuzz.spec.ts, docs/threat-analysis.md, docs/threat-rir-mitigated.md
-difficulty: easy
+description: The peer-to-peer message-framing change was reviewed line by line, two small fixes were applied, the security docs were corrected, and the type-check and full test suite were run green.
+files: packages/fret/src/rpc/protocols.ts, packages/fret/test/rpc.protocols.spec.ts, packages/fret/test/rpc.stream-errors.spec.ts, packages/fret/test/rpc.codec-properties.spec.ts, packages/fret/test/rpc.handler-fuzz.spec.ts, packages/fret/test/payload-bounds-ttl.spec.ts, docs/threat-analysis.md, docs/threat-rir-mitigated.md, docs/fret.md
 ----
 
-## Why this ticket exists
+## What was reviewed
 
-Fourth and final leg of one review. The change under review is the whole length-prefix framing
-change as a single unit, `rpc-framing-src` (f5f2eb6) through `rpc-framing-suite-green-handoff`
-(5cd9196); cumulative diff `git diff f5f2eb6^ HEAD -- packages/fret docs`.
+The whole length-prefix framing change as one unit — `rpc-framing-src` (f5f2eb6) through
+`rpc-framing-suite-green-handoff` (5cd9196); cumulative diff
+`git diff f5f2eb6^ HEAD -- packages/fret docs`.
 
-Runs 1–3 finished **all** reading: source, all five changed test files, and the docs. Run 3 also
-landed the two inline fixes below. **Nothing is left to read.** What remains is the validation run
-and writing the `complete/` ticket.
+Before framing, an outbound RPC read a stream to exhaustion under a byte cap (`readAllBounded`)
+and used end-of-stream to tell it where a message ended. Now the sender writes one
+length-prefixed frame (`sendFramed`) and the reader (`readFramed`) takes the byte count from the
+prefix, so it knows when a message is complete without waiting for the stream to close, and it
+refuses an over-sized message at the prefix rather than after buffering the body.
 
-## Remaining scope — validation only
+The review ran across four sessions: source read, test read, docs read + inline fixes, and this
+validation pass.
 
-Both commands from `packages/fret/`, foreground, no redirection:
+## Changes applied during review
 
-- `npx tsc --noEmit`
-- `yarn test` (~4 min; 824 tests were green at the implement handoff)
-
-Neither has been independently reproduced by any review run yet. Run 3 edited one test file
-(`rpc.protocols.spec.ts`) and two docs files, so the type-check covers a real edit.
-
-If either fails, judge whether the failure comes from the framing change / the run-3 edits (fix it
-here) or is pre-existing (follow the pre-existing-failure rules — never skip a test).
-
-Then write the `complete/` ticket with the `## Review findings` section, carrying the banked
-findings below verbatim plus whatever validation surfaced. Delete this ticket.
-
-## Fixes already applied by run 3 — do not redo
-
-- **`docs/threat-analysis.md` + `docs/threat-rir-mitigated.md`: stale reader description, fixed.**
+- **`docs/threat-analysis.md` + `docs/threat-rir-mitigated.md` — stale reader description, fixed.**
   Seven places described the old `readAllBounded` in the present tense as a current mitigation.
   The `**Current mitigations**` bullets at 3.4 / 3.5 / 3.7 / 4.4 now name `readFramed` and state
   the cap as a refusal of an over-declared frame *at the length prefix, before any body byte is
-  pulled*, rather than a generic byte limit. The two `**Status —**` notes (3.7, 8.4) and the RiR
-  mirror of 8.4 now say end-of-*message* comes from the length prefix and a short stream raises
-  `FrameTruncationError` instead of completing the read. Two stale source line references
-  (`protocols.ts:42-84`, `protocols.ts:53`) were dropped. The numbered findings' own historical
-  bodies and titles still say `readAllBounded` on purpose — that is the record of what was found
-  at the time, and each is now explicitly framed as pre-framing.
-- **`packages/fret/test/rpc.protocols.spec.ts`: floating promise in the new `ping RTT floor`
+  pulled*, rather than a generic byte limit. The two `**Status —**` notes (3.7, 8.4) and the
+  Right-is-Right mirror of 8.4 now say end-of-*message* comes from the length prefix and a short
+  stream raises `FrameTruncationError` instead of completing the read. Two stale source line
+  references (`protocols.ts:42-84`, `protocols.ts:53`) were dropped. The numbered findings' own
+  historical bodies and titles still say `readAllBounded` on purpose — that is the record of what
+  was found at the time, and each is now explicitly framed as pre-framing.
+- **`packages/fret/test/rpc.protocols.spec.ts` — floating promise in the new `ping RTT floor`
   `before` hook, fixed.** `registerPing` is `async` and was called bare; now awaited. It happened
   to work (the following `await a.dial(...)` gave it a turn), but an unhandled rejection there
   would be process-fatal under Node's default, and the house rule is await or `void`.
 
-## Review findings (carry into the `complete/` ticket)
+## Review findings
 
 - **Source half: no findings.** Every claim in the implement handoff was confirmed against the
   code: `sendFramed` is one `stream.send(lp.encode.single(body))`; the over-cap refusal lives in
@@ -84,7 +72,7 @@ findings below verbatim plus whatever validation surfaced. Delete this ticket.
   the rejected per-chunk idle timer as three distinct concepts, and says so explicitly.
   `test/README.md:71`'s `readFramed` bullet covers both truncation paths — iterator EOF *and* the
   20 ms poll. The two threat docs were stale and were fixed (above).
-- **Tripwire, already parked, index only:** `EOF_POLL_MS` puts a floor of up to 20 ms under
+- **Tripwire, parked in code, index only:** `EOF_POLL_MS` puts a floor of up to 20 ms under
   measured ping RTT. Parked as a code `NOTE:` at the constant in
   `packages/fret/src/rpc/protocols.ts`, not a ticket — the durable fix (iterator priming) is a
   bigger change than this one warranted. The new RTT test asserts the floor is gone for the
@@ -102,3 +90,12 @@ findings below verbatim plus whatever validation surfaced. Delete this ticket.
   right and could plausibly have got wrong — refusing an over-cap message before pulling its body,
   and holding one `iter.next()` across poll ticks rather than re-issuing it — were both checked in
   the source and are both pinned by measurement in the tests.
+
+## Validation
+
+Both run from `packages/fret/`, foreground, this pass:
+
+- `npx tsc --noEmit` — clean, no output. Covers the run-3 edit to `rpc.protocols.spec.ts`.
+- `yarn test` — **824 passing, 0 failing, 4m**. No pre-existing failures surfaced, so nothing was
+  written to `tickets/.pre-existing-error.md`. The mocha exit watchdog did not fire, so the run
+  left no open handles.
