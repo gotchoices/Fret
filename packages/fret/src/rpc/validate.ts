@@ -92,10 +92,12 @@ export const MAX_ACTIVITY_BYTES = 128 * 1024;
  *  breadcrumbs * 64 = 4096, signature (reserved, unimplemented) 512, punctuation ~256. Sums to
  *  ~10.5 KiB; rounded up to 16 KiB for headroom. */
 export const MAYBE_ACT_OVERHEAD_BYTES = 16 * 1024;
-/** Fixed fields of a Core neighbor snapshot plus its metadata allowance — see docs/fret.md
- *  *Stream management*. */
+/** Cap on the encoded size of the caller-supplied `metadata` a Core node attaches to its
+ *  outgoing snapshot. Sized so the fixed fields (≤ 12 successors + 12 predecessors + 8 sample
+ *  entries ≈ 2.5 KiB) plus this allowance stay under the Core neighbors wire cap. Over-cap
+ *  metadata is omitted from the snapshot rather than truncated — see `FretService.snapshot`. */
 export const MAX_SNAPSHOT_METADATA_BYTES_CORE = 8 * 1024;
-/** Same, Edge profile. */
+/** Same, Edge profile — sized against the Edge neighbors wire cap. */
 export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
 
 /**

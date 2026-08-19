@@ -2358,6 +2358,11 @@ export class FretService implements IFretService, Startable {
 		const selfStr = this.node.peerId.toString();
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
 		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
+		// NOTE: over-cap metadata is dropped on every snapshot build (each announce and each
+		// served neighbors request), so a persistently over-sized `setMetadata` value logs once
+		// per snapshot rather than once per change, and the application is never told its
+		// metadata is not propagating. Fine while metadata is a rarely-used diagnostic channel;
+		// if it becomes load-bearing, validate the size in `setMetadata` and reject there.
 		let outMetadata = this.metadata;
 		if (outMetadata) {
 			const metadataCap = this.cfg.profile === 'core' ? MAX_SNAPSHOT_METADATA_BYTES_CORE : MAX_SNAPSHOT_METADATA_BYTES_EDGE;

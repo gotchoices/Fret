@@ -18,10 +18,11 @@ import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
 
 /**
- * Default declared-length cap for a reply when the caller passes none: 8 KiB, the smallest
- * production per-protocol cap (neighbors on the Edge profile, `maxBytesNeighbors()`). Real
- * callers pass their protocol's own cap; this default only protects a direct consumer who
- * forgot one.
+ * Default declared-length cap for a reply when the caller passes none: 8 KiB, matching the
+ * neighbors cap on the Edge profile (`maxBytesNeighbors()`). It is not the smallest cap in the
+ * system — `sendPing` passes 1024 — because a default has to be safe for a caller whose reply
+ * shape we do not know, and every sender here passes its own cap explicitly. This default only
+ * protects a direct consumer who forgot one.
  */
 const DEFAULT_MAX_BYTES = 8 * 1024;
 
@@ -36,7 +37,7 @@ export interface RpcRequestOptions<T> {
 	isDialable?: (peerIdStr: string) => boolean;
 	/**
 	 * Declared-length cap for the reply, per protocol. Real callers pass their protocol's own
-	 * cap; the 8 KiB default (the smallest production cap — neighbors on Edge) only protects a
+	 * cap; the 8 KiB default (neighbors on Edge; see {@link DEFAULT_MAX_BYTES}) only protects a
 	 * direct consumer who forgot one.
 	 */
 	maxBytes?: number;
