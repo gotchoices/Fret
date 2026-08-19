@@ -2,7 +2,7 @@ import type { Libp2p } from 'libp2p';
 import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import type { Uint8ArrayList } from 'uint8arraylist';
-import { abortReasonError } from '../utils/deadline.js';
+import { abortReasonError, deadline } from '../utils/deadline.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:handler');
@@ -79,21 +79,36 @@ export function isUnsupportedProtocolError(err: unknown): boolean {
  * as `releaseRpcStream`). It is skipped in two cases — a stream that already left `'open'`
  * (reset by the remote, which is usually how the error arrived), and one whose write end
  * `serve` already closed, because that reply is committed and a reset would destroy it.
+ *
+ * The success-path close carries its own budget (`opts.closeBudgetMs`, default
+ * {@link RPC_TIMEOUT_MS}). `close()` resolves only once the reply has reached the transport, so a
+ * remote that accepts the stream and stops reading would otherwise hold this handler — and its
+ * stream slot — open forever: the write-side twin of the read-side slow-loris note on
+ * `readFramed`. When that budget expires the close rejects into the catch arm below with the
+ * stream's write end at `'closing'` rather than `'closed'`, so the abort runs and the slot is
+ * reclaimed. Reclaiming it destroys the undelivered reply, which is the right trade: the close
+ * never completed, so that reply was never committed, and the remote was not reading it anyway.
+ *
+ * `opts.closeBudgetMs` exists so a test need not spend the full default per case; there is no
+ * production caller that overrides it.
  */
 export async function registerRpcHandler(
 	node: Libp2p,
 	protocol: string,
-	serve: (stream: Stream, connection: Connection) => Promise<void>
+	serve: (stream: Stream, connection: Connection) => Promise<void>,
+	opts: { closeBudgetMs?: number } = {}
 ): Promise<void> {
+	const closeBudgetMs = opts.closeBudgetMs ?? RPC_TIMEOUT_MS;
 	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
 		try {
 			await serve(stream, connection);
-			// NOTE: `close()` waits for the write queue to drain, so a remote that stops reading
-			// holds this handler (and its stream slot) open with no budget of its own — the
-			// write-side twin of the read-side slow-loris note on `readFramed`. Replies are
-			// small enough to fit a muxer window today, so the wait is not reachable in practice;
-			// if it ever is, pass an `AbortOptions` deadline here rather than skipping the close.
-			await stream.close();
+			const d = deadline(closeBudgetMs);
+			try {
+				await stream.close({ signal: d.signal });
+			} finally {
+				// Mandatory: an uncleared timer fails the repo's mocha exit watchdog.
+				d.cancel();
+			}
 		} catch (err) {
 			log.error('%s handler error - %e', protocol, err);
 			if (stream.status === 'open' && stream.writeStatus !== 'closed') {
@@ -268,6 +283,16 @@ function remoteFinishedWriting(stream: unknown): boolean {
  *
  * `opts.signal` cancels the read from outside, on exactly the same contract as the deadline.
  *
+ * `timeoutMs === Infinity` means "no independent clock — bounded by `opts.signal` alone", and
+ * `opts.signal` is then **required**: an unbounded read with nothing to end it is a caller bug
+ * that presents as a hang, so it throws at entry instead. Every other part of the loop already
+ * copes — `remaining` is `Infinity`, so it is never `<= 0`, the poll interval still comes out at
+ * {@link EOF_POLL_MS}, and the `read timed out` throw below is simply unreachable. This exists so
+ * a caller that already arms a `deadline()` around the whole RPC can hand that deadline's signal
+ * down as the *only* clock: arming a second timer from the same `timeoutMs` makes which error
+ * surfaces (and which release arm runs) a race between two timers that expire a tick apart.
+ * The default stays {@link RPC_TIMEOUT_MS} for direct users of this pinned public export.
+ *
  * @throws {FrameTruncationError} when the source ends before a whole framed message arrived —
  * including a clean close right after the prefix, which the decoder completes silently on.
  * @throws if the deadline expires, `opts.signal` aborts, or the declared length exceeds
@@ -282,6 +307,9 @@ export async function readFramed(
 	opts: { signal?: AbortSignal } = {}
 ): Promise<Uint8Array> {
 	const signal = opts.signal;
+	if (timeoutMs === Infinity && signal == null) {
+		throw new Error('readFramed: timeoutMs of Infinity requires opts.signal — an unbounded read never ends');
+	}
 	if (signal?.aborted === true) throw abortReasonError(signal);
 
 	const source = lp.decode(stream, {
@@ -444,7 +472,20 @@ export async function openRpcStream(
  * are finite (libp2p's default 64 per protocol per connection; FRET passes no override), so a
  * leaked stream is a real ceiling rather than mere waste.
  *
- * Both arms are best-effort: this runs from a `finally` on an already-failing path, where a
+ * The close on the un-aborted path is itself bounded by `signal`. `Stream.close()` resolves only
+ * once pending data has reached the transport, so a peer that accepts a stream and then stops
+ * reading holds this call open with no budget of its own — worst case on the shutdown path, where
+ * the leave fan-out's entire reason for a budget is a bounded `stop()`. Passing the signal costs
+ * nothing and is only meaningful because of an **ordering** every caller must preserve: release
+ * runs from a `finally` *before* `d.cancel()`, so the deadline is still live at this point. Cancel
+ * first and the signal handed here can never fire, and the bound is silently gone.
+ *
+ * A bounded close that rejects (the signal fired mid-close, or the transport failed it) has not
+ * released the stream — bounding the wait would otherwise free the *caller* and leak the stream
+ * slot, which is the ceiling above by another route. So that arm falls through to the same
+ * `abort()` the already-aborted path uses.
+ *
+ * All arms are best-effort: this runs from a `finally` on an already-failing path, where a
  * second throw would mask the real error.
  */
 export async function releaseRpcStream(stream: Stream | undefined, signal: AbortSignal): Promise<void> {
@@ -453,5 +494,12 @@ export async function releaseRpcStream(stream: Stream | undefined, signal: Abort
 		try { stream.abort(abortReasonError(signal)); } catch { /* best effort */ }
 		return;
 	}
-	try { await stream.close(); } catch { /* best effort */ }
+	try {
+		await stream.close({ signal });
+	} catch (err) {
+		const reason = signal.aborted
+			? abortReasonError(signal)
+			: (err instanceof Error ? err : new Error(String(err)));
+		try { stream.abort(reason); } catch { /* best effort */ }
+	}
 }

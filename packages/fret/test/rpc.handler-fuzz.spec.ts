@@ -83,6 +83,8 @@ interface InboundStub {
 	closes: number
 	aborts: number
 	sends: number
+	/** `close()` calls that hung rather than completing (only when `closeHangs`). */
+	closeAttempts: number
 	/** Reply frames the handler wrote (empty when `sendThrows`). `sendFramed` passes a `Uint8ArrayList`. */
 	replies: Array<Uint8Array | Uint8ArrayList>
 	status: () => string
@@ -93,6 +95,8 @@ interface InboundStubOpts {
 	sendThrows?: Error
 	/** First read throws and flips status to `reset` — the remote tore the stream down. */
 	resetOnRead?: boolean
+	/** `close()` never resolves on its own — the remote accepted the reply and stopped reading. */
+	closeHangs?: boolean
 }
 
 function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundStub {
@@ -106,7 +110,7 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 	let i = 0
 	const rec: InboundStub = {
 		stream: undefined as unknown as Stream,
-		closes: 0, aborts: 0, sends: 0, replies: [],
+		closes: 0, aborts: 0, sends: 0, closeAttempts: 0, replies: [],
 		status: () => status,
 	}
 	const stream = {
@@ -119,8 +123,21 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 			rec.replies.push(b)
 			return true
 		},
-		close: async (): Promise<void> => {
+		close: async (o?: { signal?: AbortSignal }): Promise<void> => {
 			if (writeStatus === 'closed') return
+			// A remote that accepted the reply and stopped reading: `close()` resolves only once
+			// pending data reached the transport, so it hangs until the caller's budget fires.
+			// `writeStatus` sits at 'closing' meanwhile, which is what leaves the wrapper's abort
+			// arm eligible when the budget does fire.
+			if (opts.closeHangs) {
+				rec.closeAttempts++
+				writeStatus = 'closing'
+				return await new Promise<void>((_res, rej) => {
+					const s = o?.signal
+					if (s == null) return // never settles — the unbudgeted behavior under test
+					s.addEventListener('abort', () => { rej(new Error('close aborted')) }, { once: true })
+				})
+			}
 			rec.closes++
 			writeStatus = 'closed'
 		},
@@ -244,6 +261,38 @@ describe('RPC handler fault isolation', function () {
 			// stream is still `status: 'open'` here (half-closed, remote's write end alive), so
 			// the write end is what tells the wrapper the reply was already committed.
 			expect(s.status(), 'half-closed, not fully closed').to.equal('open')
+			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
+		})
+
+		it('bounds a success-path close against a remote that stops reading, releasing via abort', async () => {
+			const { node, invoke } = fakeNode()
+			// The budget is injected only so the case does not spend the 5s default; production
+			// has no override.
+			await registerRpcHandler(node, '/test/stalled-reader', async () => { /* replied, no release */ }, { closeBudgetMs: 100 })
+			const s = inboundStub([], { closeHangs: true })
+
+			const t0 = Date.now()
+			await invoke('/test/stalled-reader', s.stream, 'peer-a') // must settle, not hang
+			const elapsed = Date.now() - t0
+
+			// The close was attempted and never completed; the budget expiry then rejects it into
+			// the catch arm, where `writeStatus === 'closing'` (not 'closed') leaves the abort
+			// eligible — so the stream slot is reclaimed rather than held forever.
+			expect(s.closeAttempts, 'close attempted').to.equal(1)
+			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 0, aborts: 1 })
+			expect(s.status(), 'released').to.equal('aborted')
+			expect(elapsed, `elapsed ${elapsed}ms must be bounded by the injected budget`).to.be.at.most(3000)
+		})
+
+		it('does not spend the close budget on a stream the handler already closed', async () => {
+			const { node, invoke } = fakeNode()
+			await registerRpcHandler(node, '/test/handler-closed', async (stream) => { await stream.close() }, { closeBudgetMs: 100 })
+			const s = inboundStub([])
+
+			await invoke('/test/handler-closed', s.stream, 'peer-a')
+
+			// `close()` early-returns once the write end is closed, so the budgeted close is a
+			// no-op — the bound never turns a committed reply into a second release.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 

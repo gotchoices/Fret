@@ -12,6 +12,7 @@ import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { sendLeave } from '../src/rpc/leave.js'
 import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
+import * as lp from 'it-length-prefixed'
 
 // Minimal recording stubs. openRpcStream only touches `node.getConnections`,
 // `node.dialProtocol`, and per-connection `{ status, limits, remoteAddr,
@@ -239,6 +240,58 @@ describe('releaseRpcStream', () => {
 		expect(calls, 'release calls').to.deep.equal(['abort'])
 	})
 
+	// A `close()` that never resolves on its own — libp2p's contract is that it settles once the
+	// pending data reached the transport, so a peer that accepts the stream and stops reading
+	// produces exactly this. Honours `AbortOptions`, which is what the bound relies on.
+	function makeStallingClose(): { stream: Stream; calls: string[] } {
+		const calls: string[] = []
+		const stream = {
+			abort: (_err: Error) => { calls.push('abort') },
+			close: async (o?: { signal?: AbortSignal }) => {
+				calls.push('close')
+				return await new Promise<void>((_res, rej) => {
+					const s = o?.signal
+					if (s == null) return // never settles — the pre-bound behavior this test rules out
+					s.addEventListener('abort', () => { rej(abortReasonError(s)) }, { once: true })
+				})
+			},
+		}
+		return { stream: stream as unknown as Stream, calls }
+	}
+
+	it('bounds a close that never resolves, and still releases the stream', async () => {
+		const { stream, calls } = makeStallingClose()
+		const ac = new AbortController()
+		const timer = setTimeout(() => { ac.abort(new Error('budget expired')) }, 100)
+
+		const t0 = Date.now()
+		try {
+			// Callers release from a `finally` BEFORE `d.cancel()`, so the deadline is still live
+			// here — that ordering is the whole reason passing its signal bounds anything.
+			await releaseRpcStream(stream, ac.signal)
+		} finally {
+			clearTimeout(timer)
+		}
+		const elapsed = Date.now() - t0
+
+		// The close was attempted (not skipped), then the failed close fell through to abort —
+		// without which bounding the wait would free the caller and leak the stream slot.
+		expect(calls, 'release calls').to.deep.equal(['close', 'abort'])
+		expect(elapsed, `elapsed ${elapsed}ms must be bounded by the signal`).to.be.at.most(2000)
+	})
+
+	it('aborts when a close rejects for a reason other than the signal', async () => {
+		const calls: string[] = []
+		const stream = {
+			abort: (_err: Error) => { calls.push('abort') },
+			close: async () => { calls.push('close'); throw new Error('transport gone') },
+		} as unknown as Stream
+
+		await releaseRpcStream(stream, new AbortController().signal)
+
+		expect(calls, 'release calls').to.deep.equal(['close', 'abort'])
+	})
+
 	it('swallows a stream carrying neither close nor abort', async () => {
 		const bare = { id: 'stub-stream' } as unknown as Stream
 		const ac = new AbortController()
@@ -428,6 +481,65 @@ describe('RPC deadlines', () => {
 		}
 
 		expect((thrown as Error)?.message, 'abort reason surfaces').to.equal('caller gave up')
+		expectBounded(Date.now() - t0)
+	})
+
+	it('readFramed with an Infinity budget still returns a completed frame', async () => {
+		const body = new TextEncoder().encode('{"ok":true}')
+		const frame = lp.encode.single(body).subarray()
+		const source = (async function* () { yield frame })()
+
+		const out = await readFramed(source, 1024, Infinity, { signal: new AbortController().signal })
+
+		// The read loop needs no `Infinity` special-casing: `remaining` is never `<= 0` and the
+		// poll interval still comes out at EOF_POLL_MS, so the ordinary path is untouched.
+		expect(new TextDecoder().decode(out), 'frame body').to.equal('{"ok":true}')
+	})
+
+	it('readFramed refuses an Infinity budget with no signal, before touching the stream', async () => {
+		let pulls = 0
+		const counted = {
+			[Symbol.asyncIterator]: () => ({
+				next: () => { pulls++; return new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }) },
+			}),
+		}
+
+		let thrown: unknown
+		try {
+			await readFramed(counted, 1024, Infinity)
+		} catch (err) {
+			thrown = err
+		}
+
+		// An unbounded read with nothing to end it is a caller bug that presents as a hang, so it
+		// is refused at entry — no clock, no signal, and provably no byte pulled.
+		expect((thrown as Error)?.message, 'entry throw').to.contain('requires opts.signal')
+		expect(pulls, 'stream never read').to.equal(0)
+	})
+
+	it('readFramed with an Infinity budget is ended by its signal alone, never by a timer', async () => {
+		const silent = {
+			[Symbol.asyncIterator]: () => ({
+				next: () => new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }),
+			}),
+		}
+		const ac = new AbortController()
+		const timer = setTimeout(() => { ac.abort(new Error('caller gave up')) }, TIMEOUT_MS)
+
+		const t0 = Date.now()
+		let thrown: unknown
+		try {
+			await readFramed(silent, 1024, Infinity, { signal: ac.signal })
+		} catch (err) {
+			thrown = err
+		} finally {
+			clearTimeout(timer)
+		}
+
+		// The abort reason surfaces verbatim: with no second clock there is no `read timed out`
+		// error to race it, so which error a caller sees is deterministic rather than a coin flip.
+		expect((thrown as Error)?.message, 'abort reason surfaces').to.equal('caller gave up')
+		expect((thrown as Error)?.message, 'no read-timeout path').to.not.contain('read timed out')
 		expectBounded(Date.now() - t0)
 	})
 
