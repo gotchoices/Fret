@@ -600,7 +600,9 @@ All are pure and O(message size) — no hashing, no ring walks, no dialing — a
 any input, which is what makes them safe to run before the guards that used to throw on a field of
 the wrong type. `v` is deliberately unchecked on every message: nothing negotiates versions today,
 and a hard reject on an unexpected `v` would make a future v2 rollout fail closed at exactly the
-peers that have not upgraded yet.
+peers that have not upgraded yet. The snapshot's `sig` is unchecked for a different reason —
+message signing is unimplemented, so nothing reads the field — and it is carried through
+untouched rather than dropped, so a signing rollout finds it already arriving.
 
 | Parser | Rejects the message when | Normalizes |
 |---|---|---|

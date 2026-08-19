@@ -787,8 +787,8 @@ describe('RPC handler fault isolation', function () {
 			function succPredRows(field: 'successors' | 'predecessors'): FieldRow[] {
 				const overCap = Array.from({ length: 20 }, (_, i) => `${field}-${i}`)
 				// cap non-strings, then one valid string past the slice — must vanish entirely.
-				const truncateThenFilter = [
-					...Array.from({ length: SUCC_PRED_CAP }, () => 7 as unknown as string),
+				const truncateThenFilter: unknown[] = [
+					...Array.from({ length: SUCC_PRED_CAP }, () => 7),
 					'past-the-slice',
 				]
 				const expectEmpty = (s: NeighborSnapshotV1): void => {
@@ -840,6 +840,29 @@ describe('RPC handler fault isolation', function () {
 
 				...succPredRows('successors'),
 				...succPredRows('predecessors'),
+
+				// `sig` is deliberately unchecked — message signing is unimplemented, so nothing
+				// reads it. These rows make that decision testable rather than implicit: whatever
+				// arrives is carried through untouched, and an absent one stays absent. They fail
+				// if `sig` ever gains a shape rule without the decision being revisited here.
+				{
+					name: 'sig: wrong type (number) passes through untouched',
+					body: () => snapshot({ sig: 5 }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect((s as unknown as Record<string, unknown>).sig).to.equal(5),
+				},
+				{
+					name: 'sig: null passes through untouched',
+					body: () => snapshot({ sig: null }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect((s as unknown as Record<string, unknown>).sig).to.equal(null),
+				},
+				{
+					name: 'sig: missing stays absent',
+					body: () => withoutField('sig'),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect('sig' in s, 'sig: not synthesized').to.equal(false),
+				},
 			]
 
 			for (const row of rows) {
