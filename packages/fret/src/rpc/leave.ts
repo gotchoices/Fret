@@ -45,27 +45,27 @@ export async function registerLeave(
 	protocol = PROTOCOL_LEAVE,
 	onIdentityMismatch?: (claimed: string, actual: string) => void
 ): Promise<void> {
-	// Errors and stream release belong to `registerRpcHandler`, not this body.
+	// Errors and stream release belong to `registerRpcHandler`, not this body — including the
+	// close, which the seam performs under its own budget so a remote that stops reading cannot
+	// hold the handler open.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		const bytes = await readFramed(stream, 4096);
 		const msg = await decodeJson<LeaveNoticeV1>(bytes);
 		// A leave notice removes the peer it names, so an unverified `from` lets any
 		// connected peer evict any other. Reject unless `from` matches the
 		// transport-authenticated sender before touching the routing table. The drop is a
-		// normal outcome, not a failure — it closes, never aborts.
+		// normal outcome, not a failure — returning normally lets the seam close, never abort.
 		const actual = connection.remotePeer.toString();
 		if (msg.from !== actual) {
 			onIdentityMismatch?.(msg.from, actual);
 			// NOTE: debug-gated (@libp2p/logger emits only under DEBUG). If mismatch logging
 			// is ever routed to an always-on sink, a hostile peer can spam it — rate-limit then.
 			log.error('leave identity mismatch: claimed %s actual %s - dropping', msg.from, actual);
-			await stream.close();
 			return;
 		}
 		msg.replacements = sanitizeReplacements(msg.replacements);
 		await onLeave(msg);
 		sendFramed(stream, await encodeJson({ ok: true }));
-		await stream.close();
 	});
 }
 

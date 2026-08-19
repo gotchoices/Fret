@@ -24,13 +24,14 @@ export async function registerMaybeAct(
 ): Promise<void> {
 	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
-	// Errors and stream release belong to `registerRpcHandler`, not this body.
+	// Errors and stream release belong to `registerRpcHandler`, not this body — including the
+	// close, which the seam performs under its own budget so a remote that stops reading cannot
+	// hold the handler open.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		const bytes = await readFramed(stream, maxBytes);
 		const msg = await decodeJson<RouteAndMaybeActV1>(bytes);
 		const res = await handle(msg, connection.remotePeer.toString());
 		sendFramed(stream, await encodeJson(res));
-		await stream.close();
 	});
 }
 
@@ -98,8 +99,11 @@ export async function sendMaybeAct(
 		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
 		sendFramed(stream!, await encodeJson(msg));
 		// Half-close: this is the write-side flush the responder waits on, not cleanup — the
-		// read below depends on it, so it stays inside the `try`.
-		await stream!.close();
+		// read below depends on it, so it stays inside the `try`. It carries the deadline's
+		// signal for the same reason `releaseRpcStream`'s close does: `close()` resolves only
+		// once the bytes reach the transport, so against a remote that stops reading a bare
+		// close is unbounded and would outlive the RPC's own budget.
+		await stream!.close({ signal: d.signal });
 		const bytes = await readFramed(stream!, 512 * 1024, timeoutMs, { signal: d.signal });
 		return await decodeJson(bytes);
 	} finally {

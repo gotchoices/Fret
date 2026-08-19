@@ -43,10 +43,11 @@ export async function registerPing(
 	// protocol. `onInbound` hands that proof to the caller.
 	// Errors and stream release belong to `registerRpcHandler` — the reply tail below used to
 	// sit outside any try at all, so a reset stream rejected the handler promise unlogged.
+	// The body deliberately does not close: the seam's close carries a budget, and a bare
+	// `close()` here would block on a remote that stops reading and pre-empt that budget.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
 		sendFramed(stream, await encodeJson(await pingReply(getSizeEstimate)));
-		await stream.close();
 	});
 }
 

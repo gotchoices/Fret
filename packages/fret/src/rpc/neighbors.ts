@@ -31,12 +31,13 @@ export async function registerNeighbors(
 	// The request carries no inbound `from`, but the connection's remote peer is
 	// transport-authenticated — and reaching this handler at all means the remote dialed
 	// *this network's* namespaced protocol. `onInbound` hands that proof to the caller.
-	// Errors and stream release belong to `registerRpcHandler`, not these bodies.
+	// Errors and stream release belong to `registerRpcHandler`, not these bodies — including the
+	// close, which the seam performs under its own budget so a remote that stops reading cannot
+	// hold the handler open.
 	await registerRpcHandler(node, protocols.PROTOCOL_NEIGHBORS, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
 		const snap = await getSnapshot();
 		sendFramed(stream, await encodeJson(snap));
-		await stream.close();
 	});
 
 	if (onAnnounce) {
@@ -46,19 +47,17 @@ export async function registerNeighbors(
 			// The snapshot's self-reported `from` must match the transport-authenticated
 			// remote peer — otherwise a connected peer can impersonate another and poison
 			// the routing table via a forged sample/successor set. The drop is a normal
-			// outcome, not a failure — it closes, never aborts.
+			// outcome, not a failure — returning normally lets the seam close, never abort.
 			const actual = connection.remotePeer.toString();
 			if (snap.from !== actual) {
 				onIdentityMismatch?.(snap.from, actual);
 				// NOTE: debug-gated (@libp2p/logger emits only under DEBUG). If mismatch logging
 				// is ever routed to an always-on sink, a hostile peer can spam it — rate-limit then.
 				log.error('announce identity mismatch: claimed %s actual %s - dropping', snap.from, actual);
-				await stream.close();
 				return;
 			}
 			onAnnounce(snap.from, snap);
 			sendFramed(stream, await encodeJson({ ok: true }));
-			await stream.close();
 		});
 	}
 }
