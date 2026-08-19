@@ -874,7 +874,7 @@ describe('RPC codec properties', function () {
 
 		it('answers an under-cap maybeAct and refuses an over-cap one before the service sees it', async () => {
 			const maxBytes = (rig.svc as unknown as { maxBytesMaybeAct(): number }).maxBytesMaybeAct()
-			expect(maxBytes, 'edge wire cap').to.equal(256 * 1024)
+			expect(maxBytes, 'edge wire cap').to.equal(144 * 1024)
 
 			// Under the wire cap *and* under the service's own 128 KB activity cap, so this is a
 			// genuine answer rather than a payload-too-large rejection.
@@ -903,7 +903,7 @@ describe('RPC codec properties', function () {
 
 		it('merges an under-cap announce and refuses an over-cap one', async () => {
 			const maxBytes = (rig.svc as unknown as { maxBytesNeighbors(): number }).maxBytesNeighbors()
-			expect(maxBytes, 'edge wire cap').to.equal(64 * 1024)
+			expect(maxBytes, 'edge wire cap').to.equal(8 * 1024)
 
 			const senderId = rig.sender.peerId.toString()
 			const announce = (padChars: number): string => JSON.stringify({

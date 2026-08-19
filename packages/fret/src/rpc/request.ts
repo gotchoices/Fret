@@ -36,7 +36,7 @@ export interface RpcRequestOptions<T> {
 	isDialable?: (peerIdStr: string) => boolean;
 	/**
 	 * Declared-length cap for the reply, per protocol. Real callers pass their protocol's own
-	 * cap; the 64 KiB default (the smallest production cap — neighbors on Edge) only protects a
+	 * cap; the 8 KiB default (the smallest production cap — neighbors on Edge) only protects a
 	 * direct consumer who forgot one.
 	 */
 	maxBytes?: number;

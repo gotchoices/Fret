@@ -398,17 +398,17 @@ describe('rpcRequest', function () {
 		})
 
 		// Every other case passes an explicit `maxBytes`, so the DEFAULT_MAX_BYTES fallback is only
-		// ever proved *present*. Omitting it against a frame declaring 65537 bytes proves it is
-		// wired to the cap the reader enforces, at the 64 KiB boundary itself.
-		it('with maxBytes omitted the 64 KiB default is the cap that refuses the frame', async () => {
-			const s = serves(new Uint8Array(64 * 1024 + 1))
+		// ever proved *present*. Omitting it against a frame declaring 8193 bytes proves it is
+		// wired to the cap the reader enforces, at the 8 KiB boundary itself.
+		it('with maxBytes omitted the 8 KiB default is the cap that refuses the frame', async () => {
+			const s = serves(new Uint8Array(8 * 1024 + 1))
 
 			const out = await rpcRequest<PingReply>(countingNode(s.stream).node, peer, PROTOCOL, {
 				timeoutMs: TIMEOUT_MS, body: { ping: 1 }, decode: decodePing,
 			})
 
 			expect(expectKind(out, 'decode-error').error.message)
-				.to.equal('payload too large: 65537 exceeds 65536 byte limit')
+				.to.equal('payload too large: 8193 exceeds 8192 byte limit')
 			expectRelease(s, { closes: 1, aborts: 0 })
 		})
 

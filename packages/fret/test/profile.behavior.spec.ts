@@ -302,32 +302,30 @@ describe('Profile behavior tests', function () {
 	// ----- Phase 4: Payload size limits -----
 
 	describe('Payload size limits', () => {
-		it('Core maxBytesNeighbors = 128 KB (131072)', async () => {
+		it('Core maxBytesNeighbors = 16 KB (16384)', async () => {
 			const { node, svc } = await createService('core')
-			expect((svc as any).maxBytesNeighbors()).to.equal(131072)
+			expect((svc as any).maxBytesNeighbors()).to.equal(16384)
 			await svc.stop()
 			await node.stop()
 		})
 
-		it('Edge maxBytesNeighbors = 64 KB (65536)', async () => {
+		it('Edge maxBytesNeighbors = 8 KB (8192)', async () => {
 			const { node, svc } = await createService('edge')
-			expect((svc as any).maxBytesNeighbors()).to.equal(65536)
+			expect((svc as any).maxBytesNeighbors()).to.equal(8192)
 			await svc.stop()
 			await node.stop()
 		})
 
-		it('Core maxBytesMaybeAct = 512 KB (524288)', async () => {
-			const { node, svc } = await createService('core')
-			expect((svc as any).maxBytesMaybeAct()).to.equal(524288)
-			await svc.stop()
-			await node.stop()
-		})
+		it('maxBytesMaybeAct = 144 KB (147456) on both profiles', async () => {
+			const core = await createService('core')
+			expect((core.svc as any).maxBytesMaybeAct()).to.equal(147456)
+			await core.svc.stop()
+			await core.node.stop()
 
-		it('Edge maxBytesMaybeAct = 256 KB (262144)', async () => {
-			const { node, svc } = await createService('edge')
-			expect((svc as any).maxBytesMaybeAct()).to.equal(262144)
-			await svc.stop()
-			await node.stop()
+			const edge = await createService('edge')
+			expect((edge.svc as any).maxBytesMaybeAct()).to.equal(147456)
+			await edge.svc.stop()
+			await edge.node.stop()
 		})
 	})
 
