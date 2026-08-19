@@ -1627,10 +1627,10 @@ describe('RPC handler fault isolation', function () {
 
 				afterEach(async () => { await stopAll([node]) })
 
-				it('states its merge caps as the pinned per-profile literals', () => {
-					expect(capsOf(svc)).to.deep.equal(expected)
-				})
-
+				// `mergeSnapshotCaps()` is deep-equalled against these same literals by
+				// `test/announce-rate-limit.spec.ts`, which owns the caps-are-one-source-of-truth
+				// claim; re-asserting it here would be a second copy of the numbers to keep in
+				// sync. The counts below still fail loudly if the caps drift.
 				it('merges exactly 1 + successors + predecessors + sample ids, however long the lists', async () => {
 					const ids = countUpserts(svc)
 
