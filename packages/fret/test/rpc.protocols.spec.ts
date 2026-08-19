@@ -561,6 +561,69 @@ describe('RPC deadlines', () => {
 		expectBounded(Date.now() - t0)
 	})
 
+	/**
+	 * The regression guard for the false-truncation bug: a reply the remote *actually wrote* must
+	 * never be reported as cut off.
+	 *
+	 * The stub holds the stream-level state at "finished" for the whole test — `readBufferLength: 0`
+	 * and `remoteWriteStatus: 'closed'` — which is exactly the state the deleted 20ms EOF poll read
+	 * as truncation. All six functions `isMessageStream` requires are present, so `readFramed` takes
+	 * the stream path; a stub missing any one of them falls silently back to the iterable path and
+	 * this test would stop testing anything, which is what the `iterated` assertion pins.
+	 */
+	it('readFramed returns a buffered frame even while the stream reports itself finished', async () => {
+		const frame = lp.encode.single(new TextEncoder().encode('{"ok":true}')).subarray()
+		let iterated = false
+		// `byteStream` calls `stream.log.error(...)` on its EOF paths — unreached here, but a bare
+		// arrow would throw rather than log if it ever were.
+		const log = Object.assign(() => { /* unused */ }, { error: () => { /* unused */ } })
+
+		const stub = {
+			// Constant throughout: "the remote finished writing and my own buffer is drained".
+			readBufferLength: 0,
+			remoteWriteStatus: 'closed',
+			/**
+			 * The frame is handed over **synchronously, at subscribe time, and it must stay that
+			 * way.** `readFramedFromStream` calls `byteStream(stream)` — which registers this
+			 * listener — and then `bs.read({bytes:1})`, whose body runs synchronously down to its
+			 * EOF gate; there is no `await` in between. With EOF true that gate throws
+			 * `UnexpectedEOFError` unless the bytes are *already* in byteStream's buffer, so a
+			 * frame dispatched on any later turn of the event loop arrives too late.
+			 *
+			 * That models the real transport faithfully rather than gaming it: bytes that already
+			 * arrived are dispatched to a reader the instant it subscribes, and `readBufferLength: 0`
+			 * is the correct post-dispatch state — the bytes left the stream's buffer and now sit in
+			 * the reader's. Do NOT "fix" this into a `setTimeout`: the test would still look green
+			 * and would no longer exercise the bug.
+			 */
+			addEventListener: (type: string, fn: (evt: { data: Uint8Array }) => void) => {
+				if (type === 'message') fn({ data: frame })
+			},
+			removeEventListener: () => { /* no-op */ },
+			send: () => true,
+			push: () => { /* no-op: the read consumes the whole frame, so `unwrap` pushes nothing */ },
+			closeRead: () => { /* no-op */ },
+			log,
+			/**
+			 * Present **only** so this stub would fail under the pre-fix implementation, which ran
+			 * `lp.decode(stream)` over the stream as an async iterable and raced it against a 20ms
+			 * poll of the stream's own drained-and-remote-closed state. With the frame 50ms out the
+			 * poll fired first and raised `FrameTruncationError`. The stream path never touches the
+			 * iterator, which is what makes this a regression guard rather than a shape assertion.
+			 */
+			[Symbol.asyncIterator]: async function* () {
+				iterated = true
+				await new Promise((resolve) => setTimeout(resolve, 50))
+				yield frame
+			},
+		}
+
+		const out = await readFramed(stub, 1024, 1000, { signal: new AbortController().signal })
+
+		expect(new TextDecoder().decode(out), 'the frame the remote wrote, not a truncation').to.equal('{"ok":true}')
+		expect(iterated, 'the stream path was taken - the iterable fallback is the pre-fix path').to.equal(false)
+	})
+
 	it('fetchNeighbors gives up on a newStream that never resolves, reporting a timeout', async () => {
 		const t0 = Date.now()
 		// The stub reports an open connection, so the connection-only default never skips — the

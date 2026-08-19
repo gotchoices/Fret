@@ -1035,15 +1035,13 @@ describe('RPC handler fault isolation', function () {
 		const bytes = typeof payload === 'string' ? enc.encode(payload) : payload
 		const stream = await sender.dialProtocol(target, [protocol])
 		stream.send(lp.encode.single(bytes))
-		// Start the read *before* the half-close, then await both. Order matters in both
-		// directions: `readFramed` subscribes to the stream's one-shot close events when its
-		// iteration starts, so closing first can lose a reply from a handler that reads no
-		// request body (ping, the neighbors request) and therefore answers a few ticks later;
-		// while not closing at all strands the receiver, whose own budgeted close waits on our
-		// write end. FRET framing carries the body length in-band, so the close is never what
-		// delimits a message.
-		const reading = readFramed(stream, 1024 * 1024, 3000)
+		// Half-close first, then read. FRET framing carries the body length in-band, so the
+		// reader is authoritative about when a message is complete and a close can never lose a
+		// reply — including from a handler that reads no request body (ping, the neighbors
+		// request) and so answers a few ticks later. Not closing at all strands the receiver,
+		// whose own budgeted close waits on our write end.
 		const closing = stream.close().catch(() => { /* the read outcome is what this reports */ })
+		const reading = readFramed(stream, 1024 * 1024, 3000)
 		try {
 			const reply = await reading
 			await closing
