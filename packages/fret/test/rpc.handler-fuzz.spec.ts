@@ -498,6 +498,8 @@ describe('RPC handler fault isolation', function () {
 			 * pass for a parser that normalized to something else entirely.
 			 */
 			lastLeave?: LeaveNoticeV1
+			/** The last snapshot `onAnnounce` received — same rationale as `lastLeave` above. */
+			lastAnnounce?: NeighborSnapshotV1
 		}
 
 		function hooks(): Hooks { return { reasons: [], mismatches: 0, served: 0 } }
@@ -520,7 +522,7 @@ describe('RPC handler fault isolation', function () {
 			await registerNeighbors(
 				node,
 				() => snapshot() as unknown as NeighborSnapshotV1,
-				() => { h.served++ },
+				(_from, snap) => { h.served++; h.lastAnnounce = snap },
 				{ PROTOCOL_NEIGHBORS: P.PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE: P.PROTOCOL_NEIGHBORS_ANNOUNCE },
 				128 * 1024,
 				() => { h.mismatches++ },
