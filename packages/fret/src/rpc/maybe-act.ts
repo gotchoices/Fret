@@ -8,7 +8,7 @@ import {
 	registerRpcHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
-import { parseMaybeActReply, parseOrThrow } from './validate.js';
+import { parseMaybeActReply, parseOrThrow, MAX_ACTIVITY_BYTES, MAYBE_ACT_OVERHEAD_BYTES } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';
 
@@ -16,7 +16,7 @@ export async function registerMaybeAct(
 	node: Libp2p,
 	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
 	protocol = PROTOCOL_MAYBE_ACT,
-	maxBytes = 512 * 1024
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES
 ): Promise<void> {
 	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
@@ -50,7 +50,7 @@ export async function sendMaybeAct(
 		...opts,
 		body: msg,
 		halfCloseBeforeRead: true,
-		maxBytes: 512 * 1024,
+		maxBytes: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
 		// A reply that is neither shape is `decode-error`, not a half-parsed cast.
 		decode: async (b) => parseOrThrow(parseMaybeActReply, await decodeJson(b)),
 	});

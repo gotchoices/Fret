@@ -18,11 +18,12 @@ import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
 
 /**
- * Default declared-length cap for a reply when the caller passes none: 64 KiB, the smallest
- * production per-protocol cap (neighbors on the Edge profile). Real callers pass their
- * protocol's own cap; this default only protects a direct consumer who forgot one.
+ * Default declared-length cap for a reply when the caller passes none: 8 KiB, the smallest
+ * production per-protocol cap (neighbors on the Edge profile, `maxBytesNeighbors()`). Real
+ * callers pass their protocol's own cap; this default only protects a direct consumer who
+ * forgot one.
  */
-const DEFAULT_MAX_BYTES = 64 * 1024;
+const DEFAULT_MAX_BYTES = 8 * 1024;
 
 export interface RpcRequestOptions<T> {
 	/** Whole-RPC budget: dial + open + write + read + close. Defaults to {@link RPC_TIMEOUT_MS}. */

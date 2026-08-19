@@ -2358,6 +2358,15 @@ export class FretService implements IFretService, Startable {
 		const selfStr = this.node.peerId.toString();
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
 		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
+		let outMetadata = this.metadata;
+		if (outMetadata) {
+			const metadataCap = this.cfg.profile === 'core' ? MAX_SNAPSHOT_METADATA_BYTES_CORE : MAX_SNAPSHOT_METADATA_BYTES_EDGE;
+			const metadataBytes = new TextEncoder().encode(JSON.stringify(outMetadata)).byteLength;
+			if (metadataBytes > metadataCap) {
+				log.error('snapshot metadata (%d bytes) exceeds %d byte cap for profile %s - omitting from outgoing snapshot', metadataBytes, metadataCap, this.cfg.profile);
+				outMetadata = undefined;
+			}
+		}
 		return {
 			v: 1,
 			from: this.node.peerId.toString(),
@@ -2368,7 +2377,7 @@ export class FretService implements IFretService, Startable {
 			size_estimate: n,
 			confidence,
 			sig: '',
-			metadata: this.metadata,
+			metadata: outMetadata,
 		};
 	}
 
