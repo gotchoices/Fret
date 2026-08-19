@@ -1615,6 +1615,15 @@ describe('RPC handler fault isolation', function () {
 		 * `applyTouch` opens with `getById(id) ?? upsert(id, coord)` and the loop has always just
 		 * upserted that id, so it does not double-count — a doubled count is the first assumption
 		 * to re-check if these numbers ever drift.
+		 *
+		 * NOTE: this **stacks** wrappers rather than replacing them, and nothing restores. A second
+		 * call wraps the first, so a counter installed earlier keeps recording while a later one is
+		 * live. Harmless while a test installs one counter (every test below but one), but a test
+		 * that drives both merge paths must copy its first array out (`[...ids]`) before installing
+		 * the second counter — see the `relevance: null` test. Left stacking deliberately: a
+		 * restore handle would change all eight call sites for the benefit of one, and each test
+		 * gets a fresh service from `beforeEach` so nothing leaks between them. Revisit if a second
+		 * test needs two counters, or if any test ever reuses a service.
 		 */
 		function countUpserts(s: CoreFretService): string[] {
 			const store = s.getStore()
