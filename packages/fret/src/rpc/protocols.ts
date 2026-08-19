@@ -183,8 +183,8 @@ export function isFrameTruncationError(err: unknown): boolean {
 	return name === 'FrameTruncationError' || name === 'UnexpectedEOFError';
 }
 
-/** Race sentinel for the overall read deadline; resolves, never rejects (see {@link readFramed}). */
-const TIMED_OUT = Symbol('readFramed.timedOut');
+/** Race sentinel — distinct from a real `IteratorResult`, so a poll tick is never read as EOF. */
+const POLL_TICK = Symbol('readFramed.poll');
 
 /**
  * Race sentinel for the caller's abort signal. The abort arm **resolves** with this rather than
@@ -192,6 +192,50 @@ const TIMED_OUT = Symbol('readFramed.timedOut');
  * reader turns the sentinel into a throw itself.
  */
 const ABORTED = Symbol('readFramed.aborted');
+
+/**
+ * How often to re-check the stream's own end-of-read state; see {@link remoteFinishedWriting}.
+ *
+ * NOTE: this adds up to one poll interval to every RPC that hits the lost-event case, which is a
+ * floor under the measured ping RTT that feeds peer health scoring. The durable fix is to
+ * subscribe to the stream before writing, so the event is never missed at all (iterator priming);
+ * revisit this constant if RTT-derived scoring ever needs finer resolution than this floor allows.
+ */
+const EOF_POLL_MS = 20;
+
+/**
+ * The subset of libp2p's `MessageStream`/`Stream` state we consult to recognise an end-of-stream
+ * whose event we never received. Every field is optional because `readFramed` also accepts plain
+ * async iterables (tests, non-libp2p sources), which carry none of them.
+ */
+interface ReadEndState {
+	readBufferLength?: number;
+	remoteWriteStatus?: string;
+	readStatus?: string;
+}
+
+/**
+ * True when the remote has closed its writing end AND everything it sent has been drained — so no
+ * further byte can arrive, and a frame still incomplete at this point never completes.
+ *
+ * libp2p's async-iterator adaptor ends its iteration off the one-shot `remoteCloseWrite` / `close`
+ * events, which it subscribes to when iteration *starts*. Every FRET RPC opens a stream, writes,
+ * and only then begins reading, so a fast responder routinely closes before that subscription
+ * exists and the event is lost. The buffered bytes are still delivered (message dispatch is
+ * deferred until a listener attaches), but the adaptor then marks the read closed *silently* — no
+ * second event — so the iterator never yields `done` and the read runs to its full deadline.
+ * Polling the stream's own state recovers that case without ever guessing: a stream that is merely
+ * slow reports neither a closed remote nor an empty-and-final buffer, so it keeps being read.
+ *
+ * Returns false for a plain async iterable (no state to consult), leaving those callers on
+ * ordinary iterator EOF.
+ */
+function remoteFinishedWriting(stream: unknown): boolean {
+	const s = stream as ReadEndState | null;
+	if (typeof s?.readBufferLength !== 'number') return false;
+	if (s.readBufferLength > 0) return false;
+	return s.remoteWriteStatus === 'closed' || s.readStatus === 'closed';
+}
 
 /**
  * Read exactly one length-prefixed message, bounded by `maxBytes` and a single overall
@@ -205,6 +249,18 @@ const ABORTED = Symbol('readFramed.aborted');
  *
  * There is deliberately no *idle* timer — a gap between chunks means a slow link, not
  * end-of-stream — and only the overall deadline bounds a peer that stalls mid-payload.
+ *
+ * End-of-*message* is carried in the length prefix, so the reader never waits on end-of-stream to
+ * delimit a message. End-of-*stream* still has to be recognised, though, or a truncated reply is
+ * indistinguishable from a slow one: the read is therefore a poll loop that re-checks
+ * {@link remoteFinishedWriting} every {@link EOF_POLL_MS}, and turns a confirmed end into
+ * {@link FrameTruncationError} rather than sitting out the deadline. The check is race-free
+ * because the poll fires on a macrotask at least one interval after any message dispatch, so every
+ * microtask behind it (stream iterator → `lp.decode` → the pending read) has already drained: if
+ * the stream reports its read closed — which it does only once the read buffer is fully dispatched
+ * *and* the remote's write end is closed — while the pending read is still unresolved, the bytes
+ * delivered could not complete a frame. The deadline is enforced at the top of each pass and the
+ * poll interval is capped at whatever remains, so the loop overshoots it by no more than one tick.
  *
  * NOTE: an inbound handler holds a stalled stream for the full `timeoutMs` (5s default) rather
  * than failing fast, bounded by the per-profile inbound stream caps. If slow-loris pressure ever
@@ -238,10 +294,6 @@ export async function readFramed(
 	});
 	const iter = source[Symbol.asyncIterator]();
 
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	const timeout = new Promise<typeof TIMED_OUT>((resolve) => {
-		timer = setTimeout(() => resolve(TIMED_OUT), timeoutMs);
-	});
 	let onAbort: (() => void) | undefined;
 	const abortWait = signal == null
 		? undefined
@@ -250,37 +302,57 @@ export async function readFramed(
 			signal.addEventListener('abort', onAbort, { once: true });
 		});
 
+	const deadlineAt = Date.now() + timeoutMs;
+	// Issued once and held across poll ticks: re-calling `iter.next()` would queue a second read
+	// and silently drop whichever bytes the abandoned one consumes.
+	const pending = iter.next();
+	// Belt-and-braces against an unhandled rejection when a sentinel wins and `pending` is
+	// abandoned. NOTE: not load-bearing today — the `Promise.race` below attaches its own
+	// reject reaction to `pending` — but it stops mattering only for as long as the read
+	// promise is raced; keep it if that race is ever restructured.
+	pending.catch(() => {});
+	type RaceResult = IteratorResult<Uint8ArrayList> | typeof POLL_TICK | typeof ABORTED;
+
 	try {
-		const pending = iter.next();
-		// Belt-and-braces against an unhandled rejection when a sentinel wins and `pending` is
-		// abandoned. NOTE: not load-bearing today — the `Promise.race` below attaches its own
-		// reject reaction to `pending` — but it stops mattering only for as long as the read
-		// promise is raced; keep it if that race is ever restructured.
-		pending.catch(() => {});
-		type RaceResult = IteratorResult<Uint8ArrayList> | typeof TIMED_OUT | typeof ABORTED;
-		const racers: Array<Promise<RaceResult>> = [pending, timeout];
-		if (abortWait != null) racers.push(abortWait);
-		let result: RaceResult;
-		try {
-			result = await Promise.race<RaceResult>(racers);
-		} catch (err) {
-			// Defensive: an 8-byte varint declaring past 2^53 trips the library's own check before
-			// `onLength` can see the length; report it as the same over-cap failure.
-			if ((err as { name?: unknown } | null)?.name === 'InvalidDataLengthError') {
-				throw new Error(`payload too large: declared length exceeds ${maxBytes} byte limit`);
+		while (true) {
+			const remaining = deadlineAt - Date.now();
+			if (remaining <= 0) throw new Error(`read timed out after ${timeoutMs}ms`);
+
+			let timer: ReturnType<typeof setTimeout> | undefined;
+			const poll = new Promise<typeof POLL_TICK>((resolve) => {
+				timer = setTimeout(() => resolve(POLL_TICK), Math.min(remaining, EOF_POLL_MS));
+			});
+			const racers: Array<Promise<RaceResult>> = [pending, poll];
+			if (abortWait != null) racers.push(abortWait);
+			let result: RaceResult;
+			try {
+				result = await Promise.race<RaceResult>(racers);
+			} catch (err) {
+				// Defensive: an 8-byte varint declaring past 2^53 trips the library's own check before
+				// `onLength` can see the length; report it as the same over-cap failure.
+				if ((err as { name?: unknown } | null)?.name === 'InvalidDataLengthError') {
+					throw new Error(`payload too large: declared length exceeds ${maxBytes} byte limit`);
+				}
+				// Everything else — UnexpectedEOFError, InvalidDataLengthLengthError, the `onLength`
+				// cap above, source/reset errors — propagates unchanged.
+				throw err;
+			} finally {
+				clearTimeout(timer);
 			}
-			// Everything else — UnexpectedEOFError, InvalidDataLengthLengthError, the `onLength`
-			// cap above, source/reset errors — propagates unchanged.
-			throw err;
+
+			if (result === ABORTED) throw abortReasonError(signal!);
+			if (result === POLL_TICK) {
+				if (remoteFinishedWriting(stream)) {
+					throw new FrameTruncationError('stream ended before a whole framed message arrived');
+				}
+				continue; // still open — keep waiting on `pending`, bounded only by the deadline
+			}
+			if (result.done === true) {
+				throw new FrameTruncationError('stream ended before a framed message arrived');
+			}
+			return result.value.subarray();
 		}
-		if (result === TIMED_OUT) throw new Error(`read timed out after ${timeoutMs}ms`);
-		if (result === ABORTED) throw abortReasonError(signal!);
-		if (result.done === true) {
-			throw new FrameTruncationError('stream ended before a framed message arrived');
-		}
-		return result.value.subarray();
 	} finally {
-		clearTimeout(timer);
 		// One listener per read; without this a long-lived run signal accumulates one per RPC.
 		if (onAbort != null && signal != null) signal.removeEventListener('abort', onAbort);
 	}
