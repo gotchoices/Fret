@@ -1624,6 +1624,15 @@ describe('RPC handler fault isolation', function () {
 			{ profile: 'edge', caps: { successors: 8, predecessors: 8, sample: 6 } },
 		]
 
+		// Every count below is `1 + successors + predecessors + sample`, one upsert per list entry.
+		// That arithmetic holds only while the four id sets are disjoint — a collision would merge
+		// as one id and quietly shift every expectation. Pinned here rather than left to the seed
+		// ranges above, which are easy to widen into an overlap.
+		it('the fixture ids are distinct, which is what the merge-count arithmetic assumes', () => {
+			const all = [FROM, ...OVER_SUCC, ...OVER_PRED, ...OVER_SAMPLE.map((e) => e.id)]
+			expect(new Set(all).size, 'no id appears in two of the lists').to.equal(all.length)
+		})
+
 		for (const { profile, caps: expected } of profiles) {
 			describe(profile, () => {
 				let node: Libp2p
@@ -1715,12 +1724,12 @@ describe('RPC handler fault isolation', function () {
 				})
 
 				it('drops a wrong-width sample coord at the parser, so it never reaches onAnnounce', () => {
-					const parsed = makeSnapshotParser(capsOf(svc))({
+					const out = parsed(svc, {
 						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
 						sample: shortCoordSample(),
 					})
 
-					expect(parsed?.sample, 'the unusable entry is gone; the good ones survive, in order').to.deep.equal([
+					expect(out.sample, 'the unusable entry is gone; the good ones survive, in order').to.deep.equal([
 						{ id: 'good-1', coord: sampleCoord(4), relevance: 0.5 },
 						{ id: 'good-2', coord: sampleCoord(5), relevance: 0.5 },
 					])
