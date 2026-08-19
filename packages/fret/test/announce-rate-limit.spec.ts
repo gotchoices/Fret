@@ -3,11 +3,24 @@ import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import type { NeighborSnapshotV1 } from '../src/index.js'
+import { makeSnapshotParser } from '../src/rpc/validate.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { toString as u8ToString } from 'uint8arrays/to-string'
 
 const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
+
+/**
+ * Run a snapshot through the *same* parser the service wires in at registration, built from the
+ * service's own `mergeSnapshotCaps()`. The caps live at the parser and nowhere else — the merge
+ * loops no longer slice — so a test that drives `mergeAnnounceSnapshot` directly must put the
+ * parser in front of it or it is measuring an unreachable path.
+ */
+function throughParser(svc: CoreFretService, snap: NeighborSnapshotV1): NeighborSnapshotV1 {
+	const out = makeSnapshotParser((svc as any).mergeSnapshotCaps())(snap)
+	expect(out, 'an over-long snapshot is truncated, not rejected').to.not.equal(undefined)
+	return out!
+}
 
 async function makePeerIds(n: number): Promise<string[]> {
 	const ids: string[] = []
@@ -123,7 +136,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 			const pred = await makePeerIds(30)
 			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleCount: 20 })
 
-			await (svc as any).mergeAnnounceSnapshot(from, snap)
+			await (svc as any).mergeAnnounceSnapshot(from, throughParser(svc, snap))
 
 			// from(1) + capped 16 + 16 + 8 = 41; uncapped would be 1 + 30 + 30 + 20 = 81.
 			expect(svc.getStore().size()).to.equal(41)
@@ -141,7 +154,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 			const pred = await makePeerIds(30)
 			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleCount: 20 })
 
-			await (svc as any).mergeAnnounceSnapshot(from, snap)
+			await (svc as any).mergeAnnounceSnapshot(from, throughParser(svc, snap))
 
 			// from(1) + capped 8 + 8 + 6 = 23
 			expect(svc.getStore().size()).to.equal(23)
@@ -151,8 +164,10 @@ describe('inbound announce rate limiting + merge caps', function () {
 	})
 
 	it('announce merge caps match the neighbor-fetch merge caps (single source of truth)', async () => {
-		// Both mergeAnnounceSnapshot and fetchAndMergeSnapshot consume mergeSnapshotCaps(),
-		// so asserting the shared helper's values guarantees the two paths stay in lockstep.
+		// Both merge paths get their snapshot from `makeSnapshotParser(mergeSnapshotCaps())` —
+		// `registerNeighbors` on the announce path, `fetchNeighbors`' `parse` option on the fetch
+		// path — and neither merge loop caps anything itself, so asserting the shared helper's
+		// values guarantees the two paths stay in lockstep.
 		const nodeC = await createMemNode()
 		const nodeE = await createMemNode()
 		const svcC = new CoreFretService(nodeC, { profile: 'core', k: 7 })

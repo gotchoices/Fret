@@ -1747,6 +1747,15 @@ export class FretService implements IFretService, Startable {
 	 * truth shared by the neighbor-fetch merge (`fetchAndMergeSnapshot`) and the inbound-announce
 	 * merge (`mergeAnnounceSnapshot`). Bounds how many remote-supplied ids one message can force
 	 * us to parse + SHA-256 hash + upsert, independent of the RPC byte limit.
+	 *
+	 * NOTE: the **parser is the single enforcement point**, not the merge loops. Both call sites
+	 * take their caps from this one method — `makeSnapshotParser(this.mergeSnapshotCaps())` is
+	 * passed to `registerNeighbors` in `registerRpcHandlers` (announce path) and as the `parse`
+	 * option to `fetchNeighbors` in `fetchAndMergeSnapshot` (fetch path) — so a message is already
+	 * truncated by the time either merge loop sees it. Neither loop slices: enforcing in two
+	 * places is exactly how two copies of a cap drift apart, and the loops' own `try/catch` is a
+	 * separate guard (a `base64urlToCoord` throw), not a cap. Do not re-add a slice; widen or
+	 * narrow the numbers here and both paths follow.
 	 */
 	private mergeSnapshotCaps(): { successors: number; predecessors: number; sample: number } {
 		return this.cfg.profile === 'core'
@@ -1792,12 +1801,10 @@ export class FretService implements IFretService, Startable {
 				this.store.update(from, { metadata: snap.metadata });
 			}
 
-			// Cap remote-supplied lists to the same per-profile bounds as the neighbor-fetch
-			// merge — a single crafted announce must not force thousands of parse+hash+upserts.
-			const caps = this.mergeSnapshotCaps();
-			const succList = (snap.successors ?? []).slice(0, caps.successors);
-			const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
-			for (const pid of [...succList, ...predList]) {
+			// No cap here: the snapshot parser wired in at `registerRpcHandlers` already truncated
+			// these lists to `mergeSnapshotCaps()`. A second slice would be a second copy of the
+			// same bound — the drift this loop's caps were moved to the parser to prevent.
+			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 				try {
 					const coord = await hashPeerId(peerIdFromString(pid));
 					if (!this.store.getById(pid)) discovered.push(pid);
@@ -1807,8 +1814,9 @@ export class FretService implements IFretService, Startable {
 					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
 				}
 			}
-			// merge bounded sample if present
-			for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
+			// merge sample if present — truncated and per-entry vetted by the parser above; the
+			// try/catch stays for the bypassed-parser path, where `base64urlToCoord` can throw.
+			for (const s of snap.sample ?? []) {
 				try {
 					const coord = base64urlToCoord(s.coord);
 					if (!this.store.getById(s.id)) discovered.push(s.id);
@@ -2299,10 +2307,9 @@ export class FretService implements IFretService, Startable {
 		}
 		this.diag.snapshotsFetched++;
 		const snap = out.value;
-		const caps = this.mergeSnapshotCaps();
-		const succList = (snap.successors ?? []).slice(0, caps.successors);
-		const predList = (snap.predecessors ?? []).slice(0, caps.predecessors);
-		for (const pid of [...succList, ...predList]) {
+		// No cap here either: `parse` above is `makeSnapshotParser(this.mergeSnapshotCaps())`, so
+		// the reply was already truncated before it was handed back. See `mergeSnapshotCaps`.
+		for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 			try {
 				const coord = await hashPeerId(peerIdFromString(pid));
 				if (!this.store.getById(pid)) announced.push(pid);
@@ -2312,7 +2319,7 @@ export class FretService implements IFretService, Startable {
 				console.warn('failed to merge neighbor', pid, err);
 			}
 		}
-		for (const s of (snap.sample ?? []).slice(0, caps.sample)) {
+		for (const s of snap.sample ?? []) {
 			try {
 				const coord = base64urlToCoord(s.coord);
 				if (!this.store.getById(s.id)) announced.push(s.id);

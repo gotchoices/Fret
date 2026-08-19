@@ -1543,10 +1543,12 @@ describe('RPC handler fault isolation', function () {
 	//
 	// `onAnnounce` is handed an *already-parsed* snapshot, so the parse + hash + upsert loop a
 	// crafted announce drives is `FretService.mergeAnnounceSnapshot`, and its bound is
-	// `FretService.mergeSnapshotCaps()`. That same object is handed to `makeSnapshotParser` at the
-	// single registration site, so the parser truncates before the merge loop ever runs — and the
-	// point of these tests is that the two routes cost the receiver the *same*: an over-long list
-	// buys the sender no extra work either way.
+	// `FretService.mergeSnapshotCaps()` — enforced at the **snapshot parser**, which is the single
+	// enforcement point. `makeSnapshotParser(mergeSnapshotCaps())` is handed to `registerNeighbors`
+	// at the one registration site (announce) and to `fetchNeighbors` as its `parse` option (fetch),
+	// and neither merge loop slices any more. So these tests drive the parser + merge pair the way
+	// production drives it, and pin that an unparsed body is merged whole — which is what makes
+	// "the parser is where the cap lives" a fact rather than a comment.
 	//
 	// The work is **counted** (`store.upsert` calls, by id and in order) rather than inferred from
 	// "nothing crashed" — a cap that silently stopped applying would leave a passing no-crash test
@@ -1586,6 +1588,18 @@ describe('RPC handler fault isolation', function () {
 		const merge = (s: CoreFretService, from: string, snap: NeighborSnapshotV1): Promise<void> =>
 			(s as unknown as DrivableMerge).mergeAnnounceSnapshot(from, snap)
 		const capsOf = (s: CoreFretService): Caps => (s as unknown as DrivableMerge).mergeSnapshotCaps()
+
+		/**
+		 * Run a raw announce body through the *same* parser the service wires in at registration —
+		 * `makeSnapshotParser(mergeSnapshotCaps())`, built from the service's own caps rather than
+		 * from literals — so these tests drive the parser + merge pair production drives, and a
+		 * rejection fails loudly here instead of surfacing as a mystery zero count.
+		 */
+		function parsed(s: CoreFretService, body: Record<string, unknown>): NeighborSnapshotV1 {
+			const out = makeSnapshotParser(capsOf(s))(body)
+			expect(out, 'an over-long message is truncated, not rejected').to.not.equal(undefined)
+			return out!
+		}
 
 		/**
 		 * Record every id the merge loop upserts, in order.
@@ -1634,7 +1648,7 @@ describe('RPC handler fault isolation', function () {
 				it('merges exactly 1 + successors + predecessors + sample ids, however long the lists', async () => {
 					const ids = countUpserts(svc)
 
-					await merge(svc, FROM, overCapBody() as unknown as NeighborSnapshotV1)
+					await merge(svc, FROM, parsed(svc, overCapBody()))
 
 					expect(ids.length, 'one upsert for `from`, then one per capped id').to.equal(
 						1 + expected.successors + expected.predecessors + expected.sample
@@ -1648,7 +1662,7 @@ describe('RPC handler fault isolation', function () {
 				})
 
 				it('never stores an id past the cap', async () => {
-					await merge(svc, FROM, overCapBody() as unknown as NeighborSnapshotV1)
+					await merge(svc, FROM, parsed(svc, overCapBody()))
 					const store = svc.getStore()
 
 					for (const id of OVER_SUCC.slice(expected.successors)) expect(store.getById(id), `successor past the cap: ${id}`).to.equal(undefined)
@@ -1662,22 +1676,42 @@ describe('RPC handler fault isolation', function () {
 					expect(store.getById(OVER_SAMPLE[expected.sample - 1]!.id), 'last admitted sample entry').to.not.equal(undefined)
 				})
 
-				it('costs the same whether the parser truncated first or the merge loop did', async () => {
+				it('leaves the cap entirely to the parser — a bypassed body is merged whole', async () => {
+					// The other side of the single-enforcement-point claim. The merge loop no
+					// longer slices, so handing it a raw over-cap body merges every id: proof that
+					// the truncation the tests above observe came from the parser and from nowhere
+					// else. Not a reachable production path — nothing calls the merge without the
+					// parser in front of it — so this is a claim about *where* the cap lives, not
+					// a tolerated hole.
 					const raw = overCapBody()
+					const ids = countUpserts(svc)
 
-					const direct = countUpserts(svc)
 					await merge(svc, FROM, raw as unknown as NeighborSnapshotV1)
 
-					const parsed = makeSnapshotParser(capsOf(svc))(raw)
-					expect(parsed, 'an over-long message is truncated, not rejected').to.not.equal(undefined)
-					// A second unstarted service on the same node: nothing is registered until
-					// `start()`, so the two cannot collide.
-					const other = new CoreFretService(node, { profile, networkName: NETWORK })
-					const viaParser = countUpserts(other)
+					expect(ids.length, 'every id, uncapped, once the parser is out of the way').to.equal(
+						1 + OVER_SUCC.length + OVER_PRED.length + OVER_SAMPLE.length
+					)
+					expect(ids.length, 'and that is strictly more than the parsed route merges').to.be.greaterThan(
+						1 + expected.successors + expected.predecessors + expected.sample
+					)
+				})
 
-					await merge(other, FROM, parsed!)
+				it('drops a sample entry whose relevance is not a finite number', () => {
+					// `parseSample` is stricter than the merge loops it replaces: the loops read
+					// only `id` and `coord`, so a peer whose relevance encodes as `null` (a `NaN`
+					// at the sender) used to merge fine. Keeping the strictness is a decision —
+					// the wire type declares `relevance: number` as required, so `null` is
+					// malformed — and this pins it on the path both merges now share.
+					const out = parsed(svc, {
+						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
+						sample: [
+							{ id: 'good-1', coord: sampleCoord(6), relevance: 0.5 },
+							{ id: 'null-relevance', coord: sampleCoord(7), relevance: null },
+							{ id: 'good-2', coord: sampleCoord(8), relevance: 0 },
+						],
+					})
 
-					expect(viaParser, 'an over-long list buys the sender no extra work either way').to.deep.equal(direct)
+					expect(out.sample?.map((e) => e.id), 'the unusable entry is gone; a relevance of 0 is fine').to.deep.equal(['good-1', 'good-2'])
 				})
 
 				it('drops a wrong-width sample coord at the parser, so it never reaches onAnnounce', () => {
