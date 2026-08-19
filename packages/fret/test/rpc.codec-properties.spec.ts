@@ -1060,11 +1060,15 @@ describe('RPC codec properties', function () {
 		 * `metadata` whose `JSON.stringify` is exactly `allowance` bytes — the quantity
 		 * `FretService.snapshot` measures against the profile's metadata budget. A test that
 		 * instead sized the whole snapshot would be measuring a different number than the code.
-		 * `{"m":"xxx…"}` is 8 characters of punctuation plus the payload, all ASCII.
+		 * `{"m":"xxx…"}` is 8 characters of punctuation plus the payload. Measured in *encoded
+		 * bytes*, not characters, because that is what the service measures — the two coincide for
+		 * this ASCII payload, and asserting on the same quantity keeps them from drifting apart if
+		 * the payload ever stops being ASCII.
 		 */
 		function metadataAtAllowance(allowance: number): Record<string, unknown> {
 			const value = { m: 'x'.repeat(allowance - 8) }
-			expect(JSON.stringify(value).length, 'metadata sized to the allowance exactly').to.equal(allowance)
+			const bytes = new TextEncoder().encode(JSON.stringify(value)).byteLength
+			expect(bytes, 'metadata sized to the allowance exactly').to.equal(allowance)
 			return value
 		}
 
