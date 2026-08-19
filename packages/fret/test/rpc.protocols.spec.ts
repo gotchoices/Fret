@@ -399,22 +399,19 @@ describe('RPC deadlines', () => {
 
 	it('sendPing gives up on a stream that opens but never yields a chunk', async () => {
 		const t0 = Date.now()
-		let thrown: unknown
-		try {
-			await sendPing(makeSilentStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
-		} catch (err) {
-			thrown = err
-		}
+		const res = await sendPing(makeSilentStreamNode(), peer, PROTOCOLS[0], { timeoutMs: TIMEOUT_MS })
 		const elapsed = Date.now() - t0
 
-		expect(thrown, 'sendPing must reject rather than hang').to.be.instanceOf(Error)
+		// Our own budget ended it and the caller never cancelled, so this is a contact strike —
+		// distinct from the `cancelled` outcome the two tests below pin.
+		expect(res.kind, 'sendPing must report a timeout rather than hang').to.equal('timeout')
 		expectBounded(elapsed)
 	})
 
 	// The other half of the contract: `opts.signal` is the caller's own cancellation (a `stop()`,
 	// or a budget imposed from above) and the sender's deadline is a child of it, so cancelling
 	// must end the RPC well before its own `timeoutMs`.
-	it('sendPing rejects immediately on an already-aborted caller signal, without dialing', async () => {
+	it('sendPing reports cancelled immediately on an already-aborted caller signal, without dialing', async () => {
 		let dialed = false
 		const node = {
 			getConnections: () => [],
@@ -424,34 +421,30 @@ describe('RPC deadlines', () => {
 		ac.abort(new Error('service stopped'))
 
 		const t0 = Date.now()
-		let thrown: unknown
-		try {
-			await sendPing(node, peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
-		} catch (err) {
-			thrown = err
-		}
+		const res = await sendPing(node, peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
 
-		expect((thrown as Error)?.message, 'caller reason surfaces').to.equal('service stopped')
+		// The `cancelled` variant carries no error — it is deliberately not evidence about the
+		// peer, so the abort *reason* is the caller's own and does not travel back out. The kind
+		// is the whole assertion: our cancellation, not a timeout and not an unreachable peer.
+		expect(res.kind, "the caller's own cancellation ended it").to.equal('cancelled')
 		expect(dialed, 'dialProtocol called').to.equal(false)
 		expect(Date.now() - t0, 'must not wait out its own budget').to.be.at.most(MAX_MS)
 	})
 
-	it('sendPing rejects promptly when the caller signal aborts mid-flight', async () => {
+	it('sendPing reports cancelled promptly when the caller signal aborts mid-flight', async () => {
 		const ac = new AbortController()
 		const timer = setTimeout(() => { ac.abort(new Error('service stopped')) }, TIMEOUT_MS)
 
 		const t0 = Date.now()
-		let thrown: unknown
+		let res
 		try {
 			// A budget far past the abort, so only the parent signal can end this.
-			await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
-		} catch (err) {
-			thrown = err
+			res = await sendPing(makeHangingDialNode(), peer, PROTOCOLS[0], { signal: ac.signal, timeoutMs: 60_000 })
 		} finally {
 			clearTimeout(timer)
 		}
 
-		expect((thrown as Error)?.message, 'caller reason surfaces').to.equal('service stopped')
+		expect(res.kind, "the caller's own cancellation ended it").to.equal('cancelled')
 		expectBounded(Date.now() - t0)
 	})
 

@@ -153,7 +153,9 @@ describe('dead state: liveness seam', () => {
 	it('routes an unsupported-protocol failure to membership, not to the dead-state run', async () => {
 		const id = seedPeer('peer-d')
 		for (let i = 0; i < 3; i++) {
-			await (svc as any).noteRpcFailure(id, unsupportedProtocolError())
+			// `noteRpcFailure` branches on the outcome variant, not on the error's identity —
+			// `foreign-protocol` is the variant that carries an unsupported-protocol failure.
+			await (svc as any).noteRpcFailure(id, { kind: 'foreign-protocol', error: unsupportedProtocolError() })
 			store.update(id, { lastNegotiateFailureAt: 0 })
 			unspace(id)
 		}
@@ -909,12 +911,11 @@ describe('cancellation is not evidence about a peer', () => {
 		}
 	})
 
-	// NOTE: `snapshotsFetched` is pinned at +1, not "unchanged". `fetchNeighbors` swallows every
-	// failure — the abort included — into a fabricated empty snapshot, so the counter ticks for a
-	// fetch that never opened a stream and `fetchAndMergeSnapshot`'s own `wasCancelled` check
-	// cannot fire. That overcount is the accepted behaviour written up on `fetchAndMergeSnapshot`;
-	// flip this expectation to "unchanged" if `fetchNeighbors` ever distinguishes "skipped"
-	// from "empty". What matters — and is asserted — is that nothing was merged or scored.
+	// `snapshotsFetched` is pinned at *unchanged*. It used to be +1: `fetchNeighbors` swallowed
+	// every failure — the abort included — into a fabricated empty snapshot, so the counter ticked
+	// for a fetch that never opened a stream. `RpcOutcome` distinguishes `cancelled` from an `ok`
+	// carrying an empty snapshot, so `fetchAndMergeSnapshot` counts only `ok` and the overcount is
+	// gone. Nothing merged and nothing scored is asserted alongside, as before.
 	it('merges nothing and scores nothing when a snapshot fetch is cancelled', async () => {
 		const id = await unreachablePeer()
 		cancelRun()
@@ -923,7 +924,7 @@ describe('cancellation is not evidence about a peer', () => {
 
 		await (svc as any).fetchAndMergeSnapshot(id, (svc as any).runSignal)
 
-		expect(svc.getDiagnostics().snapshotsFetched, 'accepted overcount').to.equal(before + 1)
+		expect(svc.getDiagnostics().snapshotsFetched, 'a cancelled fetch is not a fetch').to.equal(before)
 		expect(store.list().length, 'nothing merged').to.equal(entriesBefore)
 		expectUnscored(id)
 	})

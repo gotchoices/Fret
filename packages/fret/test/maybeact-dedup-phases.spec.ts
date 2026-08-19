@@ -6,6 +6,7 @@ import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { PROTOCOL_MAYBE_ACT } from '../src/rpc/protocols.js'
 import type { Libp2p } from 'libp2p'
 import type { RouteAndMaybeActV1 } from '../src/index.js'
+import type { RpcOutcome } from '../src/rpc/outcome.js'
 
 /**
  * Two nodes, both running FretService, with the activity handler installed on the responder.
@@ -43,6 +44,16 @@ function baseMsg(correlationId: string): RouteAndMaybeActV1 {
 	}
 }
 
+/**
+ * Every send in this file expects a reply that arrived and decoded — the phase-dedup claims are
+ * about the *reply*, not about how the RPC ended. Unwrap the outcome once here so each assertion
+ * still reads against the message the responder sent.
+ */
+function replyOf<T>(out: RpcOutcome<T>): T {
+	expect(out.kind, `expected an 'ok' reply, got '${out.kind}'`).to.equal('ok')
+	return (out as Extract<RpcOutcome<T>, { kind: 'ok' }>).value
+}
+
 describe('maybeAct dedup is keyed on phase, not just correlation id', function () {
 	this.timeout(25000)
 
@@ -61,16 +72,16 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 
 		// Phase 1: digest-only probe. The responder is in-cluster (tiny ring), so it replies
 		// with anchors inviting a resend — and those anchors name itself.
-		const probe = await sendMaybeAct(requester, responderId, baseMsg(corrId), PROTOCOL_MAYBE_ACT)
+		const probe = replyOf(await sendMaybeAct(requester, responderId, baseMsg(corrId), PROTOCOL_MAYBE_ACT))
 		expect(probe, 'digest probe should return NearAnchor').to.have.property('anchors')
 		expect(fired, 'digest probe must not run the activity handler').to.equal(0)
 
 		// Phase 2: the resend that actually carries the work, same correlation id.
-		const act = await sendMaybeAct(
+		const act = replyOf(await sendMaybeAct(
 			requester, responderId,
 			{ ...baseMsg(corrId), activity: 'payload-data' },
 			PROTOCOL_MAYBE_ACT
-		)
+		))
 
 		expect(act, 'activity resend must not be answered from the probe\'s cache entry')
 			.to.have.property('commitCertificate')
@@ -93,8 +104,8 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		const responderId = responder.peerId.toString()
 		const msg = { ...baseMsg(corrId), activity: 'payload-data' }
 
-		const first = await sendMaybeAct(requester, responderId, msg, PROTOCOL_MAYBE_ACT)
-		const retry = await sendMaybeAct(requester, responderId, { ...msg, timestamp: Date.now() }, PROTOCOL_MAYBE_ACT)
+		const first = replyOf(await sendMaybeAct(requester, responderId, msg, PROTOCOL_MAYBE_ACT))
+		const retry = replyOf(await sendMaybeAct(requester, responderId, { ...msg, timestamp: Date.now() }, PROTOCOL_MAYBE_ACT))
 
 		expect(first).to.have.property('commitCertificate', 'cert-1')
 		expect(retry, 'a retry must return the stored certificate, not redo the work')
@@ -110,10 +121,10 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		const corrId = 'digest-replay-1'
 		const responderId = responder.peerId.toString()
 
-		const first = await sendMaybeAct(requester, responderId, baseMsg(corrId), PROTOCOL_MAYBE_ACT)
-		const replay = await sendMaybeAct(
+		const first = replyOf(await sendMaybeAct(requester, responderId, baseMsg(corrId), PROTOCOL_MAYBE_ACT))
+		const replay = replyOf(await sendMaybeAct(
 			requester, responderId, { ...baseMsg(corrId), timestamp: Date.now() }, PROTOCOL_MAYBE_ACT
-		)
+		))
 
 		expect(first).to.have.property('anchors')
 		expect(replay).to.deep.equal(first)
@@ -130,7 +141,7 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 
 		// No activity handler installed yet: the responder is in-cluster but cannot perform the
 		// work, so it answers with anchors. That is a refusal, not the answer to this work.
-		const refused = await sendMaybeAct(requester, responderId, msg, PROTOCOL_MAYBE_ACT)
+		const refused = replyOf(await sendMaybeAct(requester, responderId, msg, PROTOCOL_MAYBE_ACT))
 		expect(refused, 'no handler installed → anchors').to.have.property('anchors')
 
 		let fired = 0
@@ -139,9 +150,9 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 			return { commitCertificate: 'cert-ok' }
 		})
 
-		const retry = await sendMaybeAct(
+		const retry = replyOf(await sendMaybeAct(
 			requester, responderId, { ...msg, timestamp: Date.now() }, PROTOCOL_MAYBE_ACT
-		)
+		))
 		expect(retry, 'the retry must re-attempt the work, not replay the cached refusal')
 			.to.have.property('commitCertificate')
 		expect(fired).to.equal(1)

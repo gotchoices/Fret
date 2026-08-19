@@ -227,6 +227,10 @@ function parseSample(value: unknown, cap: number, from: string): SampleEntry[] {
 		try {
 			base64urlToCoord(entry.coord);
 		} catch (err) {
+			// NOTE: one line per dropped entry, so a hostile peer sending a full sample of bad
+			// coords costs `cap` lines per message. Harmless today — @libp2p/logger emits only
+			// under DEBUG, and the neighbors token bucket meters the messages. If snapshot
+			// logging is ever routed to an always-on sink, collapse this to one line per message.
 			log.error('snapshot from %s: dropping sample entry %s with unusable coord - %e', from, entry.id, err);
 			continue;
 		}
