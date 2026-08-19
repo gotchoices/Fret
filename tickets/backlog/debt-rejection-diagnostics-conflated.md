@@ -81,3 +81,8 @@ message kinds and complete silence for the third — the busiest one.
 Whoever splits the shared counter should settle this at the same time, since both are decisions
 about what the `diag.rejected` object promises. Nothing is broken today; the tally is simply
 blind to one case.
+
+Since `15.32-rpc-json-handler-seam` landed, `diag.rejected.malformed` also gets writes from the
+leave and neighbors-announce handlers via the shared `registerJsonHandler` seam's `onMalformed`
+hook (`'decode'` for an undecodable body, `'parse'` for a parser rejection) — more evidence for the
+same conflated-counter theme above, not a new writer class to design around.
