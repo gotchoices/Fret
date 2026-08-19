@@ -4,7 +4,7 @@ import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { decodeJson, makeProtocols, readAllBounded, registerRpcHandler } from '../src/rpc/protocols.js'
+import { decodeJson, isFrameTruncationError, makeProtocols, readFramed, registerRpcHandler } from '../src/rpc/protocols.js'
 import { registerMaybeAct, validateRouteAndMaybeAct } from '../src/rpc/maybe-act.js'
 import { registerLeave } from '../src/rpc/leave.js'
 import { registerPing } from '../src/rpc/ping.js'
@@ -12,6 +12,8 @@ import { registerNeighbors } from '../src/rpc/neighbors.js'
 import { coordToBase64url, hashKey } from '../src/ring/hash.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { NearAnchorV1, NeighborSnapshotV1 } from '../src/index.js'
+import * as lp from 'it-length-prefixed'
+import type { Uint8ArrayList } from 'uint8arraylist'
 
 // Fault isolation for the *receive* side of every FRET protocol. Before `registerRpcHandler`
 // (`src/rpc/protocols.ts`), each inbound handler's catch logged and returned without releasing
@@ -81,8 +83,8 @@ interface InboundStub {
 	closes: number
 	aborts: number
 	sends: number
-	/** Reply frames the handler wrote (empty when `sendThrows`). */
-	replies: Uint8Array[]
+	/** Reply frames the handler wrote (empty when `sendThrows`). `sendFramed` passes a `Uint8ArrayList`. */
+	replies: Array<Uint8Array | Uint8ArrayList>
 	status: () => string
 }
 
@@ -111,7 +113,7 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 		id: 'stub-inbound',
 		get status() { return status },
 		get writeStatus() { return writeStatus },
-		send: (b: Uint8Array): boolean => {
+		send: (b: Uint8Array | Uint8ArrayList): boolean => {
 			rec.sends++
 			if (opts.sendThrows) throw opts.sendThrows
 			rec.replies.push(b)
@@ -160,8 +162,19 @@ function fakeNode(): { node: Libp2p; invoke: (protocol: string, stream: Stream, 
 	return { node, invoke }
 }
 
+/** One length-prefixed frame carrying `text`, as the framed handlers now read. */
+function framed(text: string): Uint8Array {
+	return lp.encode.single(enc.encode(text)).subarray()
+}
+
 function json(obj: unknown): Uint8Array {
-	return enc.encode(JSON.stringify(obj))
+	return framed(JSON.stringify(obj))
+}
+
+/** Unframe and decode a handler reply — handlers reply framed via `sendFramed`. */
+async function decodeFramed<T>(frame: Uint8Array | Uint8ArrayList): Promise<T> {
+	const source = (async function* () { yield frame })()
+	return await decodeJson<T>(await readFramed(source, 1024 * 1024, 1000))
 }
 
 describe('RPC handler fault isolation', function () {
@@ -193,7 +206,7 @@ describe('RPC handler fault isolation', function () {
 			// One close from the handler's own success path, and the wrapper leaves it alone: a
 			// completed reply is never turned into an abort.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
-			const pong = await decodeJson<{ ok: boolean }>(s.replies[0]!)
+			const pong = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
 			expect(pong.ok).to.equal(true)
 		})
 
@@ -250,7 +263,7 @@ describe('RPC handler fault isolation', function () {
 		it('aborts once when the maybeAct body is not JSON', async () => {
 			const { node, invoke } = fakeNode()
 			await registerMaybeAct(node, async () => { throw new Error('handle must not run') }, P.PROTOCOL_MAYBE_ACT)
-			const s = inboundStub([enc.encode('{ not: json }')])
+			const s = inboundStub([framed('{ not: json }')])
 
 			await invoke(P.PROTOCOL_MAYBE_ACT, s.stream, 'peer-a')
 
@@ -261,7 +274,7 @@ describe('RPC handler fault isolation', function () {
 		it('aborts once when the maybeAct body decodes to a non-object', async () => {
 			const { node, invoke } = fakeNode()
 			await registerMaybeAct(node, async () => { throw new Error('handle must not run') }, P.PROTOCOL_MAYBE_ACT)
-			const s = inboundStub([enc.encode('null')])
+			const s = inboundStub([framed('null')])
 
 			await invoke(P.PROTOCOL_MAYBE_ACT, s.stream, 'peer-a')
 
@@ -306,7 +319,7 @@ describe('RPC handler fault isolation', function () {
 			// handler; now a non-array is simply not a replacement list.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 			expect(notice?.replacements).to.equal(undefined)
-			const reply = await decodeJson<{ ok: boolean }>(s.replies[0]!)
+			const reply = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
 			expect(reply.ok).to.equal(true)
 		})
 
@@ -314,7 +327,7 @@ describe('RPC handler fault isolation', function () {
 			const { node, invoke } = fakeNode()
 			let leaveCalls = 0
 			await registerLeave(node, () => { leaveCalls++ }, P.PROTOCOL_LEAVE)
-			const s = inboundStub([enc.encode('!!! definitely not json !!!')])
+			const s = inboundStub([framed('!!! definitely not json !!!')])
 
 			await invoke(P.PROTOCOL_LEAVE, s.stream, 'peer-a')
 
@@ -352,7 +365,7 @@ describe('RPC handler fault isolation', function () {
 			await invoke(P.PROTOCOL_PING, s.stream, 'peer-a')
 
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
-			const pong = await decodeJson<{ ok: boolean; size_estimate?: number }>(s.replies[0]!)
+			const pong = await decodeFramed<{ ok: boolean; size_estimate?: number }>(s.replies[0]!)
 			expect(pong.ok).to.equal(true)
 			expect(pong.size_estimate).to.equal(undefined)
 		})
@@ -542,21 +555,32 @@ describe('RPC handler fault isolation', function () {
 	}
 
 	/**
-	 * Write `payload`, half-close, read the reply to EOF. Returns the reply bytes, or
-	 * `undefined` when the receiver aborted (the wrapper's error arm resets the stream, so the
-	 * read throws at the sender). An empty reply distinguishes a silent drop (close, no bytes).
+	 * Write `payload` as one frame, half-close, read one framed reply. Discriminates the three
+	 * receiver outcomes: `reply` (a frame arrived), `eof` (clean close with no frame — the
+	 * identity-mismatch drop; the stream is already fully closed, so no release is needed),
+	 * `abort` (the wrapper's error arm reset the stream, so the read fails with something other
+	 * than a truncation shape).
 	 */
-	async function sendRaw(sender: Libp2p, target: PeerId, protocol: string, payload: string | Uint8Array): Promise<Uint8Array | undefined> {
+	type RawResult = { kind: 'reply'; bytes: Uint8Array } | { kind: 'eof' } | { kind: 'abort' }
+
+	async function sendRaw(sender: Libp2p, target: PeerId, protocol: string, payload: string | Uint8Array): Promise<RawResult> {
 		const bytes = typeof payload === 'string' ? enc.encode(payload) : payload
 		const stream = await sender.dialProtocol(target, [protocol])
 		try {
-			stream.send(bytes)
+			stream.send(lp.encode.single(bytes))
 			await stream.close()
-			return await readAllBounded(stream, 1024 * 1024, 3000)
-		} catch {
+			return { kind: 'reply', bytes: await readFramed(stream, 1024 * 1024, 3000) }
+		} catch (err) {
+			if (isFrameTruncationError(err)) return { kind: 'eof' }
 			try { stream.abort(new Error('sendRaw: receiver aborted')) } catch { /* already gone */ }
-			return undefined
+			return { kind: 'abort' }
 		}
+	}
+
+	/** Assert `res` carried a reply frame and narrow to its bytes. */
+	function replyBytes(res: RawResult, label: string): Uint8Array {
+		if (res.kind !== 'reply') throw new Error(`${label}: expected a reply frame, got ${res.kind}`)
+		return res.bytes
 	}
 
 	type RowExpect = 'reject' | 'abort' | 'drop' | 'ok'
@@ -567,8 +591,8 @@ describe('RPC handler fault isolation', function () {
 		payload: (senderId: string) => string
 		/**
 		 * reject — answered with the static reject (validator);
-		 * abort — no reply, stream aborted (decode/handler threw);
-		 * drop — silently closed (identity mismatch);
+		 * abort — stream aborted (decode/handler threw): the sender's read fails non-truncation;
+		 * drop — silently closed with no reply frame (identity mismatch): the sender sees EOF;
 		 * ok — answered normally.
 		 */
 		expect: RowExpect
@@ -623,29 +647,27 @@ describe('RPC handler fault isolation', function () {
 		const before = { ...svc.getDiagnostics().rejected }
 
 		for (const row of rows) {
-			const reply = await sendRaw(sender, receiver.peerId, row.protocol, row.payload(senderId))
+			const res = await sendRaw(sender, receiver.peerId, row.protocol, row.payload(senderId))
 
 			switch (row.expect) {
 				case 'reject': {
-					expect(reply, `${row.name}: answered`).to.not.equal(undefined)
-					const parsed = JSON.parse(dec.decode(reply)) as NearAnchorV1
+					const parsed = JSON.parse(dec.decode(replyBytes(res, row.name))) as NearAnchorV1
 					expect(parsed.anchors, `${row.name}: static reject`).to.deep.equal([])
 					expect(parsed.estimated_cluster_size, `${row.name}: static reject`).to.equal(0)
 					break
 				}
 				case 'abort': {
-					expect(reply, `${row.name}: no reply — aborted`).to.equal(undefined)
+					expect(res.kind, `${row.name}: no reply — aborted`).to.equal('abort')
 					break
 				}
 				case 'drop': {
-					// A clean close with no bytes: readAllBounded returns an empty buffer.
-					expect(reply, `${row.name}: dropped without a reply`).to.not.equal(undefined)
-					expect(reply!.byteLength, `${row.name}: dropped without a reply`).to.equal(0)
+					// A clean close with no reply frame: `readFramed` throws its truncation shape,
+					// which `sendRaw` maps to `eof` — distinct from the receiver aborting.
+					expect(res.kind, `${row.name}: dropped without a reply`).to.equal('eof')
 					break
 				}
 				case 'ok': {
-					expect(reply, `${row.name}: answered`).to.not.equal(undefined)
-					expect(reply!.byteLength, `${row.name}: answered`).to.be.greaterThan(0)
+					expect(replyBytes(res, row.name).byteLength, `${row.name}: answered`).to.be.greaterThan(0)
 					break
 				}
 			}
@@ -690,9 +712,8 @@ describe('RPC handler fault isolation', function () {
 				'all concurrent streams released'
 			)
 
-			const reply = await sendRaw(rig.sender, rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
-			expect(reply, 'well-formed message still answered').to.not.equal(undefined)
-			const parsed = JSON.parse(dec.decode(reply)) as NearAnchorV1
+			const res = await sendRaw(rig.sender, rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
+			const parsed = JSON.parse(dec.decode(replyBytes(res, 'well-formed message still answered'))) as NearAnchorV1
 			expect(parsed.estimated_cluster_size, 'a real answer, not the static reject').to.be.greaterThan(0)
 		})
 
@@ -719,26 +740,21 @@ describe('RPC handler fault isolation', function () {
 			// give the bucket a moment so the final well-formed message is answered, not busied.
 			await sleep(1000)
 
-			const act = await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
-			expect(act, 'maybeAct answers').to.not.equal(undefined)
+			const act = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg())), 'maybeAct answers')
 			expect((JSON.parse(dec.decode(act)) as NearAnchorV1).estimated_cluster_size).to.be.greaterThan(0)
 
-			const neighbors = await sendRaw(sender, receiver.peerId, P.PROTOCOL_NEIGHBORS, 'x')
-			expect(neighbors, 'neighbors answers').to.not.equal(undefined)
+			const neighbors = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_NEIGHBORS, 'x'), 'neighbors answers')
 			expect((JSON.parse(dec.decode(neighbors)) as NeighborSnapshotV1).from).to.equal(receiver.peerId.toString())
 
-			const ping = await sendRaw(sender, receiver.peerId, P.PROTOCOL_PING, 'x')
-			expect(ping, 'ping answers').to.not.equal(undefined)
+			const ping = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_PING, 'x'), 'ping answers')
 			expect((JSON.parse(dec.decode(ping)) as { ok: boolean }).ok).to.equal(true)
 
-			const leave = await sendRaw(sender, receiver.peerId, P.PROTOCOL_LEAVE, JSON.stringify({ v: 1, from: senderId, timestamp: Date.now() }))
-			expect(leave, 'leave answers').to.not.equal(undefined)
+			const leave = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_LEAVE, JSON.stringify({ v: 1, from: senderId, timestamp: Date.now() })), 'leave answers')
 			expect((JSON.parse(dec.decode(leave)) as { ok: boolean }).ok).to.equal(true)
 
-			const announce = await sendRaw(sender, receiver.peerId, P.PROTOCOL_NEIGHBORS_ANNOUNCE, JSON.stringify({
+			const announce = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_NEIGHBORS_ANNOUNCE, JSON.stringify({
 				v: 1, from: senderId, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
-			}))
-			expect(announce, 'announce answers').to.not.equal(undefined)
+			})), 'announce answers')
 			expect((JSON.parse(dec.decode(announce)) as { ok: boolean }).ok).to.equal(true)
 		})
 
@@ -781,8 +797,7 @@ describe('RPC handler fault isolation', function () {
 
 			await sleep(1000) // bucket refill, as in the memory-transport case
 
-			const reply = await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg()))
-			expect(reply, 'well-formed message still answered').to.not.equal(undefined)
+			const reply = replyBytes(await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, JSON.stringify(baseMsg())), 'well-formed message still answered')
 			expect((JSON.parse(dec.decode(reply)) as NearAnchorV1).estimated_cluster_size).to.be.greaterThan(0)
 		})
 	})
