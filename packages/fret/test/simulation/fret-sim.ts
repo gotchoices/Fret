@@ -195,8 +195,8 @@ export class FretSimulation {
 		return false
 	}
 
-	private addPeer(index: number): SimPeer {
-		const peer = this.createPeer(index)
+	private addPeer(index: number, isJoin = false): SimPeer {
+		const peer = this.createPeer(index, isJoin)
 		this.peers.set(peer.id, peer)
 		const store = new DigitreeStore()
 		store.upsert(peer.id, peer.coord)
@@ -213,19 +213,19 @@ export class FretSimulation {
 		return this.rng.next() < edgeThreshold ? EDGE_PROFILE : CORE_PROFILE
 	}
 
-	private createPeer(index: number): SimPeer {
+	private createPeer(index: number, isJoin: boolean): SimPeer {
 		const id = `peer-${index.toString().padStart(4, '0')}`
-		const coord = this.generateCoord(index)
+		const coord = this.generateCoord(index, isJoin)
 		const profileConfig = this.assignProfile()
 		return { id, coord, alive: true, connected: new Set(), neighbors: new Set(), profileConfig }
 	}
 
 	/** Generate a ring coordinate based on placement strategy. */
-	private generateCoord(index: number): Uint8Array {
+	private generateCoord(index: number, isJoin: boolean): Uint8Array {
 		const placement = this.config.placement ?? 'uniform'
 		switch (placement) {
 			case 'uniform':
-				return this.uniformCoord(index)
+				return isJoin ? this.randomCoord() : this.uniformCoord(index, this.config.n)
 			case 'clustered':
 				return this.clusteredCoord()
 			case 'skewed':
@@ -233,16 +233,21 @@ export class FretSimulation {
 		}
 	}
 
-	/** Evenly spaced on the 256-bit ring. */
-	private uniformCoord(index: number): Uint8Array {
+	/** Evenly spaced on the 256-bit ring, over a fixed population. */
+	private uniformCoord(index: number, population: number): Uint8Array {
 		const coord = new Uint8Array(32)
 		const bigIndex = BigInt(index)
-		const range = (1n << 256n) / BigInt(Math.max(1, this.nextPeerIndex))
+		const range = (1n << 256n) / BigInt(Math.max(1, population))
 		const val = bigIndex * range
 		for (let i = 0; i < 32; i++) {
 			coord[31 - i] = Number((val >> BigInt(i * 8)) & 0xffn)
 		}
 		return coord
+	}
+
+	/** Seeded-random ring position for a mid-run joiner — models placement by hash of peer id. */
+	private randomCoord(): Uint8Array {
+		return bigintToCoord(this.rng.nextBigInt(256))
 	}
 
 	/** Gaussian spread around cluster centers. */
@@ -505,7 +510,7 @@ export class FretSimulation {
 
 	private handleJoin(): void {
 		const index = this.nextPeerIndex++
-		const peer = this.addPeer(index)
+		const peer = this.addPeer(index, true)
 		// Immediately connect the new peer to some existing alive peers
 		this.handleConnect(peer.id)
 	}
