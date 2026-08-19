@@ -946,6 +946,43 @@ describe('RPC handler fault isolation', function () {
 					expectSnapshot: (s) =>
 						expect(s.sample).to.deep.equal(Array.from({ length: SAMPLE_CAP }, (_, i) => ({ id: `over-${i}`, coord: sampleCoord(i + 1), relevance: 0.5 }))),
 				},
+				{
+					// The row above cannot distinguish the two orders — with every entry valid,
+					// slice-then-filter and filter-then-slice agree. This one separates them, the
+					// same way `truncateThenFilter` does for the id lists: `SAMPLE_CAP` unusable
+					// entries followed by a valid one. Slice-then-filter (today) drops the valid
+					// entry along with the junk that displaced it; filter-then-slice would keep it,
+					// letting an over-long list of junk smuggle real entries in behind the cap.
+					name: `sample: truncate-then-filter order (valid entry past the ${SAMPLE_CAP} slice)`,
+					body: () => snapshot({ sample: [...Array.from({ length: SAMPLE_CAP }, () => 7), sampleEntry({ id: 'past-the-slice' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([]),
+				},
+				{
+					// `parseSample` rebuilds each entry from the three fields it vetted rather than
+					// passing the received object through, so an attacker cannot ride extra keys
+					// into the merge loop. Unlike `sig` at the top level, nothing here is carried.
+					name: 'sample: entry is rebuilt from vetted fields, extra keys dropped',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'extras', extra: 'ride-along', coord2: sampleCoord(1) })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'extras', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					// The wrong-width rows above trip `base64urlToCoord`'s own length check; these
+					// two trip the *decoder* underneath it, which is a different throw site. Both
+					// must be caught by `parseSample`, or a malformed coord escapes the parser and
+					// reaches the store's write seam inside the merge loop.
+					name: 'sample: coord is not decodable base64url at all',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', coord: '!!!not-base64!!!' }), sampleEntry({ id: 'ok-14' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-14', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
+				{
+					name: 'sample: coord is an empty string',
+					body: () => snapshot({ sample: [sampleEntry({ id: 'bad', coord: '' }), sampleEntry({ id: 'ok-15' })] }),
+					expect: 'normalize',
+					expectSnapshot: (s) => expect(s.sample).to.deep.equal([{ id: 'ok-15', coord: sampleCoord(9), relevance: 0.5 }]),
+				},
 			]
 
 			function advisoryNumberRows(field: 'size_estimate' | 'confidence'): FieldRow[] {
