@@ -1,5 +1,5 @@
 import { describe, it } from 'mocha'
-import { FretSimulation } from './simulation/fret-sim.js'
+import { FretSimulation, type PlacementStrategy } from './simulation/fret-sim.js'
 
 describe('Churn scenario simulations', function () {
 	this.timeout(60000)
@@ -322,55 +322,15 @@ describe('Churn scenario simulations', function () {
 		}
 	})
 
-	it('uniform placement keeps joiners spread across the ring', () => {
-		const sim = new FretSimulation({
-			seed: 8008,
-			n: 40,
-			k: 15,
-			m: 8,
-			churnRatePerSec: 2,
-			stabilizationIntervalMs: 500,
-			durationMs: 10000,
-		})
-		sim.initialize()
-		sim.scheduleBatchJoin(10, 3000)
+	it('uniform placement keeps a batch of joiners spread across the ring', () => {
+		assertPlacementSeparates('batch burst', { churnRatePerSec: 0, batchJoin: true })
+	})
 
-		while (sim.scheduler.pending() > 0) {
-			const evt = sim.scheduler.nextEvent()
-			if (!evt || evt.time > 10000) break
-			;sim.processEvent(evt)
-		}
-
-		const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
-		const coordsBig = alive
-			.map((p) => coordToBigInt(p.coord))
-			.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-
-		const ringSize = 1n << 256n
-		let maxGap = 0n
-		for (let i = 0; i < coordsBig.length; i++) {
-			const cur = coordsBig[i]!
-			const next = coordsBig[(i + 1) % coordsBig.length]!
-			const gap = i === coordsBig.length - 1 ? ringSize - cur + next : next - cur
-			if (gap > maxGap) maxGap = gap
-		}
-		const uniformSpacing = ringSize / BigInt(coordsBig.length)
-		const ratio = Number(maxGap) / Number(uniformSpacing)
-		console.log(
-			'  Peers alive:',
-			coordsBig.length,
-			'max gap / uniform spacing:',
-			ratio.toFixed(2)
-		)
-
-		// Measured max-gap/uniform-spacing ratio across seeds 8008/8009/8010: 5.00 / 2.81 / 3.65.
-		// Threshold set to 10x for headroom above the worst observed.
-		const maxAllowed = uniformSpacing * 10n
-		if (maxGap > maxAllowed) {
-			throw new Error(
-				`Largest gap ${maxGap} exceeds ${maxAllowed} (10x uniform spacing ${uniformSpacing})`
-			)
-		}
+	it('uniform placement keeps churn-driven joiners spread across the ring', () => {
+		// `handleChurn` calls `handleJoin` for every leave, so churn-driven joins run through the
+		// same placement path as a batch join. Covered as its own case rather than mixed into the
+		// batch one: a statistic can pass on a mix while being blind to one arm of it.
+		assertPlacementSeparates('steady trickle', { churnRatePerSec: 2, batchJoin: false })
 	})
 })
 
@@ -381,4 +341,113 @@ function coordToBigInt(coord: Uint8Array): bigint {
 		v = (v << 8n) | BigInt(coord[i]!)
 	}
 	return v
+}
+
+/**
+ * How clumped a ring is: scan an arc one even-spacing wide (ringSize / peers) anchored at each
+ * peer in turn, wrapping, and return the most peers any such arc contains.
+ *
+ * This replaced a largest-gap-over-even-spacing statistic, which was vacuous here: piling every
+ * joiner into one sliver makes that sliver denser while the surviving evenly-placed initial
+ * population still holds the largest hole down, so the number barely moves — and on the pure
+ * batch-join case the buggy and fixed placements produced bit-identical readings.
+ */
+function maxPeersInOneSpacingArc(coords: readonly bigint[]): number {
+	const ringSize = 1n << 256n
+	const sorted = [...coords].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+	if (sorted.length === 0) return 0
+	const arcWidth = ringSize / BigInt(sorted.length)
+
+	let worst = 0
+	for (const anchor of sorted) {
+		let inArc = 0
+		for (const other of sorted) {
+			const offset = (other - anchor + ringSize) % ringSize
+			if (offset < arcWidth) inArc++
+		}
+		if (inArc > worst) worst = inArc
+	}
+	return worst
+}
+
+interface PlacementCase {
+	churnRatePerSec: number
+	batchJoin: boolean
+}
+
+/** Seeds every placement reading below is taken over. */
+const PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]
+
+/**
+ * Peers-in-one-even-spacing-arc readings, over PLACEMENT_SEEDS at n=40 / k=15 / m=8 /
+ * stabilize 500ms / 10s:
+ *
+ *   join pattern     uniform (fixed)   clumped-joiners (the bug)
+ *   batch burst      3 3 3 3 3         11 11 11 11 11
+ *   steady trickle   3 3 3 4 3         18 18 16 16 16
+ *
+ * Worst fixed reading 4, best buggy reading 11, nothing in between — so 7 sits 1.75x above
+ * everything the fixed placement produced and 1.57x below everything the bug produced. Both
+ * arms are asserted below, so the threshold's separating power is re-proved on every run
+ * rather than measured once at authoring time.
+ */
+const MAX_PEERS_IN_ONE_SPACING_ARC = 7
+
+function placementReading(placement: PlacementStrategy, seed: number, c: PlacementCase): number {
+	const sim = new FretSimulation({
+		seed,
+		n: 40,
+		k: 15,
+		m: 8,
+		churnRatePerSec: c.churnRatePerSec,
+		// Deliberately far coarser than the 500ms the other cases in this file use: stabilization
+		// changes neither a peer's coordinate nor its alive flag, so it cannot move this
+		// statistic — it only costs wall time. Every reading in the table above was taken at both
+		// 500ms and 5000ms and came out identical, while the 20 runs these two cases perform went
+		// from 100s to 3s.
+		stabilizationIntervalMs: 5000,
+		durationMs: 10000,
+		placement,
+	})
+	sim.initialize()
+	if (c.batchJoin) sim.scheduleBatchJoin(10, 3000)
+
+	while (sim.scheduler.pending() > 0) {
+		const evt = sim.scheduler.nextEvent()
+		if (!evt || evt.time > 10000) break
+		sim.processEvent(evt)
+	}
+
+	const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+	return maxPeersInOneSpacingArc(alive.map((p) => coordToBigInt(p.coord)))
+}
+
+/**
+ * Assert both directions at once: the shipped placement reads under the threshold and the
+ * deliberately-clumping placement reads over it. Asserting only the passing arm is what let a
+ * guard with no separating power ship in the first place.
+ */
+function assertPlacementSeparates(label: string, c: PlacementCase): void {
+	for (const seed of PLACEMENT_SEEDS) {
+		const fixed = placementReading('uniform', seed, c)
+		const clumped = placementReading('clumped-joiners', seed, c)
+		console.log(
+			`  ${label} seed ${seed}: uniform ${fixed}, clumped-joiners ${clumped}` +
+				` (threshold ${MAX_PEERS_IN_ONE_SPACING_ARC})`
+		)
+
+		if (fixed > MAX_PEERS_IN_ONE_SPACING_ARC) {
+			throw new Error(
+				`${label} seed ${seed}: uniform placement packed ${fixed} peers into one even-spacing ` +
+					`arc, expected ≤${MAX_PEERS_IN_ONE_SPACING_ARC}`
+			)
+		}
+		if (clumped <= MAX_PEERS_IN_ONE_SPACING_ARC) {
+			throw new Error(
+				`${label} seed ${seed}: clumped-joiners placement packed only ${clumped} peers into one ` +
+					`even-spacing arc, expected >${MAX_PEERS_IN_ONE_SPACING_ARC} — the guard no longer ` +
+					`separates the bug from the fix and its threshold needs re-measuring`
+			)
+		}
+	}
 }

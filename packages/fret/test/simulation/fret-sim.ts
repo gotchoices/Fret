@@ -43,7 +43,17 @@ export interface SimPeer {
 	profileConfig: SimPeerConfig
 }
 
-export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed'
+/**
+ * How ring coordinates are handed out.
+ *
+ * `clumped-joiners` is a **deliberate defect**, kept as a negative control: it reproduces the
+ * pre-fix joiner placement in which every mid-run joiner landed at `index / (index + 1)` of the
+ * ring, so joiners piled into an ever-narrowing sliver near the ring's top instead of spreading
+ * out. `test/churn-scenarios.spec.ts` asserts that its placement guard reads *over* threshold
+ * under this strategy and under threshold under `uniform`, so the guard proves its own
+ * separating power on every run rather than at authoring time only.
+ */
+export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed' | 'clumped-joiners'
 
 export interface ClusterConfig {
 	numClusters: number
@@ -226,6 +236,14 @@ export class FretSimulation {
 		switch (placement) {
 			case 'uniform':
 				return isJoin ? this.randomCoord() : this.uniformCoord(index, this.config.n)
+			case 'clumped-joiners':
+				// The pre-fix bug, on purpose. handleJoin does `nextPeerIndex++` before creating
+				// the peer, so the old `uniformCoord(index, this.nextPeerIndex)` was exactly
+				// `index / (index + 1)` of the ring — 40/41, 41/42, ... — all converging on the
+				// same point. Spelled out as `index + 1` rather than read back off the mutable
+				// counter so the intent survives any future change to when the counter is bumped.
+				// Initial peers are placed evenly, exactly as `uniform` does.
+				return isJoin ? this.uniformCoord(index, index + 1) : this.uniformCoord(index, this.config.n)
 			case 'clustered':
 				return this.clusteredCoord()
 			case 'skewed':
