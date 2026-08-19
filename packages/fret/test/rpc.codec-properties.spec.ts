@@ -1955,4 +1955,31 @@ describe('reply parsers as wired into the senders', function () {
 		expect(out.kind).to.equal('ok')
 		expect(out.kind === 'ok' ? out.value : undefined).to.deep.equal(widest)
 	})
+
+	// The certificate arm is the one carrying the actual work result, and it is the arm whose
+	// shape the wiring changed (it projects where the bare cast passed the whole body through).
+	// `WIRED_SENDERS` serves a NearAnchor for `sendMaybeAct`, so without these the arm is covered
+	// as a parser but never as *wired*.
+	it('sendMaybeAct accepts a commit certificate and projects it to the declared shape', async () => {
+		const reply = { v: 1, commitCertificate: 'cert-bytes', extra: 'ignored' }
+		const out = await sendMaybeAct(nodeReplying(replyStream(reply)), selfId, MAYBE_ACT_MSG, P.PROTOCOL_MAYBE_ACT, { timeoutMs: 500 })
+		expect(out.kind).to.equal('ok')
+		// Exactly the declared shape: `RouteProgress.result` is `{commitCertificate: string}`, and
+		// both read sites test `'commitCertificate' in ...` and read nothing else.
+		expect(out.kind === 'ok' ? out.value : undefined).to.deep.equal({ commitCertificate: 'cert-bytes' })
+	})
+
+	it('sendMaybeAct refuses a certificate reply whose certificate is not a string', async () => {
+		// A non-string `commitCertificate` falls through to the NearAnchor arm, which the body
+		// does not satisfy — so it is refused rather than surfacing a certificate of the wrong type
+		// to `routeAct`'s callers.
+		for (const bad of [1, null, true, [], {}]) {
+			const out = await sendMaybeAct(
+				nodeReplying(replyStream({ v: 1, commitCertificate: bad })),
+				selfId, MAYBE_ACT_MSG, P.PROTOCOL_MAYBE_ACT, { timeoutMs: 500 }
+			)
+			expect(out.kind, `commitCertificate: ${JSON.stringify(bad)}`).to.equal('decode-error')
+			expect(out).to.not.have.property('value')
+		}
+	})
 })

@@ -154,8 +154,14 @@ async function writeBody(
  * Decode phase — separate from {@link classify} on purpose: a decode callback's own throw must
  * never classify as timeout or foreign-protocol. Caller-signal aborted → `cancelled`, anything
  * else → `decode-error`. The busy shape is tested on the parsed value *before* `decode` runs,
- * so a validator never sees a busy reply. The body is parsed twice (once here for the busy
- * check, once by `decode`) — accepted: these are small framed messages.
+ * so a validator never sees a busy reply.
+ *
+ * NOTE: accepted tradeoff — the body is parsed twice, once here for the busy check and once by
+ * `decode`; simplicity weighed over threading the already-parsed value into `decode`, which would
+ * change the signature of a publicly exported helper (`decode` takes bytes, so a consumer's
+ * validator does too). These are small framed messages, bounded by the per-protocol byte cap.
+ * Revisit if a protocol ever admits a body large enough for the second parse to show in profiles,
+ * or if a `decode` gains a reason to need the raw bytes.
  */
 async function decodeReply<T>(
 	bytes: Uint8Array,

@@ -326,6 +326,14 @@ export const parseNearAnchor: Parser<NearAnchorV1> = (msg) => {
  * A maybeAct reply: either a commit certificate or a NearAnchor. Discriminated on
  * `commitCertificate` being a string *first*, since that shape carries none of NearAnchor's
  * fields and would otherwise fail the numeric checks.
+ *
+ * The certificate arm **projects** — it returns `{commitCertificate}` alone and drops every other
+ * field the reply carried — where the NearAnchor arm spreads `{...msg}`. That asymmetry is
+ * deliberate, not an oversight: the certificate arm's declared type (`RouteProgress.result`, and
+ * `routeAct`'s return) is exactly `{commitCertificate: string}`, and both read sites test
+ * `'commitCertificate' in ...` and read nothing else, so a passed-through extra field is reachable
+ * by no consumer. NearAnchor spreads because its own type carries the advisory fields (`v`, and
+ * anything a future version adds beside them) that the id-list and numeric rules do not name.
  */
 export const parseMaybeActReply: Parser<NearAnchorV1 | { commitCertificate: string }> = (msg) => {
 	if (!isPlainObject(msg)) return undefined;

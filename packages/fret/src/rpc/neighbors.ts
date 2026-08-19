@@ -91,10 +91,10 @@ export async function registerNeighbors(
  * copies no cap numbers from anywhere and `FretService` always supplies
  * `makeSnapshotParser(this.mergeSnapshotCaps())`.
  *
- * NOTE: the default is therefore reachable only from tests — a caller that omits it silently gets
- * no truncation. Kept defaulted deliberately (three test call sites pass no parser, and the
- * options bag makes a required member a breaking change for every one of them); revisit if a
- * second production caller appears.
+ * NOTE: the default is reachable only from tests, for the same reason and on the same terms as
+ * `registerNeighbors`' `snapshotParser` above — see that note. The one difference: here the
+ * parameter lives on an options bag, so making it required later costs only the three test call
+ * sites that omit it, not a signature reorder.
  */
 export async function fetchNeighbors(
 	node: Libp2p,
