@@ -877,6 +877,14 @@ describe('RPC handler fault isolation', function () {
 		 * ok — answered normally.
 		 */
 		expect: RowExpect
+		/**
+		 * Which `diag.rejected` counter this row must increment, or absent for none. Stated per
+		 * row rather than derived from the row name: the two body-level drop reasons look
+		 * identical on the wire (both are a close with no reply), so nothing but this field
+		 * distinguishes them, and a name-matched split silently misaccounts the first row whose
+		 * name reads like the other kind.
+		 */
+		counts?: 'malformed' | 'identityMismatch'
 	}
 
 	/** The measured defect matrix from the ticket, plus the decoder's non-object shapes. */
@@ -886,29 +894,29 @@ describe('RPC handler fault isolation', function () {
 			{ name: 'maybeAct: truncated JSON', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '{"v":1,"key":"', expect: 'abort' },
 			{ name: 'maybeAct: null top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => 'null', expect: 'abort' },
 			{ name: 'maybeAct: array top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '[1,2,3]', expect: 'abort' },
-			{ name: 'maybeAct: bad base64url key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ key: '!!!bad!!!' })), expect: 'reject' },
-			{ name: 'maybeAct: absent key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(withoutKey()), expect: 'reject' },
-			{ name: 'maybeAct: numeric breadcrumbs', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ breadcrumbs: 5 })), expect: 'reject' },
-			{ name: 'maybeAct: string want_k', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ want_k: 'abc' })), expect: 'reject' },
-			{ name: 'maybeAct: numeric activity', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ activity: 5 })), expect: 'reject' },
+			{ name: 'maybeAct: bad base64url key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ key: '!!!bad!!!' })), expect: 'reject', counts: 'malformed' },
+			{ name: 'maybeAct: absent key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(withoutKey()), expect: 'reject', counts: 'malformed' },
+			{ name: 'maybeAct: numeric breadcrumbs', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ breadcrumbs: 5 })), expect: 'reject', counts: 'malformed' },
+			{ name: 'maybeAct: string want_k', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ want_k: 'abc' })), expect: 'reject', counts: 'malformed' },
+			{ name: 'maybeAct: numeric activity', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ activity: 5 })), expect: 'reject', counts: 'malformed' },
 			// A well-formed frame whose *body* will not decode is a body-level failure under
 			// `registerJsonHandler`, so it drops (close, no reply) rather than aborting. Framing
 			// failures still abort — see the maybeAct rows above, which are not on that seam.
-			{ name: 'leave: non-JSON', protocol: P.PROTOCOL_LEAVE, payload: () => 'total garbage', expect: 'drop' },
+			{ name: 'leave: non-JSON', protocol: P.PROTOCOL_LEAVE, payload: () => 'total garbage', expect: 'drop', counts: 'malformed' },
 			{ name: 'leave: numeric replacements', protocol: P.PROTOCOL_LEAVE, payload: (senderId) => JSON.stringify({ v: 1, from: senderId, replacements: 5, timestamp: Date.now() }), expect: 'ok' },
 			// A *parseable* peer id that is not the sender: the wire-shape parser refuses an
 			// unparseable `from` before the handler's identity check ever runs, so a placeholder
 			// here would count as `malformed` and never reach the mismatch path it is testing.
-			{ name: 'leave: from mismatch', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() }), expect: 'drop' },
-			{ name: 'leave: from absent', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, timestamp: Date.now() }), expect: 'drop' },
+			{ name: 'leave: from mismatch', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() }), expect: 'drop', counts: 'identityMismatch' },
+			{ name: 'leave: from absent', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, timestamp: Date.now() }), expect: 'drop', counts: 'malformed' },
 			// An unparseable `from` is a *parser* rejection, so it counts `malformed` — the
 			// counter split the accounting below asserts. Distinct from the mismatch row, whose
 			// `from` parses fine and is refused one step later by the identity check.
-			{ name: 'leave: unparseable from', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: 'not-a-parseable-peer-id', timestamp: Date.now() }), expect: 'drop' },
+			{ name: 'leave: unparseable from', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: 'not-a-parseable-peer-id', timestamp: Date.now() }), expect: 'drop', counts: 'malformed' },
 			// Same body-level rule as the leave rows: a decodable frame carrying an undecodable
 			// body drops rather than aborting.
-			{ name: 'announce: null top level', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => 'null', expect: 'drop' },
-			{ name: 'announce: from mismatch', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now(), successors: [], predecessors: [], sig: '' }), expect: 'drop' },
+			{ name: 'announce: null top level', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => 'null', expect: 'drop', counts: 'malformed' },
+			{ name: 'announce: from mismatch', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now(), successors: [], predecessors: [], sig: '' }), expect: 'drop', counts: 'identityMismatch' },
 			{ name: 'neighbors: garbage body ignored', protocol: P.PROTOCOL_NEIGHBORS, payload: () => 'garbage the request handler never reads', expect: 'ok' },
 			{ name: 'ping: garbage body ignored', protocol: P.PROTOCOL_PING, payload: () => 'garbage the ping handler never reads', expect: 'ok' },
 		]
@@ -975,17 +983,20 @@ describe('RPC handler fault isolation', function () {
 			)
 		}
 
-		const after = svc.getDiagnostics().rejected
-		const rejectRows = rows.filter((r) => r.expect === 'reject').length
-		const dropRows = rows.filter((r) => r.expect === 'drop').length
 		// Body-level drops split two ways now that leave/announce run on `registerJsonHandler`:
-		// a body the parser refuses counts `malformed` (alongside the maybeAct validator rows),
-		// while a well-formed body whose `from` is not the transport-authenticated sender still
-		// counts `identityMismatch`. Naming the identity rows keeps both sides honest.
-		const identityRows = rows.filter((r) => r.name.endsWith('from mismatch')).length
-		const parserDropRows = dropRows - identityRows
-		expect(after.malformed - before.malformed, 'every validator and parser rejection counted').to.equal(rejectRows + parserDropRows)
-		expect(after.identityMismatch - before.identityMismatch, 'every identity drop counted').to.equal(identityRows)
+		// a body the decoder or parser refuses counts `malformed` (alongside the maybeAct
+		// validator rows), while a well-formed body whose `from` is not the
+		// transport-authenticated sender counts `identityMismatch`. The split is read off each
+		// row's own `counts`, so adding a row states its counter rather than inheriting one from
+		// how the row happens to be named.
+		const after = svc.getDiagnostics().rejected
+		const expected = (which: 'malformed' | 'identityMismatch'): number => rows.filter((r) => r.counts === which).length
+		expect(after.malformed - before.malformed, 'every validator, decoder and parser rejection counted').to.equal(expected('malformed'))
+		expect(after.identityMismatch - before.identityMismatch, 'every identity drop counted').to.equal(expected('identityMismatch'))
+		// A row that rejects but names no counter is a row whose accounting was never stated.
+		for (const r of rows) {
+			if (r.expect === 'reject' || r.expect === 'drop') expect(r.counts, `${r.name}: states which counter it increments`).to.not.equal(undefined)
+		}
 	}
 
 	describe('over the memory transport', () => {

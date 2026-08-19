@@ -65,3 +65,19 @@ Whatever shape is chosen, it needs to cover:
 - The design notes (`docs/fret.md`) name this counter in three places — the departure-notice
   section, the concurrency-cap bullet under operating profiles, and the security section's rate
   limiting bullet. All three need updating together.
+
+## Second arm: one protocol reports nothing at all for an undecodable body
+
+Found while reviewing `15.325-rpc-json-handler-counter-tests`. Same site — the `diag.rejected`
+object and the handlers that write to it.
+
+The counters are not only conflated, they are also **not applied evenly across protocols**. A
+departure notice or an announcement whose body is not valid JSON is dropped and tallied under
+"did not parse". The routing/act request is not on the same shared handler seam: an undecodable
+body there makes the handler throw, the connection's stream is torn down, and **no counter moves
+at all**. So an operator watching a node being fed garbage sees a rising tally for two of the
+message kinds and complete silence for the third — the busiest one.
+
+Whoever splits the shared counter should settle this at the same time, since both are decisions
+about what the `diag.rejected` object promises. Nothing is broken today; the tally is simply
+blind to one case.
