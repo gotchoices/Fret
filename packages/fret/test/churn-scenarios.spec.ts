@@ -321,4 +321,65 @@ describe('Churn scenario simulations', function () {
 			throw new Error('Expected churn to produce leaves; the case would pass vacuously')
 		}
 	})
+
+	it('uniform placement keeps joiners spread across the ring', () => {
+		const sim = new FretSimulation({
+			seed: 8008,
+			n: 40,
+			k: 15,
+			m: 8,
+			churnRatePerSec: 2,
+			stabilizationIntervalMs: 500,
+			durationMs: 10000,
+		})
+		sim.initialize()
+		sim.scheduleBatchJoin(10, 3000)
+
+		while (sim.scheduler.pending() > 0) {
+			const evt = sim.scheduler.nextEvent()
+			if (!evt || evt.time > 10000) break
+			;sim.processEvent(evt)
+		}
+
+		const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+		const coordsBig = alive
+			.map((p) => coordToBigInt(p.coord))
+			.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+
+		const ringSize = 1n << 256n
+		let maxGap = 0n
+		for (let i = 0; i < coordsBig.length; i++) {
+			const cur = coordsBig[i]!
+			const next = coordsBig[(i + 1) % coordsBig.length]!
+			const gap = i === coordsBig.length - 1 ? ringSize - cur + next : next - cur
+			if (gap > maxGap) maxGap = gap
+		}
+		const uniformSpacing = ringSize / BigInt(coordsBig.length)
+		const ratio = Number(maxGap) / Number(uniformSpacing)
+		console.log(
+			'  Peers alive:',
+			coordsBig.length,
+			'max gap / uniform spacing:',
+			ratio.toFixed(2)
+		)
+
+		// TODO(sim-joiner-placement): threshold is a generous placeholder (20x) pending a
+		// measured run across 2-3 seeds — tighten once the real ratio is known, then drop
+		// this comment and the diagnostic console.log above if it doesn't match file style.
+		const maxAllowed = uniformSpacing * 20n
+		if (maxGap > maxAllowed) {
+			throw new Error(
+				`Largest gap ${maxGap} exceeds ${maxAllowed} (20x uniform spacing ${uniformSpacing})`
+			)
+		}
+	})
 })
+
+/** Inverse of bigintToCoord in fret-sim.ts: 32-byte big-endian Uint8Array -> BigInt. */
+function coordToBigInt(coord: Uint8Array): bigint {
+	let v = 0n
+	for (let i = 0; i < 32; i++) {
+		v = (v << 8n) | BigInt(coord[i]!)
+	}
+	return v
+}
