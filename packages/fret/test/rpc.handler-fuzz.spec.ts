@@ -1557,8 +1557,14 @@ describe('RPC handler fault isolation', function () {
 	// detached merge cannot be counted deterministically. The one exception is the wiring test
 	// that closes the block: it drives the *registered* handler, and buys determinism back by
 	// wrapping `mergeAnnounceSnapshot` on the instance to capture and await the detached promise.
+	//
+	// The **fetch** path is the block's other half and shares every fixture: `fetchAndMergeSnapshot`
+	// builds the same `makeSnapshotParser(mergeSnapshotCaps())` and hands it to `fetchNeighbors` as
+	// `opts.parse`. It is driven through a stub reply stream (`fetchMerged`) rather than through
+	// `fetchNeighbors` directly, because that sender's `parse` *defaults* to `Infinity` caps — a
+	// test that called it would prove nothing about the caps the service supplies.
 	// -----------------------------------------------------------------------------------------
-	describe('announce snapshot merge caps', () => {
+	describe('snapshot merge caps', () => {
 		interface Caps { successors: number; predecessors: number; sample: number }
 		interface DrivableMerge {
 			mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void>
@@ -1617,6 +1623,66 @@ describe('RPC handler fault isolation', function () {
 			const ids: string[] = []
 			holder.upsert = (id: string, coord: Uint8Array): unknown => { ids.push(id); return inner(id, coord) }
 			return ids
+		}
+
+		/**
+		 * A stub stream serving exactly one framed reply.
+		 *
+		 * The fetch is the simplest of the five senders: `fetchNeighbors` passes no body and does
+		 * not half-close, so `rpcRequest` runs open → read → release and `sendFramed` is never
+		 * called. Only the async iterator and a resolving `close` are load-bearing — `send` exists
+		 * to satisfy the `Stream` type, and `abort` is reached only if that close rejects.
+		 */
+		function replyStream(body: Record<string, unknown>): Stream {
+			const chunks = [json(body)]
+			let i = 0
+			return {
+				id: 'fetch-reply-stub',
+				send: (): boolean => true,
+				close: async (): Promise<void> => { /* released */ },
+				abort: (): void => { /* released */ },
+				[Symbol.asyncIterator]: () => ({
+					next: async (): Promise<IteratorResult<Uint8Array>> => {
+						const c = chunks[i++]
+						return c === undefined ? { done: true, value: undefined } : { done: false, value: c }
+					},
+				}),
+			} as unknown as Stream
+		}
+
+		/** The private fetch-path entry point — `async`, and it awaits its own merges. */
+		interface DrivableFetch {
+			fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]>
+		}
+
+		/**
+		 * Drive one raw snapshot body through the *fetch* path; report the ids it upserted and
+		 * the ids it reports as newly seen.
+		 *
+		 * `openRpcStream` picks an open connection out of `node.getConnections(pid)`, and the
+		 * fetch dials `'never'` — so with no connection the whole call is `skipped` and upserts
+		 * nothing, a zero count indistinguishable from a cap doing its job. Overriding
+		 * `getConnections` on the block's real node is what makes the test prove anything; it is
+		 * restored afterwards so teardown still sees the node's own connections. A bare
+		 * `{status, newStream}` is not a limited connection (`isLimitedConnection` reads `limits`
+		 * then `remoteAddr`), so it is the chosen one.
+		 */
+		async function fetchMerged(
+			node: Libp2p,
+			svc: CoreFretService,
+			body: Record<string, unknown>
+		): Promise<{ ids: string[]; announced: string[] }> {
+			const stream = replyStream(body)
+			const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
+			const real = holder.getConnections.bind(node)
+			holder.getConnections = () => [{ status: 'open', newStream: async () => stream }] as unknown as Connection[]
+			const ids = countUpserts(svc)
+			try {
+				const announced = await (svc as unknown as DrivableFetch).fetchAndMergeSnapshot(FROM, undefined)
+				return { ids, announced }
+			} finally {
+				holder.getConnections = real
+			}
 		}
 
 		// Pinned literally rather than read back out of `mergeSnapshotCaps()`, so the expectation
@@ -1820,6 +1886,69 @@ describe('RPC handler fault isolation', function () {
 					for (const id of OVER_SUCC.slice(expected.successors)) expect(store.getById(id), `successor past the cap: ${id}`).to.equal(undefined)
 					for (const id of OVER_PRED.slice(expected.predecessors)) expect(store.getById(id), `predecessor past the cap: ${id}`).to.equal(undefined)
 					for (const e of OVER_SAMPLE.slice(expected.sample)) expect(store.getById(e.id), `sample entry past the cap: ${e.id}`).to.equal(undefined)
+				})
+
+				it('applies the same caps on the fetch path, and never upserts the snapshot sender', async () => {
+					// The fetch path's own cap test — until now its truncation rested on reading
+					// the code. Two differences from the announce path above, both load-bearing:
+					//
+					//   - `fetchAndMergeSnapshot` never upserts `snap.from`, so the expected list
+					//     is `successors + predecessors + sample` with no leading `FROM`.
+					//   - a body the parser refuses comes back as `decode-error`, which returns
+					//     early having upserted nothing. So this deep-equals the full expected id
+					//     list rather than asserting `<= cap` — under which a fixture rejected for
+					//     some unrelated reason would pass as a cap doing its job.
+					const expectedIds = [
+						...OVER_SUCC.slice(0, expected.successors),
+						...OVER_PRED.slice(0, expected.predecessors),
+						...OVER_SAMPLE.slice(0, expected.sample).map((e) => e.id),
+					]
+
+					const { ids, announced } = await fetchMerged(node, svc, overCapBody())
+
+					expect(ids, 'the first N of each list, in merge order').to.deep.equal(expectedIds)
+					expect(ids, 'the fetch path never upserts the sender').to.not.include(FROM)
+					// Every merged id was new to this empty store, so the method's own return
+					// value is a second reading of the same truncation.
+					expect(announced, 'every merged id was new to this store').to.deep.equal(expectedIds)
+
+					// ...and the store agrees, so the list above is the cap doing its job rather
+					// than the merge having stopped early for some other reason.
+					const store = svc.getStore()
+					expect(store.getById(OVER_SUCC[expected.successors - 1]!), 'last admitted successor').to.not.equal(undefined)
+					expect(store.getById(OVER_SUCC[expected.successors]!), 'first successor past the cap').to.equal(undefined)
+					expect(store.getById(OVER_PRED[expected.predecessors]!), 'first predecessor past the cap').to.equal(undefined)
+					expect(store.getById(OVER_SAMPLE[expected.sample]!.id), 'first sample entry past the cap').to.equal(undefined)
+					expect(store.getById(FROM), 'the sender itself was never stored').to.equal(undefined)
+				})
+
+				it('drops a `relevance: null` sample entry on both merge paths', async () => {
+					// The parser test above pins the drop at the parser; this pins that both merge
+					// paths inherit it — which is what makes "the parser is the single enforcement
+					// point" a claim about the whole system rather than about one function. The
+					// strictness is a decision, not an accident: the wire type declares
+					// `relevance: number` as required, so `null` is malformed.
+					const body = {
+						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
+						sample: [
+							{ id: 'good-1', coord: sampleCoord(6), relevance: 0.5 },
+							{ id: 'null-relevance', coord: sampleCoord(7), relevance: null },
+							{ id: 'good-2', coord: sampleCoord(8), relevance: 0 },
+						],
+					}
+
+					const counted = countUpserts(svc)
+					await merge(svc, FROM, parsed(svc, body))
+					// Copied out before the fetch below: `countUpserts` stacks wrappers rather
+					// than replacing them, so a counter installed earlier keeps recording while a
+					// later one is live.
+					const announceIds = [...counted]
+					expect(announceIds, 'announce: the sender, then the two usable entries').to.deep.equal([FROM, 'good-1', 'good-2'])
+
+					const { ids: fetchIds } = await fetchMerged(node, svc, body)
+					expect(fetchIds, 'fetch: the two usable entries, and no sender').to.deep.equal(['good-1', 'good-2'])
+
+					expect(svc.getStore().getById('null-relevance'), 'reached the store on neither path').to.equal(undefined)
 				})
 			})
 		}
