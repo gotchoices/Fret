@@ -6,7 +6,7 @@ import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { decodeJson, encodeJson, isFrameTruncationError, makeProtocols, readFramed, registerRpcHandler, sendFramed } from '../src/rpc/protocols.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
-import { parseRouteAndMaybeAct } from '../src/rpc/validate.js'
+import { makeSnapshotParser, parseRouteAndMaybeAct } from '../src/rpc/validate.js'
 import { registerLeave } from '../src/rpc/leave.js'
 import { registerPing } from '../src/rpc/ping.js'
 import { registerNeighbors } from '../src/rpc/neighbors.js'
@@ -466,6 +466,191 @@ describe('RPC handler fault isolation', function () {
 		})
 	})
 
+	// -----------------------------------------------------------------------------------------
+	// The two "why was this message rejected" counters, at the seam that feeds them.
+	//
+	// `registerJsonHandler` has two body-level drop paths that report through `onMalformed`
+	// (`'decode'` when `decodeJson` throws, `'parse'` when the parser refuses) and a third that
+	// reports through neither (`serve` returning `undefined` — the identity mismatch, which the
+	// handler bodies count on their own `onIdentityMismatch`). Nothing pinned *which* reason each
+	// path passes, so the two values could be swapped silently, and `FretService` wires this hook
+	// to a counter it intends to split by reason later. These cases assert the reason by value.
+	// -----------------------------------------------------------------------------------------
+	describe('body-level drop hooks: onMalformed reason vs identity mismatch', () => {
+		interface Hooks {
+			/** Every `onMalformed` reason, in order — asserted by value, not by call count. */
+			reasons: Array<'decode' | 'parse'>
+			mismatches: number
+			/** How many times the handler body's own callback (`onLeave` / `onAnnounce`) ran. */
+			served: number
+		}
+
+		function hooks(): Hooks { return { reasons: [], mismatches: 0, served: 0 } }
+
+		function snapshot(over: Record<string, unknown> = {}): Record<string, unknown> {
+			return { v: 1, from: PEER_ACTUAL, timestamp: Date.now(), successors: [], predecessors: [], sig: '', ...over }
+		}
+
+		async function registerLeaveWithHooks(node: Libp2p, h: Hooks): Promise<void> {
+			await registerLeave(
+				node,
+				() => { h.served++ },
+				P.PROTOCOL_LEAVE,
+				() => { h.mismatches++ },
+				(reason) => { h.reasons.push(reason) }
+			)
+		}
+
+		async function registerAnnounceWithHooks(node: Libp2p, h: Hooks): Promise<void> {
+			await registerNeighbors(
+				node,
+				() => snapshot() as unknown as NeighborSnapshotV1,
+				() => { h.served++ },
+				{ PROTOCOL_NEIGHBORS: P.PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE: P.PROTOCOL_NEIGHBORS_ANNOUNCE },
+				128 * 1024,
+				() => { h.mismatches++ },
+				undefined,
+				// Explicit rather than defaulted, mirroring how `FretService` supplies it; the
+				// default is covered on its own below.
+				makeSnapshotParser({ successors: 16, predecessors: 16, sample: 8 }),
+				(reason) => { h.reasons.push(reason) }
+			)
+		}
+
+		interface Subject {
+			name: string
+			protocol: string
+			register: (node: Libp2p, h: Hooks) => Promise<void>
+			/** Decodes to an object the parser refuses: `from` will not parse as a peer id. */
+			parseReject: () => Record<string, unknown>
+			/** Decodes and parses, but `from` is a *different* parseable peer id than the sender. */
+			mismatched: () => Record<string, unknown>
+		}
+
+		const subjects: Subject[] = [
+			{
+				name: 'leave',
+				protocol: P.PROTOCOL_LEAVE,
+				register: registerLeaveWithHooks,
+				parseReject: () => ({ v: 1, from: 'not-a-parseable-peer-id', timestamp: Date.now() }),
+				mismatched: () => ({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() }),
+			},
+			{
+				name: 'announce',
+				protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE,
+				register: registerAnnounceWithHooks,
+				parseReject: () => snapshot({ from: 'not-a-parseable-peer-id' }),
+				mismatched: () => snapshot({ from: PEER_CLAIMED }),
+			},
+		]
+
+		for (const subject of subjects) {
+			describe(subject.name, () => {
+				/** Drive one body through the registered handler and report what the seam did. */
+				async function drive(chunks: Uint8Array[]): Promise<{ h: Hooks; s: InboundStub }> {
+					const { node, invoke } = fakeNode()
+					const h = hooks()
+					await subject.register(node, h)
+					const s = inboundStub(chunks)
+					await invoke(subject.protocol, s.stream, PEER_ACTUAL)
+					return { h, s }
+				}
+
+				/** Every body-level drop is a close with no reply, and never runs the body. */
+				function expectDropped(h: Hooks, s: InboundStub, label: string): void {
+					expect({ closes: s.closes, aborts: s.aborts }, `${label}: closed, never aborted`).to.deep.equal({ closes: 1, aborts: 0 })
+					expect(s.sends, `${label}: no reply sent`).to.equal(0)
+					expect(h.served, `${label}: handler body never ran`).to.equal(0)
+				}
+
+				it("reports 'decode' for a body that is not JSON", async () => {
+					const { h, s } = await drive([framed('!!! definitely not json !!!')])
+
+					expect(h.reasons, 'reason asserted by value').to.deep.equal(['decode'])
+					expect(h.mismatches, 'a decode failure is not an identity mismatch').to.equal(0)
+					expectDropped(h, s, 'non-JSON body')
+				})
+
+				it("reports 'decode' for a body that decodes to a non-object", async () => {
+					// `decodeJson` rejects any non-object top level, so this takes the same arm as
+					// unparseable text — the parser is never reached.
+					const { h, s } = await drive([framed('null')])
+
+					expect(h.reasons).to.deep.equal(['decode'])
+					expect(h.mismatches).to.equal(0)
+					expectDropped(h, s, 'non-object body')
+				})
+
+				it("reports 'parse' for a decodable object the parser rejects", async () => {
+					const { h, s } = await drive([json(subject.parseReject())])
+
+					expect(h.reasons, "the parser arm, not the decode arm").to.deep.equal(['parse'])
+					expectDropped(h, s, 'parser-rejected body')
+				})
+
+				// The pair the split exists for. An unparseable `from` never reaches `serve`, so
+				// the identity check cannot see it; a parseable-but-wrong `from` reaches `serve`
+				// and is refused there, a path `onMalformed` is deliberately not on.
+				it('counts an unparseable `from` as malformed and never as an identity mismatch', async () => {
+					const { h, s } = await drive([json(subject.parseReject())])
+
+					expect(h.reasons).to.deep.equal(['parse'])
+					expect(h.mismatches, 'the parser runs before serve, so the identity check never ran').to.equal(0)
+					expectDropped(h, s, 'unparseable from')
+				})
+
+				it('counts a parseable-but-wrong `from` as an identity mismatch and never as malformed', async () => {
+					const { h, s } = await drive([json(subject.mismatched())])
+
+					expect(h.mismatches, 'the serve-returns-undefined drop').to.equal(1)
+					expect(h.reasons, 'neither onMalformed arm is on the identity path').to.deep.equal([])
+					expectDropped(h, s, 'mismatched from')
+				})
+			})
+		}
+
+		// `registerNeighbors`' `snapshotParser` is trailing and defaulted, and every production
+		// caller supplies one — so the default (`Infinity` caps: "validate the shape, truncate
+		// nothing") is reachable only from tests and was untested. Omitting it means also omitting
+		// `onMalformed`, which is the parameter after it, so the rejection is asserted through the
+		// drop's observable effects rather than through the hook.
+		describe("registerNeighbors' defaulted snapshotParser", () => {
+			async function driveDefault(body: Record<string, unknown>): Promise<{ announced: NeighborSnapshotV1 | undefined; s: InboundStub }> {
+				const { node, invoke } = fakeNode()
+				let announced: NeighborSnapshotV1 | undefined
+				await registerNeighbors(
+					node,
+					() => snapshot() as unknown as NeighborSnapshotV1,
+					(_from, snap) => { announced = snap },
+					{ PROTOCOL_NEIGHBORS: P.PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE: P.PROTOCOL_NEIGHBORS_ANNOUNCE },
+					128 * 1024
+				)
+				const s = inboundStub([json(body)])
+				await invoke(P.PROTOCOL_NEIGHBORS_ANNOUNCE, s.stream, PEER_ACTUAL)
+				return { announced, s }
+			}
+
+			it('still rejects a malformed snapshot, so shape checking is live', async () => {
+				const { announced, s } = await driveDefault(snapshot({ from: 'not-a-parseable-peer-id' }))
+
+				expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
+				expect(s.sends, 'no reply for a dropped snapshot').to.equal(0)
+				expect(announced, 'onAnnounce never ran').to.equal(undefined)
+			})
+
+			it('truncates nothing — an id list far past any profile cap is merged whole', async () => {
+				// 50 is well past the largest production cap (Core 16 successors / 16 predecessors).
+				const successors = Array.from({ length: 50 }, (_, i) => peerIdStr(10 + i))
+				const { announced, s } = await driveDefault(snapshot({ successors }))
+
+				expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
+				expect(announced?.successors, 'the whole list, in order').to.deep.equal(successors)
+				const reply = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
+				expect(reply.ok).to.equal(true)
+			})
+		})
+	})
+
 	describe('decodeJson top-level shape', () => {
 		const rejects = [
 			{ name: 'the literal null', text: 'null' },
@@ -716,6 +901,10 @@ describe('RPC handler fault isolation', function () {
 			// here would count as `malformed` and never reach the mismatch path it is testing.
 			{ name: 'leave: from mismatch', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: PEER_CLAIMED, timestamp: Date.now() }), expect: 'drop' },
 			{ name: 'leave: from absent', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, timestamp: Date.now() }), expect: 'drop' },
+			// An unparseable `from` is a *parser* rejection, so it counts `malformed` — the
+			// counter split the accounting below asserts. Distinct from the mismatch row, whose
+			// `from` parses fine and is refused one step later by the identity check.
+			{ name: 'leave: unparseable from', protocol: P.PROTOCOL_LEAVE, payload: () => JSON.stringify({ v: 1, from: 'not-a-parseable-peer-id', timestamp: Date.now() }), expect: 'drop' },
 			// Same body-level rule as the leave rows: a decodable frame carrying an undecodable
 			// body drops rather than aborting.
 			{ name: 'announce: null top level', protocol: P.PROTOCOL_NEIGHBORS_ANNOUNCE, payload: () => 'null', expect: 'drop' },
