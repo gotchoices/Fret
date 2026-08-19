@@ -2362,6 +2362,15 @@ export class FretService implements IFretService, Startable {
 		const selfStr = this.node.peerId.toString();
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
 		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
+		// NOTE: nothing here validates the *encoded* snapshot against MAX_NEIGHBORS_BYTES — the
+		// emission is bounded by construction instead (fixed id counts, ids bounded by the peer-id
+		// encoding, and the metadata byte cap below), and the encoding cases in
+		// `test/rpc.codec-properties.spec.ts` are the guard that the worst legal build still fits.
+		// Measured headroom is ~4.8 KiB (worst Core build 11,575 bytes against the 16 KiB cap), so
+		// the invariant is not close. If the emission caps, the metadata allowance, or the set of
+		// snapshot fields ever grow, add a byte check here rather than widening the test — a
+		// snapshot that overflows the cap is refused at the receiver's length prefix and so fails
+		// silently and one-directionally, which is the failure mode the single cap exists to end.
 		// NOTE: over-cap metadata is dropped on every snapshot build (each announce and each
 		// served neighbors request), so a persistently over-sized `setMetadata` value logs once
 		// per snapshot rather than once per change, and the application is never told its
