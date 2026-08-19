@@ -517,6 +517,36 @@ describe('RPC deadlines', () => {
 		expect(pulls, 'stream never read').to.equal(0)
 	})
 
+	it('readFramed refuses a non-positive or NaN budget, before touching the stream', async () => {
+		let pulls = 0
+		const counted = {
+			[Symbol.asyncIterator]: () => ({
+				next: () => { pulls++; return new Promise<IteratorResult<Uint8Array>>(() => { /* never settles */ }) },
+			}),
+		}
+
+		// `NaN` was the worst of these: `Math.min(NaN, EOF_POLL_MS)` is `NaN`, `setTimeout` clamps
+		// that to zero, and the poll loop spun once per event-loop turn for as long as the stream
+		// stayed open. `0` and negatives fired `remaining <= 0` at once. All three are now refused
+		// at entry, and the guard is written `!(timeoutMs > 0)` so `NaN` is caught alongside them.
+		for (const bad of [Number.NaN, 0, -1]) {
+			let thrown: unknown
+			try {
+				await readFramed(counted, 1024, bad, { signal: new AbortController().signal })
+			} catch (err) {
+				thrown = err
+			}
+			expect((thrown as Error)?.message, `entry throw for ${bad}`).to.contain('must be a positive number or Infinity')
+		}
+		expect(pulls, 'stream never read').to.equal(0)
+
+		// `Infinity` is the one non-finite value that still passes, since it means "bounded by the
+		// signal alone" rather than "no budget at all".
+		const frame = lp.encode.single(new TextEncoder().encode('{"ok":true}')).subarray()
+		const out = await readFramed((async function* () { yield frame })(), 1024, Infinity, { signal: new AbortController().signal })
+		expect(new TextDecoder().decode(out), 'Infinity still passes').to.equal('{"ok":true}')
+	})
+
 	it('readFramed with an Infinity budget is ended by its signal alone, never by a timer', async () => {
 		const silent = {
 			[Symbol.asyncIterator]: () => ({
