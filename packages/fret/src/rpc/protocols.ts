@@ -2,6 +2,7 @@ import type { Libp2p } from 'libp2p';
 import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import type { Uint8ArrayList } from 'uint8arraylist';
+import type { Deadline } from '../utils/deadline.js';
 import { abortReasonError, deadline } from '../utils/deadline.js';
 import { createLogger } from '../logger.js';
 
@@ -93,6 +94,13 @@ export function isUnsupportedProtocolError(err: unknown): boolean {
  * reclaimed. Reclaiming it destroys the undelivered reply, which is the right trade: the close
  * never completed, so that reply was never committed, and the remote was not reading it anyway.
  *
+ * A close that expires its budget and a handler body that threw both land in the same catch arm,
+ * but they call for opposite operator responses — "the peer accepted our reply and stopped
+ * reading" is a remote-behavior signal, while "the handler threw" is ours — so they log
+ * distinctly. The discriminator is the budget's own signal rather than the error's identity:
+ * libp2p's `close()` rejects with whatever its internal `pEvent` turns the abort into, so
+ * matching on {@link DeadlineExpiredError} would depend on a wrapping detail we do not own.
+ *
  * `opts.closeBudgetMs` exists so a test need not spend the full default per case; there is no
  * production caller that overrides it.
  */
@@ -104,17 +112,26 @@ export async function registerRpcHandler(
 ): Promise<void> {
 	const closeBudgetMs = opts.closeBudgetMs ?? RPC_TIMEOUT_MS;
 	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
+		let closeBudget: Deadline | undefined;
 		try {
 			await serve(stream, connection);
-			const d = deadline(closeBudgetMs);
+			// NOTE: this arms an AbortController + setTimeout for every inbound message on every
+			// protocol. It is load-bearing (no handler body closes for itself any more), but it is
+			// still a per-message allocation; if inbound cost ever shows up in a profile, measure
+			// the timer churn before the handler bodies and consider one shared timer wheel.
+			closeBudget = deadline(closeBudgetMs);
 			try {
-				await stream.close({ signal: d.signal });
+				await stream.close({ signal: closeBudget.signal });
 			} finally {
 				// Mandatory: an uncleared timer fails the repo's mocha exit watchdog.
-				d.cancel();
+				closeBudget.cancel();
 			}
 		} catch (err) {
-			log.error('%s handler error - %e', protocol, err);
+			if (closeBudget?.signal.aborted === true) {
+				log.error('%s reply close exceeded %dms budget - remote stopped reading, aborting stream', protocol, closeBudgetMs);
+			} else {
+				log.error('%s handler error - %e', protocol, err);
+			}
 			if (stream.status === 'open' && stream.writeStatus !== 'closed') {
 				try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* best effort */ }
 			}
