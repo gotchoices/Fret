@@ -468,6 +468,10 @@ export class FretSimulation {
 		const peer = this.peers.get(peerId)
 		if (!peer || !peer.alive) return
 
+		// NOTE: a departed peer keeps its entry in `peers` and its store in `stores` — every
+		// hot path filters on `alive`, so this is memory, not per-tick cost. Continuous churn
+		// makes both maps grow linearly in run length x rate (59 entries for a 40-peer 10s run
+		// at 2/s). If a long or high-rate run ever runs out of memory, reclaim here.
 		peer.alive = false
 		peer.connected.clear()
 		peer.neighbors.clear()

@@ -279,7 +279,11 @@ describe('Churn scenario simulations', function () {
 		// Each churn event is a paired leave + join, so joins = n + churnEvents and
 		// leaves = churnEvents. The population therefore never drifts from n. Before
 		// pairing landed, this run lost one peer per event and ended at 20 alive.
-		const churnEvents = Math.floor(config.durationMs / Math.floor(1000 / config.churnRatePerSec)) - 1
+		// Mirrors scheduleChurn's loop (t = interval; t < durationMs; t += interval), which
+		// yields ceil(durationMs / interval) - 1 events. Ceil, not floor: with a non-dividing
+		// interval (rate 3 -> 333ms) floor undercounts by one.
+		const churnInterval = Math.floor(1000 / config.churnRatePerSec)
+		const churnEvents = Math.ceil(config.durationMs / churnInterval) - 1
 		console.log('  Joins:', metrics.totalJoins, 'leaves:', metrics.totalLeaves, 'alive:', sim.aliveCount())
 
 		if (metrics.totalLeaves !== churnEvents) {
