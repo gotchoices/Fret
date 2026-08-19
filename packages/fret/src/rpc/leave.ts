@@ -1,18 +1,15 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
 import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_LEAVE,
-	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
 	readFramed,
 	sendFramed,
-	openRpcStream,
 	registerRpcHandler,
-	releaseRpcStream,
 } from './protocols.js';
-import { deadline } from '../utils/deadline.js';
+import { rpcRequest } from './request.js';
+import type { RpcOutcome } from './outcome.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('rpc:leave');
@@ -75,18 +72,7 @@ export async function sendLeave(
 	notice: LeaveNoticeV1,
 	protocol = PROTOCOL_LEAVE,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<void> {
-	const pid = peerIdFromString(peerIdStr);
-	const d = deadline(opts.timeoutMs ?? RPC_TIMEOUT_MS, opts.signal);
-	let stream: Stream | undefined;
-	try {
-		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
-		sendFramed(stream!, await encodeJson(notice));
-	} finally {
-		// The close *is* the flush for this write-only RPC; on the aborted path
-		// `releaseRpcStream` swaps it for a synchronous `abort` so a stalled remote cannot
-		// hold `stop()` open past its shutdown budget.
-		await releaseRpcStream(stream, d.signal);
-		d.cancel();
-	}
+): Promise<RpcOutcome<undefined>> {
+	// Write-only — still reads no reply; see the parking note in docs/fret.md *Leave*.
+	return rpcRequest(node, peerIdStr, protocol, { ...opts, body: notice });
 }

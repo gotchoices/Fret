@@ -1,19 +1,13 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
-import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_PING,
-	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
-	isFrameTruncationError,
-	readFramed,
 	sendFramed,
-	openRpcStream,
 	registerRpcHandler,
-	releaseRpcStream,
 } from './protocols.js';
-import { deadline } from '../utils/deadline.js';
+import { rpcRequest } from './request.js';
+import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
 
@@ -27,10 +21,6 @@ export interface PingResponseV1 {
 }
 
 export type SizeEstimateProvider = () => { size_estimate?: number; confidence?: number } | BusyResponseV1 | Promise<{ size_estimate?: number; confidence?: number } | BusyResponseV1>;
-
-function isBusy(res: unknown): res is BusyResponseV1 {
-	return typeof res === 'object' && res !== null && 'busy' in res && (res as any).busy === true;
-}
 
 export async function registerPing(
 	node: Libp2p,
@@ -59,6 +49,10 @@ export async function registerPing(
  * A failed estimate is not a failed ping — it degrades to a plain pong.
  */
 async function pingReply(getSizeEstimate?: SizeEstimateProvider): Promise<PingResponseV1 | BusyResponseV1> {
+	// Busy test on the size-estimate *provider's return* — an in-process value, not a wire reply,
+	// so this is not a copy of `rpcRequest`'s busy classification.
+	const isBusy = (res: unknown): res is BusyResponseV1 =>
+		typeof res === 'object' && res !== null && 'busy' in res && (res as { busy?: unknown }).busy === true;
 	const pong = (): PingResponseV1 => ({ ok: true, ts: Date.now() });
 	if (!getSizeEstimate) return pong();
 	let sizeInfo: Awaited<ReturnType<SizeEstimateProvider>>;
@@ -78,55 +72,23 @@ async function pingReply(getSizeEstimate?: SizeEstimateProvider): Promise<PingRe
 }
 
 /**
- * Ping `peer` over this network's namespaced protocol.
- *
- * `opts.timeoutMs` is the budget for the *whole* RPC — dial, stream open, and read — not the
- * read alone. `opts.signal` cancels it from outside (a `stop()`, or a caller-imposed budget);
- * the sender's own deadline is a child of it, so a caller can tell its own cancellation from a
- * genuine timeout by checking the signal it passed.
+ * Ping `peer` over this network's namespaced protocol. Read-only request (the handler replies
+ * without reading); dial 'always'. `ok.value.ok` is the peer's own pong flag; rttMs on the
+ * outcome. Truncation/undecodable replies are `decode-error` — the service scores them as
+ * proof of life.
  */
 export async function sendPing(
 	node: Libp2p,
 	peer: string,
 	protocol = PROTOCOL_PING,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<{ ok: boolean; rttMs: number; size_estimate?: number; confidence?: number }> {
-	const pid = peerIdFromString(peer);
-	const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS;
-	const d = deadline(timeoutMs, opts.signal);
-	let stream: Stream | undefined;
-	try {
-		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
-		// RTT is measured from *after* the open: a dial is not round-trip time, and counting it
-		// inflated first-contact latency into peer health scoring.
-		const start = Date.now();
-		let bytes: Uint8Array;
-		try {
-			bytes = await readFramed(stream!, 1024, timeoutMs, { signal: d.signal });
-		} catch (err) {
-			// A truncated or absent reply is a live peer answering badly — membership evidence,
-			// never a contact strike (the service books strikes only for a *thrown* sendPing).
-			// Every other error — reset, deadline, abort, payload-too-large — keeps propagating.
-			if (isFrameTruncationError(err)) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
-			throw err;
-		}
-		const rttMs = Math.max(0, Date.now() - start);
-		try {
-			const res = await decodeJson<PingResponseV1 | BusyResponseV1>(bytes);
-			if (isBusy(res)) return { ok: false, rttMs };
-			return {
-				ok: Boolean(res.ok),
-				rttMs,
-				size_estimate: res.size_estimate,
-				confidence: res.confidence
-			};
-		} catch (err) {
-			log.error('sendPing decode failed - %e', err);
-			return { ok: false, rttMs };
-		}
-	} finally {
-		await releaseRpcStream(stream, d.signal);
-		d.cancel();
-	}
+): Promise<RpcOutcome<{ ok: boolean; size_estimate?: number; confidence?: number }>> {
+	return rpcRequest(node, peer, protocol, {
+		...opts,
+		maxBytes: 1024,
+		decode: async (b) => {
+			const r = await decodeJson<PingResponseV1>(b);
+			return { ok: Boolean(r.ok), size_estimate: r.size_estimate, confidence: r.confidence };
+		},
+	});
 }
-

@@ -21,6 +21,7 @@ import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/nei
 import { registerMaybeAct, sendMaybeAct, validateRouteAndMaybeAct } from '../rpc/maybe-act.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
+import type { RpcOutcome } from '../rpc/outcome.js';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
@@ -653,12 +654,12 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Route one failed outbound RPC to the evidence channel it actually belongs to.
-	 *
-	 * An unsupported-protocol error means the dial *succeeded* and the remote answered at the
-	 * transport layer — it is demonstrably alive, and the error is evidence about which network
-	 * it serves, so it takes the membership path and never a liveness strike. Anything else is a
-	 * failure to reach the peer at all and takes the contact-failure seam.
+	 * Route one failed outbound RPC to the evidence channel it actually belongs to, branching on
+	 * the outcome variant: `foreign-protocol` proves the peer alive on another network and takes
+	 * the membership path; `unreachable` / `timeout` are failures to reach the peer at all and
+	 * take the contact-failure seam; `decode-error` is proof of life answering badly — relevance
+	 * decay only, never a strike. `ok` / `busy` / `cancelled` / `skipped` are the callers' to
+	 * handle.
 	 *
 	 * It deliberately records **no backoff**: each call site keeps whatever backoff behavior it
 	 * already had, so routing failures through here introduces none where there was none.
@@ -666,13 +667,23 @@ export class FretService implements IFretService, Startable {
 	 * Never throws — it is bookkeeping on an already-failed path, and several call sites run it
 	 * from inside a `catch` where a second throw would escape into a background loop.
 	 */
-	private async noteRpcFailure(id: string, err: unknown): Promise<void> {
+	private async noteRpcFailure(id: string, outcome: RpcOutcome<unknown>): Promise<void> {
 		try {
-			if (isUnsupportedProtocolError(err)) {
-				this.applyMembershipSignal(id, 'negotiate-failure');
-				return;
+			switch (outcome.kind) {
+				case 'foreign-protocol':
+					this.applyMembershipSignal(id, 'negotiate-failure');
+					return;
+				case 'unreachable':
+				case 'timeout':
+					await this.applyContactFailure(id, await this.coordOf(id));
+					return;
+				case 'decode-error':
+					// Proof of life answering badly: relevance decay only, never a strike.
+					await this.applyFailure(id, await this.coordOf(id));
+					return;
+				default:
+					return; // ok / busy / cancelled / skipped are the callers' to handle
 			}
-			await this.applyContactFailure(id, await this.coordOf(id));
 		} catch (e) {
 			log.error('noteRpcFailure bookkeeping failed for %s - %e', id, e);
 		}
@@ -1301,24 +1312,22 @@ export class FretService implements IFretService, Startable {
 	private async sendAnnouncementsRateLimited(ids: string[], snap: NeighborSnapshotV1): Promise<void> {
 		const sig = this.runSignal;
 		for (const id of ids) {
-			// Both halves are load-bearing, and the check has to be *here* rather than in the catch
-			// below. `stopped` covers ordinary shutdown; the signal covers the case `stopped` cannot
-			// see — a stop() + start() landing mid-loop, where `sig` is the aborted controller of the
-			// run this loop belongs to while `stopped` is already back to false. A `wasCancelled`
-			// guard in the catch would never fire on that path: `announceNeighbors` swallows every
-			// error internally (the abort included), so the loop would keep taking an announce token
-			// and counting `announcementsSent` for every remaining target of a cancelled run.
+			// Both halves are load-bearing. `stopped` covers ordinary shutdown; the signal covers
+			// the case `stopped` cannot see — a stop() + start() landing mid-loop, where `sig` is
+			// the aborted controller of the run this loop belongs to while `stopped` is already
+			// back to false, so the `cancelled` outcome below (checked against the *new* run's
+			// signal state, not this loop's) cannot stand in for it.
 			if (this.stopped || this.wasCancelled(sig)) break;
 			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
-				await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
+				const out = await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
 					dial: true, signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
 				});
-				this.diag.announcementsSent++;
+				if (out.kind === 'ok') this.diag.announcementsSent++;
+				else if (out.kind !== 'cancelled') log.error('announce to %s failed: %s', id, out.kind);
 			} catch (err) {
-				// Reachable only for a malformed id (`peerIdFromString` runs outside the sender's own
-				// try); cancellation is owned by the top-of-loop check above, not by this catch.
+				// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
 				log.error('announce failed to %s - %e', id, err);
 			}
 		}
@@ -1387,10 +1396,19 @@ export class FretService implements IFretService, Startable {
 		const targets = budget === undefined ? dialable : dialable.slice(0, budget);
 		const results = await runPooled(targets.map((id) => async () => {
 			try {
-				await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-				this.diag.pingsSent++;
+				const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+				switch (out.kind) {
+					case 'ok': case 'busy': case 'decode-error':
+						this.diag.pingsSent++; // parity: counted whenever the old sendPing *returned*
+						return;
+					case 'foreign-protocol': case 'unreachable': case 'timeout':
+						log.error('%s ping failed for %s - %s', label, id, out.kind);
+						return;
+					case 'cancelled': case 'skipped':
+						return;
+				}
 			} catch (err) {
-				if (this.wasCancelled(sig)) return;
+				// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
 				log.error('%s ping failed for %s - %e', label, id, err);
 			}
 		}), { concurrency: this.maintenanceConcurrency, signal: sig });

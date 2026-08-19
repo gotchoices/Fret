@@ -1,19 +1,15 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
-import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_NEIGHBORS,
 	PROTOCOL_NEIGHBORS_ANNOUNCE,
-	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
 	readFramed,
 	sendFramed,
-	openRpcStream,
 	registerRpcHandler,
-	releaseRpcStream,
 } from './protocols.js';
-import { deadline } from '../utils/deadline.js';
+import { rpcRequest } from './request.js';
+import type { RpcOutcome } from './outcome.js';
 import type { NeighborSnapshotV1, BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
 
@@ -62,51 +58,24 @@ export async function registerNeighbors(
 	}
 }
 
-/** The "nothing usable came back" answer, returned on every non-answer path (see the NOTE below). */
-function emptySnapshot(from: string): NeighborSnapshotV1 {
-	return { v: 1, from, timestamp: Date.now(), successors: [], predecessors: [], sig: '' } as NeighborSnapshotV1;
-}
-
 /**
- * Fetch `peerIdOrStr`'s neighbor snapshot. Connection-only (`requireExisting`).
- *
- * `opts.timeoutMs` budgets the whole RPC (open + read); `opts.signal` cancels it.
- *
- * NOTE: every failure — including a timeout and a cancellation — is swallowed into a fabricated
- * empty snapshot, so the caller cannot tell "this peer has no neighbors" from "this call never
- * completed". That predates the deadline work and is `15-rpc-shared-helper`'s "fetchNeighbors
- * fabricates success" arm; the deadline is cancelled and the stream released on that path either
- * way, so the fabrication leaks neither a timer nor a stream.
+ * Fetch `peerIdOrStr`'s neighbor snapshot. Connection-only (dial `'never'`): no existing
+ * connection yields `skipped` — nothing attempted, nothing fabricated. Every failure mode is
+ * its own `RpcOutcome` variant; the decoded snapshot is not shape-validated beyond "JSON
+ * object" (parity with the cast this replaced).
  */
 export async function fetchNeighbors(
 	node: Libp2p,
 	peerIdOrStr: string,
 	protocol = PROTOCOL_NEIGHBORS,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<NeighborSnapshotV1> {
-	const pid = peerIdFromString(peerIdOrStr);
-	const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS;
-	const d = deadline(timeoutMs, opts.signal);
-	let stream: Stream | undefined;
-	try {
-		stream = await openRpcStream(node, pid, [protocol], { requireExisting: true, signal: d.signal });
-		if (stream == null) {
-			// No existing connection - skip to reduce churn
-			return emptySnapshot(peerIdOrStr);
-		}
-		const bytes = await readFramed(stream, 128 * 1024, timeoutMs, { signal: d.signal });
-		const res = await decodeJson<NeighborSnapshotV1 | BusyResponseV1>(bytes);
-		if ('busy' in res && (res as BusyResponseV1).busy) {
-			return emptySnapshot(peerIdOrStr);
-		}
-		return res as NeighborSnapshotV1;
-	} catch (err) {
-		log.error('fetchNeighbors decode failed for %s - %e', peerIdOrStr, err);
-		return emptySnapshot(peerIdOrStr);
-	} finally {
-		await releaseRpcStream(stream, d.signal);
-		d.cancel();
-	}
+): Promise<RpcOutcome<NeighborSnapshotV1>> {
+	return rpcRequest(node, peerIdOrStr, protocol, {
+		...opts,
+		dial: 'never',
+		maxBytes: 128 * 1024,
+		decode: (b) => decodeJson<NeighborSnapshotV1>(b),
+	});
 }
 
 /**
@@ -124,26 +93,13 @@ export async function announceNeighbors(
 	snapshot: NeighborSnapshotV1,
 	protocol = PROTOCOL_NEIGHBORS_ANNOUNCE,
 	opts: { dial?: boolean; signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<void> {
-	const pid = peerIdFromString(peerIdOrStr);
-	const d = deadline(opts.timeoutMs ?? RPC_TIMEOUT_MS, opts.signal);
-	let stream: Stream | undefined;
-	try {
-		stream = await openRpcStream(node, pid, [protocol], {
-			requireExisting: opts.dial !== true,
-			signal: d.signal,
-		});
-		if (stream == null) {
-			return; // no connection and dialing not requested
-		}
-		sendFramed(stream, await encodeJson(snapshot));
-	} catch (err) {
-		log.error('announceNeighbors failed to %s - %e', peerIdOrStr, err);
-	} finally {
-		// The close *is* the flush for this write-only RPC, so it happens here rather than in the
-		// `try`; on the aborted path `releaseRpcStream` swaps it for a synchronous `abort`.
-		await releaseRpcStream(stream, d.signal);
-		d.cancel();
-	}
+): Promise<RpcOutcome<undefined>> {
+	// Write-only: `ok` proves the body reached the transport, nothing more. No swallow — the
+	// caller sees every outcome now.
+	return rpcRequest(node, peerIdOrStr, protocol, {
+		signal: opts.signal,
+		timeoutMs: opts.timeoutMs,
+		dial: opts.dial === true ? 'always' : 'never',
+		body: snapshot,
+	});
 }
-

@@ -1,19 +1,15 @@
 import type { Libp2p } from 'libp2p';
-import type { Stream } from '@libp2p/interface';
-import { peerIdFromString } from '@libp2p/peer-id';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import {
 	PROTOCOL_MAYBE_ACT,
-	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
 	readFramed,
 	sendFramed,
-	openRpcStream,
 	registerRpcHandler,
-	releaseRpcStream,
 } from './protocols.js';
-import { deadline } from '../utils/deadline.js';
+import { rpcRequest } from './request.js';
+import type { RpcOutcome } from './outcome.js';
 import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';
 
 export async function registerMaybeAct(
@@ -90,25 +86,13 @@ export async function sendMaybeAct(
 	msg: RouteAndMaybeActV1,
 	protocol = PROTOCOL_MAYBE_ACT,
 	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
-): Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }> {
-	const pid = peerIdFromString(peerIdStr);
-	const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS;
-	const d = deadline(timeoutMs, opts.signal);
-	let stream: Stream | undefined;
-	try {
-		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
-		sendFramed(stream!, await encodeJson(msg));
-		// Half-close: this is the write-side flush the responder waits on, not cleanup — the
-		// read below depends on it, so it stays inside the `try`. It carries the deadline's
-		// signal for the same reason `releaseRpcStream`'s close does: `close()` resolves only
-		// once the bytes reach the transport, so against a remote that stops reading a bare
-		// close is unbounded and would outlive the RPC's own budget.
-		await stream!.close({ signal: d.signal });
-		const bytes = await readFramed(stream!, 512 * 1024, timeoutMs, { signal: d.signal });
-		return await decodeJson(bytes);
-	} finally {
-		await releaseRpcStream(stream, d.signal);
-		d.cancel();
-	}
+): Promise<RpcOutcome<NearAnchorV1 | { commitCertificate: string }>> {
+	return rpcRequest(node, peerIdStr, protocol, {
+		...opts,
+		body: msg,
+		halfCloseBeforeRead: true,
+		maxBytes: 512 * 1024,
+		decode: (b) => decodeJson<NearAnchorV1 | { commitCertificate: string }>(b),
+	});
 }
 
