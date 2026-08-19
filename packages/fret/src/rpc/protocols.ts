@@ -187,9 +187,12 @@ export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
  * The receiver (`readFramed`) reads the count and hands over exactly that body, so end-of-message
  * is carried in-band rather than inferred from stream close.
  *
- * Single `send` on purpose — the prefix and body go out as one `Uint8ArrayList` — and write
- * backpressure is deliberately out of scope here (owned by the follow-up write-backpressure
- * ticket); the boolean is `stream.send`'s own "queue has room" result, passed through.
+ * Single `send` on purpose — the prefix and body go out as one `Uint8ArrayList`, so a frame is
+ * never split across two writes. The returned boolean is `stream.send`'s own "queue has room"
+ * result, passed through: `false` means the write was accepted but the transport's buffer is
+ * now full. `rpcRequest` honors it (waiting for `'drain'`, bounded by the RPC deadline signal);
+ * the legacy senders still ignore it until `15.2b-rpc-sender-migration` moves them onto the
+ * helper.
  */
 export function sendFramed(stream: Stream, body: Uint8Array): boolean {
 	return stream.send(lp.encode.single(body));

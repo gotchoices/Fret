@@ -150,6 +150,15 @@ export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
 // `sendFramed` and `readFramed` ship together for the same reason: a consumer given only the
 // reader hand-rolls the writer, and the framing has to match.
 export { validateTimestamp, sendFramed, readFramed, openRpcStream, releaseRpcStream } from './rpc/protocols.js';
+// `rpcRequest` is the one owner of the open/write/read/close sequence those four primitives
+// compose, so a consumer sending a request never re-derives the order or the release rule. It
+// never throws for a network outcome — an unreachable peer, a foreign protocol, a truncated
+// reply, a busy answer and a timeout are all variants of the `RpcOutcome` it returns, and only a
+// caller bug (a malformed peer id, an unsatisfiable dial policy) throws. Callers that read the
+// outcome therefore branch on evidence about the peer rather than on error identity.
+export { rpcRequest } from './rpc/request.js';
+export type { RpcRequestOptions } from './rpc/request.js';
+export type { RpcOutcome } from './rpc/outcome.js';
 export type { Stream } from '@libp2p/interface';
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {

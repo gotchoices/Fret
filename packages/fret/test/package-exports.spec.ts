@@ -59,6 +59,8 @@ describe('package public surface', () => {
 		// The framed message codec those two bracket: one length-prefixed write, one framed read.
 		expect(fretIndex.sendFramed).to.be.a('function')
 		expect(fretIndex.readFramed).to.be.a('function')
+		// The helper that owns the whole sequence those four compose.
+		expect(fretIndex.rpcRequest).to.be.a('function')
 	})
 
 	it('exports the types the seam signature needs', () => {
@@ -68,5 +70,18 @@ describe('package public surface', () => {
 			...args: Parameters<typeof fretIndex.openRpcStream>
 		) => Promise<Stream | undefined> = fretIndex.openRpcStream
 		expect(open).to.equal(fretIndex.openRpcStream)
+		// Same for the request helper's own two types. The parameters are named one by one rather
+		// than spread from `Parameters<typeof rpcRequest>`: that tuple instantiates the generic at
+		// `T = unknown`, so the assignment would not check what a caller actually writes. Naming
+		// `opts` as `RpcRequestOptions<undefined>` drives inference to `T = undefined` instead.
+		const req: (
+			node: Parameters<typeof fretIndex.rpcRequest>[0],
+			peer: string,
+			protocol: string,
+			opts?: fretIndex.RpcRequestOptions<undefined>
+		) => Promise<fretIndex.RpcOutcome<undefined>> = fretIndex.rpcRequest
+		expect(req).to.equal(fretIndex.rpcRequest)
+		const o: fretIndex.RpcRequestOptions<number> = { maxBytes: 1024 }
+		expect(o.maxBytes).to.equal(1024)
 	})
 })
