@@ -1751,6 +1751,73 @@ describe('RPC handler fault isolation', function () {
 					expect(ids, 'only the unusable entry is skipped').to.deep.equal([FROM, OVER_SUCC[0]!, OVER_PRED[0]!, 'good-1', 'good-2'])
 					expect(svc.getStore().getById('short-coord'), 'never reached the store write seam').to.equal(undefined)
 				})
+
+				it('applies the cap through the handler the service actually registers', async () => {
+					// The wiring test, and the only one in this block that is one. Every test above
+					// applies `makeSnapshotParser(...)` from the test body, which restates
+					// `registerRpcHandlers`' 8th argument rather than proving it — unwire the parser at
+					// the registration site and all of them still pass. This one registers the real
+					// handlers on a node that records instead of registering, invokes the announce
+					// protocol with a raw over-cap frame, and counts the same upserts, so the truncation
+					// it observes can only have come from the parser the service wired in.
+					const handlers = new Map<string, InboundHandler>()
+					;(node as unknown as { handle: (p: string, h: InboundHandler) => Promise<void> }).handle =
+						async (protocol, h) => { handlers.set(protocol, h) }
+					// Private, and it registers all five protocols. Called directly rather than via
+					// `start()`: stabilization and the peerStore seed drag their own upserts into the
+					// counter, and this test is about one message's cost.
+					await (svc as unknown as { registerRpcHandlers(): Promise<void> }).registerRpcHandlers()
+
+					// The announce handler's `onInbound` hook runs `noteInboundRpc(from)`, which also
+					// upserts `from` — detached, racing the merge's own first upsert. It is guarded by
+					// `if (!getById(id))`, so seeding `from` first makes it a no-op and the count
+					// deterministic. Seeded before the counter is installed so the seed is not itself
+					// counted; the merge's own unconditional `upsert(from, ...)` still is.
+					svc.getStore().upsert(FROM, new Uint8Array(32).fill(60))
+
+					// `handleAnnounce` detaches the merge, so an upsert count taken around the handler
+					// call is not deterministic. Wrap the method on the instance to capture and await
+					// the promise it returns; the snapshot still arrives through the real parser, so
+					// nothing on the path under test is replaced.
+					const merges: Array<Promise<void>> = []
+					const drivable = svc as unknown as DrivableMerge
+					const innerMerge = drivable.mergeAnnounceSnapshot.bind(svc)
+					drivable.mergeAnnounceSnapshot = (from: string, snap: NeighborSnapshotV1): Promise<void> => {
+						const p = innerMerge(from, snap)
+						merges.push(p)
+						return p
+					}
+
+					const ids = countUpserts(svc)
+					const handler = handlers.get(P.PROTOCOL_NEIGHBORS_ANNOUNCE)
+					expect(handler, 'the service registered an announce handler').to.not.equal(undefined)
+
+					// The transport-authenticated remote must equal the body's `from`: the handler drops
+					// a mismatch without replying, and the merge would then never run — a silent zero
+					// count rather than a visible failure.
+					const s = inboundStub([json(overCapBody())])
+					await handler!(s.stream, { remotePeer: { toString: () => FROM } } as unknown as Connection)
+
+					expect(merges.length, 'the announce reached the merge at all').to.equal(1)
+					await Promise.all(merges)
+
+					expect(ids.length, 'truncated by the parser the service wired in, not by this test').to.equal(
+						1 + expected.successors + expected.predecessors + expected.sample
+					)
+					expect(ids, 'the first N of each list, in merge order').to.deep.equal([
+						FROM,
+						...OVER_SUCC.slice(0, expected.successors),
+						...OVER_PRED.slice(0, expected.predecessors),
+						...OVER_SAMPLE.slice(0, expected.sample).map((e) => e.id),
+					])
+
+					// ...and nothing past the cap reached the store, so the count above is the cap
+					// doing its job rather than the merge having stopped early for some other reason.
+					const store = svc.getStore()
+					for (const id of OVER_SUCC.slice(expected.successors)) expect(store.getById(id), `successor past the cap: ${id}`).to.equal(undefined)
+					for (const id of OVER_PRED.slice(expected.predecessors)) expect(store.getById(id), `predecessor past the cap: ${id}`).to.equal(undefined)
+					for (const e of OVER_SAMPLE.slice(expected.sample)) expect(store.getById(e.id), `sample entry past the cap: ${e.id}`).to.equal(undefined)
+				})
 			})
 		}
 	})
