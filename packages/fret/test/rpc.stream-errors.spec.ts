@@ -9,7 +9,7 @@ import { createMemNode, createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { PROTOCOL_NEIGHBORS, PROTOCOL_PING, RPC_TIMEOUT_MS } from '../src/rpc/protocols.js'
-import { DeadlineExpiredError } from '../src/utils/deadline.js'
+import type { RpcOutcome } from '../src/rpc/outcome.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { announceNeighbors, fetchNeighbors } from '../src/rpc/neighbors.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
@@ -18,35 +18,38 @@ import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
 import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 
-// What each outbound RPC does when the reply fails *partway through*, and what the service records
-// about the peer as a result. The read primitive itself is covered elsewhere
+// What each outbound RPC returns when the reply fails *partway through*, and what the service
+// records about the peer as a result. The read primitive itself is covered elsewhere
 // (`payload-bounds-ttl.spec.ts` pins the declared-length cap, the mid-stream stall and
-// deadline-over-truncation; `rpc.protocols.spec.ts` pins the whole-RPC deadlines). Three failure
-// shapes none of those produce:
+// deadline-over-truncation; `rpc.request.spec.ts` pins `rpcRequest` — the shared
+// open/write/read/release sequence — against every failure shape in isolation). Three failure
+// shapes this file drives through the *senders*:
 //
 //   1. **Reset mid-stream** — the reply iterator *throws* after some bytes (connection reset, muxer
 //      error, remote abort).
 //   2. **Clean EOF mid-payload** — the peer closes tidily after half a framed message. Not a
-//      timeout: the frame never completes, so `readFramed` throws a truncation error
+//      timeout: the frame never completes, so `readFramed` raises a truncation error
 //      (`UnexpectedEOFError` for a partial body still buffered) before any decode runs.
 //   3. **Partial then stall** — bytes arrive, then nothing.
 //
-// Two kinds of assertion live here and they are labelled as such:
+// Since the sender migration (`15.2-rpc-sender-migration`) every sender runs on `rpcRequest` and
+// returns an `RpcOutcome<T>`, so the senders share one contract:
 //
-// **Invariants** must hold before *and* after `tickets/plan/15-rpc-shared-helper` lands:
-//   - A partial payload is never parsed as a whole message.
-//   - The stream is released exactly once — `close()` on the un-aborted path, `abort()` on the
-//     aborted one (`releaseRpcStream`) — even when the read threw.
+//   - A network failure is an *outcome*, never a throw: a reset is `unreachable`, a truncated or
+//     undecodable reply is `decode-error`, a stall is `timeout`, the caller's own abort is
+//     `cancelled`. Only a caller bug throws.
+//   - A partial payload is never parsed as a whole message — and no value field exists on a
+//     non-`ok` outcome, so "nothing salvaged" is structural rather than asserted per field.
+//   - The stream is released exactly once, and the arm is deterministic: `rpcRequest` reads on a
+//     single clock (`readFramed` in `Infinity` mode, bounded by the RPC deadline alone), so on a
+//     timeout the deadline signal has always fired before the `finally` and release is the
+//     synchronous `abort()`; every other read failure releases by `close()`.
 //   - No unhandled rejection escapes — including from wire bytes queued after the first frame,
 //     which a single-frame read never pulls.
 //   - Our own cancellation is never evidence about the peer: no contact strike, no backoff, no
 //     relevance decay.
-//   - A reset mid-stream is a failed contact; an answered-but-undecodable reply never demotes a
-//     peer to `foreign`.
-//
-// **Today's contract** is expected to *change* under `15-rpc-shared-helper` and each such
-// assertion names the arm it belongs to inline. Do not delete those tests when the shared helper
-// lands — update the expectation and keep the case.
+//   - A reset mid-stream is a failed contact; an answered-but-undecodable reply proves the peer
+//     alive, so it books relevance decay only and never demotes the peer to `foreign`.
 
 const enc = new TextEncoder()
 
@@ -122,7 +125,7 @@ type ReadStep =
 
 interface StubStream {
 	stream: Stream
-	/** `close()` calls. `sendMaybeAct` half-closes inside its `try` *and* releases in its `finally`. */
+	/** `close()` calls. `sendMaybeAct` half-closes before its read *and* releases from its `finally`. */
 	closes: number
 	/** `abort()` calls — the release `releaseRpcStream` picks once a signal has aborted. */
 	aborts: number
@@ -209,52 +212,22 @@ function release(s: StubStream): { closes: number; aborts: number } {
 	return { closes: s.closes, aborts: s.aborts }
 }
 
+/**
+ * Narrow an outcome to an expected kind, failing with the outcome's own error message when it
+ * carries one. Generic over `T` so an `ok` narrowing types `value` at the call site.
+ */
+function expectKind<T, K extends RpcOutcome<T>['kind']>(
+	outcome: RpcOutcome<T>,
+	kind: K
+): Extract<RpcOutcome<T>, { kind: K }> {
+	const detail = 'error' in outcome && outcome.error instanceof Error ? ` (${outcome.error.message})` : ''
+	expect(outcome.kind, `expected outcome '${kind}', got '${outcome.kind}'${detail}`).to.equal(kind)
+	return outcome as Extract<RpcOutcome<T>, { kind: K }>
+}
+
 function elapsedBounded(elapsed: number): void {
 	expect(elapsed, `elapsed ${elapsed}ms must not be far under the ${TIMEOUT_MS}ms budget`).to.be.at.least(MIN_MS)
 	expect(elapsed, `elapsed ${elapsed}ms must be bounded by roughly the ${TIMEOUT_MS}ms budget`).to.be.at.most(MAX_MS)
-}
-
-/**
- * The rejection a stalled read produces at a *sender*.
- *
- * Two clocks can end it and both are correct. The whole-RPC deadline and `readFramed`'s own timer
- * are armed from the same `timeoutMs` moments apart, so either can fire first: the deadline signal
- * yields a `DeadlineExpiredError`, the read timer the `read timed out` message. Assert whichever
- * arm was taken rather than pretending the race does not exist; what matters either way is that
- * the call *rejects* instead of returning the partial frame as an answer. (The read-timer message
- * is pinned deterministically against the primitive in `payload-bounds-ttl.spec.ts`, where the
- * read budget is genuinely the only clock.)
- */
-function expectStallRejection(thrown: unknown): void {
-	expect(thrown, 'must reject rather than answer from a partial frame').to.be.instanceOf(Error)
-	if (thrown instanceof DeadlineExpiredError) return
-	expect((thrown as Error).message, 'read-deadline arm').to.include('read timed out')
-}
-
-/**
- * Release accounting for a read that ended on the RPC's **own budget** rather than on a caller's
- * signal — where *which* release arm runs is subject to the same two-clock race as
- * {@link expectStallRejection}, and for the same reason.
- *
- * `releaseRpcStream` picks the synchronous `abort()` only if the deadline signal has already
- * fired by the time the `finally` runs. When the loop's own `remaining <= 0` check wins instead,
- * the read throws while that signal is still un-aborted and release goes through `close()`. Both
- * are one release of one stream; neither is a leak. Asserting a fixed `{ closes, aborts }` pair
- * here is a flake, not a stronger test — it failed in review against the *un*expected arm.
- *
- * `flushCloses` is the sender's own pre-read half-close, which is not a release: 1 for
- * `sendMaybeAct` (`maybe-act.ts:64`), 0 for every other sender.
- *
- * The arm itself *is* pinned deterministically, in two places where only one clock exists: the
- * caller-cancellation cases below (the caller's signal is aborted before the `finally`, so
- * `abort()` is guaranteed) and `rpc.protocols.spec.ts`'s direct `releaseRpcStream` cases.
- */
-function expectReleasedOnce(s: StubStream, flushCloses = 0): void {
-	const releases = (s.closes - flushCloses) + s.aborts
-	expect(
-		releases,
-		`released exactly once — closes ${s.closes} (${flushCloses} of them the request flush), aborts ${s.aborts}`
-	).to.equal(1)
 }
 
 /** Poll `predicate` until true, or fail after `limitMs`. */
@@ -298,8 +271,9 @@ describe('RPC stream failures', function () {
 		expect(seen, 'unhandled rejection escaped').to.deep.equal([])
 	})
 
-	// Real Ed25519 ids: every sender runs `peerIdFromString` on its target before anything else,
-	// outside its `try`, so a synthetic string would fail for the wrong reason.
+	// Real Ed25519 ids: every sender runs `peerIdFromString` on its target before anything else —
+	// a malformed id is a caller bug and the one thing that still throws — so a synthetic string
+	// would fail for the wrong reason.
 	let peer: string
 
 	before(async () => {
@@ -307,17 +281,13 @@ describe('RPC stream failures', function () {
 	})
 
 	describe('reset mid-stream', () => {
-		it('sendPing propagates the reset and releases the stream exactly once', async () => {
+		it('sendPing returns unreachable and releases the stream exactly once', async () => {
 			const s = resetsAfter(HALF_PING)
 
-			let thrown: unknown
-			try {
-				await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect((thrown as Error)?.message, 'the reset surfaces').to.equal('connection reset by peer')
+			const u = expectKind(res, 'unreachable')
+			expect(u.error.message, 'the reset is preserved on the outcome').to.equal('connection reset by peer')
 			// Invariant: released exactly once, and via `close()` because nothing aborted — the read
 			// failed on its own rather than being cancelled or timed out.
 			expect(release(s), 'released once, by close').to.deep.equal({ closes: 1, aborts: 0 })
@@ -326,208 +296,176 @@ describe('RPC stream failures', function () {
 		// A reset before any bytes and one mid-frame take different paths through `readFramed`
 		// (no length prefix yet vs a partially-read frame), and only the second has partial
 		// data that *could* be mis-returned.
-		it('sendPing propagates a reset that lands before any bytes', async () => {
+		it('sendPing returns unreachable for a reset that lands before any bytes', async () => {
 			const s = resetsAfter()
 
-			let thrown: unknown
-			try {
-				await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect((thrown as Error)?.message).to.equal('connection reset by peer')
+			const u = expectKind(res, 'unreachable')
+			expect(u.error.message).to.equal('connection reset by peer')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		// The contrast that makes the case above meaningful: zero bytes plus a *clean* EOF is an
-		// answer (`ok: false`), while zero bytes plus a reset is a rejection. The discriminator is
-		// how the read ended, not how much arrived.
-		it('sendPing answers ok: false for a peer that closes without sending', async () => {
+		// The contrast that makes the cases above meaningful: the discriminator is still how the
+		// read ended, not how much arrived — a reset is `unreachable` (the read died under us),
+		// while zero bytes plus a *clean* EOF is a truncated frame and lands as `decode-error`
+		// (the peer answered, and answered nothing usable). The pre-migration `ok: false` collapse
+		// is gone: an empty reply is no longer dressed up as an answer.
+		it('sendPing returns decode-error for a peer that closes without sending', async () => {
 			const s = makeStubStream([{ kind: 'eof' }])
 
 			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect(res.ok).to.equal(false)
-			expect(res.size_estimate, 'nothing invented from an empty reply').to.equal(undefined)
+			expectKind(res, 'decode-error')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('fetchNeighbors swallows the reset into its fabricated empty snapshot', async () => {
+		it('fetchNeighbors returns unreachable rather than fabricating an empty snapshot', async () => {
 			const s = resetsAfter(HALF_SNAPSHOT)
 
-			const snap = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
+			const res = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			// Invariant: nothing from the truncated bytes reaches the caller.
-			expect(snap.successors, 'successors').to.deep.equal([])
-			expect(snap.predecessors, 'predecessors').to.deep.equal([])
-			expect(snap.sample, 'sample').to.equal(undefined)
-			expect(JSON.stringify(snap), 'no field parsed out of the partial document').to.not.include('ghost')
-			// TODAY'S CONTRACT — `15-rpc-shared-helper`, arm "fetchNeighbors fabricates success on
-			// every failure": a reset is reported as a real (empty) answer, indistinguishable from a
-			// peer that genuinely has no neighbors. Under the discriminated result type this becomes
-			// a distinguishable failure; update the expectation, keep the case.
-			expect(snap.from, 'fabricated in our own words, not the peer\'s').to.equal(peer)
+			// Invariant: nothing from the truncated bytes reaches the caller. There is no fabricated
+			// empty snapshot anywhere anymore — a reset is a distinguishable failure, not a peer that
+			// "genuinely has no neighbors".
+			const u = expectKind(res, 'unreachable')
+			expect(u.error.message).to.equal('connection reset by peer')
+			expect(JSON.stringify(res), 'no field parsed out of the partial document').to.not.include('ghost')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('sendMaybeAct propagates the reset, and the double close is harmless', async () => {
+		it('sendMaybeAct returns unreachable, and the double close is harmless', async () => {
 			const s = resetsAfter(HALF_NEAR_ANCHOR)
 
-			let thrown: unknown
-			try {
-				await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('reset-mid-stream'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('reset-mid-stream'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect((thrown as Error)?.message).to.equal('connection reset by peer')
-			// `sendMaybeAct` half-closes inside its `try` to flush the request (`maybe-act.ts:64`) and
-			// then `releaseRpcStream` closes again from the `finally`. Two `close()` calls, one real
-			// release: the second neither throws nor leaks, which is why the exactly-once invariant is
-			// stated as "closed or aborted, never leaked" rather than "close called once".
+			const u = expectKind(res, 'unreachable')
+			expect(u.error.message).to.equal('connection reset by peer')
+			// `sendMaybeAct` half-closes before its read to flush the request (`halfCloseBeforeRead`)
+			// and then `releaseRpcStream` closes again from the `finally`. Two `close()` calls, one
+			// real release: the second neither throws nor leaks, which is why the exactly-once
+			// invariant is stated as "closed or aborted, never leaked" rather than "close called once".
 			expect(release(s), 'flush close + release close').to.deep.equal({ closes: 2, aborts: 0 })
 			expect(s.sends, 'the request was written before the reply failed').to.equal(1)
 		})
 	})
 
 	describe('clean EOF mid-payload', () => {
-		it('sendPing collapses a half-received reply into ok: false', async () => {
+		it('sendPing returns decode-error for a half-received reply', async () => {
 			const s = halfThenEof(HALF_PING)
 
 			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			// Invariant: never a half-populated `PingResponseV1`. The truncated frame's body bytes
-			// name `size_estimate`, so a lenient partial parse would surface it here.
-			expect(res.ok, 'not parsed as an answer').to.equal(false)
-			expect(res.size_estimate, 'nothing salvaged from the partial document').to.equal(undefined)
-			expect(res.confidence).to.equal(undefined)
-			expect(res.rttMs, 'a plausible round trip was still measured').to.be.a('number').and.to.be.at.least(0)
+			// Invariant: never a half-populated reply. The truncated frame's body bytes name
+			// `size_estimate`, but a non-`ok` outcome carries no value field at all — "nothing
+			// salvaged from the partial document" is structural now.
+			expectKind(res, 'decode-error')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('fetchNeighbors returns the empty snapshot, with nothing taken from the truncated bytes', async () => {
+		it('fetchNeighbors returns decode-error, with nothing taken from the truncated bytes', async () => {
 			const s = halfThenEof(HALF_SNAPSHOT)
 
-			const snap = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
+			const res = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect(snap.successors).to.deep.equal([])
-			expect(snap.predecessors).to.deep.equal([])
-			expect(snap.sample).to.equal(undefined)
-			expect(JSON.stringify(snap)).to.not.include('ghost')
+			expectKind(res, 'decode-error')
+			expect(JSON.stringify(res)).to.not.include('ghost')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('sendMaybeAct rejects rather than returning a half-decoded NearAnchor', async () => {
+		it('sendMaybeAct returns decode-error rather than a half-decoded NearAnchor', async () => {
 			const s = halfThenEof(HALF_NEAR_ANCHOR)
 
-			let thrown: unknown
-			try {
-				await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('half-json'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('half-json'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
 			// Invariant: the truncated document is never handed back as an answer. Under framing the
-			// read itself refuses the incomplete frame — no decode ever runs on partial bytes.
-			expect(thrown, 'must reject').to.be.instanceOf(Error)
+			// read itself refuses the incomplete frame — no decode ever runs on partial bytes — and
+			// the read's own error is preserved on the outcome.
+			const d = expectKind(res, 'decode-error')
 			expect(
 				['FrameTruncationError', 'UnexpectedEOFError'],
 				'the framed read is what failed'
-			).to.include((thrown as Error).name)
+			).to.include(d.error.name)
 			expect(release(s)).to.deep.equal({ closes: 2, aborts: 0 })
 		})
 
-		// TODAY'S CONTRACT — `15-rpc-shared-helper`, arms "fetchNeighbors fabricates success on every
-		// failure" and "the liveness seam now has to guess whether a peer was reached". One piece of
-		// evidence, three different answers. This is the whole reason the discriminated result type
-		// exists; asserting the divergence in one place is what makes the fix visible as a diff here
-		// rather than as three unrelated expectation edits.
-		it('reports one undecodable reply three different ways across the three senders', async () => {
+		// The headline of the sender migration (`15.2-rpc-sender-migration`): one piece of
+		// evidence, ONE answer. Before `rpcRequest`, the three senders reported an undecodable
+		// reply three different ways — ping collapsed it into `ok: false`, fetchNeighbors
+		// fabricated an empty snapshot, sendMaybeAct threw — and the service consequently booked a
+		// contact strike on the maybeAct path and none on the ping path for identical evidence.
+		// All three now return `decode-error`; the converged service consequence is pinned end to
+		// end further down.
+		it('reports one undecodable reply the same way across all three senders', async () => {
 			const pingRes = await sendPing(
 				nodeServing(halfThenEof(HALF_PING).stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS }
 			)
-			const snap = await fetchNeighbors(
+			const snapRes = await fetchNeighbors(
 				nodeServing(halfThenEof(HALF_SNAPSHOT).stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS }
 			)
-			let actThrown: unknown
-			try {
-				await sendMaybeAct(
-					nodeServing(halfThenEof(HALF_NEAR_ANCHOR).stream), peer,
-					maybeActMsg('divergence'), PROTOCOL, { timeoutMs: TIMEOUT_MS }
-				)
-			} catch (err) {
-				actThrown = err
-			}
+			const actRes = await sendMaybeAct(
+				nodeServing(halfThenEof(HALF_NEAR_ANCHOR).stream), peer,
+				maybeActMsg('convergence'), PROTOCOL, { timeoutMs: TIMEOUT_MS }
+			)
 
-			expect(pingRes.ok, 'ping: a returned non-answer').to.equal(false)
-			expect(snap.successors, 'neighbors: a fabricated success').to.deep.equal([])
-			expect(actThrown, 'maybeAct: a rejection').to.be.instanceOf(Error)
-			// The service consequence, pinned end to end further down: the same badly-answering peer
-			// earns a contact strike on the maybeAct path and none on the ping path.
+			expect(pingRes.kind, 'ping').to.equal('decode-error')
+			expect(snapRes.kind, 'neighbors').to.equal('decode-error')
+			expect(actRes.kind, 'maybeAct').to.equal('decode-error')
 		})
 	})
 
-	// These three end on the RPC's own budget, so they assert release-exactly-once rather than a
-	// fixed arm — see {@link expectReleasedOnce}. The "released by abort" half of the invariant is
-	// pinned deterministically in "the caller cancels mid-stream" below.
+	// These three end on the RPC's own budget — and unlike the pre-migration senders, which armed
+	// two timers from the same `timeoutMs` and raced them, `rpcRequest` reads on the deadline alone.
+	// So both the outcome (`timeout`) and the release arm are deterministic: the deadline signal has
+	// fired before the `finally` runs, and `releaseRpcStream` provably takes the synchronous
+	// `abort()` — a stalled remote is never cleaned up with the unbounded `close()`.
 	describe('partial then stall', () => {
-		it('sendPing rejects within its budget and releases the stream', async () => {
+		it('sendPing times out within its budget and releases the stream by abort', async () => {
 			const s = partialThenStall(HALF_PING)
 
 			const t0 = Date.now()
-			let thrown: unknown
-			try {
-				await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 			const elapsed = Date.now() - t0
 
-			expectStallRejection(thrown)
-			// Bounded, not merely eventual: "it rejected" would pass at ten minutes.
+			expectKind(res, 'timeout')
+			// Bounded, not merely eventual: "it timed out" would pass at ten minutes.
 			elapsedBounded(elapsed)
-			expectReleasedOnce(s)
+			expect(release(s), 'released once, by abort').to.deep.equal({ closes: 0, aborts: 1 })
 		})
 
-		it('fetchNeighbors gives up within its budget and releases the stream', async () => {
+		it('fetchNeighbors times out within its budget and releases the stream by abort', async () => {
 			const s = partialThenStall(HALF_SNAPSHOT)
 
 			const t0 = Date.now()
-			const snap = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
+			const res = await fetchNeighbors(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 			const elapsed = Date.now() - t0
 
-			expect(snap.successors).to.deep.equal([])
-			expect(JSON.stringify(snap)).to.not.include('ghost')
+			expectKind(res, 'timeout')
+			expect(JSON.stringify(res)).to.not.include('ghost')
 			elapsedBounded(elapsed)
-			expectReleasedOnce(s)
+			expect(release(s)).to.deep.equal({ closes: 0, aborts: 1 })
 		})
 
-		it('sendMaybeAct rejects within its budget and releases the stream after its flush close', async () => {
+		it('sendMaybeAct times out within its budget and releases by abort after its flush close', async () => {
 			const s = partialThenStall(HALF_NEAR_ANCHOR)
 
 			const t0 = Date.now()
-			let thrown: unknown
-			try {
-				await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('stall'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendMaybeAct(nodeServing(s.stream), peer, maybeActMsg('stall'), PROTOCOL, { timeoutMs: TIMEOUT_MS })
 			const elapsed = Date.now() - t0
 
-			expectStallRejection(thrown)
+			expectKind(res, 'timeout')
 			elapsedBounded(elapsed)
-			// One of the `close()` calls is always the request flush inside the `try`; exactly one
-			// release follows it, by whichever arm the budget race selected.
-			expectReleasedOnce(s, 1)
+			// The `close()` is the pre-read request flush; the release itself is the abort.
+			expect(release(s), 'flush close + release abort').to.deep.equal({ closes: 1, aborts: 1 })
 			expect(s.sends, 'the request was written before the reply stalled').to.equal(1)
 		})
 	})
 
-	// Unlike the budget-driven cases above, the caller's signal is the *only* clock here — it is
-	// aborted well before either deadline could fire — so `releaseRpcStream` provably takes its
-	// `abort()` arm and these cases pin it exactly. This is where "a stalled remote is released by
-	// the synchronous abort, never by the unbounded close" is actually asserted.
+	// The caller's signal is the *only* clock here — it is aborted well before the deliberately
+	// huge deadline could fire — so the outcome is `cancelled` rather than `timeout`, and
+	// `releaseRpcStream` provably takes its `abort()` arm: the signal has fired before the
+	// `finally` runs. The `cancelled` variant carries no error — the kind IS the assertion; the
+	// caller's own abort reason is not evidence about the peer and is not transported.
 	describe('the caller cancels mid-stream', () => {
 		/** Abort `ac` at the start of the read that follows the first chunk — bytes in, then a cancel. */
 		function cancelAfterFirstChunk(ac: AbortController, bytes: Uint8Array): StubStream {
@@ -536,57 +474,47 @@ describe('RPC stream failures', function () {
 			})
 		}
 
-		it('sendPing rejects with the caller reason and releases by abort', async () => {
+		it('sendPing returns cancelled and releases by abort', async () => {
 			const ac = new AbortController()
 			const s = cancelAfterFirstChunk(ac, HALF_PING)
 
 			const t0 = Date.now()
-			let thrown: unknown
-			try {
-				// A budget far past the abort, so only the caller's signal can end this.
-				await sendPing(nodeServing(s.stream), peer, PROTOCOL, { signal: ac.signal, timeoutMs: 60_000 })
-			} catch (err) {
-				thrown = err
-			}
+			// A budget far past the abort, so only the caller's signal can end this.
+			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { signal: ac.signal, timeoutMs: 60_000 })
 
-			expect((thrown as Error)?.message, 'caller reason surfaces').to.equal('caller gave up')
+			expectKind(res, 'cancelled')
 			expect(s.delivered, 'the cancel really landed mid-stream').to.equal(1)
 			expect(release(s), 'released once, by abort').to.deep.equal({ closes: 0, aborts: 1 })
 			expect(Date.now() - t0, 'must not wait out its own budget').to.be.at.most(MAX_MS)
 		})
 
-		it('sendMaybeAct rejects with the caller reason and releases by abort', async () => {
+		it('sendMaybeAct returns cancelled and releases by abort', async () => {
 			const ac = new AbortController()
 			const s = cancelAfterFirstChunk(ac, HALF_NEAR_ANCHOR)
 
-			let thrown: unknown
-			try {
-				await sendMaybeAct(
-					nodeServing(s.stream), peer, maybeActMsg('cancelled'), PROTOCOL,
-					{ signal: ac.signal, timeoutMs: 60_000 }
-				)
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendMaybeAct(
+				nodeServing(s.stream), peer, maybeActMsg('cancelled'), PROTOCOL,
+				{ signal: ac.signal, timeoutMs: 60_000 }
+			)
 
-			expect((thrown as Error)?.message).to.equal('caller gave up')
-			expect(release(s)).to.deep.equal({ closes: 1, aborts: 1 })
+			expectKind(res, 'cancelled')
+			expect(release(s), 'flush close + release abort').to.deep.equal({ closes: 1, aborts: 1 })
 		})
 
-		it('fetchNeighbors swallows the cancellation into its fabricated empty snapshot', async () => {
+		it('fetchNeighbors returns cancelled rather than dressing the abort up as an empty snapshot', async () => {
 			const ac = new AbortController()
 			const s = cancelAfterFirstChunk(ac, HALF_SNAPSHOT)
 
-			const snap = await fetchNeighbors(
+			const res = await fetchNeighbors(
 				nodeServing(s.stream), peer, PROTOCOL, { signal: ac.signal, timeoutMs: 60_000 }
 			)
 
-			// TODAY'S CONTRACT — `15-rpc-shared-helper`, arm "fetchNeighbors fabricates success on
-			// every failure". A cancelled fetch is indistinguishable from an empty one, which is why
-			// `fetchAndMergeSnapshot` overcounts `snapshotsFetched` on a cancelled tick (documented at
-			// that method, and pinned in `dead-state.spec.ts`). Nothing is merged either way.
-			expect(snap.successors).to.deep.equal([])
-			expect(JSON.stringify(snap)).to.not.include('ghost')
+			// Before the migration `fetchNeighbors` swallowed its own cancellation into a fabricated
+			// empty snapshot — which is why `fetchAndMergeSnapshot` used to overcount
+			// `snapshotsFetched` on a cancelled tick. The outcome switch ended both: a cancelled
+			// fetch is `cancelled`, and the caller records nothing.
+			expectKind(res, 'cancelled')
+			expect(JSON.stringify(res)).to.not.include('ghost')
 			expect(release(s)).to.deep.equal({ closes: 0, aborts: 1 })
 		})
 	})
@@ -605,8 +533,10 @@ describe('RPC stream failures', function () {
 
 			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: 2000 })
 
-			expect(res.ok, 'the complete framed reply was the answer').to.equal(true)
-			expect(res.size_estimate).to.equal(42)
+			const ok = expectKind(res, 'ok')
+			expect(ok.value.ok, 'the complete framed reply was the answer').to.equal(true)
+			expect(ok.value.size_estimate).to.equal(42)
+			expect(ok.rttMs, 'a real round trip was measured').to.be.a('number').and.to.be.at.least(0)
 			expect(s.delivered, 'exactly one pull — the trailing step never ran').to.equal(1)
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 			// Were the trailing step ever pulled, give its rejection time to land under the guard.
@@ -618,59 +548,56 @@ describe('RPC stream failures', function () {
 		// Both failures are available in the same read: `sendPing`'s cap is 1024 bytes and the reset
 		// is queued behind a frame whose prefix declares 2048. `readFramed` refuses at the prefix —
 		// before any body byte — so the following `iter.next()` is never called and the cap wins
-		// deterministically. Asserted so the outcome is *stated* rather than incidental.
+		// deterministically. An over-cap reply came from a peer that answered, so it classifies as
+		// `decode-error` — an unusable answer — not `unreachable`.
 		it('reports the payload cap, not the reset', async () => {
 			const s = makeStubStream([
 				{ kind: 'chunk', bytes: frame(new Uint8Array(2048)) },
 				{ kind: 'reject', error: reset() },
 			])
 
-			let thrown: unknown
-			try {
-				await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			expect((thrown as Error)?.message, 'the cap wins').to.include('payload too large')
-			expect((thrown as Error)?.message).to.not.include('connection reset')
+			const d = expectKind(res, 'decode-error')
+			expect(d.error.message, 'the cap wins').to.include('payload too large')
+			expect(d.error.message).to.not.include('connection reset')
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 	})
 
 	// Announce and leave have no read to fail, so their arm is the write-side reset — and the point
-	// is that they release the stream either way, since outbound stream caps are finite
-	// (libp2p's default 64 per protocol per connection) and a leaked stream is a real ceiling.
+	// is that they release the stream either way, since outbound stream caps are finite (libp2p's
+	// default 64 per protocol per connection) and a leaked stream is a real ceiling. Both now
+	// return an outcome: a failed write is `unreachable` — `sendLeave` no longer propagates it as a
+	// throw, and `announceNeighbors` no longer swallows it silently.
 	describe('the write-only RPCs', () => {
 		const snapshot = (): NeighborSnapshotV1 => ({
 			v: 1, from: peer, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
 		})
 
-		it('announceNeighbors swallows a reset while writing and still releases the stream', async () => {
+		it('announceNeighbors returns unreachable for a reset while writing and still releases the stream', async () => {
 			const s = makeStubStream([], { sendThrows: reset() })
 
 			// `dial: true`: the default is connection-only, and this stub node reports a connection
 			// anyway, but stating it keeps the case aligned with the service's announce choke point.
-			await announceNeighbors(nodeServing(s.stream), peer, snapshot(), PROTOCOL, { dial: true, timeoutMs: TIMEOUT_MS })
+			const res = await announceNeighbors(nodeServing(s.stream), peer, snapshot(), PROTOCOL, { dial: true, timeoutMs: TIMEOUT_MS })
 
+			expectKind(res, 'unreachable')
 			expect(s.sends, 'the write was attempted').to.equal(1)
 			expect(release(s), 'released once despite the failed write').to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('sendLeave propagates a reset while writing and still releases the stream', async () => {
+		it('sendLeave returns unreachable for a reset while writing and still releases the stream', async () => {
 			const s = makeStubStream([], { sendThrows: reset() })
 
-			let thrown: unknown
-			try {
-				await sendLeave(
-					nodeServing(s.stream), peer, { v: 1, from: peer, timestamp: Date.now() },
-					PROTOCOL, { timeoutMs: TIMEOUT_MS }
-				)
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendLeave(
+				nodeServing(s.stream), peer, { v: 1, from: peer, timestamp: Date.now() },
+				PROTOCOL, { timeoutMs: TIMEOUT_MS }
+			)
 
-			expect((thrown as Error)?.message, 'leave does not swallow').to.equal('connection reset by peer')
+			const u = expectKind(res, 'unreachable')
+			expect(u.error.message, 'the reset is preserved on the outcome').to.equal('connection reset by peer')
+			expect(s.sends).to.equal(1)
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 	})
@@ -788,7 +715,7 @@ describe('RPC stream failures', function () {
 			expect(store.getById(hop)?.membership, 'liveness, not membership').to.equal('member')
 		})
 
-		it('books a contact strike for a hop that answers with a truncated reply', async () => {
+		it('books relevance decay — not a contact strike — for a hop that answers with a truncated reply', async () => {
 			const keyBytes = enc.encode('half-json-forward-key')
 			const hop = await seedHopBesideKey(keyBytes)
 			serve(halfThenEof(HALF_NEAR_ANCHOR))
@@ -796,24 +723,23 @@ describe('RPC stream failures', function () {
 			await svc.routeAct(maybeActMsg('half-json-forward', keyBytes))
 
 			const e = store.getById(hop)!
-			// TODAY'S CONTRACT — `15-rpc-shared-helper`, arm "the liveness seam now has to guess
-			// whether a peer was reached". This peer accepted the stream, replied, and merely replied
-			// *badly*: it is demonstrably alive. The truncation error (`UnexpectedEOFError`)
-			// propagates out of `sendMaybeAct`, and `noteRpcFailure` classifies every non-negotiate
-			// error as unreachability — so three such replies would mark a live peer dead. Under the
-			// discriminated result type this becomes a `decode-error` outcome and the strike goes
-			// away; change this expectation to 0 then, and keep the case.
-			expect(e.contactFailures, 'today: an undecodable reply is booked as unreachability').to.equal(1)
-			// Invariant either way: an answered-but-undecodable reply is not negotiate-failure
-			// evidence, so it can never demote the peer to `foreign`.
+			// This peer accepted the stream, replied, and merely replied *badly*: it is demonstrably
+			// alive. `sendMaybeAct` returns `decode-error`, and `noteRpcFailure` books that as
+			// relevance decay alone — three such replies can no longer mark a live peer dead. (Before
+			// the sender migration the truncation error propagated as a throw, every non-negotiate
+			// throw was classified as unreachability, and this same case earned a contact strike.)
+			expect(e.contactFailures, 'an answered-but-undecodable reply is not unreachability').to.equal(0)
+			expect(e.failureCount, 'relevance decay is what is recorded').to.equal(1)
+			// Invariant: an answered-but-undecodable reply is not negotiate-failure evidence either,
+			// so it can never demote the peer to `foreign`.
 			expect(e.negotiateFailures, 'no negotiate failure').to.equal(0)
 			expect(e.membership, 'never demoted to foreign by a decode error').to.equal('member')
 		})
 
-		// The other half of the divergence pinned at the sender level: identical evidence, and the
-		// ping path books nothing but relevance decay because `sendPing` collapses an undecodable
-		// reply into `ok: false`. So the service treats a badly-answering maybeAct peer as
-		// unreachable and a badly-answering ping peer as merely unhelpful.
+		// The other half of the old divergence, now converged: identical evidence on the ping path
+		// books the identical answer. `sendPing` returns `decode-error` (the `ok: false` collapse is
+		// gone), and `probeNeighborLatency` records a failed ping plus relevance decay — never a
+		// contact strike, because the peer demonstrably answered.
 		it('books no strike for the same truncated reply on the ping path', async () => {
 			const id = await seedMember()
 			serve(halfThenEof(HALF_PING))
@@ -823,8 +749,6 @@ describe('RPC stream failures', function () {
 			}).probeNeighborLatency(id, undefined)
 
 			const e = store.getById(id)!
-			// TODAY'S CONTRACT — same `15-rpc-shared-helper` arm as above; this is the side of the
-			// asymmetry that will *stay* correct, so expect only the maybeAct side to change.
 			expect(e.contactFailures, 'the peer answered, so it is alive').to.equal(0)
 			expect(e.failureCount, 'relevance decay is all that is recorded').to.equal(1)
 			expect(e.state).to.not.equal('dead')
@@ -846,7 +770,8 @@ describe('RPC stream failures', function () {
 
 			// Invariant: our own cancellation is never evidence about the peer — no contact strike, no
 			// relevance decay, no backoff, no `pingsFail`, whether it lands before the dial or (as
-			// here) with bytes already buffered.
+			// here) with bytes already buffered. The `cancelled` outcome is what makes this explicit:
+			// the probe switches on it and records nothing.
 			expect(svc.getDiagnostics().pingsSent, 'no ping counted').to.equal(before.pingsSent)
 			expect(svc.getDiagnostics().pingsFail, 'no ping failure counted').to.equal(before.pingsFail)
 			const e = store.getById(id)!
@@ -880,10 +805,14 @@ describe('RPC stream failures', function () {
 	// primitive's missed-EOF bug is the precedent: a stub-only suite agreed with itself and not
 	// with libp2p. Both stub-only shapes that a live peer *can* be made to produce are re-driven here
 	// over TCP + noise + yamux: a clean EOF mid-frame, and a reset mid-reply (the responder calls
-	// `Stream.abort()` after a partial write, which is what a handler throwing mid-reply would do if
-	// it released its stream at all — see `15-rpc-shared-helper`'s "handler error paths leak
-	// streams"). The stall shape has no real-transport counterpart worth the wall time: it is a
-	// responder doing nothing, and asserting it means spending a full RPC budget per case.
+	// `Stream.abort()` after a partial write — what a handler that throws mid-reply does now that
+	// `registerRpcHandler` releases handler streams on error). The stall shape has no
+	// real-transport counterpart worth the wall time: it is a responder doing nothing, and asserting
+	// it means spending a full RPC budget per case. One live-muxer nuance the stubs cannot show: a
+	// reset may or may not deliver the buffered bytes before failing the read, so the reset cases
+	// accept either failure outcome (`unreachable` when the read died, `decode-error` when the
+	// truncated frame arrived first); a clean half-close always delivers its bytes, so that arm is
+	// pinned exactly.
 	describe('over a real transport', () => {
 		let a: Libp2p
 		let b: Libp2p
@@ -928,73 +857,54 @@ describe('RPC stream failures', function () {
 			expect(elapsed, `took ${elapsed}ms of a ${RPC_TIMEOUT_MS}ms budget`).to.be.lessThan(RPC_TIMEOUT_MS / 2)
 		}
 
-		it('fetchNeighbors answers promptly, and empty, for a peer that writes half a snapshot and closes', async () => {
+		it('fetchNeighbors answers decode-error, promptly, for a peer that writes half a snapshot and closes', async () => {
 			const id = await serving(PROTOCOL_NEIGHBORS, halfThenClose(HALF_SNAPSHOT))
 
 			const t0 = Date.now()
-			const snap = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
+			const res = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
 
-			expect(snap.successors, 'nothing parsed out of the truncated document').to.deep.equal([])
-			expect(snap.predecessors).to.deep.equal([])
-			expect(snap.sample).to.equal(undefined)
-			expect(JSON.stringify(snap)).to.not.include('ghost')
+			expectKind(res, 'decode-error')
+			expect(JSON.stringify(res), 'nothing parsed out of the truncated document').to.not.include('ghost')
 			expectPrompt(Date.now() - t0)
 			await expectStreamReleased(PROTOCOL_NEIGHBORS)
 		})
 
 		// The reset shape otherwise rests entirely on stubs, which is exactly the arrangement the
-		// missed-EOF bug got wrong. Over a live muxer the reset surfaces as a *read* failure rather
-		// than as EOF, so `fetchNeighbors` reaches its `catch` instead of its decode — a different
-		// path to the same fabricated empty snapshot.
-		it('fetchNeighbors answers promptly, and empty, for a peer that resets mid-reply', async () => {
+		// missed-EOF bug got wrong. Over a live muxer the reset may surface as a read failure
+		// (`unreachable`) or, if the buffered bytes are delivered first, as a truncated frame
+		// (`decode-error`) — either way a failure outcome, never an answer.
+		it('fetchNeighbors answers a failure outcome, promptly, for a peer that resets mid-reply', async () => {
 			const id = await serving(PROTOCOL_NEIGHBORS, halfThenReset(HALF_SNAPSHOT))
 
 			const t0 = Date.now()
-			const snap = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
+			const res = await fetchNeighbors(b, id, PROTOCOL_NEIGHBORS)
 
-			expect(snap.successors).to.deep.equal([])
-			expect(JSON.stringify(snap), 'no field parsed out of the partial document').to.not.include('ghost')
+			expect(['unreachable', 'decode-error'], 'a failure outcome, never a snapshot').to.include(res.kind)
+			expect(JSON.stringify(res), 'no field parsed out of the partial document').to.not.include('ghost')
 			expectPrompt(Date.now() - t0)
 			await expectStreamReleased(PROTOCOL_NEIGHBORS)
 		})
 
-		// Ping is the other sender a live peer can be driven against, and it is the one whose contract
-		// is "collapse anything unusable into `ok: false`" — the arm the service leans on to decide a
-		// badly-answering peer is alive rather than unreachable. Both shapes must reach it.
-		it('sendPing collapses a real half-reply and a real reset into ok: false', async () => {
+		// Ping is the other sender a live peer can be driven against. Before the migration it had a
+		// res/thrown split here — a truncated reply collapsed into `ok: false` while a reset threw —
+		// and the case had to accept whichever arm the muxer produced. Outcomes collapse the split:
+		// nothing throws, a truncated reply is `decode-error`, and the reset arm is one of the two
+		// failure kinds depending on whether the buffered bytes arrived first.
+		it('sendPing answers decode-error for a real half-reply, and a failure outcome for a real reset', async () => {
 			const halfId = await serving(PROTOCOL_PING, halfThenClose(HALF_PING))
 			const half = await sendPing(b, halfId, PROTOCOL_PING)
 
-			expect(half.ok, 'half reply: not parsed as an answer').to.equal(false)
-			expect(half.size_estimate, 'nothing salvaged from the partial document').to.equal(undefined)
+			expectKind(half, 'decode-error')
 			await expectStreamReleased(PROTOCOL_PING)
 
 			await a.unhandle(PROTOCOL_PING)
 			await a.handle(PROTOCOL_PING, halfThenReset(HALF_PING))
 
 			const t0 = Date.now()
-			let thrown: unknown
-			let res: Awaited<ReturnType<typeof sendPing>> | undefined
-			try {
-				res = await sendPing(b, halfId, PROTOCOL_PING)
-			} catch (err) {
-				thrown = err
-			}
+			const res = await sendPing(b, halfId, PROTOCOL_PING)
 			expectPrompt(Date.now() - t0)
 
-			// A live reset surfaces as a read failure, which `sendPing` does *not* map to `ok: false`
-			// — it maps exactly the truncation names (`isFrameTruncationError`) and decode failures,
-			// and propagates everything else. So the two shapes diverge here in a way the service
-			// cares about: a truncated reply is `ok: false` (alive, decay only) while a reset
-			// propagates and `noteRpcFailure` books it as a contact strike. Assert whichever arm the
-			// transport produced rather than pretending only one is possible — a muxer that delivers
-			// the buffered bytes before the reset yields the first, one that discards them the second.
-			if (thrown !== undefined) {
-				expect(thrown, 'reset: propagates rather than answering').to.be.instanceOf(Error)
-			} else {
-				expect(res?.ok, 'reset: never a positive answer').to.equal(false)
-				expect(res?.size_estimate, 'nothing salvaged').to.equal(undefined)
-			}
+			expect(['unreachable', 'decode-error'], 'reset: a failure outcome, never an answer').to.include(res.kind)
 			await expectStreamReleased(PROTOCOL_PING)
 		})
 	})

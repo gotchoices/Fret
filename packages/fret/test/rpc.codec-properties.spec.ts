@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, it } from 'mocha'
+import { afterEach, before, beforeEach, describe, it } from 'mocha'
 import { expect } from 'chai'
 import fc from 'fast-check'
 import type { Libp2p } from 'libp2p'
@@ -21,6 +21,16 @@ import {
 import { DigitreeStore, type SerializedPeerEntry, type SerializedTable } from '../src/store/digitree-store.js'
 import type { TokenBucket } from '../src/utils/token-bucket.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
+import type { PingResponseV1 } from '../src/rpc/ping.js'
+import {
+	makeSnapshotParser,
+	parseLeaveNotice,
+	parseMaybeActReply,
+	parseNearAnchor,
+	parsePingResponse,
+	parseRouteAndMaybeAct,
+	type Parser,
+} from '../src/rpc/validate.js'
 import type { BusyResponseV1, NearAnchorV1, NeighborSnapshotV1 } from '../src/index.js'
 
 // The second half of the fuzz tier from `plan/7-rpc-codec-fuzzing`. `rpc-handler-fault-isolation`
@@ -1363,6 +1373,373 @@ describe('RPC codec properties', function () {
 			expect(reply, 'busy is still a reply').to.not.equal(undefined)
 			expect(isBusy(await decodeJson(reply!))).to.equal(true)
 			await waitUntil(() => openStreams(P.PROTOCOL_NEIGHBORS) === 0, 2000, 'no inbound stream left open')
+		})
+	})
+
+	// -----------------------------------------------------------------------------------------
+	// Wire-shape parsers (`src/rpc/validate.ts`).
+	//
+	// Two properties and a table, because they catch different failures. The properties cover the
+	// two directions a parser drifts: (1) it never rejects what `encodeJson` produced from a
+	// *legal* message — the over-strict direction, which no hand-written case finds, since the
+	// cases are written by whoever wrote the rule; and (2) it never throws, on anything at all —
+	// the under-defensive direction, which is the whole reason the parsers exist (a guard that
+	// threw used to leak the inbound stream). The table then pins the *normalized value*, since
+	// truncation and drop-entry are invisible to a "did not reject" assertion.
+	// -----------------------------------------------------------------------------------------
+	describe('wire-shape parsers', () => {
+		// The receiver's own merge caps (Core). `makeSnapshotParser` is a factory precisely so
+		// these are the service's numbers passed in once rather than a second copy that drifts.
+		const CAPS = { successors: 16, predecessors: 16, sample: 8 }
+		const parseSnapshot = makeSnapshotParser(CAPS)
+
+		// Peer ids have to be *real* here. This file's other arbitraries draw ids from
+		// `arbNastyString` on purpose — they prove the codec is lossless, not that a validator
+		// accepts them — so reusing them would make every legal-message property fail on `from`.
+		const legalPeerIds: string[] = []
+		before(async () => {
+			for (let i = 0; i < 8; i++) {
+				legalPeerIds.push(peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString())
+			}
+		})
+		const arbPeerId = fc.nat({ max: 7 }).map((i) => legalPeerIds[i]!)
+
+		// ---- the legal side: what our own encoder can produce from a valid message ----
+
+		const arbLegalSnapshot = withOptionals(fc.record({
+			v: fc.constant(1 as const),
+			from: arbPeerId,
+			timestamp: arbJsonNumber,
+			successors: fc.array(arbPeerId, { maxLength: 8 }),
+			predecessors: fc.array(arbPeerId, { maxLength: 8 }),
+			sample: fc.array(
+				fc.record({ id: arbPeerId, coord: arbCoordB64, relevance: arbJsonNumber }),
+				{ maxLength: 6 }
+			),
+			size_estimate: arbJsonNumber,
+			confidence: arbUnitInterval,
+			sig: arbNastyString,
+			metadata: arbMetadata,
+		}), [...SNAPSHOT_OPTIONALS])
+
+		const arbLegalRouteAndMaybeAct = withOptionals(fc.record({
+			v: fc.constant(1 as const),
+			key: arbCoordB64,
+			want_k: arbJsonNumber,
+			wants: arbJsonNumber,
+			ttl: arbJsonNumber,
+			min_sigs: arbJsonNumber,
+			digest: fc.string({ maxLength: 64 }),
+			activity: arbNastyString,
+			breadcrumbs: fc.array(arbPeerId, { maxLength: 8 }),
+			correlation_id: fc.string({ maxLength: 64 }),
+			timestamp: arbJsonNumber,
+			signature: arbNastyString,
+		}), [...MAYBE_ACT_OPTIONALS])
+
+		// `replacements` is generated non-empty: an empty list sanitizes to *absent*, which is the
+		// documented normalization and is pinned in the table below rather than here.
+		const arbLegalLeaveNotice = withOptionals(fc.record({
+			v: fc.constant(1 as const),
+			from: arbPeerId,
+			replacements: fc.array(arbPeerId, { minLength: 1, maxLength: 12 }),
+			timestamp: arbJsonNumber,
+		}), [...LEAVE_OPTIONALS])
+
+		const arbLegalNearAnchor: fc.Arbitrary<NearAnchorV1> = fc.record({
+			v: fc.constant(1 as const),
+			anchors: fc.array(arbPeerId, { maxLength: 2 }),
+			cohort_hint: fc.array(arbPeerId, { maxLength: 8 }),
+			estimated_cluster_size: arbJsonNumber,
+			confidence: arbUnitInterval,
+		})
+
+		const arbLegalPingResponse: fc.Arbitrary<PingResponseV1> = withOptionals(fc.record({
+			ok: fc.boolean(),
+			ts: arbJsonNumber,
+			size_estimate: arbJsonNumber,
+			confidence: arbUnitInterval,
+		}), ['size_estimate', 'confidence'])
+
+		/** Push a value through the real wire codec, exactly as a handler would receive it. */
+		async function overTheWire(value: unknown): Promise<unknown> {
+			return decodeJson(await encodeJson(value))
+		}
+
+		describe('never reject what our own encoder produced', () => {
+			it('NeighborSnapshot', async () => {
+				await fc.assert(fc.asyncProperty(arbLegalSnapshot, async (snap) => {
+					const parsed = parseSnapshot(await overTheWire(snap))
+					expect(parsed, 'legal snapshot rejected').to.not.equal(undefined)
+					// Nothing is normalized away either. The one difference is an absent `sample`,
+					// which becomes `[]` so the merge loop never has to re-check the field.
+					expect(parsed).to.deep.equal({ ...snap, sample: snap.sample ?? [] })
+				}), opts)
+			})
+
+			it('RouteAndMaybeAct', async () => {
+				await fc.assert(fc.asyncProperty(arbLegalRouteAndMaybeAct, async (msg) => {
+					const parsed = parseRouteAndMaybeAct(await overTheWire(msg))
+					expect(parsed, 'legal maybeAct rejected').to.not.equal(undefined)
+					// This one normalizes nothing, so the decoded message comes back untouched.
+					expect(parsed).to.deep.equal(msg)
+				}), opts)
+			})
+
+			it('LeaveNotice', async () => {
+				await fc.assert(fc.asyncProperty(arbLegalLeaveNotice, async (notice) => {
+					const parsed = parseLeaveNotice(await overTheWire(notice))
+					expect(parsed, 'legal leave notice rejected').to.not.equal(undefined)
+					expect(parsed).to.deep.equal(notice)
+				}), opts)
+			})
+
+			it('NearAnchor, as itself and as a maybeAct reply', async () => {
+				await fc.assert(fc.asyncProperty(arbLegalNearAnchor, async (reply) => {
+					const wire = await overTheWire(reply)
+					expect(parseNearAnchor(wire), 'legal NearAnchor rejected').to.deep.equal(reply)
+					expect(parseMaybeActReply(wire), 'same reply through the maybeAct arm').to.deep.equal(reply)
+				}), opts)
+			})
+
+			it('a commit certificate reply', async () => {
+				await fc.assert(fc.asyncProperty(arbNastyString, async (cert) => {
+					const parsed = parseMaybeActReply(await overTheWire({ commitCertificate: cert }))
+					expect(parsed).to.deep.equal({ commitCertificate: cert })
+				}), opts)
+			})
+
+			it('PingResponse, projected to what sendPing returns', async () => {
+				await fc.assert(fc.asyncProperty(arbLegalPingResponse, async (reply) => {
+					const parsed = parsePingResponse(await overTheWire(reply))
+					// `ts` is carried by the wire type and read by nobody, so it is projected away
+					// — but it must never make the reply *reject*.
+					const expected: Record<string, unknown> = { ok: reply.ok }
+					if (reply.size_estimate !== undefined) expected.size_estimate = reply.size_estimate
+					if (reply.confidence !== undefined) expected.confidence = reply.confidence
+					expect(parsed).to.deep.equal(expected)
+				}), opts)
+			})
+		})
+
+		describe('never throw, whatever arrives', () => {
+			// The deliberately-illegal arbitraries from the top of this file are exactly right
+			// here: their ids and coords are `arbNastyString`, i.e. the shapes a hostile or
+			// version-skewed peer sends.
+			const arbAnything: fc.Arbitrary<unknown> = fc.oneof(
+				arbJsonValue,
+				arbNeighborSnapshot,
+				arbRouteAndMaybeAct,
+				arbNearAnchor,
+				arbLeaveNotice,
+				arbSerializedTable,
+				fc.record({ ok: arbJsonValue, ts: arbJsonValue }),
+				fc.record({ commitCertificate: arbJsonValue })
+			)
+
+			const PARSERS: Array<[string, Parser<unknown>]> = [
+				['parseRouteAndMaybeAct', parseRouteAndMaybeAct],
+				['parseLeaveNotice', parseLeaveNotice],
+				['makeSnapshotParser', parseSnapshot],
+				['parsePingResponse', parsePingResponse],
+				['parseNearAnchor', parseNearAnchor],
+				['parseMaybeActReply', parseMaybeActReply],
+			]
+
+			it('returns undefined or a normalized value — never an exception', () => {
+				fc.assert(fc.property(arbAnything, (value) => {
+					for (const [name, parse] of PARSERS) {
+						expect(() => parse(value), name).to.not.throw()
+					}
+				}), opts)
+			})
+
+			// The shapes that used to throw rather than reject, kept as explicit cases so a
+			// regression names itself instead of surfacing as a shrunk counterexample.
+			const hostile: unknown[] = [
+				null, undefined, [], 'a string', 7, true,
+				{ successors: 5 }, { successors: [null, 1, {}] },
+				{ sample: 'not an array' }, { sample: [null, 7, { id: 1 }] },
+				{ replacements: 5 }, { anchors: {} }, { cohort_hint: 7 },
+				Object.create(null) as unknown,
+			]
+			for (const [i, value] of hostile.entries()) {
+				it(`survives hostile shape #${i}`, () => {
+					for (const [name, parse] of PARSERS) {
+						expect(() => parse(value), name).to.not.throw()
+					}
+				})
+			}
+		})
+
+		describe('NeighborSnapshot normalization', () => {
+			const snap = (over: Record<string, unknown> = {}): Record<string, unknown> => ({
+				v: 1, from: legalPeerIds[0], timestamp: 1,
+				successors: [], predecessors: [], sig: '', ...over,
+			})
+			const ids = (n: number, prefix = 's'): string[] => Array.from({ length: n }, (_, i) => `${prefix}${i}`)
+
+			it('rejects a message whose `from` is not a peer id', () => {
+				expect(parseSnapshot(snap({ from: 'not-a-peer-id' })), 'unparseable').to.equal(undefined)
+				expect(parseSnapshot(snap({ from: 7 })), 'numeric').to.equal(undefined)
+				const noFrom = snap(); delete noFrom.from
+				expect(parseSnapshot(noFrom), 'absent').to.equal(undefined)
+			})
+
+			it('rejects a message whose `timestamp` is not finite', () => {
+				expect(parseSnapshot(snap({ timestamp: 'now' })), 'string').to.equal(undefined)
+				// A legal non-finite arrives as `null` (the codec's documented loss), so the
+				// finite check has to reject `null` rather than throw on it.
+				expect(parseSnapshot(snap({ timestamp: null })), 'null').to.equal(undefined)
+				const noTs = snap(); delete noTs.timestamp
+				expect(parseSnapshot(noTs), 'absent').to.equal(undefined)
+			})
+
+			it('normalizes absent id lists to empty ones', () => {
+				const bare = snap(); delete bare.successors; delete bare.predecessors
+				const parsed = parseSnapshot(bare)
+				expect(parsed?.successors).to.deep.equal([])
+				expect(parsed?.predecessors).to.deep.equal([])
+				expect(parsed?.sample, 'absent sample too').to.deep.equal([])
+			})
+
+			it('keeps an id list that sits exactly on the cap', () => {
+				const exact = ids(CAPS.successors)
+				expect(parseSnapshot(snap({ successors: exact }))?.successors).to.deep.equal(exact)
+			})
+
+			it('truncates one over the cap rather than rejecting the message', () => {
+				const over = ids(CAPS.successors + 1)
+				const parsed = parseSnapshot(snap({ successors: over, predecessors: ids(40, 'p') }))
+				expect(parsed, 'over-cap is not a rejection').to.not.equal(undefined)
+				expect(parsed?.successors).to.deep.equal(over.slice(0, CAPS.successors))
+				expect(parsed?.predecessors).to.have.lengthOf(CAPS.predecessors)
+			})
+
+			it('truncates *before* filtering, so a huge junk list costs cap-many comparisons', () => {
+				// 16 non-strings then 4 strings: if the filter ran first the strings would survive.
+				const crafted = [...Array.from({ length: CAPS.successors }, () => null), 'a', 'b', 'c', 'd']
+				expect(parseSnapshot(snap({ successors: crafted }))?.successors).to.deep.equal([])
+			})
+
+			it('drops non-string id entries without rejecting the message', () => {
+				const parsed = parseSnapshot(snap({ successors: ['a', null, 7, {}, 'b'] }))
+				expect(parsed?.successors).to.deep.equal(['a', 'b'])
+			})
+
+			it('drops a sample entry that fails any of its three checks, keeping the rest', () => {
+				const good = { id: 'ok', coord: coordToBase64url(new Uint8Array(COORD_BYTES)), relevance: 0.5 }
+				const parsed = parseSnapshot(snap({
+					sample: [
+						good,
+						{ id: 7, coord: good.coord, relevance: 1 },          // id not a string
+						{ id: 'x', coord: 'AAAA', relevance: 1 },            // coord decodes short
+						{ id: 'y', coord: good.coord, relevance: null },     // relevance not finite
+						{ id: 'z', coord: 'not base64url!!', relevance: 1 }, // coord undecodable
+						null,
+					],
+				}))
+				expect(parsed, 'a bad entry drops the entry, not the message').to.not.equal(undefined)
+				expect(parsed?.sample).to.deep.equal([good])
+			})
+
+			it('truncates the sample to the cap', () => {
+				const coord = coordToBase64url(new Uint8Array(COORD_BYTES))
+				const many = Array.from({ length: CAPS.sample + 4 }, (_, i) => ({ id: `s${i}`, coord, relevance: i }))
+				expect(parseSnapshot(snap({ sample: many }))?.sample).to.have.lengthOf(CAPS.sample)
+			})
+
+			it('drops advisory numerics of the wrong type, keeping the message', () => {
+				const parsed = parseSnapshot(snap({ size_estimate: 'lots', confidence: null }))
+				expect(parsed, 'advisory fields never reject').to.not.equal(undefined)
+				expect(parsed).to.not.have.property('size_estimate')
+				expect(parsed).to.not.have.property('confidence')
+				const kept = parseSnapshot(snap({ size_estimate: 42, confidence: 0.25 }))
+				expect(kept?.size_estimate).to.equal(42)
+				expect(kept?.confidence).to.equal(0.25)
+			})
+
+			it('drops `metadata` unless it is a non-null non-array object', () => {
+				for (const bad of [null, [], 'str', 7, true]) {
+					expect(parseSnapshot(snap({ metadata: bad })), JSON.stringify(bad)).to.not.have.property('metadata')
+				}
+				expect(parseSnapshot(snap({ metadata: { a: 1 } }))?.metadata).to.deep.equal({ a: 1 })
+			})
+		})
+
+		describe('LeaveNotice normalization', () => {
+			const notice = (over: Record<string, unknown> = {}): Record<string, unknown> =>
+				({ v: 1, from: legalPeerIds[0], timestamp: 1, ...over })
+
+			it('rejects a bad `from` or `timestamp`', () => {
+				expect(parseLeaveNotice(notice({ from: 'nope' }))).to.equal(undefined)
+				expect(parseLeaveNotice(notice({ timestamp: 'soon' }))).to.equal(undefined)
+			})
+
+			it('caps replacements at 12 and drops unparseable ids', () => {
+				const twenty = Array.from({ length: 20 }, (_, i) => legalPeerIds[i % 8]!)
+				expect(parseLeaveNotice(notice({ replacements: twenty }))?.replacements)
+					.to.deep.equal(twenty.slice(0, 12))
+				expect(parseLeaveNotice(notice({ replacements: [legalPeerIds[0], 'junk', 7] }))?.replacements)
+					.to.deep.equal([legalPeerIds[0]])
+			})
+
+			it('reports an emptied replacement list as absent, not as []', () => {
+				// The distinction is load-bearing: the receiver's `if (!replacements)` guard is
+				// what keeps a leave notice from entering the record-replacements loop at all.
+				for (const bad of [[], ['junk'], 5, null, undefined]) {
+					const parsed = parseLeaveNotice(notice({ replacements: bad }))
+					expect(parsed, JSON.stringify(bad ?? null)).to.not.equal(undefined)
+					expect(parsed).to.not.have.property('replacements')
+				}
+			})
+		})
+
+		describe('reply normalization', () => {
+			it('parsePingResponse demands a real boolean rather than coercing', () => {
+				// `Boolean(r.ok)` is what this replaces: it turned every one of these into a
+				// confident answer about a peer that had not actually said `ok`.
+				for (const bad of [1, 0, 'true', null, undefined, {}]) {
+					expect(parsePingResponse({ ok: bad, ts: 1 }), JSON.stringify(bad ?? null)).to.equal(undefined)
+				}
+				expect(parsePingResponse({ ok: false, ts: 1 })).to.deep.equal({ ok: false })
+			})
+
+			it('parsePingResponse drops advisory numerics individually', () => {
+				expect(parsePingResponse({ ok: true, ts: 1, size_estimate: 'x', confidence: 0.5 }))
+					.to.deep.equal({ ok: true, confidence: 0.5 })
+			})
+
+			it('parseNearAnchor rejects a reply that cannot state its numerics', () => {
+				const base = { v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 3, confidence: 0.5 }
+				expect(parseNearAnchor({ ...base, estimated_cluster_size: null })).to.equal(undefined)
+				expect(parseNearAnchor({ ...base, confidence: 'high' })).to.equal(undefined)
+				expect(parseNearAnchor(base)).to.deep.equal(base)
+			})
+
+			it('parseNearAnchor caps the hint lists and normalizes missing ones', () => {
+				const parsed = parseNearAnchor({
+					v: 1,
+					anchors: Array.from({ length: 12 }, (_, i) => `a${i}`),
+					cohort_hint: [...Array.from({ length: 20 }, (_, i) => `c${i}`), null],
+					estimated_cluster_size: 3,
+					confidence: 0.5,
+				})
+				expect(parsed?.anchors, 'anchors cap').to.have.lengthOf(8)
+				expect(parsed?.cohort_hint, 'cohort hint cap').to.have.lengthOf(16)
+				const bare = parseNearAnchor({ v: 1, estimated_cluster_size: 0, confidence: 0 })
+				expect(bare?.anchors).to.deep.equal([])
+				expect(bare?.cohort_hint).to.deep.equal([])
+			})
+
+			it('parseMaybeActReply discriminates on a string commitCertificate', () => {
+				expect(parseMaybeActReply({ commitCertificate: 'cert' })).to.deep.equal({ commitCertificate: 'cert' })
+				// A non-string `commitCertificate` is not the certificate arm, so it falls through
+				// to the NearAnchor arm — which this shape fails.
+				expect(parseMaybeActReply({ commitCertificate: 5 })).to.equal(undefined)
+				expect(parseMaybeActReply({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 1, confidence: 1 }))
+					.to.deep.equal({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 1, confidence: 1 })
+			})
 		})
 	})
 })

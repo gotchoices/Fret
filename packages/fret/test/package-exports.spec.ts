@@ -3,7 +3,7 @@ import { expect } from 'chai'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import * as fretIndex from '../src/index.js'
-import type { Stream } from '../src/index.js'
+import type { NearAnchorV1, Stream } from '../src/index.js'
 
 // `openRpcStream` is the one place FRET opens an outbound protocol stream, and it is meant to be
 // reusable by consumers. These checks pin the three things that make it actually reachable, not
@@ -63,6 +63,23 @@ describe('package public surface', () => {
 		expect(fretIndex.rpcRequest).to.be.a('function')
 	})
 
+	it('root entry exports the wire-shape parsers', () => {
+		// Same rationale as the seam above: a consumer registering its own handler over this node
+		// otherwise re-derives the shape rules by hand. One spot-check per parser — the module is
+		// behaviourally pinned by `test/rpc.codec-properties.spec.ts`, not here.
+		expect(fretIndex.parseRouteAndMaybeAct).to.be.a('function')
+		expect(fretIndex.parseLeaveNotice).to.be.a('function')
+		expect(fretIndex.makeSnapshotParser).to.be.a('function')
+		expect(fretIndex.parsePingResponse).to.be.a('function')
+		expect(fretIndex.parseNearAnchor).to.be.a('function')
+		expect(fretIndex.parseMaybeActReply).to.be.a('function')
+		expect(fretIndex.sanitizeReplacements).to.be.a('function')
+		// The primitives they are spelled with stay module-scoped — implementation detail, not
+		// surface — so a consumer cannot depend on them and they can change without a major.
+		expect(fretIndex).to.not.have.property('isPeerIdString')
+		expect(fretIndex).to.not.have.property('boundedStringArray')
+	})
+
 	it('exports the types the seam signature needs', () => {
 		// Type-level, not runtime: a consumer must be able to name `openRpcStream`'s return type
 		// without reaching past the package root. Fails `tsc --noEmit`, not mocha, if it regresses.
@@ -83,5 +100,9 @@ describe('package public surface', () => {
 		expect(req).to.equal(fretIndex.rpcRequest)
 		const o: fretIndex.RpcRequestOptions<number> = { maxBytes: 1024 }
 		expect(o.maxBytes).to.equal(1024)
+		// `Parser<T>` is the one type the parser surface needs a consumer to be able to name: it
+		// is what says `undefined` means "rejected" rather than "no value here".
+		const parse: fretIndex.Parser<NearAnchorV1> = fretIndex.parseNearAnchor
+		expect(parse).to.equal(fretIndex.parseNearAnchor)
 	})
 })
