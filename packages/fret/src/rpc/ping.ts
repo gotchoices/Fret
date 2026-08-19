@@ -33,10 +33,14 @@ export async function registerPing(
 	// `registerJsonHandler` — a decode step here would be pure ceremony. Encoding, errors and
 	// stream release (including the budgeted close) belong to the seam, not this body.
 	await registerJsonHandler(node, protocol, {
-		// NOTE: deliberately not an `async` arrow — it returns `pingReply`'s promise directly. `sendPing`
-		// writes no request body, so this reply is the first thing on the stream and every extra
-		// async hop between the handler being invoked and the frame being written is one the
-		// caller spends waiting on a stream it has not finished negotiating.
+		// NOTE: deliberately not an `async` arrow — it returns `pingReply`'s promise directly, so it
+		// adds no microtask hop of its own. That is not a style preference: `readFramed` can
+		// currently conclude the remote finished writing while a written reply is still in flight,
+		// and the trigger is microtask depth before the handler's first write. Two extra ticks on
+		// top of the seam's own two (`await opts.serve(...)` then `await encodeJson(...)`) is
+		// enough; the caller then reads a complete reply as a truncated frame (`decode-error`).
+		// So the margin here is thin, and the fix belongs in `readFramed`, not in this shape —
+		// see `tickets/fix/framed-read-false-truncation`. Retire this note once that lands.
 		serve: (connection) => {
 			onInbound?.(connection.remotePeer.toString());
 			return pingReply(getSizeEstimate);

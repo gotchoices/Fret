@@ -42,9 +42,12 @@ export async function registerNeighbors(
 	// bodies — including the close, which it performs under its own budget so a remote that stops
 	// reading cannot hold the handler open.
 	await registerJsonHandler(node, protocols.PROTOCOL_NEIGHBORS, {
-		// NOTE: not an `async` arrow — it hands back `getSnapshot()`'s own promise. Same reasoning as
-		// ping — this protocol reads no request body, so the reply is the first thing on the
-		// stream and an extra async hop is pure latency before the caller's first read.
+		// NOTE: not an `async` arrow — it hands back `getSnapshot()`'s own promise, adding no
+		// microtask hop of its own. Same hazard as ping, and it is a correctness margin rather
+		// than a latency one: `readFramed` can currently report a written reply as a truncated
+		// frame once enough microtasks elapse before the handler's first write, and the seam
+		// already spends two of them. Fix lives in `readFramed` —
+		// see `tickets/fix/framed-read-false-truncation`. Retire this note once that lands.
 		serve: (connection) => {
 			onInbound?.(connection.remotePeer.toString());
 			return getSnapshot();
