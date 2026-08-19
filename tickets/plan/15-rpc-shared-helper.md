@@ -1,5 +1,5 @@
 ----
-description: The code that sends and receives every network message is copy-pasted four or five times with three inconsistent ways of reporting failure, which leaks connections on bad input, hides unreachable and foreign peers behind fake successful responses, and skips all validation of incoming data — a single shared helper fixes all of these at once.
+description: The code that sends and receives every network message is copy-pasted four or five times with three inconsistent ways of reporting failure, which hides unreachable and foreign peers behind fake successful responses and skips all validation of incoming data — a single shared helper fixes all of these at once.
 files: packages/fret/src/rpc/*
 difficulty: hard
 ----
@@ -7,7 +7,7 @@ Today every RPC sender repeats the same open, send, close, read, decode, and fin
 
 Consequences to fix as part of this work:
 
-- Handler error paths leak streams. Every handler catch only logs; none aborts or closes the stream, so a malformed request leaves the inbound stream open until the muxer times out while the remote burns its full read window. Ping's fallback send/close also sits outside any try/catch and can reject the handler promise on a reset stream.
+- ~~Handler error paths leak streams.~~ **Landed elsewhere — see the resolved-arm note at the end of this ticket.** The receive half of this consolidation already exists as `registerRpcHandler` (`src/rpc/protocols.ts`); all five handlers register through it. Adopt it, do not re-derive it.
 - `fetchNeighbors` fabricates success on every failure. Unreachable, busy, decode-error, and foreign-protocol outcomes all return a synthetic empty snapshot indistinguishable from a real one, so the fetched-snapshot counter books garbage, failure and backoff are never recorded, and swallowing the unsupported-protocol error means foreign classification can never happen on this path. The busy-detection check also throws on a null decode, using an exception as control flow into the same fake snapshot.
 - No shape validation of decoded messages. The decoder blindly casts to the target type; the `from` field is never parsed as a peer id, snapshot arrays are unbounded within the byte cap (thousands of ids), and breadcrumbs are unbounded and grow every hop. Only the leave-notice replacement sanitizer does this correctly.
 - Backpressure and cancellation are ignored. Stream sends that return false or throw when the buffer fills at 128-512 KiB are not handled, no AbortSignal is threaded anywhere, and ping starts its round-trip clock before dialing, inflating first-contact latency. The maybe-act RPC also accepts 512 KiB at the wire layer while the service rejects payloads over 128 KiB only after fully buffering.
@@ -123,3 +123,25 @@ become `decode-error` outcomes and the contact strike on the maybeAct path goes 
 invariants in that spec — a partial payload is never parsed as a whole message, the stream is
 released exactly once, no unhandled rejection escapes, our own cancellation scores nothing — must
 survive the refactor unchanged.
+
+Arm resolved elsewhere (landed by `rpc-handler-fault-isolation`, commit history around
+`test/rpc.handler-fuzz.spec.ts`): **the receive half of this consolidation is already built.**
+`registerRpcHandler(node, protocol, serve)` in `src/rpc/protocols.ts` is the single registration
+seam every inbound handler now goes through — leave, ping, neighbors, neighbors-announce and
+maybeAct all call it. It closes a stream the handler left open on success (`close()` early-returns
+when the write end is already closing, so a handler that replied and closed is not released twice)
+and `abort()`s synchronously on error, skipping the abort for a stream the remote already reset and
+for one whose write end the handler already closed — because that reply is committed and a reset
+would destroy it. The load-bearing subtlety: `status` alone cannot answer "did the handler already
+release this?", since a half-closable stream stays `open` until the *remote* closes its write end,
+which for every FRET sender happens only after it has read the reply. The **write-end** status is
+the one to branch on. Pinned by `test/rpc.handler-fuzz.spec.ts`.
+
+So the `registerJsonHandler` requirement above narrows: the transport/lifecycle half is done, and
+what remains for the handler side is the *decode + validate + reply-encode* layer stacked on top of
+`registerRpcHandler` — per-message shape validators, the max-bytes tightening, and the single
+discriminated reply contract. Do not replace or re-implement the seam; the fault-isolation rules
+above are correctness rules a rewrite would have to re-derive, and `handler-fuzz` will fail if it
+does so incorrectly. The sender half (`rpcRequest`) is untouched by this and remains the bulk of
+the work.
+

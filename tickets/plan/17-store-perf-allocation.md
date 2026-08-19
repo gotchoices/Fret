@@ -10,3 +10,14 @@ Expected behavior: a lookup reuses a cached key for each entry instead of rebuil
 References: review store section, minor perf finding "Hot-path allocation churn" (digitree-store.ts:64-73, 253-293). Fix hint: cache the per-entry key (on the frozen entry or a WeakMap); collect wrap walks into a set and exit early on a repeat.
 
 Note on the early-exit half: "a repeat id proves the walk wrapped" is only sound because the store now guarantees exactly one tree entry per peer id (landed by `store-index-tree-invariant`; see the *Routing store (Digitree) & indices (A2)* section of `docs/fret.md`, and `packages/fret/test/digitree.invariants.spec.ts`). Before that, a duplicated id could appear mid-walk with no wrap having occurred, and the early exit would silently truncate the walk. Worth a one-line `NOTE:` at the walk site recording that dependency when this lands, so the two do not drift apart.
+
+Note added while tending (2026-08-18): **half this ticket's premise moved, but neither half is
+retired.** `coordToHex` is now a byte-to-hex-pair lookup table rather than per-byte
+`toString(16).padStart(2, '0')`, which was measured at 38% of total CPU in the N=100 simulation
+before the change. What that fixed is the *cost per hex string*; it did not remove the string. The
+key builder at `digitree-store.ts:153` still constructs a fresh 64-character hex string plus an
+`id`-suffixed concatenation on every binary-search probe, so the allocation churn this ticket names
+is still there — just cheaper per unit. Re-measure before sizing the work: the caching half may now
+be worth noticeably less than it looked, while the wrap-walk early-exit half is untouched by that
+change and is where the remaining structural win is. Do not promote this on the old 38% number.
+

@@ -14,3 +14,13 @@ Mechanical cleanups in the rpc directory that carry no behavior risk on their ow
 Expected behavior: the same wire behavior with less duplication, safer types, no wasted acknowledgement bytes, and a visible signal when the decoder has to strip unexpected bytes.
 
 References: review RPC-section "Mechanical cleanups" (rpc/* various).
+
+Note added while tending (2026-08-18): **sequenced deliberately after `rpc-shared-helper`, and it
+should stay there.** That ticket states it "deletes roughly half of the rpc directory" — a shared
+`rpcRequest` helper plus per-message validators absorbing the send/receive boilerplate. Several
+items here (the needless `async` on the JSON helpers, the duplicated constants, the non-null
+assertions in sender bodies) sit in exactly the code that consolidation rewrites, so landing them
+first is churn that the refactor then re-touches, and landing them *concurrently* is a merge
+conflict across the whole directory. Re-read this ticket after the consolidation lands: expect some
+items to be gone, and the survivors to have moved into the shared helper.
+
