@@ -7,7 +7,8 @@ import {
 	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
-	readAllBounded,
+	readFramed,
+	sendFramed,
 	openRpcStream,
 	registerRpcHandler,
 	releaseRpcStream,
@@ -25,10 +26,10 @@ export async function registerMaybeAct(
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
 	// Errors and stream release belong to `registerRpcHandler`, not this body.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
-		const bytes = await readAllBounded(stream, maxBytes);
+		const bytes = await readFramed(stream, maxBytes);
 		const msg = await decodeJson<RouteAndMaybeActV1>(bytes);
 		const res = await handle(msg, connection.remotePeer.toString());
-		stream.send(await encodeJson(res));
+		sendFramed(stream, await encodeJson(res));
 		await stream.close();
 	});
 }
@@ -95,11 +96,11 @@ export async function sendMaybeAct(
 	let stream: Stream | undefined;
 	try {
 		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
-		stream!.send(await encodeJson(msg));
+		sendFramed(stream!, await encodeJson(msg));
 		// Half-close: this is the write-side flush the responder waits on, not cleanup — the
 		// read below depends on it, so it stays inside the `try`.
 		await stream!.close();
-		const bytes = await readAllBounded(stream!, 512 * 1024, timeoutMs, { signal: d.signal });
+		const bytes = await readFramed(stream!, 512 * 1024, timeoutMs, { signal: d.signal });
 		return await decodeJson(bytes);
 	} finally {
 		await releaseRpcStream(stream, d.signal);

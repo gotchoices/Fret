@@ -6,7 +6,8 @@ import {
 	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
-	readAllBounded,
+	readFramed,
+	sendFramed,
 	openRpcStream,
 	registerRpcHandler,
 	releaseRpcStream,
@@ -46,7 +47,7 @@ export async function registerLeave(
 ): Promise<void> {
 	// Errors and stream release belong to `registerRpcHandler`, not this body.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
-		const bytes = await readAllBounded(stream, 4096);
+		const bytes = await readFramed(stream, 4096);
 		const msg = await decodeJson<LeaveNoticeV1>(bytes);
 		// A leave notice removes the peer it names, so an unverified `from` lets any
 		// connected peer evict any other. Reject unless `from` matches the
@@ -63,7 +64,7 @@ export async function registerLeave(
 		}
 		msg.replacements = sanitizeReplacements(msg.replacements);
 		await onLeave(msg);
-		stream.send(await encodeJson({ ok: true }));
+		sendFramed(stream, await encodeJson({ ok: true }));
 		await stream.close();
 	});
 }
@@ -80,7 +81,7 @@ export async function sendLeave(
 	let stream: Stream | undefined;
 	try {
 		stream = await openRpcStream(node, pid, [protocol], { signal: d.signal });
-		stream!.send(await encodeJson(notice));
+		sendFramed(stream!, await encodeJson(notice));
 	} finally {
 		// The close *is* the flush for this write-only RPC; on the aborted path
 		// `releaseRpcStream` swaps it for a synchronous `abort` so a stalled remote cannot

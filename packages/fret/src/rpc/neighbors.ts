@@ -7,7 +7,8 @@ import {
 	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
-	readAllBounded,
+	readFramed,
+	sendFramed,
 	openRpcStream,
 	registerRpcHandler,
 	releaseRpcStream,
@@ -34,13 +35,13 @@ export async function registerNeighbors(
 	await registerRpcHandler(node, protocols.PROTOCOL_NEIGHBORS, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
 		const snap = await getSnapshot();
-		stream.send(await encodeJson(snap));
+		sendFramed(stream, await encodeJson(snap));
 		await stream.close();
 	});
 
 	if (onAnnounce) {
 		await registerRpcHandler(node, protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, async (stream, connection) => {
-			const bytes = await readAllBounded(stream, maxBytes);
+			const bytes = await readFramed(stream, maxBytes);
 			const snap = await decodeJson<NeighborSnapshotV1>(bytes);
 			// The snapshot's self-reported `from` must match the transport-authenticated
 			// remote peer — otherwise a connected peer can impersonate another and poison
@@ -56,7 +57,7 @@ export async function registerNeighbors(
 				return;
 			}
 			onAnnounce(snap.from, snap);
-			stream.send(await encodeJson({ ok: true }));
+			sendFramed(stream, await encodeJson({ ok: true }));
 			await stream.close();
 		});
 	}
@@ -94,7 +95,7 @@ export async function fetchNeighbors(
 			// No existing connection - skip to reduce churn
 			return emptySnapshot(peerIdOrStr);
 		}
-		const bytes = await readAllBounded(stream, 128 * 1024, timeoutMs, { signal: d.signal });
+		const bytes = await readFramed(stream, 128 * 1024, timeoutMs, { signal: d.signal });
 		const res = await decodeJson<NeighborSnapshotV1 | BusyResponseV1>(bytes);
 		if ('busy' in res && (res as BusyResponseV1).busy) {
 			return emptySnapshot(peerIdOrStr);
@@ -136,7 +137,7 @@ export async function announceNeighbors(
 		if (stream == null) {
 			return; // no connection and dialing not requested
 		}
-		stream.send(await encodeJson(snapshot));
+		sendFramed(stream, await encodeJson(snapshot));
 	} catch (err) {
 		log.error('announceNeighbors failed to %s - %e', peerIdOrStr, err);
 	} finally {

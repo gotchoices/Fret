@@ -147,7 +147,9 @@ export { DedupCache, DEDUP_TTL_MS } from './service/dedup-cache.js';
 // release rule (abort once the caller's signal has fired, close otherwise) is the half a consumer
 // gets wrong — a bare `close()` is unbounded against a stalled remote. Exporting only the opener
 // invites a hand-rolled releaser, which is the class of bug this export exists to retire.
-export { validateTimestamp, readAllBounded, openRpcStream, releaseRpcStream } from './rpc/protocols.js';
+// `sendFramed` and `readFramed` ship together for the same reason: a consumer given only the
+// reader hand-rolls the writer, and the framing has to match.
+export { validateTimestamp, sendFramed, readFramed, openRpcStream, releaseRpcStream } from './rpc/protocols.js';
 export type { Stream } from '@libp2p/interface';
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {

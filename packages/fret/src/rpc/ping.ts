@@ -6,7 +6,9 @@ import {
 	RPC_TIMEOUT_MS,
 	encodeJson,
 	decodeJson,
-	readAllBounded,
+	isFrameTruncationError,
+	readFramed,
+	sendFramed,
 	openRpcStream,
 	registerRpcHandler,
 	releaseRpcStream,
@@ -43,7 +45,7 @@ export async function registerPing(
 	// sit outside any try at all, so a reset stream rejected the handler promise unlogged.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		onInbound?.(connection.remotePeer.toString());
-		stream.send(await encodeJson(await pingReply(getSizeEstimate)));
+		sendFramed(stream, await encodeJson(await pingReply(getSizeEstimate)));
 		await stream.close();
 	});
 }
@@ -97,9 +99,17 @@ export async function sendPing(
 		// RTT is measured from *after* the open: a dial is not round-trip time, and counting it
 		// inflated first-contact latency into peer health scoring.
 		const start = Date.now();
-		const bytes = await readAllBounded(stream!, 1024, timeoutMs, { signal: d.signal });
+		let bytes: Uint8Array;
+		try {
+			bytes = await readFramed(stream!, 1024, timeoutMs, { signal: d.signal });
+		} catch (err) {
+			// A truncated or absent reply is a live peer answering badly — membership evidence,
+			// never a contact strike (the service books strikes only for a *thrown* sendPing).
+			// Every other error — reset, deadline, abort, payload-too-large — keeps propagating.
+			if (isFrameTruncationError(err)) return { ok: false, rttMs: Math.max(0, Date.now() - start) };
+			throw err;
+		}
 		const rttMs = Math.max(0, Date.now() - start);
-		if (bytes.length === 0) return { ok: false, rttMs };
 		try {
 			const res = await decodeJson<PingResponseV1 | BusyResponseV1>(bytes);
 			if (isBusy(res)) return { ok: false, rttMs };
