@@ -1,6 +1,8 @@
 import type { Libp2p } from 'libp2p';
 import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
+import { byteStream } from '@libp2p/utils';
+import { decode as decodeVarint } from 'uint8-varint';
 import type { Uint8ArrayList } from 'uint8arraylist';
 import type { Deadline } from '../utils/deadline.js';
 import { abortReasonError, deadline } from '../utils/deadline.js';
@@ -329,9 +331,6 @@ export function isFrameTruncationError(err: unknown): boolean {
 	return name === 'FrameTruncationError' || name === 'UnexpectedEOFError';
 }
 
-/** Race sentinel — distinct from a real `IteratorResult`, so a poll tick is never read as EOF. */
-const POLL_TICK = Symbol('readFramed.poll');
-
 /**
  * Race sentinel for the caller's abort signal. The abort arm **resolves** with this rather than
  * rejecting, so an abort that loses the race can never surface as an unhandled rejection; the
@@ -340,121 +339,94 @@ const POLL_TICK = Symbol('readFramed.poll');
 const ABORTED = Symbol('readFramed.aborted');
 
 /**
- * How often to re-check the stream's own end-of-read state; see {@link remoteFinishedWriting}.
- *
- * NOTE: this adds up to one poll interval to every RPC that hits the lost-event case, which is a
- * floor under the measured ping RTT that feeds peer health scoring. The durable fix is to
- * subscribe to the stream before writing, so the event is never missed at all (iterator priming);
- * revisit this constant if RTT-derived scoring ever needs finer resolution than this floor allows.
+ * True when `stream` carries the full libp2p message-stream surface `readFramed`'s stream path
+ * needs: the five functions `@libp2p/utils`'s stream helpers validate (`addEventListener`,
+ * `removeEventListener`, `send`, `push`, `log`) plus `closeRead`, which its EOF detection reads —
+ * a stream passing the first five but lacking `closeRead` would make `byteStream.read` hang until
+ * the signal fires rather than throw on EOF. Everything else (test stubs, plain async iterables)
+ * takes the iterable path.
  */
-const EOF_POLL_MS = 20;
-
-/**
- * The subset of libp2p's `MessageStream`/`Stream` state we consult to recognise an end-of-stream
- * whose event we never received. Every field is optional because `readFramed` also accepts plain
- * async iterables (tests, non-libp2p sources), which carry none of them.
- */
-interface ReadEndState {
-	readBufferLength?: number;
-	remoteWriteStatus?: string;
-	readStatus?: string;
+function isMessageStream(
+	stream: AsyncIterable<Uint8Array | Uint8ArrayList>
+): stream is AsyncIterable<Uint8Array | Uint8ArrayList> & Stream {
+	const s = stream as Partial<Record<'closeRead' | 'addEventListener' | 'removeEventListener' | 'send' | 'push' | 'log', unknown>> | null;
+	return typeof s?.closeRead === 'function'
+		&& typeof s.addEventListener === 'function'
+		&& typeof s.removeEventListener === 'function'
+		&& typeof s.send === 'function'
+		&& typeof s.push === 'function'
+		&& typeof s.log === 'function';
 }
 
 /**
- * True when the remote has closed its writing end AND everything it sent has been drained — so no
- * further byte can arrive, and a frame still incomplete at this point never completes.
+ * Stream-path read: one varint length prefix, then exactly that many body bytes, via
+ * `@libp2p/utils`'s `byteStream` — which reads at the same layer the stream's own EOF state
+ * lives at, so a frame the remote actually wrote is never reported as truncated (the invariant
+ * the old poll loop violated; see {@link readFramed}).
  *
- * libp2p's async-iterator adaptor ends its iteration off the one-shot `remoteCloseWrite` / `close`
- * events, which it subscribes to when iteration *starts*. Every FRET RPC opens a stream, writes,
- * and only then begins reading, so a fast responder routinely closes before that subscription
- * exists and the event is lost. The buffered bytes are still delivered (message dispatch is
- * deferred until a listener attaches), but the adaptor then marks the read closed *silently* — no
- * second event — so the iterator never yields `done` and the read runs to its full deadline.
- * Polling the stream's own state recovers that case without ever guessing: a stream that is merely
- * slow reports neither a closed remote nor an empty-and-final buffer, so it keeps being read.
- *
- * Returns false for a plain async iterable (no state to consult), leaving those callers on
- * ordinary iterator EOF.
+ * The prefix is read one byte at a time and decoded after each: `uint8-varint`'s `decode` throws
+ * `RangeError` on a partial varint, so the loop stops at the first successful decode with the
+ * buffer holding exactly the varint — no over-read to hand back. Nine prefix bytes without a
+ * successful decode declare a length of at least 2^56, over every FRET cap, so the cap failure
+ * is raised without waiting for more. The cap is still enforced at the prefix, before any body
+ * byte is pulled.
  */
-function remoteFinishedWriting(stream: unknown): boolean {
-	const s = stream as ReadEndState | null;
-	if (typeof s?.readBufferLength !== 'number') return false;
-	if (s.readBufferLength > 0) return false;
-	return s.remoteWriteStatus === 'closed' || s.readStatus === 'closed';
+async function readFramedFromStream(stream: Stream, maxBytes: number, signal: AbortSignal): Promise<Uint8Array> {
+	const bs = byteStream(stream);
+	try {
+		const prefix = new Uint8Array(9);
+		let length = 0;
+		let declared: number | undefined;
+		while (declared === undefined) {
+			let byte: Uint8ArrayList;
+			try {
+				byte = await bs.read({ bytes: 1, signal });
+			} catch (err) {
+				if ((err as { name?: unknown } | null)?.name === 'UnexpectedEOFError') {
+					throw new FrameTruncationError(length === 0
+						? 'stream ended before a framed message arrived'
+						: 'stream ended before a whole framed message arrived');
+				}
+				throw err;
+			}
+			prefix[length++] = byte.get(0);
+			try {
+				declared = decodeVarint(prefix.subarray(0, length));
+			} catch (err) {
+				if (!(err instanceof RangeError)) throw err;
+				// Partial varint — keep reading. At 9 bytes the declared length is >= 2^56 whatever
+				// the remaining bytes say, so it can only ever fail the cap below.
+				if (length >= 9) {
+					throw new PayloadTooLargeError(`payload too large: declared length exceeds ${maxBytes} byte limit`);
+				}
+			}
+		}
+		if (declared > maxBytes) {
+			throw new PayloadTooLargeError(`payload too large: ${declared} exceeds ${maxBytes} byte limit`);
+		}
+		// An empty frame is valid here; `decodeJson`'s `empty response` rejection covers it downstream.
+		if (declared === 0) return new Uint8Array(0);
+		// A body that ends early throws `UnexpectedEOFError`, which propagates unchanged —
+		// `isFrameTruncationError` already matches that name.
+		return (await bs.read({ bytes: declared, signal })).subarray();
+	} finally {
+		// `unwrap()` pushes unread trailing bytes back via `stream.push()`, which throws
+		// `StreamStateError` when the read side is already closed — listeners are removed before
+		// the push, so swallowing is safe.
+		try { bs.unwrap(); } catch { /* stream already closed; nothing to hand back */ }
+	}
 }
 
 /**
- * Read exactly one length-prefixed message, bounded by `maxBytes` and a single overall
- * `timeoutMs` deadline.
- *
- * The declared-length cap is enforced in the decoder's `onLength` hook — which fires the moment
- * the varint prefix is consumed, before any body byte is pulled — rather than via the library's
- * own `maxDataLength` check, which throws *before* the prefix is consumed and so cannot report
- * the declared length. Either way an over-declared message costs the receiver the prefix, never
- * the body.
- *
- * There is deliberately no *idle* timer — a gap between chunks means a slow link, not
- * end-of-stream — and only the overall deadline bounds a peer that stalls mid-payload.
- *
- * End-of-*message* is carried in the length prefix, so the reader never waits on end-of-stream to
- * delimit a message. End-of-*stream* still has to be recognised, though, or a truncated reply is
- * indistinguishable from a slow one: the read is therefore a poll loop that re-checks
- * {@link remoteFinishedWriting} every {@link EOF_POLL_MS}, and turns a confirmed end into
- * {@link FrameTruncationError} rather than sitting out the deadline. The check is race-free
- * because the poll fires on a macrotask at least one interval after any message dispatch, so every
- * microtask behind it (stream iterator → `lp.decode` → the pending read) has already drained: if
- * the stream reports its read closed — which it does only once the read buffer is fully dispatched
- * *and* the remote's write end is closed — while the pending read is still unresolved, the bytes
- * delivered could not complete a frame. The deadline is enforced at the top of each pass and the
- * poll interval is capped at whatever remains, so the loop overshoots it by no more than one tick.
- *
- * NOTE: an inbound handler holds a stalled stream for the full `timeoutMs` (5s default) rather
- * than failing fast, bounded by the per-profile inbound stream caps. If slow-loris pressure ever
- * shows up, give handlers a shorter read deadline — do not reintroduce an idle timer.
- *
- * `opts.signal` cancels the read from outside, on exactly the same contract as the deadline.
- *
- * `timeoutMs === Infinity` means "no independent clock — bounded by `opts.signal` alone", and
- * `opts.signal` is then **required**: an unbounded read with nothing to end it is a caller bug
- * that presents as a hang, so it throws at entry instead. Every other part of the loop already
- * copes — `remaining` is `Infinity`, so it is never `<= 0`, the poll interval still comes out at
- * {@link EOF_POLL_MS}, and the `read timed out` throw below is simply unreachable. This exists so
- * a caller that already arms a `deadline()` around the whole RPC can hand that deadline's signal
- * down as the *only* clock: arming a second timer from the same `timeoutMs` makes which error
- * surfaces (and which release arm runs) a race between two timers that expire a tick apart.
- * The default stays {@link RPC_TIMEOUT_MS} for direct users of this pinned public export.
- *
- * @throws {FrameTruncationError} when the source ends before a whole framed message arrived —
- * including a clean close right after the prefix, which the decoder completes silently on.
- * @throws at entry if `timeoutMs` is not a positive number or `Infinity` — `NaN`, `0` and
- * negatives all reach the loop as a hot spin or an instant expiry rather than a budget, and this
- * is an exported entry point a consumer can compute a timeout for.
- * @throws {PayloadTooLargeError} when the declared length exceeds `maxBytes`, raised at the
- * prefix before any body byte is pulled.
- * @throws if the deadline expires or `opts.signal` aborts — a partial read is an error, never a
- * short-but-valid result. An empty frame
- * (prefix `0x00`) is *not* an error here: it returns an empty buffer, and `decodeJson`'s own
- * `empty response` rejection covers it downstream.
+ * Iterable-path read for plain async iterables (tests, non-libp2p sources): `lp.decode` with the
+ * cap enforced in its `onLength` hook, one read issued and held, raced against the abort signal.
+ * No stream state exists to consult, so the read ends on iterator EOF alone.
  */
-export async function readFramed(
+async function readFramedFromIterable(
 	stream: AsyncIterable<Uint8Array | Uint8ArrayList>,
 	maxBytes: number,
-	timeoutMs = RPC_TIMEOUT_MS,
-	opts: { signal?: AbortSignal } = {}
+	signal: AbortSignal
 ): Promise<Uint8Array> {
-	const signal = opts.signal;
-	if (timeoutMs === Infinity && signal == null) {
-		throw new Error('readFramed: timeoutMs of Infinity requires opts.signal — an unbounded read never ends');
-	}
-	// `!(x > 0)` rather than `x <= 0`, so it also catches NaN — which is the worst of the three:
-	// `Math.min(NaN, EOF_POLL_MS)` is NaN, `setTimeout` clamps that to zero, and the poll loop
-	// spins one iteration per event-loop turn for as long as the stream stays open. Infinity
-	// passes, which is the mode documented above.
-	if (!(timeoutMs > 0)) {
-		throw new Error(`readFramed: timeoutMs must be a positive number or Infinity, got ${timeoutMs}`);
-	}
-	if (signal?.aborted === true) throw abortReasonError(signal);
-
 	const source = lp.decode(stream, {
 		maxDataLength: Number.MAX_SAFE_INTEGER,
 		onLength: (declared) => {
@@ -466,66 +438,134 @@ export async function readFramed(
 	const iter = source[Symbol.asyncIterator]();
 
 	let onAbort: (() => void) | undefined;
-	const abortWait = signal == null
-		? undefined
-		: new Promise<typeof ABORTED>((resolve) => {
-			onAbort = () => resolve(ABORTED);
-			signal.addEventListener('abort', onAbort, { once: true });
-		});
+	const abortWait = new Promise<typeof ABORTED>((resolve) => {
+		onAbort = () => resolve(ABORTED);
+		signal.addEventListener('abort', onAbort, { once: true });
+	});
 
-	const deadlineAt = Date.now() + timeoutMs;
-	// Issued once and held across poll ticks: re-calling `iter.next()` would queue a second read
-	// and silently drop whichever bytes the abandoned one consumes.
+	// Issued once and held: re-calling `iter.next()` would queue a second read and silently drop
+	// whichever bytes the abandoned one consumes.
 	const pending = iter.next();
-	// Belt-and-braces against an unhandled rejection when a sentinel wins and `pending` is
-	// abandoned. NOTE: not load-bearing today — the `Promise.race` below attaches its own
-	// reject reaction to `pending` — but it stops mattering only for as long as the read
-	// promise is raced; keep it if that race is ever restructured.
+	// Belt-and-braces against an unhandled rejection when the abort sentinel wins and `pending`
+	// is abandoned. NOTE: not load-bearing today — the `Promise.race` below attaches its own
+	// reject reaction — but it stops mattering only for as long as the read promise is raced;
+	// keep it if that race is ever restructured.
 	pending.catch(() => {});
-	type RaceResult = IteratorResult<Uint8ArrayList> | typeof POLL_TICK | typeof ABORTED;
 
 	try {
-		while (true) {
-			const remaining = deadlineAt - Date.now();
-			if (remaining <= 0) throw new Error(`read timed out after ${timeoutMs}ms`);
-
-			let timer: ReturnType<typeof setTimeout> | undefined;
-			const poll = new Promise<typeof POLL_TICK>((resolve) => {
-				timer = setTimeout(() => resolve(POLL_TICK), Math.min(remaining, EOF_POLL_MS));
-			});
-			const racers: Array<Promise<RaceResult>> = [pending, poll];
-			if (abortWait != null) racers.push(abortWait);
-			let result: RaceResult;
-			try {
-				result = await Promise.race<RaceResult>(racers);
-			} catch (err) {
-				// Defensive: an 8-byte varint declaring past 2^53 trips the library's own check before
-				// `onLength` can see the length; report it as the same over-cap failure.
-				if ((err as { name?: unknown } | null)?.name === 'InvalidDataLengthError') {
-					throw new PayloadTooLargeError(`payload too large: declared length exceeds ${maxBytes} byte limit`);
-				}
-				// Everything else — UnexpectedEOFError, InvalidDataLengthLengthError, the `onLength`
-				// cap above, source/reset errors — propagates unchanged.
-				throw err;
-			} finally {
-				clearTimeout(timer);
+		let result: IteratorResult<Uint8ArrayList> | typeof ABORTED;
+		try {
+			result = await Promise.race([pending, abortWait]);
+		} catch (err) {
+			// Defensive: an 8-byte varint declaring past 2^53 trips the library's own check before
+			// `onLength` can see the length; report it as the same over-cap failure.
+			if ((err as { name?: unknown } | null)?.name === 'InvalidDataLengthError') {
+				throw new PayloadTooLargeError(`payload too large: declared length exceeds ${maxBytes} byte limit`);
 			}
-
-			if (result === ABORTED) throw abortReasonError(signal!);
-			if (result === POLL_TICK) {
-				if (remoteFinishedWriting(stream)) {
-					throw new FrameTruncationError('stream ended before a whole framed message arrived');
-				}
-				continue; // still open — keep waiting on `pending`, bounded only by the deadline
-			}
-			if (result.done === true) {
-				throw new FrameTruncationError('stream ended before a framed message arrived');
-			}
-			return result.value.subarray();
+			// Everything else — UnexpectedEOFError, InvalidDataLengthLengthError, the `onLength`
+			// cap above, source/reset errors — propagates unchanged.
+			throw err;
 		}
+		if (result === ABORTED) throw abortReasonError(signal);
+		if (result.done === true) {
+			throw new FrameTruncationError('stream ended before a framed message arrived');
+		}
+		return result.value.subarray();
 	} finally {
 		// One listener per read; without this a long-lived run signal accumulates one per RPC.
-		if (onAbort != null && signal != null) signal.removeEventListener('abort', onAbort);
+		if (onAbort != null) signal.removeEventListener('abort', onAbort);
+	}
+}
+
+/** Fresh read of `s?.aborted` behind a call boundary, so flow narrowing cannot pin its value. */
+function signalFired(s: AbortSignal | undefined): boolean {
+	return s?.aborted === true;
+}
+
+/**
+ * Read exactly one length-prefixed message, bounded by `maxBytes` and a single overall
+ * `timeoutMs` deadline.
+ *
+ * **Invariant: a frame the remote actually wrote is never reported as truncated.** Two
+ * implementations behind this one signature uphold it, dispatched on what `stream` is
+ * ({@link isMessageStream}):
+ *
+ * - A **libp2p stream** is read through `@libp2p/utils`'s `byteStream`, which reads frames at the
+ *   same layer as the stream's own EOF state — one buffer, no timer, no blind spot.
+ *   `read({ bytes })` either returns the requested bytes or throws `UnexpectedEOFError` on a
+ *   genuine end-of-stream, so end-of-stream is recognised by the reader itself rather than
+ *   cross-checked from outside. (The previous implementation polled stream-level EOF state every
+ *   20 ms while delivered bytes could still sit in two buffers *below* that state — libp2p's
+ *   stream-iterator queue and `lp.decode`'s accumulator — so it could raise
+ *   {@link FrameTruncationError} on a healthy connection carrying a complete reply.)
+ * - A **plain async iterable** (test stubs, non-libp2p sources) keeps the `lp.decode` path and
+ *   ends on iterator EOF alone — no stream state exists to consult, and none is.
+ *
+ * On both paths the declared-length cap is enforced at the length prefix, before any body byte
+ * is pulled: an over-declared message costs the receiver the prefix, never the body.
+ *
+ * There is deliberately no *idle* timer — a gap between chunks means a slow link, not
+ * end-of-stream — and only the overall deadline bounds a peer that stalls mid-payload.
+ *
+ * NOTE: an inbound handler holds a stalled stream for the full `timeoutMs` (5s default) rather
+ * than failing fast, bounded by the per-profile inbound stream caps. If slow-loris pressure ever
+ * shows up, give handlers a shorter read deadline — do not reintroduce an idle timer.
+ *
+ * `opts.signal` cancels the read from outside, on exactly the same contract as the deadline.
+ *
+ * `timeoutMs === Infinity` means "no independent clock — bounded by `opts.signal` alone", and
+ * `opts.signal` is then **required**: an unbounded read with nothing to end it is a caller bug
+ * that presents as a hang, so it throws at entry instead. This exists so a caller that already
+ * arms a `deadline()` around the whole RPC can hand that deadline's signal down as the *only*
+ * clock: arming a second timer from the same `timeoutMs` makes which error surfaces (and which
+ * release arm runs) a race between two timers that expire a tick apart. The default stays
+ * {@link RPC_TIMEOUT_MS} for direct users of this pinned public export.
+ *
+ * @throws {FrameTruncationError} when the source genuinely ends before a whole framed message
+ * arrived — including a clean close right after the prefix.
+ * @throws at entry if `timeoutMs` is not a positive number or `Infinity` — `NaN`, `0` and
+ * negatives are not budgets, and this is an exported entry point a consumer can compute a
+ * timeout for.
+ * @throws {PayloadTooLargeError} when the declared length exceeds `maxBytes`, raised at the
+ * prefix before any body byte is pulled.
+ * @throws if the deadline expires or `opts.signal` aborts — a partial read is an error, never a
+ * short-but-valid result. An empty frame (prefix `0x00`) is *not* an error here: it returns an
+ * empty buffer, and `decodeJson`'s own `empty response` rejection covers it downstream.
+ */
+export async function readFramed(
+	stream: AsyncIterable<Uint8Array | Uint8ArrayList>,
+	maxBytes: number,
+	timeoutMs = RPC_TIMEOUT_MS,
+	opts: { signal?: AbortSignal } = {}
+): Promise<Uint8Array> {
+	const signal = opts.signal;
+	if (timeoutMs === Infinity && signal == null) {
+		throw new Error('readFramed: timeoutMs of Infinity requires opts.signal — an unbounded read never ends');
+	}
+	// `!(x > 0)` rather than `x <= 0`, so it also catches NaN. Infinity passes, which is the mode
+	// documented above.
+	if (!(timeoutMs > 0)) {
+		throw new Error(`readFramed: timeoutMs must be a positive number or Infinity, got ${timeoutMs}`);
+	}
+	if (signal?.aborted === true) throw abortReasonError(signal);
+
+	// Finite mode arms one deadline (a child of the caller's signal); Infinity mode reads under
+	// the caller's signal alone. Either way exactly one clock bounds the read.
+	const d = timeoutMs === Infinity ? undefined : deadline(timeoutMs, signal);
+	const readSignal = d?.signal ?? signal!;
+	try {
+		return isMessageStream(stream)
+			? await readFramedFromStream(stream, maxBytes, readSignal)
+			: await readFramedFromIterable(stream, maxBytes, readSignal);
+	} catch (err) {
+		// The caller's own signal wins the attribution; only the deadline's solo expiry is a
+		// read timeout. Read through a call so TS does not carry the entry check's narrowing of
+		// the readonly `aborted` here — it flips mid-read, which flow analysis cannot see.
+		if (signalFired(signal)) throw abortReasonError(signal!);
+		if (signalFired(d?.signal)) throw new Error(`read timed out after ${timeoutMs}ms`);
+		throw err;
+	} finally {
+		d?.cancel();
 	}
 }
 
