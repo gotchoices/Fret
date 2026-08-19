@@ -2274,7 +2274,12 @@ export class FretService implements IFretService, Startable {
 	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		const announced: string[] = [];
 		// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
-		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, { signal });
+		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, {
+			signal,
+			// Same caps the merge loop below slices to, supplied once — the parser truncates ahead
+			// of the parse-and-hash loop instead of after it, and the two cannot drift.
+			parse: makeSnapshotParser(this.mergeSnapshotCaps()),
+		});
 		switch (out.kind) {
 			case 'skipped':      // no connection — nothing attempted, count nothing
 			case 'cancelled':    // our own cancellation — not evidence about the peer

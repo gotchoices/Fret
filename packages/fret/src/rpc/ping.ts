@@ -5,6 +5,7 @@ import {
 	registerJsonHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
+import { parseOrThrow, parsePingResponse } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
 import { createLogger } from '../logger.js';
@@ -85,9 +86,10 @@ export async function sendPing(
 	return rpcRequest(node, peer, protocol, {
 		...opts,
 		maxBytes: 1024,
-		decode: async (b) => {
-			const r = await decodeJson<PingResponseV1>(b);
-			return { ok: Boolean(r.ok), size_estimate: r.size_estimate, confidence: r.confidence };
-		},
+		// The parser replaces the old `Boolean(r.ok)` coercion: a legal value always encodes as a
+		// boolean, so the coercion could only ever have hidden a malformed peer. A rejection
+		// throws (see `parseOrThrow`) and surfaces as `decode-error` — proof of life, never a
+		// contact strike.
+		decode: async (b) => parseOrThrow(parsePingResponse, await decodeJson(b)),
 	});
 }

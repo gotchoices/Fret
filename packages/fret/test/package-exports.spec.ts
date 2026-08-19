@@ -74,6 +74,22 @@ describe('package public surface', () => {
 		expect(fretIndex.parseNearAnchor).to.be.a('function')
 		expect(fretIndex.parseMaybeActReply).to.be.a('function')
 		expect(fretIndex.sanitizeReplacements).to.be.a('function')
+		// The adapter that wires one of those parsers into `rpcRequest`'s `decode`, plus the way
+		// to recognise its rejection. It belongs with the parsers because passing a parser in raw
+		// is a silent bug (an `ok` carrying `undefined`), not a compile error.
+		expect(fretIndex.parseOrThrow).to.be.a('function')
+		expect(fretIndex.ReplyRejectedError).to.be.a('function')
+		expect(fretIndex.isReplyRejectedError).to.be.a('function')
+		// The pair behaves: a rejection throws the named error, a pass returns the normalized value.
+		expect(() => fretIndex.parseOrThrow(fretIndex.parsePingResponse, { ok: 'yes' })).to.throw()
+		try {
+			fretIndex.parseOrThrow(fretIndex.parsePingResponse, { ok: 'yes' })
+			expect.fail('parseOrThrow must throw on a rejected reply')
+		} catch (err) {
+			expect(fretIndex.isReplyRejectedError(err), 'rejection recognised by identity').to.equal(true)
+			expect(err).to.be.instanceOf(fretIndex.ReplyRejectedError)
+		}
+		expect(fretIndex.parseOrThrow(fretIndex.parsePingResponse, { ok: true })).to.deep.equal({ ok: true })
 		// The primitives they are spelled with stay module-scoped — implementation detail, not
 		// surface — so a consumer cannot depend on them and they can change without a major.
 		expect(fretIndex).to.not.have.property('isPeerIdString')

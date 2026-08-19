@@ -6,7 +6,7 @@ import {
 	registerJsonHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
-import { makeSnapshotParser } from './validate.js';
+import { makeSnapshotParser, parseOrThrow } from './validate.js';
 import type { Parser } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { NeighborSnapshotV1, BusyResponseV1 } from '../index.js';
@@ -83,20 +83,36 @@ export async function registerNeighbors(
 /**
  * Fetch `peerIdOrStr`'s neighbor snapshot. Connection-only (dial `'never'`): no existing
  * connection yields `skipped` — nothing attempted, nothing fabricated. Every failure mode is
- * its own `RpcOutcome` variant; the decoded snapshot is not shape-validated beyond "JSON
- * object" (parity with the cast this replaced).
+ * its own `RpcOutcome` variant; a reply the parser rejects is `decode-error`.
+ *
+ * `opts.parse` is the snapshot parser, supplied by the caller because only the caller knows the
+ * profile's merge caps — the same reason `registerNeighbors` takes one. It carries that
+ * function's `Infinity`-caps default ("validate the shape, truncate nothing"), so the default
+ * copies no cap numbers from anywhere and `FretService` always supplies
+ * `makeSnapshotParser(this.mergeSnapshotCaps())`.
+ *
+ * NOTE: the default is therefore reachable only from tests — a caller that omits it silently gets
+ * no truncation. Kept defaulted deliberately (three test call sites pass no parser, and the
+ * options bag makes a required member a breaking change for every one of them); revisit if a
+ * second production caller appears.
  */
 export async function fetchNeighbors(
 	node: Libp2p,
 	peerIdOrStr: string,
 	protocol = PROTOCOL_NEIGHBORS,
-	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
+	opts: { signal?: AbortSignal; timeoutMs?: number; parse?: Parser<NeighborSnapshotV1> } = {}
 ): Promise<RpcOutcome<NeighborSnapshotV1>> {
+	const parse = opts.parse ?? makeSnapshotParser({
+		successors: Number.POSITIVE_INFINITY,
+		predecessors: Number.POSITIVE_INFINITY,
+		sample: Number.POSITIVE_INFINITY,
+	});
 	return rpcRequest(node, peerIdOrStr, protocol, {
-		...opts,
+		signal: opts.signal,
+		timeoutMs: opts.timeoutMs,
 		dial: 'never',
 		maxBytes: 128 * 1024,
-		decode: (b) => decodeJson<NeighborSnapshotV1>(b),
+		decode: async (b) => parseOrThrow(parse, await decodeJson(b)),
 	});
 }
 

@@ -8,6 +8,7 @@ import {
 	registerRpcHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
+import { parseMaybeActReply, parseOrThrow } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';
 
@@ -50,7 +51,8 @@ export async function sendMaybeAct(
 		body: msg,
 		halfCloseBeforeRead: true,
 		maxBytes: 512 * 1024,
-		decode: (b) => decodeJson<NearAnchorV1 | { commitCertificate: string }>(b),
+		// A reply that is neither shape is `decode-error`, not a half-parsed cast.
+		decode: async (b) => parseOrThrow(parseMaybeActReply, await decodeJson(b)),
 	});
 }
 

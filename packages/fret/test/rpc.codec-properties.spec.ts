@@ -31,7 +31,12 @@ import {
 	parseRouteAndMaybeAct,
 	type Parser,
 } from '../src/rpc/validate.js'
-import type { BusyResponseV1, NearAnchorV1, NeighborSnapshotV1 } from '../src/index.js'
+import type { BusyResponseV1, NearAnchorV1, NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
+import type { Connection } from '@libp2p/interface'
+import type { RpcOutcome } from '../src/rpc/outcome.js'
+import { sendPing } from '../src/rpc/ping.js'
+import { fetchNeighbors } from '../src/rpc/neighbors.js'
+import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 
 // The second half of the fuzz tier from `plan/7-rpc-codec-fuzzing`. `rpc-handler-fault-isolation`
 // (`test/rpc.handler-fuzz.spec.ts`) made malformed input safe to *receive*; this file proves three
@@ -1741,5 +1746,213 @@ describe('RPC codec properties', function () {
 					.to.deep.equal({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 1, confidence: 1 })
 			})
 		})
+	})
+})
+
+// =================================================================================================
+// Phase 5 — the parsers as *wired*, not merely as functions
+//
+// The parsers above are pure and were already covered as functions. What this phase covers is the
+// seam that consumes them: `rpcRequest`'s decode phase has no `undefined` check, so a `Parser`
+// handed in raw returns `{ kind: 'ok', value: undefined }` on a rejection — an `ok` carrying
+// `undefined` dressed as the reply, and it type-checks silently. `parseOrThrow` is the adapter
+// that turns a rejection into a throw, which `rpcRequest` classifies as `decode-error`.
+//
+// So the properties below assert on the **value**, not merely on `kind`: written against a raw
+// parser the malformed property fails (kind is `ok`), and asserting only `kind !== 'ok'` would
+// pass vacuously against any throwing validator including a broken one.
+// =================================================================================================
+
+/** One whole framed message: varint length prefix + body. */
+function frameOf(value: unknown): Uint8Array {
+	return lp.encode.single(enc.encode(JSON.stringify(value))).subarray()
+}
+
+/** A stream that serves exactly one framed reply and then ends. */
+function replyStream(reply: unknown): Stream {
+	const chunks: Uint8Array[] = [frameOf(reply)]
+	let i = 0
+	const stream = {
+		id: 'reply-stub',
+		send: (): boolean => true,
+		close: async (): Promise<void> => { /* released */ },
+		abort: (): void => { /* released */ },
+		[Symbol.asyncIterator]: () => ({
+			next: async (): Promise<IteratorResult<Uint8Array>> => {
+				const c = chunks[i++]
+				return c === undefined ? { done: true, value: undefined } : { done: false, value: c }
+			},
+		}),
+	}
+	return stream as unknown as Stream
+}
+
+/** A node whose every RPC — dialed or over an existing connection — lands on `stream`. */
+function nodeReplying(stream: Stream): Libp2p {
+	const conn = { status: 'open', newStream: async () => stream }
+	return {
+		getConnections: () => [conn] as unknown as Connection[],
+		dialProtocol: async () => stream,
+	} as unknown as Libp2p
+}
+
+/**
+ * The three senders that read a reply, each reduced to "serve this body, give me the outcome".
+ * Keeping them in one table is what makes the properties below cover all three by construction
+ * rather than by three near-copies that drift apart.
+ */
+interface WiredSender {
+	name: string
+	send: (node: Libp2p, peer: string) => Promise<RpcOutcome<unknown>>
+	/** A legal reply this node's own encoders can produce. */
+	legal: (selfId: string) => Record<string, unknown>
+	/** What `ok.value` must be for that legal reply, after the parser's normalization. */
+	expected: (selfId: string) => unknown
+}
+
+const MAYBE_ACT_MSG: RouteAndMaybeActV1 = {
+	v: 1, key: coordToBase64url(new Uint8Array(COORD_BYTES)), want_k: 3, ttl: 4, min_sigs: 2,
+	correlation_id: 'cid', timestamp: 1, signature: '',
+}
+
+const WIRED_SENDERS: WiredSender[] = [
+	{
+		name: 'sendPing',
+		send: (node, peer) => sendPing(node, peer, P.PROTOCOL_PING, { timeoutMs: 500 }),
+		legal: () => ({ ok: true, ts: 7, size_estimate: 42, confidence: 0.5 }),
+		// `ts` is carried by the wire type and read by nobody, so the parser projects it away —
+		// but it must not make the reply *reject*, which is what this pins.
+		expected: () => ({ ok: true, size_estimate: 42, confidence: 0.5 }),
+	},
+	{
+		name: 'fetchNeighbors',
+		send: (node, peer) => fetchNeighbors(node, peer, P.PROTOCOL_NEIGHBORS, { timeoutMs: 500 }),
+		legal: (selfId) => ({
+			v: 1, from: selfId, timestamp: 1, successors: [], predecessors: [], sample: [], sig: '',
+		}),
+		expected: (selfId) => ({
+			v: 1, from: selfId, timestamp: 1, successors: [], predecessors: [], sample: [], sig: '',
+		}),
+	},
+	{
+		name: 'sendMaybeAct',
+		send: (node, peer) => sendMaybeAct(node, peer, MAYBE_ACT_MSG, P.PROTOCOL_MAYBE_ACT, { timeoutMs: 500 }),
+		legal: () => ({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 3, confidence: 0.5 }),
+		expected: () => ({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 3, confidence: 0.5 }),
+	},
+]
+
+describe('reply parsers as wired into the senders', function () {
+	this.timeout(30_000)
+
+	let selfId: string
+
+	before(async () => {
+		selfId = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString()
+	})
+
+	for (const sender of WIRED_SENDERS) {
+		it(`${sender.name}: a legal reply from our own encoder survives the wired parser`, async () => {
+			const out = await sender.send(nodeReplying(replyStream(sender.legal(selfId))), selfId)
+			expect(out.kind, `${sender.name} must accept a legal reply`).to.equal('ok')
+			expect(out.kind === 'ok' ? out.value : undefined).to.deep.equal(sender.expected(selfId))
+		})
+	}
+
+	/**
+	 * Field-type fuzzing over each sender's own legal reply: replace one field's value with a
+	 * value of a different type. Every mutant either parses (the parser normalizes advisory
+	 * fields rather than rejecting) or is refused — but it must never surface as an `ok` whose
+	 * value is `undefined` or half-parsed, and the sender must never throw.
+	 */
+	const arbWrongTyped = fc.constantFrom<unknown>(null, 1, 'x', true, [], {})
+
+	for (const sender of WIRED_SENDERS) {
+		it(`${sender.name}: a malformed reply is decode-error, never a throw or an ok carrying undefined`, async () => {
+			await fc.assert(
+				fc.asyncProperty(
+					fc.nat(),
+					arbWrongTyped,
+					async (fieldIdx, value) => {
+						const legal = sender.legal(selfId)
+						const keys = Object.keys(legal)
+						const mutant = { ...legal, [keys[fieldIdx % keys.length]]: value }
+						// A throw out of a sender is itself the failure — `rpcRequest` never
+						// throws for a network outcome, and a validator must not change that.
+						const out = await sender.send(nodeReplying(replyStream(mutant)), selfId)
+						if (out.kind === 'ok') {
+							// A surviving mutant is one the parser normalized rather than
+							// refused. It must still be a real value, never `undefined`.
+							expect(out.value, 'ok must never carry undefined').to.not.equal(undefined)
+							expect(out.value).to.be.an('object')
+							return
+						}
+						expect(out.kind, 'a refused reply is decode-error').to.equal('decode-error')
+						expect(out).to.not.have.property('value')
+					}
+				),
+				{ numRuns: 120 }
+			)
+		})
+	}
+
+	it('a reply that is not an object at all is decode-error for every sender', async () => {
+		for (const sender of WIRED_SENDERS) {
+			for (const body of [null, 5, 'nope', [1, 2], true]) {
+				const out = await sender.send(nodeReplying(replyStream(body)), selfId)
+				expect(out.kind, `${sender.name} on ${JSON.stringify(body)}`).to.equal('decode-error')
+				expect(out).to.not.have.property('value')
+			}
+		}
+	})
+
+	it('a busy reply is still busy, not a parser rejection', async () => {
+		// The busy shape is tested on the parsed body *before* `decode` runs, so a validator never
+		// sees one. Wiring a parser must not turn a peer saying "overloaded" into `decode-error` —
+		// the service scores those differently (busy records backoff; decode-error decays relevance).
+		for (const sender of WIRED_SENDERS) {
+			const busy: BusyResponseV1 = { v: 1, busy: true, retry_after_ms: 250 }
+			const out = await sender.send(nodeReplying(replyStream(busy)), selfId)
+			expect(out.kind, sender.name).to.equal('busy')
+		}
+	})
+
+	it('sendPing no longer coerces a non-boolean ok into a confident answer', async () => {
+		// The `Boolean(r.ok)` coercion this replaced turned `ok: 1` into a confident `ok: true`
+		// about a peer that never said so. Now it is a refused reply.
+		const out = await sendPing(nodeReplying(replyStream({ ok: 1, ts: 1 })), selfId, P.PROTOCOL_PING, { timeoutMs: 500 })
+		expect(out.kind).to.equal('decode-error')
+	})
+
+	it('fetchNeighbors truncates with the caps its caller supplies', async () => {
+		// The parser comes from the caller because only the caller knows the profile's merge caps.
+		// Supplying tight ones must truncate exactly as the merge loop would.
+		const reply: NeighborSnapshotV1 = {
+			v: 1, from: selfId, timestamp: 1,
+			successors: ['a', 'b', 'c', 'd'], predecessors: ['e', 'f', 'g'], sample: [], sig: '',
+		}
+		const out = await fetchNeighbors(nodeReplying(replyStream(reply)), selfId, P.PROTOCOL_NEIGHBORS, {
+			timeoutMs: 500,
+			parse: makeSnapshotParser({ successors: 2, predecessors: 1, sample: 0 }),
+		})
+		expect(out.kind).to.equal('ok')
+		const snap = out.kind === 'ok' ? out.value : undefined
+		expect(snap?.successors).to.deep.equal(['a', 'b'])
+		expect(snap?.predecessors).to.deep.equal(['e'])
+	})
+
+	it("the reply caps cannot refuse this node's own largest legal output", async () => {
+		// `pickAnchors` yields at most 2 anchors and the widest cohort-hint producer
+		// (`buildNearAnchor`) emits at most 8 ids, against caps of 8 and 16 — 4x and 2x headroom.
+		const widest: NearAnchorV1 = {
+			v: 1,
+			anchors: ['a0', 'a1'],
+			cohort_hint: Array.from({ length: 8 }, (_, i) => `c${i}`),
+			estimated_cluster_size: 15,
+			confidence: 0.5,
+		}
+		const out = await sendMaybeAct(nodeReplying(replyStream(widest)), selfId, MAYBE_ACT_MSG, P.PROTOCOL_MAYBE_ACT, { timeoutMs: 500 })
+		expect(out.kind).to.equal('ok')
+		expect(out.kind === 'ok' ? out.value : undefined).to.deep.equal(widest)
 	})
 })

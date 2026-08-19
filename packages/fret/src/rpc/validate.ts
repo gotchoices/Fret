@@ -244,6 +244,43 @@ function parseSample(value: unknown, cap: number, from: string): SampleEntry[] {
 // ---------------------------------------------------------------------------------------------
 
 /**
+ * The error a wired-in reply parser throws on rejection. Named (a stable `name`, matched by
+ * {@link isReplyRejectedError}) rather than a bare `Error` so a classifier — and a test — can
+ * recognise it by identity instead of by message text, the house rule the
+ * `isFrameTruncationError` / `isPayloadTooLargeError` pair already follows.
+ */
+export class ReplyRejectedError extends Error {
+	constructor(message: string) {
+		super(message);
+		this.name = 'ReplyRejectedError';
+	}
+}
+
+/** True for the error {@link parseOrThrow} raises. Identity, not message text. */
+export function isReplyRejectedError(err: unknown): boolean {
+	return (err as { name?: unknown } | null)?.name === 'ReplyRejectedError';
+}
+
+/**
+ * Adapt a {@link Parser} into the `decode` callback `rpcRequest` wants.
+ *
+ * `rpcRequest`'s decode phase has **no `undefined` check**: a throw becomes `decode-error`, but a
+ * *returned* `undefined` becomes `{ kind: 'ok', value: undefined }` — the "an `ok` carrying
+ * `undefined` dressed as the reply" failure the helper's two overloads exist to prevent, and it
+ * type-checks silently (`T` infers as `Reply | undefined`). So a parser is never passed in raw;
+ * it goes through here, which turns a rejection into a throw.
+ *
+ * Chosen over teaching `rpcRequest` to treat a returned `undefined` as `decode-error`: that is
+ * simpler at these three call sites but makes `undefined` unreturnable as a legitimate reply for
+ * every consumer of a publicly exported helper. `rpcRequest` stays untouched.
+ */
+export function parseOrThrow<T>(parse: Parser<T>, msg: unknown): T {
+	const parsed = parse(msg);
+	if (parsed === undefined) throw new ReplyRejectedError('reply rejected by wire-shape parser');
+	return parsed;
+}
+
+/**
  * A ping reply, projected to what `sendPing` actually returns.
  *
  * `ok` must be a **boolean**: a legal value always encodes as one, so the `Boolean(r.ok)` coercion

@@ -182,8 +182,16 @@ export {
 	parseNearAnchor,
 	parseMaybeActReply,
 	sanitizeReplacements,
+	// The adapter that wires a `Parser` into `rpcRequest`'s `decode`. It ships with the parsers
+	// because passing one in raw is a silent bug rather than a compile error: `rpcRequest` has no
+	// `undefined` check, so a returned rejection becomes `{ kind: 'ok', value: undefined }` and
+	// `T` infers as `Reply | undefined`. Its error type is exported alongside so a consumer can
+	// recognise the rejection by identity, not by message text.
+	parseOrThrow,
+	ReplyRejectedError,
+	isReplyRejectedError,
 } from './rpc/validate.js';
-export type { Parser } from './rpc/validate.js';
+export type { Parser, SnapshotCaps } from './rpc/validate.js';
 
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {

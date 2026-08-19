@@ -628,14 +628,41 @@ Three rules in that table are decisions rather than mechanics:
   parsers exist to stop. (`importTable`'s all-or-nothing rule is the other case and is untouched: a
   corrupt persisted table is better refused whole.)
 - **`ok` must be a boolean** on a ping reply. A legal value always encodes as one, so the
-  `Boolean(r.ok)` coercion it will replace could only ever have hidden a malformed peer. The
-  parser exists but is **not yet wired**: `sendPing` still passes a bare `decodeJson` cast and
-  still performs that coercion (`src/rpc/ping.ts`), as do `fetchNeighbors` and `sendMaybeAct`.
-  Wiring every reply decoder onto its parser is `tickets/implement/15.33-rpc-reply-parsers-and-caps`.
+  `Boolean(r.ok)` coercion it replaced could only ever have hidden a malformed peer.
 
 The reply caps are set so a cap can never refuse this node's own legal output: `pickAnchors` yields
 at most 2 anchors and the cohort hint is built from at most 8 ids, so 8 / 16 are 4× and 2× the
 largest lists the producers can emit.
+
+**Every reply parser is wired into its sender, through one adapter.** `rpcRequest`'s decode phase
+has no `undefined` check — a throw becomes `decode-error`, but a *returned* `undefined` becomes
+`{kind: 'ok', value: undefined}`, exactly the "an `ok` carrying `undefined` dressed as the reply"
+failure its two overloads exist to prevent, and it type-checks silently (`T` infers as
+`Reply | undefined`). So a `Parser` is never passed in as `decode`; it goes through
+`parseOrThrow(parse, msg)` (`src/rpc/validate.ts`), which raises a named `ReplyRejectedError`
+(matched by `isReplyRejectedError`, the house rule the `isFrameTruncationError` /
+`isPayloadTooLargeError` pair already follows) when the parser rejects. The alternative — teaching
+`rpcRequest` to read a returned `undefined` as `decode-error` — is simpler at the three call sites
+but makes `undefined` unreturnable as a legitimate reply for every consumer of a publicly exported
+helper, so `rpcRequest` is left untouched. The adapter, the error class and the predicate are
+exported from the package root beside the parsers, since passing a parser in raw is a silent bug
+rather than a compile error for a consumer too.
+
+| Sender | Reply parser |
+|---|---|
+| `sendPing` | `parsePingResponse` — this *is* the removed `Boolean(r.ok)` coercion's replacement |
+| `sendMaybeAct` | `parseMaybeActReply` |
+| `fetchNeighbors` | a snapshot parser **supplied by the caller** on the options bag (`opts.parse`), because only the caller knows its profile's merge caps. `FretService` passes `makeSnapshotParser(this.mergeSnapshotCaps())` — the same numbers the merge loop slices to, supplied once, so the parser truncates ahead of the parse-and-hash loop instead of after it. It carries the same `Infinity`-caps default `registerNeighbors`' `snapshotParser` does ("validate the shape, truncate nothing"), reachable only from tests |
+| `announceNeighbors`, `sendLeave` | write-only — no `decode`, so no parser |
+
+A rejection is therefore `decode-error`, which is proof of life and never a contact strike
+(`noteRpcFailure` decays relevance only) — the right classification, since a reply that arrived
+over this network's namespaced protocol is membership evidence whatever its body says. A `busy`
+reply is unaffected: `rpcRequest` tests the busy shape on the parsed body *before* `decode` runs,
+so a validator never sees one. Pinned by the wired-path phase of
+`test/rpc.codec-properties.spec.ts`, which drives all three senders against a served frame and
+asserts on the `ok` *value* rather than merely on `kind` — written against a raw parser the
+malformed-reply property fails, and a kind-only assertion would pass vacuously.
 
 Because `encodeJson` drops an own property whose value is `undefined`, an optional field can only
 ever arrive *absent* — so a parser that demanded `null`, or rejected a missing optional, would
