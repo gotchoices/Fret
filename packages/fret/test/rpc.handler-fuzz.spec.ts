@@ -105,6 +105,13 @@ interface InboundStub {
 	sends: number
 	/** `close()` calls that hung rather than completing (only when `closeHangs`). */
 	closeAttempts: number
+	/**
+	 * Chunk pulls the reader made. `lp.decode` pulls whole chunks, so a frame handed over as
+	 * two chunks — the varint length prefix, then the body — makes "the body was never pulled"
+	 * a *measurement* rather than an inference from the absence of a crash. Handed over as one
+	 * chunk a single pull delivers both and the counter proves nothing.
+	 */
+	pulls: number
 	/** Reply frames the handler wrote (empty when `sendThrows`). `sendFramed` passes a `Uint8ArrayList`. */
 	replies: Array<Uint8Array | Uint8ArrayList>
 	status: () => string
@@ -130,7 +137,7 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 	let i = 0
 	const rec: InboundStub = {
 		stream: undefined as unknown as Stream,
-		closes: 0, aborts: 0, sends: 0, closeAttempts: 0, replies: [],
+		closes: 0, aborts: 0, sends: 0, closeAttempts: 0, pulls: 0, replies: [],
 		status: () => status,
 	}
 	const stream = {
@@ -168,6 +175,7 @@ function inboundStub(chunks: Uint8Array[], opts: InboundStubOpts = {}): InboundS
 		},
 		[Symbol.asyncIterator]: () => ({
 			next: async (): Promise<IteratorResult<Uint8Array>> => {
+				rec.pulls++
 				if (opts.resetOnRead) {
 					status = 'reset'
 					writeStatus = 'closed'
@@ -483,6 +491,13 @@ describe('RPC handler fault isolation', function () {
 			mismatches: number
 			/** How many times the handler body's own callback (`onLeave` / `onAnnounce`) ran. */
 			served: number
+			/**
+			 * The last notice `onLeave` received. The *normalizing* rows of the leave field
+			 * matrix below assert what reached the body, not merely that it ran: a neutralized
+			 * field is only pinned by the value that came through, so the counter alone would
+			 * pass for a parser that normalized to something else entirely.
+			 */
+			lastLeave?: LeaveNoticeV1
 		}
 
 		function hooks(): Hooks { return { reasons: [], mismatches: 0, served: 0 } }
@@ -494,7 +509,7 @@ describe('RPC handler fault isolation', function () {
 		async function registerLeaveWithHooks(node: Libp2p, h: Hooks): Promise<void> {
 			await registerLeave(
 				node,
-				() => { h.served++ },
+				(notice) => { h.served++; h.lastLeave = notice },
 				P.PROTOCOL_LEAVE,
 				() => { h.mismatches++ },
 				(reason) => { h.reasons.push(reason) }
@@ -544,24 +559,35 @@ describe('RPC handler fault isolation', function () {
 			},
 		]
 
+		/**
+		 * Drive one body through a freshly registered handler and report what the seam did.
+		 * Shared with the leave field matrix below rather than copied into it — the matrix wants
+		 * this exact rig against this exact `Hooks` record.
+		 */
+		async function driveWith(
+			protocol: string,
+			register: (node: Libp2p, h: Hooks) => Promise<void>,
+			chunks: Uint8Array[]
+		): Promise<{ h: Hooks; s: InboundStub }> {
+			const { node, invoke } = fakeNode()
+			const h = hooks()
+			await register(node, h)
+			const s = inboundStub(chunks)
+			await invoke(protocol, s.stream, PEER_ACTUAL)
+			return { h, s }
+		}
+
+		/** Every body-level drop is a close with no reply, and never runs the body. */
+		function expectDropped(h: Hooks, s: InboundStub, label: string): void {
+			expect({ closes: s.closes, aborts: s.aborts }, `${label}: closed, never aborted`).to.deep.equal({ closes: 1, aborts: 0 })
+			expect(s.sends, `${label}: no reply sent`).to.equal(0)
+			expect(h.served, `${label}: handler body never ran`).to.equal(0)
+		}
+
 		for (const subject of subjects) {
 			describe(subject.name, () => {
-				/** Drive one body through the registered handler and report what the seam did. */
-				async function drive(chunks: Uint8Array[]): Promise<{ h: Hooks; s: InboundStub }> {
-					const { node, invoke } = fakeNode()
-					const h = hooks()
-					await subject.register(node, h)
-					const s = inboundStub(chunks)
-					await invoke(subject.protocol, s.stream, PEER_ACTUAL)
-					return { h, s }
-				}
-
-				/** Every body-level drop is a close with no reply, and never runs the body. */
-				function expectDropped(h: Hooks, s: InboundStub, label: string): void {
-					expect({ closes: s.closes, aborts: s.aborts }, `${label}: closed, never aborted`).to.deep.equal({ closes: 1, aborts: 0 })
-					expect(s.sends, `${label}: no reply sent`).to.equal(0)
-					expect(h.served, `${label}: handler body never ran`).to.equal(0)
-				}
+				const drive = (chunks: Uint8Array[]): Promise<{ h: Hooks; s: InboundStub }> =>
+					driveWith(subject.protocol, subject.register, chunks)
 
 				it("reports 'decode' for a body that is not JSON", async () => {
 					const { h, s } = await drive([framed('!!! definitely not json !!!')])
@@ -609,6 +635,124 @@ describe('RPC handler fault isolation', function () {
 			})
 		}
 
+		// -------------------------------------------------------------------------------------
+		// Leave notice, one row per field per way of being wrong.
+		//
+		// The columns are deliberately *not* uniform, because `parseLeaveNotice` does not treat
+		// its three fields alike. `from` and `timestamp` are load-bearing (the receiver removes
+		// the peer `from` names), so a wrong value **rejects**: the whole notice drops, the seam
+		// closes with no reply, and `onLeave` never runs. `replacements` is advisory, so a wrong
+		// value **normalizes**: the notice is still served and still answered `{ok: true}`, with
+		// the field neutralized. "Over cap" is meaningful only for the list field, and "missing"
+		// collapses into "wrong type" for the two rejecting ones. So each row states its own
+		// expectation rather than inheriting one from its column.
+		//
+		// Every row asserts the release *arm* (close, never abort) rather than only the release
+		// count: the count alone passes for an abort too, so it would prove nothing about the
+		// rule that body-level drops close and only frame-level failures tear the stream down.
+		// -------------------------------------------------------------------------------------
+		describe('leave notice field matrix', () => {
+			interface FieldRow {
+				name: string
+				body: () => Record<string, unknown>
+				/** `reject` — the whole notice drops. `normalize` — served and answered, field neutralized. */
+				expect: 'reject' | 'normalize'
+				/**
+				 * For `normalize` rows: the `replacements` value `onLeave` must have received.
+				 * `undefined` means the key is *absent* from the notice, not present-and-empty —
+				 * `parseLeaveNotice` deletes it rather than writing `[]`, and the two are
+				 * different things to a receiver that iterates it.
+				 */
+				replacements?: string[]
+			}
+
+			function wellFormed(over: Record<string, unknown> = {}): Record<string, unknown> {
+				return { v: 1, from: PEER_ACTUAL, timestamp: Date.now(), ...over }
+			}
+
+			function without(field: string): Record<string, unknown> {
+				const m = wellFormed()
+				delete m[field]
+				return m
+			}
+
+			/** 15 parseable ids — past the 12-entry cap `sanitizeReplacements` slices to. */
+			const overCap = Array.from({ length: 15 }, (_, i) => peerIdStr(20 + i))
+			/** 12 unparseable entries, then 3 parseable ones sitting past the cap. */
+			const validPastTheSlice = [
+				...Array.from({ length: 12 }, (_, i) => `not-a-peer-${i}`),
+				...Array.from({ length: 3 }, (_, i) => peerIdStr(50 + i)),
+			]
+
+			const rows: FieldRow[] = [
+				// `from` — must satisfy `isPeerIdString` (a `peerIdFromString` try/catch).
+				{ name: 'from: unparseable string', body: () => wellFormed({ from: 'not-a-parseable-peer-id' }), expect: 'reject' },
+				{ name: 'from: empty string', body: () => wellFormed({ from: '' }), expect: 'reject' },
+				{ name: 'from: wrong type (number)', body: () => wellFormed({ from: 5 }), expect: 'reject' },
+				{ name: 'from: wrong type (array)', body: () => wellFormed({ from: [PEER_ACTUAL] }), expect: 'reject' },
+				{ name: 'from: wrong type (object)', body: () => wellFormed({ from: { id: PEER_ACTUAL } }), expect: 'reject' },
+				{ name: 'from: null', body: () => wellFormed({ from: null }), expect: 'reject' },
+				{ name: 'from: missing', body: () => without('from'), expect: 'reject' },
+
+				// `timestamp` — must be a finite `number`. Nothing coerces, which is why the
+				// numeric-string row is worth stating on its own: '5' rejects exactly like 'now'.
+				{ name: 'timestamp: numeric string', body: () => wellFormed({ timestamp: '5' }), expect: 'reject' },
+				{ name: 'timestamp: non-numeric string', body: () => wellFormed({ timestamp: 'now' }), expect: 'reject' },
+				{ name: 'timestamp: wrong type (boolean)', body: () => wellFormed({ timestamp: true }), expect: 'reject' },
+				{ name: 'timestamp: null', body: () => wellFormed({ timestamp: null }), expect: 'reject' },
+				{ name: 'timestamp: missing', body: () => without('timestamp'), expect: 'reject' },
+
+				// `replacements` — any non-array is treated as absent. It used to reach `.slice`
+				// and throw out of the handler, which leaked the inbound stream.
+				{ name: 'replacements: wrong type (number)', body: () => wellFormed({ replacements: 5 }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: wrong type (string)', body: () => wellFormed({ replacements: PEER_CLAIMED }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: wrong type (object)', body: () => wellFormed({ replacements: { 0: PEER_CLAIMED } }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: null', body: () => wellFormed({ replacements: null }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: missing', body: () => without('replacements'), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: empty array', body: () => wellFormed({ replacements: [] }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: every entry unparseable', body: () => wellFormed({ replacements: ['nope', 'also-nope'] }), expect: 'normalize', replacements: undefined },
+				{ name: 'replacements: non-string entries', body: () => wellFormed({ replacements: [1, 2, 3] }), expect: 'normalize', replacements: undefined },
+				// Over cap: sliced to 12, in order.
+				{ name: 'replacements: over the 12 cap', body: () => wellFormed({ replacements: overCap }), expect: 'normalize', replacements: overCap.slice(0, 12) },
+				// Mixed: the unparseable entries are dropped rather than rejecting the message.
+				{ name: 'replacements: mixed valid and invalid', body: () => wellFormed({ replacements: [peerIdStr(40), 'nope', peerIdStr(41), 7, peerIdStr(42)] }), expect: 'normalize', replacements: [peerIdStr(40), peerIdStr(41), peerIdStr(42)] },
+				// The row that pins the *order* of the two operations. `sanitizeReplacements`
+				// slices to 12 and only then filters, so parseable ids sitting past the cap are
+				// gone before the filter sees them and the result is empty. Filter-then-slice
+				// would keep all three, so this row fails if the two are ever swapped.
+				{ name: 'replacements: valid entries sitting past the slice', body: () => wellFormed({ replacements: validPastTheSlice }), expect: 'normalize', replacements: undefined },
+			]
+
+			for (const row of rows) {
+				it(`${row.expect}s — ${row.name}`, async () => {
+					const { h, s } = await driveWith(P.PROTOCOL_LEAVE, registerLeaveWithHooks, [json(row.body())])
+
+					if (row.expect === 'reject') {
+						expectDropped(h, s, row.name)
+						expect(h.reasons, `${row.name}: the parser arm, not the decoder's`).to.deep.equal(['parse'])
+						expect(h.mismatches, `${row.name}: the parser runs before serve`).to.equal(0)
+						return
+					}
+
+					// Normalizing rows: the notice is still a notice, and still answered.
+					expect({ closes: s.closes, aborts: s.aborts }, `${row.name}: closed, never aborted`).to.deep.equal({ closes: 1, aborts: 0 })
+					expect(h.reasons, `${row.name}: nothing malformed about a normalized field`).to.deep.equal([])
+					expect(h.served, `${row.name}: onLeave ran`).to.equal(1)
+					const reply = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
+					expect(reply.ok, `${row.name}: answered ok`).to.equal(true)
+
+					// What reached the body, not merely that it did.
+					const notice = h.lastLeave!
+					expect(notice.from, `${row.name}: from untouched`).to.equal(PEER_ACTUAL)
+					if (row.replacements === undefined) {
+						expect('replacements' in notice, `${row.name}: the key is deleted, not emptied`).to.equal(false)
+					} else {
+						expect(notice.replacements, `${row.name}: normalized list`).to.deep.equal(row.replacements)
+					}
+				})
+			}
+		})
+
 		// `registerNeighbors`' `snapshotParser` is trailing and defaulted, and every production
 		// caller supplies one — so the default (`Infinity` caps: "validate the shape, truncate
 		// nothing") is reachable only from tests and was untested. Omitting it means also omitting
@@ -648,6 +792,60 @@ describe('RPC handler fault isolation', function () {
 				const reply = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
 				expect(reply.ok).to.equal(true)
 			})
+		})
+	})
+
+	// -----------------------------------------------------------------------------------------
+	// Frame-level failures abort, where body-level failures close.
+	//
+	// `registerJsonHandler` reads through `readFramed` and lets a framing throw propagate into
+	// `registerRpcHandler`'s error arm, so a frame that never yielded a body is torn down rather
+	// than closed politely. Nothing was committed on either path, so there is no reply to protect.
+	// -----------------------------------------------------------------------------------------
+	describe('frame-level failures abort', () => {
+		/** The cap `registerLeave` fixes inside itself — not a parameter of the registration. */
+		const LEAVE_MAX_BYTES = 4096
+
+		async function driveLeave(chunks: Uint8Array[]): Promise<{ served: number; s: InboundStub }> {
+			const { node, invoke } = fakeNode()
+			let served = 0
+			await registerLeave(node, () => { served++ }, P.PROTOCOL_LEAVE)
+			const s = inboundStub(chunks)
+			await invoke(P.PROTOCOL_LEAVE, s.stream, PEER_ACTUAL)
+			return { served, s }
+		}
+
+		it('aborts a truncated frame — a length prefix promising more bytes than follow', async () => {
+			const whole = json({ v: 1, from: PEER_ACTUAL, timestamp: Date.now() })
+			const truncated = whole.subarray(0, whole.byteLength - 5)
+
+			const { served, s } = await driveLeave([truncated])
+
+			// The source runs out mid-frame, `readFramed` sees `done` and raises
+			// `FrameTruncationError`. Contrast the body-level rows above, which arrive as one
+			// well-formed frame and therefore close.
+			expect({ closes: s.closes, aborts: s.aborts }, 'torn down, not closed').to.deep.equal({ closes: 0, aborts: 1 })
+			expect(s.sends, 'no reply written').to.equal(0)
+			expect(served, 'onLeave never ran').to.equal(0)
+		})
+
+		it('aborts an over-cap frame at the length prefix, without pulling the body', async () => {
+			const body = enc.encode('x'.repeat(LEAVE_MAX_BYTES * 2))
+			const frame = lp.encode.single(body).subarray()
+			const prefixLen = frame.byteLength - body.byteLength
+			// Handed over as two chunks on purpose: `lp.decode` pulls whole chunks, so one chunk
+			// carrying prefix+body would be delivered by a single pull and the counter below
+			// would pass whatever the decoder did with the body. Split at the varint boundary,
+			// "the body was never pulled" is measured rather than inferred — the same
+			// measure-do-not-infer rule `test/rpc.codec-properties.spec.ts` applies to the codec.
+			const chunks = [frame.subarray(0, prefixLen), frame.subarray(prefixLen)]
+
+			const { served, s } = await driveLeave(chunks)
+
+			expect({ closes: s.closes, aborts: s.aborts }, 'torn down, not closed').to.deep.equal({ closes: 0, aborts: 1 })
+			expect(s.pulls, 'refused in onLength — the body was never pulled').to.equal(1)
+			expect(s.sends, 'no reply written').to.equal(0)
+			expect(served, 'onLeave never ran').to.equal(0)
 		})
 	})
 
