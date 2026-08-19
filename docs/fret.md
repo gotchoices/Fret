@@ -136,7 +136,7 @@ Routing rule:
 3. TTL guards prevent loops; breadcrumbs help diagnose route quality.
 
 Cheap-guard rejections (ordering vs the rate limit):
-- **A structural validator runs immediately after the bucket and before every other guard** (`validateRouteAndMaybeAct`, `src/rpc/maybe-act.ts`): field types, finite numbers, a base64url-decodable `key` (decoded once in the handler and handed down to `routeAct`/`nearAnchorOnly`, so neither can throw on the field again), and caps on `key` / `correlation_id` / `breadcrumbs` sizes. All O(message size) — no hashing, no ring walks. A failure returns the same static reject as the other guards and increments `diag.rejected.malformed`. The position is load-bearing both ways: after the bucket so a malformed flood is metered like any other, before the remaining guards so none of them can throw on a field of the wrong type (a thrown guard used to leak the inbound stream). maybeAct-only today; `tickets/plan/15-rpc-shared-helper` generalizes it to the other wire messages.
+- **A structural validator runs immediately after the bucket and before every other guard** (`parseRouteAndMaybeAct`, `src/rpc/validate.ts`): field types, finite numbers, a base64url-decodable `key` (decoded once in the handler and handed down to `routeAct`/`nearAnchorOnly`, so neither can throw on the field again), and caps on `key` / `correlation_id` / `breadcrumbs` sizes. All O(message size) — no hashing, no ring walks. A failure returns the same static reject as the other guards and increments `diag.rejected.malformed`. The position is load-bearing both ways: after the bucket so a malformed flood is metered like any other, before the remaining guards so none of them can throw on a field of the wrong type (a thrown guard used to leak the inbound stream). It is one of the parsers in `src/rpc/validate.ts`, which gathers the wire-shape rule for **every** inbound message and reply in one module — see *Wire-shape parsers* below. maybeAct is still the only handler wired to its parser; the remaining handlers are moved onto a shared JSON handler seam by `tickets/implement/15.32-rpc-json-handler-seam`.
 - **The maybeAct token bucket is taken first, before any per-message work at all** — before the malformed-structure check above, the breadcrumb-loop check, the dedup lookup, the timestamp check, the TTL check and the payload-size check. Any other order leaves the guards themselves unmetered, so a flood of trivially-invalid messages (stale timestamp, `ttl: 0`) would never touch the bucket while still costing the receiver per-message work. A message rejected by a guard therefore spends a token exactly like a valid one; the reply on an empty bucket is the usual `Busy` + `retry_after_ms`.
 - **A guard rejection is a static, zero-computation reply**: a `NearAnchor` with empty `anchors` / `cohortHint` and `estimatedClusterSize`/`confidence` of 0. It deliberately does *not* compute real anchors, because that hashes the key and walks the ring twice — the very per-message cost the bucket exists to bound. The sender loses the routing hint it used to get on these paths and falls back to its own local cohort for the next attempt, which is the accepted price.
 - Real anchors are computed on a rejection in exactly one case: `routeAct` throwing unexpectedly. That happens *after* the token was spent and real routing was attempted, so a best-effort answer is worth its cost there.
@@ -578,7 +578,62 @@ usable next hops.
 
 All five wire messages — and every reply — travel as one length-prefixed frame per direction per stream: an unsigned-varint byte count (`it-length-prefixed`) followed by that many bytes of UTF-8 JSON, with any bytes after the frame ignored (never pulled). Every body is a JSON **object**. `decodeJson` (`src/rpc/protocols.ts`) rejects any non-object top-level value (the literal `null`, an array, a number, a string, a boolean) at the decode boundary, so no handler body ever null-checks what it decoded. It also trims NUL/tab/LF/CR/space from both ends before parsing — interop-defensive only: with framing the reader hands over exactly the counted body, so padding can only come from a sender that framed it *inside* the count (e.g. `JSON + "\n"`); a body of nothing but padding is refused rather than parsed.
 
-**The codec is lossless on everything these formats admit, with three stated exceptions.** `encodeJson` → `decodeJson` is the identity on every field below — lone surrogates included, since `JSON.stringify` has been well-formed since ES2019 and escapes an unpaired code unit rather than letting UTF-8 mangle it. What does not survive: `-0` arrives as `0` (no FRET field distinguishes the two — relevance, latency and estimates are all magnitudes); `NaN` and `±Infinity` arrive as `null` (unreachable from routing logic, which rejects a non-finite `ttl` / `want_k` / `min_sigs` / `timestamp` in `validateRouteAndMaybeAct`); and an own property whose value is `undefined` is dropped, so `undefined` can only mean *absent* on the wire and `null` is the value that round-trips. All three are pinned as contract — not endorsed — by `test/rpc.codec-properties.spec.ts`, which also proves the round trip over generated instances of all five wire types plus `SerializedTable`, and proves both halves of the coordinate codecs (`base64urlToCoord` / `hexToCoord` accept exactly a 32-byte coordinate and reject everything else).
+**The codec is lossless on everything these formats admit, with three stated exceptions.** `encodeJson` → `decodeJson` is the identity on every field below — lone surrogates included, since `JSON.stringify` has been well-formed since ES2019 and escapes an unpaired code unit rather than letting UTF-8 mangle it. What does not survive: `-0` arrives as `0` (no FRET field distinguishes the two — relevance, latency and estimates are all magnitudes); `NaN` and `±Infinity` arrive as `null` (unreachable from routing logic, which rejects a non-finite `ttl` / `want_k` / `min_sigs` / `timestamp` in `parseRouteAndMaybeAct`); and an own property whose value is `undefined` is dropped, so `undefined` can only mean *absent* on the wire and `null` is the value that round-trips. All three are pinned as contract — not endorsed — by `test/rpc.codec-properties.spec.ts`, which also proves the round trip over generated instances of all five wire types plus `SerializedTable`, and proves both halves of the coordinate codecs (`base64urlToCoord` / `hexToCoord` accept exactly a 32-byte coordinate and reject everything else).
+
+#### Wire-shape parsers
+
+Every shape rule these formats imply lives in one module, `src/rpc/validate.ts`, so a reader finds
+the rule for any inbound message in one place rather than in whichever handler happens to check it.
+
+**They are parsers, not type guards.** One signature throughout — `Parser<T> = (msg: unknown) => T |
+undefined`, where `undefined` means "reject this message" and anything else is the message *as
+normalized*. Two of the shapes must normalize while they check (truncate an over-long id list, drop
+a malformed sample entry, drop an advisory field of the wrong type), and a `msg is T` guard cannot
+express that without mutating its argument — so returning the normalized value makes narrowing and
+normalization one step, and no caller can consume an un-normalized message. Mixing the two forms
+inside one module is the drift the module exists to end, so `parseRouteAndMaybeAct` keeps the parser
+signature even though it normalizes nothing.
+
+All are pure and O(message size) — no hashing, no ring walks, no dialing — and **none throws** on
+any input, which is what makes them safe to run before the guards that used to throw on a field of
+the wrong type. `v` is deliberately unchecked on every message: nothing negotiates versions today,
+and a hard reject on an unexpected `v` would make a future v2 rollout fail closed at exactly the
+peers that have not upgraded yet.
+
+| Parser | Rejects the message when | Normalizes |
+|---|---|---|
+| `parseRouteAndMaybeAct` | any of the checks under *Cheap-guard rejections*, plus `digest` over 4096 chars | nothing |
+| `parseLeaveNotice` | `from` is not a parseable peer id, or `timestamp` is not finite | `replacements` → `sanitizeReplacements` (≤ 12, parse-checked, `undefined` when empty) |
+| `makeSnapshotParser(caps)` | `from` is not a parseable peer id, or `timestamp` is not finite | `successors` / `predecessors` truncated to `caps` then non-strings dropped; `sample` truncated then vetted per entry (id string, `coord` decodes to exactly 32 bytes, `relevance` finite) with a skip-and-log per drop; `size_estimate` / `confidence` / `metadata` dropped individually when the wrong type |
+| `parsePingResponse` | `ok` is not a boolean | projects to `{ ok, size_estimate?, confidence? }`, dropping either numeric when not finite |
+| `parseNearAnchor` | `estimated_cluster_size` or `confidence` is not finite | `anchors` ≤ 8, `cohort_hint` ≤ 16, missing → `[]` |
+| `parseMaybeActReply` | neither reply shape matches | discriminates on `commitCertificate` being a string, else parses as a NearAnchor |
+
+Three rules in that table are decisions rather than mechanics:
+
+- **Truncate, don't reject, for the snapshot's id lists.** The merge loops already `slice` to exactly
+  the caps the factory is given, so truncating at the parser changes no behavior — it only moves the
+  cost ahead of the parse-and-hash loop. Rejecting the whole message would be new behavior that
+  punishes an honest peer running a larger profile. `makeSnapshotParser` is a factory over
+  `{successors, predecessors, sample}` precisely so the parser's caps and the receiver's merge caps
+  are the same numbers supplied once, and cannot drift.
+- **Skip-and-log per `sample` entry**, which is today's merge-loop rule kept deliberately. A `coord`
+  is vetted by *decoding* it, so a wrong-width coordinate is dropped here instead of reaching the
+  store's write seam, where it throws — and a throw inside a merge loop is exactly the leak the
+  parsers exist to stop. (`importTable`'s all-or-nothing rule is the other case and is untouched: a
+  corrupt persisted table is better refused whole.)
+- **`ok` must be a boolean** on a ping reply. A legal value always encodes as one, so the
+  `Boolean(r.ok)` coercion this replaces could only ever have hidden a malformed peer.
+
+The reply caps are set so a cap can never refuse this node's own legal output: `pickAnchors` yields
+at most 2 anchors and the cohort hint is built from at most 8 ids, so 8 / 16 are 4× and 2× the
+largest lists the producers can emit.
+
+Because `encodeJson` drops an own property whose value is `undefined`, an optional field can only
+ever arrive *absent* — so a parser that demanded `null`, or rejected a missing optional, would
+refuse a message its own encoder produced. `test/rpc.codec-properties.spec.ts` pins that as a
+round-trip property over generated **legal** instances (real peer ids, real coordinates), alongside
+a never-throws property over deliberately illegal ones.
 
 #### Neighbor snapshot (JSON)
 ```

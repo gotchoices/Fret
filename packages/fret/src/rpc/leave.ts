@@ -1,5 +1,4 @@
 import type { Libp2p } from 'libp2p';
-import { peerIdFromString } from '@libp2p/peer-id';
 import {
 	PROTOCOL_LEAVE,
 	encodeJson,
@@ -9,6 +8,7 @@ import {
 	registerRpcHandler,
 } from './protocols.js';
 import { rpcRequest } from './request.js';
+import { sanitizeReplacements } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import { createLogger } from '../logger.js';
 
@@ -19,21 +19,6 @@ export interface LeaveNoticeV1 {
 	from: string;
 	replacements?: string[];
 	timestamp: number;
-}
-
-const MAX_REPLACEMENTS = 12;
-
-function sanitizeReplacements(ids: unknown): string[] | undefined {
-	// Wire JSON is untrusted: a non-array here (a number, a string) used to reach `.slice` and
-	// throw out of the handler, which leaked the inbound stream before the registration seam
-	// caught it. Treat any non-array as absent.
-	if (!Array.isArray(ids) || ids.length === 0) return undefined;
-	const valid: string[] = [];
-	for (const id of ids.slice(0, MAX_REPLACEMENTS)) {
-		if (typeof id !== 'string') continue;
-		try { peerIdFromString(id); valid.push(id); } catch { /* drop unparseable */ }
-	}
-	return valid.length > 0 ? valid : undefined;
 }
 
 export async function registerLeave(

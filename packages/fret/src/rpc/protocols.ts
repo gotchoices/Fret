@@ -148,7 +148,7 @@ export async function registerRpcHandler(
  *   - `-0` arrives as `0`. No FRET field distinguishes them (relevance, latency and estimates are
  *     all magnitudes); revisit only if a field ever needs signed zero.
  *   - `NaN` / `±Infinity` arrive as `null`. Unreachable from routing logic, which rejects a
- *     non-finite `ttl` / `want_k` / `min_sigs` / `timestamp` in `validateRouteAndMaybeAct`.
+ *     non-finite `ttl` / `want_k` / `min_sigs` / `timestamp` in `parseRouteAndMaybeAct`.
  *   - An own property whose value is `undefined` is dropped, so `undefined` can only ever mean
  *     "absent" on the wire. `null` is the value that round-trips.
  * Everything else the wire formats admit is lossless, lone surrogates included (`JSON.stringify`

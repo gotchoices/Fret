@@ -160,6 +160,22 @@ export { rpcRequest } from './rpc/request.js';
 export type { RpcRequestOptions } from './rpc/request.js';
 export type { RpcOutcome } from './rpc/outcome.js';
 export type { Stream } from '@libp2p/interface';
+// The wire-shape parsers are exported for the same reason `registerRpcHandler` / `rpcRequest` /
+// `openRpcStream` are: a consumer registering its own handler over this node otherwise re-derives
+// the shape rules by hand, and a hand-rolled copy is what drifts. They are pure functions with no
+// service state behind them. The primitives they are spelled with (peer-id parsing, bounded string
+// arrays) stay module-scoped — implementation detail, not surface.
+export {
+	parseRouteAndMaybeAct,
+	parseLeaveNotice,
+	makeSnapshotParser,
+	parsePingResponse,
+	parseNearAnchor,
+	parseMaybeActReply,
+	sanitizeReplacements,
+} from './rpc/validate.js';
+export type { Parser } from './rpc/validate.js';
+
 
 export function createFret(node: Libp2p, cfg?: Partial<FretConfig>): FretService {
 	return new FretServiceClass(node, cfg);

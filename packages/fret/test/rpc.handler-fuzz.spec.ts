@@ -5,7 +5,8 @@ import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { decodeJson, encodeJson, isFrameTruncationError, makeProtocols, readFramed, registerRpcHandler, sendFramed } from '../src/rpc/protocols.js'
-import { registerMaybeAct, validateRouteAndMaybeAct } from '../src/rpc/maybe-act.js'
+import { registerMaybeAct } from '../src/rpc/maybe-act.js'
+import { parseRouteAndMaybeAct } from '../src/rpc/validate.js'
 import { registerLeave } from '../src/rpc/leave.js'
 import { registerPing } from '../src/rpc/ping.js'
 import { registerNeighbors } from '../src/rpc/neighbors.js'
@@ -463,15 +464,15 @@ describe('RPC handler fault isolation', function () {
 		})
 	})
 
-	describe('validateRouteAndMaybeAct', () => {
+	describe('parseRouteAndMaybeAct', () => {
 		it('accepts a well-formed message, with and without the optional fields', () => {
-			expect(validateRouteAndMaybeAct(baseMsg())).to.equal(true)
-			expect(validateRouteAndMaybeAct(baseMsg({
+			expect(parseRouteAndMaybeAct(baseMsg())).to.not.equal(undefined)
+			expect(parseRouteAndMaybeAct(baseMsg({
 				wants: 2,
 				breadcrumbs: ['peer-a', 'peer-b'],
 				activity: 'YWN0',
 				digest: 'ZGln',
-			}))).to.equal(true)
+			}))).to.not.equal(undefined)
 		})
 
 		const bad: Array<{ name: string; msg: () => unknown }> = [
@@ -494,10 +495,11 @@ describe('RPC handler fault isolation', function () {
 			{ name: 'an oversized correlation_id', msg: () => baseMsg({ correlation_id: 'x'.repeat(300) }) },
 			{ name: 'a numeric activity', msg: () => baseMsg({ activity: 5 }) },
 			{ name: 'a numeric digest', msg: () => baseMsg({ digest: 5 }) },
+			{ name: 'an oversized digest', msg: () => baseMsg({ digest: 'd'.repeat(5000) }) },
 		]
 		for (const { name, msg } of bad) {
 			it(`rejects ${name}`, () => {
-				expect(validateRouteAndMaybeAct(msg())).to.equal(false)
+				expect(parseRouteAndMaybeAct(msg())).to.equal(undefined)
 			})
 		}
 
@@ -505,7 +507,7 @@ describe('RPC handler fault isolation', function () {
 		// `neighborDistance(...) < NaN` was always false, so the node silently believed it was
 		// never in-cluster for that message instead of rejecting it.
 		it('rejects the NaN-window shape rather than disabling the membership test', () => {
-			expect(validateRouteAndMaybeAct(baseMsg({ want_k: 'abc', wants: 'def' }))).to.equal(false)
+			expect(parseRouteAndMaybeAct(baseMsg({ want_k: 'abc', wants: 'def' }))).to.equal(undefined)
 		})
 	})
 

@@ -18,7 +18,8 @@ import { hashKey, hashPeerId, coordToBase64url, base64urlToCoord } from '../ring
 import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
-import { registerMaybeAct, sendMaybeAct, validateRouteAndMaybeAct } from '../rpc/maybe-act.js';
+import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
+import { parseRouteAndMaybeAct } from '../rpc/validate.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
 import type { RpcOutcome } from '../rpc/outcome.js';
@@ -350,7 +351,7 @@ export class FretService implements IFretService, Startable {
 			ttlExpired: 0,
 			rateLimited: 0,
 			identityMismatch: 0,
-			/** Inbound maybeAct messages that failed `validateRouteAndMaybeAct` (structure/type). */
+			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
 			malformed: 0,
 		},
 	};
@@ -1149,7 +1150,7 @@ export class FretService implements IFretService, Startable {
 		// too, never an unmetered pre-filter) and before every guard below — each of which reads
 		// fields the validator vouches for (`breadcrumbs?.includes` on a number was a throw that
 		// leaked the inbound stream). O(message size): no hashing, no ring walks.
-		if (!validateRouteAndMaybeAct(msg)) { this.diag.rejected.malformed++; return this.staticReject(); }
+		if (!parseRouteAndMaybeAct(msg)) { this.diag.rejected.malformed++; return this.staticReject(); }
 		// The one decode of `key`. Handed down to `routeAct` / `nearAnchorOnly` so neither can
 		// throw on the field the validator just vetted — the double-throw that used to make the
 		// fallback as fragile as the path it backstopped.
@@ -1595,7 +1596,7 @@ export class FretService implements IFretService, Startable {
 	 * advance notice makes affordable.
 	 *
 	 * The list is already bounded at 12 and parse-checked by `sanitizeReplacements`
-	 * (`src/rpc/leave.ts`), which is what bounds the local hash + upsert work below.
+	 * (`src/rpc/validate.ts`), which is what bounds the local hash + upsert work below.
 	 */
 	private async recordLeaveReplacements(replacements: string[] | undefined, departedId: string): Promise<void> {
 		if (!replacements || replacements.length === 0) return;

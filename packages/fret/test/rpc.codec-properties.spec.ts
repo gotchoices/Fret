@@ -438,7 +438,7 @@ describe('RPC codec properties', function () {
 
 		// NOTE (contract, not a defect to fix here): `NaN` and `±Infinity` serialise as `null`.
 		// Every consumer of these fields already guards with `Number.isFinite` — the maybeAct
-		// validator (`validateRouteAndMaybeAct`) rejects a non-finite `ttl` / `want_k` /
+		// validator (`parseRouteAndMaybeAct`) rejects a non-finite `ttl` / `want_k` /
 		// `min_sigs` / `timestamp` outright — so the lossy encoding cannot reach routing logic.
 		it('turns a non-finite number into null', async () => {
 			const back = await decodeJson<Record<string, unknown>>(
