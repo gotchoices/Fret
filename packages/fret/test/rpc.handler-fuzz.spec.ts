@@ -4,7 +4,7 @@ import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { decodeJson, isFrameTruncationError, makeProtocols, readFramed, registerRpcHandler } from '../src/rpc/protocols.js'
+import { decodeJson, encodeJson, isFrameTruncationError, makeProtocols, readFramed, registerRpcHandler, sendFramed } from '../src/rpc/protocols.js'
 import { registerMaybeAct, validateRouteAndMaybeAct } from '../src/rpc/maybe-act.js'
 import { registerLeave } from '../src/rpc/leave.js'
 import { registerPing } from '../src/rpc/ping.js'
@@ -213,15 +213,15 @@ describe('RPC handler fault isolation', function () {
 	})
 
 	describe('registerRpcHandler release accounting', () => {
-		it('does not re-release a stream the handler already closed', async () => {
+		it('closes a completed ping reply exactly once, from the seam', async () => {
 			const { node, invoke } = fakeNode()
 			await registerPing(node, P.PROTOCOL_PING)
 			const s = inboundStub([])
 
 			await invoke(P.PROTOCOL_PING, s.stream, 'peer-a')
 
-			// One close from the handler's own success path, and the wrapper leaves it alone: a
-			// completed reply is never turned into an abort.
+			// The close comes from the seam — no FRET handler body closes for itself — and it is
+			// the only release: a completed reply is never turned into an abort.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 			const pong = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
 			expect(pong.ok).to.equal(true)
@@ -264,35 +264,46 @@ describe('RPC handler fault isolation', function () {
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 
-		it('bounds a success-path close against a remote that stops reading, releasing via abort', async () => {
+		it('bounds a real handler\'s success-path close against a remote that stops reading, releasing via abort', async () => {
 			const { node, invoke } = fakeNode()
-			// The budget is injected only so the case does not spend the 5s default; production
-			// has no override.
-			await registerRpcHandler(node, '/test/stalled-reader', async () => { /* replied, no release */ }, { closeBudgetMs: 100 })
+			// `registerPing`'s handler body, verbatim, with its two optional collaborators absent:
+			// reply and return, no close of its own. Registered directly rather than through
+			// `registerPing` because the budget must be injected (so the case does not spend the
+			// 5s production default) and `registerPing` takes no handler opts — threading a
+			// `closeBudgetMs` through the `register*` helpers would change production signatures
+			// to serve a test. What is under test is the *seam* against a real body's shape.
+			await registerRpcHandler(node, '/test/stalled-reader', async (stream) => {
+				sendFramed(stream, await encodeJson({ ok: true, ts: Date.now() }))
+			}, { closeBudgetMs: 100 })
 			const s = inboundStub([], { closeHangs: true })
 
 			const t0 = Date.now()
 			await invoke('/test/stalled-reader', s.stream, 'peer-a') // must settle, not hang
 			const elapsed = Date.now() - t0
 
-			// The close was attempted and never completed; the budget expiry then rejects it into
-			// the catch arm, where `writeStatus === 'closing'` (not 'closed') leaves the abort
-			// eligible — so the stream slot is reclaimed rather than held forever.
+			// The reply was written, then the close was attempted and never completed; the budget
+			// expiry rejects it into the catch arm, where `writeStatus === 'closing'` (not
+			// 'closed') leaves the abort eligible — so the stream slot is reclaimed rather than
+			// held forever, at the cost of the undelivered reply the remote was not reading.
+			expect(s.sends, 'reply written').to.equal(1)
 			expect(s.closeAttempts, 'close attempted').to.equal(1)
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 0, aborts: 1 })
 			expect(s.status(), 'released').to.equal('aborted')
 			expect(elapsed, `elapsed ${elapsed}ms must be bounded by the injected budget`).to.be.at.most(3000)
 		})
 
-		it('does not spend the close budget on a stream the handler already closed', async () => {
+		it('lets an external seam consumer close for itself without a second release', async () => {
 			const { node, invoke } = fakeNode()
 			await registerRpcHandler(node, '/test/handler-closed', async (stream) => { await stream.close() }, { closeBudgetMs: 100 })
 			const s = inboundStub([])
 
 			await invoke('/test/handler-closed', s.stream, 'peer-a')
 
-			// `close()` early-returns once the write end is closed, so the budgeted close is a
-			// no-op — the bound never turns a committed reply into a second release.
+			// No FRET handler is this shape any more — the seam closes for all five — but
+			// `registerRpcHandler` is exported from the package root, so a consumer wrapping its
+			// own protocol may still close in its body. `close()` early-returns once the write end
+			// is closed, so the budgeted close is a no-op and the committed reply is never turned
+			// into a second release.
 			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 		})
 

@@ -316,6 +316,9 @@ function remoteFinishedWriting(stream: unknown): boolean {
  *
  * @throws {FrameTruncationError} when the source ends before a whole framed message arrived —
  * including a clean close right after the prefix, which the decoder completes silently on.
+ * @throws at entry if `timeoutMs` is not a positive number or `Infinity` — `NaN`, `0` and
+ * negatives all reach the loop as a hot spin or an instant expiry rather than a budget, and this
+ * is an exported entry point a consumer can compute a timeout for.
  * @throws if the deadline expires, `opts.signal` aborts, or the declared length exceeds
  * `maxBytes` — a partial read is an error, never a short-but-valid result. An empty frame
  * (prefix `0x00`) is *not* an error here: it returns an empty buffer, and `decodeJson`'s own
@@ -330,6 +333,13 @@ export async function readFramed(
 	const signal = opts.signal;
 	if (timeoutMs === Infinity && signal == null) {
 		throw new Error('readFramed: timeoutMs of Infinity requires opts.signal — an unbounded read never ends');
+	}
+	// `!(x > 0)` rather than `x <= 0`, so it also catches NaN — which is the worst of the three:
+	// `Math.min(NaN, EOF_POLL_MS)` is NaN, `setTimeout` clamps that to zero, and the poll loop
+	// spins one iteration per event-loop turn for as long as the stream stays open. Infinity
+	// passes, which is the mode documented above.
+	if (!(timeoutMs > 0)) {
+		throw new Error(`readFramed: timeoutMs must be a positive number or Infinity, got ${timeoutMs}`);
 	}
 	if (signal?.aborted === true) throw abortReasonError(signal);
 
@@ -509,6 +519,11 @@ export async function openRpcStream(
  * All arms are best-effort: this runs from a `finally` on an already-failing path, where a
  * second throw would mask the real error.
  */
+// NOTE: the release-before-cancel ordering above is a prose rule, not an enforced one — a sender
+// that calls `d.cancel()` first still compiles, still passes, and silently loses the bound on the
+// close (the signal handed here can no longer fire). All five senders get it right today; if a
+// sixth is added, or one is reordered, consider taking the `Deadline` itself here so the cancel
+// cannot precede the release.
 export async function releaseRpcStream(stream: Stream | undefined, signal: AbortSignal): Promise<void> {
 	if (stream == null) return;
 	if (signal.aborted) {
