@@ -755,6 +755,117 @@ describe('RPC handler fault isolation', function () {
 			}
 		})
 
+		// -------------------------------------------------------------------------------------
+		// Announce snapshot, one row per field per way of being wrong. Mirrors the leave field
+		// matrix above: `from` and `timestamp` are load-bearing (identity check, freshness),
+		// so a wrong value **rejects** the whole snapshot. `successors` / `predecessors` are
+		// `boundedStringArray(value, cap)` — any non-array (including missing) normalizes to
+		// `[]`, entries are truncated to `cap` *then* filtered to strings, in that order.
+		// `sample` and the advisory numerics are the sibling ticket's rows, appended to this
+		// same table without restructuring it.
+		// -------------------------------------------------------------------------------------
+		describe('announce snapshot field matrix', () => {
+			interface FieldRow {
+				name: string
+				body: () => Record<string, unknown>
+				/** `reject` — the whole snapshot drops. `normalize` — served, field neutralized. */
+				expect: 'reject' | 'normalize'
+				/** For `normalize` rows: assert what reached `onAnnounce` beyond the defaults. */
+				expectSnapshot?: (snap: NeighborSnapshotV1) => void
+			}
+
+			/** `snapshot()` already sets successors/predecessors/sig, so "missing" needs a delete. */
+			function withoutField(field: string): Record<string, unknown> {
+				const m = snapshot()
+				delete m[field]
+				return m
+			}
+
+			/** The cap `registerAnnounceWithHooks` supplies to `makeSnapshotParser`. */
+			const SUCC_PRED_CAP = 16
+
+			function succPredRows(field: 'successors' | 'predecessors'): FieldRow[] {
+				const overCap = Array.from({ length: 20 }, (_, i) => `${field}-${i}`)
+				// cap non-strings, then one valid string past the slice — must vanish entirely.
+				const truncateThenFilter = [
+					...Array.from({ length: SUCC_PRED_CAP }, () => 7 as unknown as string),
+					'past-the-slice',
+				]
+				const expectEmpty = (s: NeighborSnapshotV1): void => {
+					expect(s[field], `${field}: normalizes to []`).to.deep.equal([])
+				}
+				return [
+					{ name: `${field}: non-array (number)`, body: () => snapshot({ [field]: 5 }), expect: 'normalize', expectSnapshot: expectEmpty },
+					{ name: `${field}: non-array (string)`, body: () => snapshot({ [field]: 'nope' }), expect: 'normalize', expectSnapshot: expectEmpty },
+					{ name: `${field}: non-array (object)`, body: () => snapshot({ [field]: { 0: 'a' } }), expect: 'normalize', expectSnapshot: expectEmpty },
+					{ name: `${field}: non-array (null)`, body: () => snapshot({ [field]: null }), expect: 'normalize', expectSnapshot: expectEmpty },
+					{ name: `${field}: missing`, body: () => withoutField(field), expect: 'normalize', expectSnapshot: expectEmpty },
+					{ name: `${field}: array of non-strings`, body: () => snapshot({ [field]: [1, 2, 3] }), expect: 'normalize', expectSnapshot: expectEmpty },
+					{
+						name: `${field}: over the ${SUCC_PRED_CAP} cap`,
+						body: () => snapshot({ [field]: overCap }),
+						expect: 'normalize',
+						expectSnapshot: (s) => expect(s[field]).to.deep.equal(overCap.slice(0, SUCC_PRED_CAP)),
+					},
+					{
+						name: `${field}: mixed valid and invalid entries`,
+						body: () => snapshot({ [field]: ['a', 5, 'b', null, 'c'] }),
+						expect: 'normalize',
+						expectSnapshot: (s) => expect(s[field]).to.deep.equal(['a', 'b', 'c']),
+					},
+					{
+						// Pins truncate-then-filter order: filter-then-slice would keep 'past-the-slice'.
+						name: `${field}: truncate-then-filter order (valid entry past the slice)`,
+						body: () => snapshot({ [field]: truncateThenFilter }),
+						expect: 'normalize',
+						expectSnapshot: expectEmpty,
+					},
+				]
+			}
+
+			const rows: FieldRow[] = [
+				{ name: 'from: unparseable string', body: () => snapshot({ from: 'not-a-parseable-peer-id' }), expect: 'reject' },
+				{ name: 'from: empty string', body: () => snapshot({ from: '' }), expect: 'reject' },
+				{ name: 'from: wrong type (number)', body: () => snapshot({ from: 5 }), expect: 'reject' },
+				{ name: 'from: wrong type (array)', body: () => snapshot({ from: [PEER_ACTUAL] }), expect: 'reject' },
+				{ name: 'from: wrong type (object)', body: () => snapshot({ from: { id: PEER_ACTUAL } }), expect: 'reject' },
+				{ name: 'from: null', body: () => snapshot({ from: null }), expect: 'reject' },
+				{ name: 'from: missing', body: () => withoutField('from'), expect: 'reject' },
+
+				{ name: 'timestamp: numeric string', body: () => snapshot({ timestamp: '5' }), expect: 'reject' },
+				{ name: 'timestamp: non-numeric string', body: () => snapshot({ timestamp: 'now' }), expect: 'reject' },
+				{ name: 'timestamp: wrong type (boolean)', body: () => snapshot({ timestamp: true }), expect: 'reject' },
+				{ name: 'timestamp: null', body: () => snapshot({ timestamp: null }), expect: 'reject' },
+				{ name: 'timestamp: missing', body: () => withoutField('timestamp'), expect: 'reject' },
+
+				...succPredRows('successors'),
+				...succPredRows('predecessors'),
+			]
+
+			for (const row of rows) {
+				it(`${row.expect}s — ${row.name}`, async () => {
+					const { h, s } = await driveWith(P.PROTOCOL_NEIGHBORS_ANNOUNCE, registerAnnounceWithHooks, [json(row.body())])
+
+					if (row.expect === 'reject') {
+						expectDropped(h, s, row.name)
+						expect(h.reasons, `${row.name}: the parser arm, not the decoder's`).to.deep.equal(['parse'])
+						expect(h.mismatches, `${row.name}: the parser runs before serve`).to.equal(0)
+						return
+					}
+
+					expect({ closes: s.closes, aborts: s.aborts }, `${row.name}: closed, never aborted`).to.deep.equal({ closes: 1, aborts: 0 })
+					expect(h.reasons, `${row.name}: nothing malformed about a normalized field`).to.deep.equal([])
+					expect(h.served, `${row.name}: onAnnounce ran`).to.equal(1)
+					const reply = await decodeFramed<{ ok: boolean }>(s.replies[0]!)
+					expect(reply.ok, `${row.name}: answered ok`).to.equal(true)
+
+					const snap = h.lastAnnounce!
+					expect(snap.from, `${row.name}: from untouched`).to.equal(PEER_ACTUAL)
+					row.expectSnapshot?.(snap)
+				})
+			}
+		})
+
 		// `registerNeighbors`' `snapshotParser` is trailing and defaulted, and every production
 		// caller supplies one — so the default (`Infinity` caps: "validate the shape, truncate
 		// nothing") is reachable only from tests and was untested. Omitting it means also omitting
