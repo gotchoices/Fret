@@ -262,4 +262,59 @@ describe('Churn scenario simulations', function () {
 			)
 		}
 	})
+
+	it('continuous churn keeps the population stationary', () => {
+		const config = {
+			seed: 6006,
+			n: 40,
+			k: 15,
+			m: 8,
+			churnRatePerSec: 2,
+			stabilizationIntervalMs: 500,
+			durationMs: 10000,
+		}
+		const sim = new FretSimulation(config)
+		const metrics = sim.run()
+
+		// Each churn event is a paired leave + join, so joins = n + churnEvents and
+		// leaves = churnEvents. The population therefore never drifts from n. Before
+		// pairing landed, this run lost one peer per event and ended at 20 alive.
+		const churnEvents = Math.floor(config.durationMs / Math.floor(1000 / config.churnRatePerSec)) - 1
+		console.log('  Joins:', metrics.totalJoins, 'leaves:', metrics.totalLeaves, 'alive:', sim.aliveCount())
+
+		if (metrics.totalLeaves !== churnEvents) {
+			throw new Error(`Expected ${churnEvents} leaves, got ${metrics.totalLeaves}`)
+		}
+		if (metrics.totalJoins !== config.n + churnEvents) {
+			throw new Error(`Expected ${config.n + churnEvents} joins, got ${metrics.totalJoins}`)
+		}
+		if (sim.aliveCount() !== config.n) {
+			throw new Error(`Expected ${config.n} alive at end, got ${sim.aliveCount()}`)
+		}
+	})
+
+	it('churn replays identically across runs at one seed', () => {
+		// Churn now draws its leaver at fire time rather than at setup, so the RNG is
+		// consumed interleaved with every other event. Lazy scheduling is precisely what
+		// could introduce order-dependence, so pin byte-identical metrics across two runs.
+		const config = {
+			seed: 7007,
+			n: 30,
+			k: 15,
+			m: 8,
+			churnRatePerSec: 3,
+			stabilizationIntervalMs: 500,
+			durationMs: 8000,
+		}
+
+		const first = new FretSimulation(config).run()
+		const second = new FretSimulation(config).run()
+
+		if (JSON.stringify(first) !== JSON.stringify(second)) {
+			throw new Error('Churn run is not deterministic across two runs at the same seed')
+		}
+		if (first.totalLeaves === 0) {
+			throw new Error('Expected churn to produce leaves; the case would pass vacuously')
+		}
+	})
 })

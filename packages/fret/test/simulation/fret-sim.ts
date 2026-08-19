@@ -55,7 +55,14 @@ export interface SimConfig {
 	n: number // initial peers
 	k: number // cluster size
 	m: number // neighbors (S/P set size)
-	churnRatePerSec: number // peers leaving/joining per second
+	/**
+	 * Churn events per second. Each event is a *paired* departure and arrival: one peer
+	 * picked from the currently-alive population leaves, and one fresh peer joins, so the
+	 * population stays stationary — matching this field's "peers leaving/joining per second"
+	 * meaning. Leave-only churn made every threshold measured at a non-zero rate a
+	 * measurement of population collapse rather than of behavior under churn.
+	 */
+	churnRatePerSec: number
 	stabilizationIntervalMs: number
 	durationMs: number
 	messageBus?: MessageBusConfig
@@ -283,16 +290,27 @@ export class FretSimulation {
 		}
 	}
 
+	/**
+	 * Schedule the churn cadence only. Which peer leaves is decided at fire time by
+	 * handleChurn, not here: picking up front drew every leaver from the *initial*
+	 * population, so a late joiner could never churn and a peer drawn twice produced a
+	 * second no-op leave.
+	 */
 	private scheduleChurn(): void {
 		const intervalMs = Math.floor(1000 / this.config.churnRatePerSec)
 		for (let t = intervalMs; t < this.config.durationMs; t += intervalMs) {
-			const alive = Array.from(this.peers.values()).filter((p) => p.alive)
-			if (alive.length === 0) continue
-			const leaving = this.rng.pick(alive)
-			if (leaving) {
-				this.scheduler.schedule({ type: 'leave', peerId: leaving.id }, t)
-			}
+			this.scheduler.schedule({ type: 'churn' }, t)
 		}
+	}
+
+	/** One churn event: the currently-alive population loses one peer and gains one. */
+	private handleChurn(): void {
+		const alive = Array.from(this.peers.values()).filter((p) => p.alive)
+		const leaving = this.rng.pick(alive)
+		if (leaving) {
+			this.handleLeave(leaving.id)
+		}
+		this.handleJoin()
 	}
 
 	scheduleBatchLeave(count: number, atMs: number): string[] {
@@ -342,6 +360,9 @@ export class FretSimulation {
 				break
 			case 'join':
 				this.handleJoin()
+				break
+			case 'churn':
+				this.handleChurn()
 				break
 			case 'stabilize':
 				this.handleStabilize()

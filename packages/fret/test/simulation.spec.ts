@@ -3,7 +3,14 @@ import { FretSimulation } from './simulation/fret-sim.js'
 import type { SimMetrics } from './simulation/sim-metrics.js'
 
 describe('FRET simulation tests', function () {
-	this.timeout(60000)
+	// NOTE: the N=100 case dominates this budget. Churn pairs each departure with an
+	// arrival, so its population now holds at 100 for the whole 10s run instead of
+	// collapsing toward 50, roughly doubling the per-tick stabilization work; the run
+	// crossed the previous 60s ceiling under full-suite CPU contention (27s measured in
+	// isolation). If this suite's wall time becomes a problem,
+	// shorten that case's durationMs rather than lowering churnRatePerSec — the rate is
+	// what the case is measuring.
+	this.timeout(180000)
 
 	it('converges with N=5, no churn', () => {
 		const sim = new FretSimulation({
@@ -48,7 +55,9 @@ describe('FRET simulation tests', function () {
 			durationMs: 10000,
 		})
 		const metrics = sim.run()
-		if (metrics.totalJoins !== 25) throw new Error(`Expected 25 joins, got ${metrics.totalJoins}`)
+		// Churn is on, so each churn event pairs a departure with a fresh arrival:
+		// totalJoins exceeds n by the number of churn events. Only the floor is pinned.
+		if (metrics.totalJoins < 25) throw new Error(`Expected ≥ 25 joins, got ${metrics.totalJoins}`)
 		if (metrics.avgNeighborCount === 0) throw new Error('No neighbors found')
 		console.log('  N=25 metrics:', metrics)
 	})
@@ -64,7 +73,9 @@ describe('FRET simulation tests', function () {
 			durationMs: 10000,
 		})
 		const metrics = sim.run()
-		if (metrics.totalJoins !== 100) throw new Error(`Expected 100 joins, got ${metrics.totalJoins}`)
+		// Churn pairs each departure with an arrival (see churnRatePerSec), so totalJoins
+		// exceeds n once churn is on; the initial population is the floor.
+		if (metrics.totalJoins < 100) throw new Error(`Expected ≥ 100 joins, got ${metrics.totalJoins}`)
 		console.log('  N=100 metrics:', metrics)
 	})
 })
