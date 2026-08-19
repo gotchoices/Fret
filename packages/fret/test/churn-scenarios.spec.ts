@@ -6,7 +6,7 @@ describe('Churn scenario simulations', function () {
 
 	it('batched leave: 30% simultaneous departure recovers coverage', () => {
 		const sim = new FretSimulation({
-			seed: 8008,
+			seed: 1001,
 			n: 50,
 			k: 15,
 			m: 8,
@@ -51,7 +51,7 @@ describe('Churn scenario simulations', function () {
 
 	it('batched join: burst of new peers stabilizes without orphans', () => {
 		const sim = new FretSimulation({
-			seed: 8008,
+			seed: 2002,
 			n: 20,
 			k: 15,
 			m: 8,
@@ -102,7 +102,7 @@ describe('Churn scenario simulations', function () {
 
 	it('mixed churn: continuous join/leave maintains coverage above threshold', () => {
 		const sim = new FretSimulation({
-			seed: 8008,
+			seed: 3003,
 			n: 40,
 			k: 15,
 			m: 8,
@@ -164,7 +164,7 @@ describe('Churn scenario simulations', function () {
 
 	it('proactive announcements: dead neighbors pruned after stabilization', () => {
 		const sim = new FretSimulation({
-			seed: 8008,
+			seed: 4004,
 			n: 30,
 			k: 15,
 			m: 8,
@@ -202,7 +202,7 @@ describe('Churn scenario simulations', function () {
 
 	it('routing under churn: lookups succeed during active churn', () => {
 		const sim = new FretSimulation({
-			seed: 8008,
+			seed: 5005,
 			n: 50,
 			k: 15,
 			m: 8,
@@ -265,7 +265,7 @@ describe('Churn scenario simulations', function () {
 
 	it('continuous churn keeps the population stationary', () => {
 		const config = {
-			seed: 8008,
+			seed: 6006,
 			n: 40,
 			k: 15,
 			m: 8,
@@ -302,7 +302,7 @@ describe('Churn scenario simulations', function () {
 		// consumed interleaved with every other event. Lazy scheduling is precisely what
 		// could introduce order-dependence, so pin byte-identical metrics across two runs.
 		const config = {
-			seed: 8008,
+			seed: 7007,
 			n: 30,
 			k: 15,
 			m: 8,
