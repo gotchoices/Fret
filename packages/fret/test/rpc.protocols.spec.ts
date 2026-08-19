@@ -479,8 +479,9 @@ describe('RPC deadlines', () => {
 
 		const out = await readFramed(source, 1024, Infinity, { signal: new AbortController().signal })
 
-		// The read loop needs no `Infinity` special-casing: `remaining` is never `<= 0` and the
-		// poll interval still comes out at EOF_POLL_MS, so the ordinary path is untouched.
+		// The read loop needs no `Infinity` special-casing: with no independent clock, the read is
+		// bounded by `opts.signal` alone, and the iterable/stream path below runs exactly as it
+		// would under any other budget.
 		expect(new TextDecoder().decode(out), 'frame body').to.equal('{"ok":true}')
 	})
 
@@ -513,10 +514,10 @@ describe('RPC deadlines', () => {
 			}),
 		}
 
-		// `NaN` was the worst of these: `Math.min(NaN, EOF_POLL_MS)` is `NaN`, `setTimeout` clamps
-		// that to zero, and the poll loop spun once per event-loop turn for as long as the stream
-		// stayed open. `0` and negatives fired `remaining <= 0` at once. All three are now refused
-		// at entry, and the guard is written `!(timeoutMs > 0)` so `NaN` is caught alongside them.
+		// `NaN` was historically the worst of these: fed into a timer computation it clamps to zero
+		// and can spin. `0` and negatives were likewise degenerate budgets. All three are now
+		// refused at entry, and the guard is written `!(timeoutMs > 0)` so `NaN` is caught alongside
+		// them.
 		for (const bad of [Number.NaN, 0, -1]) {
 			let thrown: unknown
 			try {

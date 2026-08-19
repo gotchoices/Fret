@@ -68,7 +68,7 @@ Bootstrap peer ID extraction now uses proper `@multiformats/multiaddr` parsing i
 - **Payload bounds & TTL validation** (`test/payload-bounds-ttl.spec.ts`)
   - `validateTimestamp`: accepts within ±30 s (default equals the dedup TTL), rejects outside, supports custom drift
   - `handleMaybeAct` rejects a 60 s-stale message — the regression guard for the window tightening (±5 min accepted it)
-  - `readFramed`: reads a framed message within limit; rejects an over-declared frame at the prefix (single- and multi-chunk); reads across >100 ms chunk gaps; overall-deadline timeout never returns a partial frame; `FrameTruncationError` on close-without-frame — whether the iterator reports EOF or the 20 ms `EOF_POLL_MS` end-of-stream poll catches a close whose event libp2p lost; zero-length frame → empty buffer
+  - `readFramed`: reads a framed message within limit; rejects an over-declared frame at the prefix (single- and multi-chunk); reads across >100 ms chunk gaps; overall-deadline timeout never returns a partial frame; truncation on close-without-frame — a real libp2p stream raises `UnexpectedEOFError` from the stream's own EOF state (no polling), a plain async iterable raises `FrameTruncationError` on iterator EOF; zero-length frame → empty buffer
   - Oversized maybeAct payload at RPC layer rejected without crash
   - Stale/future timestamp rejection with diagnostic counters
   - TTL ≤ 0 rejection with diagnostic counter
