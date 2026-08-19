@@ -652,7 +652,7 @@ rather than a compile error for a consumer too.
 |---|---|
 | `sendPing` | `parsePingResponse` — this *is* the removed `Boolean(r.ok)` coercion's replacement |
 | `sendMaybeAct` | `parseMaybeActReply` |
-| `fetchNeighbors` | a snapshot parser **supplied by the caller** on the options bag (`opts.parse`), because only the caller knows its profile's merge caps. `FretService` passes `makeSnapshotParser(this.mergeSnapshotCaps())` — the same numbers the merge loop slices to, supplied once, so the parser truncates ahead of the parse-and-hash loop instead of after it. It carries the same `Infinity`-caps default `registerNeighbors`' `snapshotParser` does ("validate the shape, truncate nothing"), reachable only from tests |
+| `fetchNeighbors` | a snapshot parser **supplied by the caller** on the options bag (`opts.parse`), because only the caller knows its profile's merge caps. `FretService` passes `makeSnapshotParser(this.mergeSnapshotCaps())` — the same one method the announce path's `snapshotParser` takes its numbers from, so the parser truncates ahead of the parse-and-hash loop and the loop itself never slices. It carries the same `Infinity`-caps default `registerNeighbors`' `snapshotParser` does ("validate the shape, truncate nothing"), reachable only from tests |
 | `announceNeighbors`, `sendLeave` | write-only — no `decode`, so no parser |
 
 A rejection is therefore `decode-error`, which is proof of life and never a contact strike
