@@ -76,13 +76,13 @@ function boundedStringArray(value: unknown, cap: number): string[] {
 // ---------------------------------------------------------------------------------------------
 
 /** Encoded `key` cap — generous against real content keys (≤ 64 raw bytes today). */
-const MAX_KEY_CHARS = 1024;
+export const MAX_KEY_CHARS = 1024;
 /** Minted ids are `selfId|timestamp|uuid` ≈ 100 chars; the cap bounds the dedup-cache key. */
-const MAX_CORRELATION_ID_CHARS = 256;
+export const MAX_CORRELATION_ID_CHARS = 256;
 /** Breadcrumbs grow one per hop and TTL bounds hops; 64 is far past any real route. */
-const MAX_BREADCRUMBS = 64;
+export const MAX_BREADCRUMBS = 64;
 /** `digest` is a lightweight summary, not a payload — `activity` is where bulk belongs. */
-const MAX_DIGEST_CHARS = 4096;
+export const MAX_DIGEST_CHARS = 4096;
 
 /** `handleMaybeAct`'s own activity-size refusal — the wire cap for maybeAct is derived from this
  *  plus {@link MAYBE_ACT_OVERHEAD_BYTES}, so the two numbers can no longer disagree. Unchanged,
@@ -133,7 +133,7 @@ export const parseRouteAndMaybeAct: Parser<RouteAndMaybeActV1> = (msg) => {
 // LeaveNotice
 // ---------------------------------------------------------------------------------------------
 
-const MAX_REPLACEMENTS = 12;
+export const MAX_REPLACEMENTS = 12;
 
 /**
  * The suggested-replacement list of a leave notice, bounded and parse-checked.
