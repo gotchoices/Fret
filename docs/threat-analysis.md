@@ -189,7 +189,7 @@ Additionally, `mergeAnnounceSnapshot` does not apply the profile-bounded caps (c
 
 - **Preconditions**: Connection to target.
 - **Impact**: CPU/memory pressure from hash computations (each peer ID = SHA-256 + relevance scoring with KDE). Outbound announcement amplification (discovered peers trigger `announceToNewPeers`, each cascading to `announceFanout` peers). At sustained rate, can overwhelm the event loop, especially on Edge devices.
-- **Current mitigations**: `readAllBounded` limits payload to 128KB. `enforceCapacity` bounds store. `bucketAnnounce` limits outbound cascade. But the inbound announce path itself is completely unrated.
+- **Current mitigations**: `readFramed` refuses an over-declared frame at the length prefix, before any body byte is pulled (neighbors cap 128 KB Core / 64 KB Edge). `enforceCapacity` bounds store. `bucketAnnounce` limits outbound cascade. But the inbound announce path itself is completely unrated.
 - **Missing**: Rate limit on inbound announce processing. Array length caps matching `mergeNeighborSnapshots`.
 
 #### 3.5 JSON Parsing Attacks
@@ -203,7 +203,7 @@ Additionally, `mergeAnnounceSnapshot` does not apply the profile-bounded caps (c
 
 - **Preconditions**: Ability to send messages.
 - **Impact**: Potential prototype pollution via metadata. Parsing-related memory spikes.
-- **Current mitigations**: `readAllBounded` limits total bytes. `maxBytes` per protocol.
+- **Current mitigations**: `readFramed` refuses a frame whose declared length exceeds the per-protocol `maxBytes`, at the prefix.
 
 #### 3.6 Dedup Cache Poisoning
 **Severity: Medium**
@@ -221,7 +221,7 @@ The dedup cache (`DedupCache`) has max 1024 entries. An attacker can pre-fill th
 #### 3.7 Stream Resource Exhaustion
 **Severity: Medium**
 
-`readAllBounded` (`protocols.ts:42-84`) reads from a stream with a 5-second timeout and 100ms idle timeout after first data. An attacker can:
+`readAllBounded` — the pre-framing reader, since replaced by `readFramed` — read from a stream with a 5-second timeout and a 100ms idle timeout after first data. An attacker can:
 
 1. **Slow-read attack**: Send data very slowly (one byte at a time, each within the 100ms idle window), tying up the handler for up to 5 seconds per connection.
 2. **Half-open streams**: Open streams but never send data, consuming the 5-second timeout before the handler can proceed.
@@ -230,8 +230,8 @@ With multiple connections, this ties up handler threads and exhausts the in-flig
 
 - **Preconditions**: Multiple connections to target.
 - **Impact**: Handler exhaustion, effective DoS.
-- **Current mitigations**: 5-second absolute timeout. `readAllBounded` byte limit. In-flight concurrency cap on maybeAct (16 core). libp2p connection limits.
-- **Status — partly overtaken**: the 100ms idle timeout described above no longer exists. `readAllBounded` is bounded by one overall deadline (`RPC_TIMEOUT_MS`, 5s) and ends a read on iterator EOF or on the stream reporting the remote finished writing. That kills the trickle variant — pacing bytes to stay inside an idle window buys the attacker nothing, because there is no window to stay inside — but leaves the hold itself: a stalled inbound stream still occupies a handler for the full 5s, bounded by the per-profile inbound stream caps. The `NOTE:` on `readAllBounded` records the intended fix if slow-loris pressure ever shows up (a shorter read deadline for inbound handlers specifically) and rules out reintroducing an idle timer, which truncated healthy transfers and failure-scored honest senders.
+- **Current mitigations**: 5-second absolute timeout. `readFramed`'s declared-length refusal at the prefix. In-flight concurrency cap on maybeAct (16 core). libp2p connection limits.
+- **Status — partly overtaken**: the 100ms idle timeout described above no longer exists, and `readAllBounded` itself has been replaced by `readFramed`. Every message is now one length-prefixed frame, so end-of-*message* is carried in the prefix and the reader never waits on end-of-stream to know a message is complete; the read is bounded by one overall deadline (`RPC_TIMEOUT_MS`, 5s), and a stream that ends before the declared body arrives raises `FrameTruncationError` rather than yielding a partial message (recognised either from iterator EOF or from the 20ms end-of-stream poll, which exists only to spot a close whose event libp2p lost). That kills the trickle variant — pacing bytes to stay inside an idle window buys the attacker nothing, because there is no window to stay inside — but leaves the hold itself: a stalled inbound stream still occupies a handler for the full 5s, bounded by the per-profile inbound stream caps. The `NOTE:` on `readFramed` records the intended fix if slow-loris pressure ever shows up (a shorter read deadline for inbound handlers specifically) and rules out reintroducing an idle timer, which truncated healthy transfers and failure-scored honest senders.
 
 ---
 
@@ -288,7 +288,7 @@ Every peer ID received in a snapshot must be hashed: `hashPeerId(peerIdFromStrin
 
 - **Preconditions**: One connection, crafted announcements.
 - **Impact**: CPU-bound processing delays stabilization and routing. Event loop blocking if SHA-256 is synchronous (it's async via multiformats but still CPU-intensive).
-- **Current mitigations**: Profile-bounded caps on processed entries (capSucc/capPred/capSample). `readAllBounded` payload limit.
+- **Current mitigations**: Profile-bounded caps on processed entries (capSucc/capPred/capSample). `readFramed`'s declared-length refusal at the prefix.
 
 #### 4.5 Stabilization Amplification
 **Severity: Medium**
@@ -663,12 +663,12 @@ While these functions have try/catch internally, any uncaught rejection in neste
 #### 8.4 `readAllBounded` Timing Sensitivity
 **Severity: Low**
 
-The 100ms idle timeout after first data (`protocols.ts:53`) is fragile:
+The 100ms idle timeout after first data (in the pre-framing `readAllBounded`) was fragile:
 - In high-latency networks, legitimate responses may arrive in chunks >100ms apart.
 - Muxer implementations may buffer differently.
 - This could cause truncated reads of legitimate messages, interpreted as protocol errors.
 
-- **Status — obsolete**: the idle timeout was removed. `readAllBounded` is bounded only by its overall deadline, so a chunk gap is treated as a slow link rather than end-of-stream and the truncation this finding describes can no longer happen. Reintroducing an idle timer is ruled out at the function's `NOTE:`.
+- **Status — obsolete**: the idle timeout was removed, and `readAllBounded` has since been replaced by `readFramed`. A chunk gap is treated as a slow link rather than end-of-stream, and the frame's own length prefix — not a silence — says when the message is complete, so the truncation this finding describes can no longer happen. Reintroducing an idle timer is ruled out at the function's `NOTE:`.
 
 ---
 

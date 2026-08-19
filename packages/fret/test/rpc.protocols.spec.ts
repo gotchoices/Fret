@@ -545,7 +545,7 @@ describe('ping RTT floor', () => {
 		b = await createMemNode()
 		await a.start()
 		await b.start()
-		registerPing(b, PROTOCOLS[0])
+		await registerPing(b, PROTOCOLS[0])
 		await a.dial(b.getMultiaddrs()[0]!)
 	})
 
