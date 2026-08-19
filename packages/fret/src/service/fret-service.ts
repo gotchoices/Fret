@@ -1973,28 +1973,44 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<void> {
 		try {
-			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-			this.diag.pingsSent++;
-			if (res.ok) {
-				await this.applySuccess(id, await this.coordOf(id), res.rttMs);
-				this.diag.pingsOk++;
-			} else {
-				// The peer answered — busy, empty, or undecodable, which `sendPing` collapses into
-				// one result — so it is alive. Decay relevance only; never a liveness strike.
-				await this.applyFailure(id, await this.coordOf(id));
-				this.diag.pingsFail++;
+			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			switch (out.kind) {
+				case 'ok':
+					this.diag.pingsSent++;
+					if (out.value.ok) {
+						await this.applySuccess(id, await this.coordOf(id), out.rttMs);
+						this.diag.pingsOk++;
+					} else {
+						// The peer's own negative pong: alive — decay relevance only, never a strike.
+						await this.applyFailure(id, await this.coordOf(id));
+						this.diag.pingsFail++;
+					}
+					return;
+				case 'busy':
+					// Deliberate NEW behavior: the near pass records backoff for busy alone; timeout
+					// and unreachable still record none here (failure-recovery.spec pins that).
+					this.diag.pingsSent++;
+					this.diag.pingsFail++;
+					this.recordBackoff(id);
+					return;
+				case 'decode-error':
+					this.diag.pingsSent++;
+					this.diag.pingsFail++;
+					await this.noteRpcFailure(id, out); // decay only
+					return;
+				case 'foreign-protocol':
+				case 'unreachable':
+				case 'timeout':
+					this.diag.pingsFail++;
+					await this.noteRpcFailure(id, out);
+					return;
+				case 'cancelled':
+				case 'skipped':
+					return; // our own cancellation / never attempted: record nothing
 			}
 		} catch (err) {
-			// Our own cancellation says nothing about the peer: no strike, no counter.
-			if (this.wasCancelled(signal)) return;
-			// benign during churn - do not warn each tick
-			// console.warn('ping failed for', id, err);
-			this.diag.pingsFail++;
-			// The seam decides which evidence this is: a failed negotiation is membership
-			// evidence about a peer that answered (this path is member-gated, so `id` is a
-			// *confirmed* member and the likeliest cause is a restart), while anything else is
-			// a failure to reach it at all and counts toward the dead-state run.
-			await this.noteRpcFailure(id, err);
+			// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
+			log.error('probeNeighborLatency failed for %s - %e', id, err);
 		}
 	}
 
@@ -2117,41 +2133,55 @@ export class FretService implements IFretService, Startable {
 	 * Probe a single peer with a namespaced ping. Success → `applySuccess`, which confirms
 	 * membership *and* clears any contact-failure run, resurrecting a `dead` peer — which is what
 	 * makes both arms of {@link reprobeExcludedTargets} recoveries rather than mere reclassification.
-	 * Unsupported-protocol → one more strike toward the negotiate-failure threshold (see
-	 * `applyMembershipSignal`), demoting to foreign only once the run completes; any other failure
-	 * is a failed contact and counts toward the dead-state run. Every failure backs off either way
-	 * so we don't hammer an unreachable-but-connected peer every tick.
+	 * Failures route through {@link noteRpcFailure} on the outcome variant — `foreign-protocol` is
+	 * one more strike toward the negotiate-failure threshold (see `applyMembershipSignal`);
+	 * `unreachable` / `timeout` count toward the dead-state run. Every failure backs off so we
+	 * don't hammer an unreachable-but-connected peer every tick.
 	 *
 	 * `signal` is the tick budget (a child of the run signal), an explicit parameter for the same
 	 * reason as on `probeNeighborLatency`.
 	 */
 	private async probeMembership(id: string, signal: AbortSignal | undefined): Promise<void> {
 		try {
-			const res = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
-			this.diag.pingsSent++;
-			if (res.ok) {
-				await this.applySuccess(id, await this.coordOf(id), res.rttMs); // marks member (and clears backoff)
-				this.diag.pingsOk++;
-				this.clearBackoff(id);
-			} else {
-				// empty/busy reply — ambiguous; leave unknown and back off briefly.
-				this.diag.pingsFail++;
-				this.recordBackoff(id);
+			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			switch (out.kind) {
+				case 'ok':
+					this.diag.pingsSent++;
+					if (out.value.ok) {
+						await this.applySuccess(id, await this.coordOf(id), out.rttMs); // marks member, clears contact run
+						this.diag.pingsOk++;
+						this.clearBackoff(id);
+					} else {
+						// Negative pong — ambiguous; leave unknown and back off briefly (today's parity).
+						this.diag.pingsFail++;
+						this.recordBackoff(id);
+					}
+					return;
+				case 'busy':
+				case 'decode-error':
+					// Today's ambiguous `!res.ok` branch: answered but unusable — back off, no strike.
+					this.diag.pingsSent++;
+					this.diag.pingsFail++;
+					this.recordBackoff(id);
+					return;
+				case 'foreign-protocol':
+				case 'unreachable':
+				case 'timeout':
+					// Back off either way so the foreign re-probe (which exists to recover a
+					// *mislabeled* same-network peer) does not hammer a genuinely-foreign peer. The
+					// backoff grows exponentially (factor doubles each window, up to 32×) so probing
+					// tapers toward ~once/32s.
+					this.diag.pingsFail++;
+					await this.noteRpcFailure(id, out);
+					this.recordBackoff(id);
+					return;
+				case 'cancelled':
+				case 'skipped':
+					return; // no backoff — next tick probes fresh
 			}
 		} catch (err) {
-			// Our own cancellation: not evidence about the peer, and no backoff either — the next
-			// run (or tick) should probe it fresh.
-			if (this.wasCancelled(signal)) return;
-			this.diag.pingsFail++;
-			// Unsupported protocol is evidence of absence — foreign only once a run of these
-			// accumulates (a peer that has simply not registered its handlers yet produces the
-			// identical error); anything else is a failed contact and counts toward the dead-state
-			// run instead. Back off either way so the occasional foreign re-probe (which exists to
-			// recover a *mislabeled* same-network peer) does not hammer a genuinely-foreign peer
-			// that keeps returning this error. The backoff grows exponentially (factor doubles each
-			// window, up to 32×) so probing tapers toward ~once/32s.
-			await this.noteRpcFailure(id, err);
-			this.recordBackoff(id);
+			// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
+			log.error('probeMembership failed for %s - %e', id, err);
 		}
 	}
 
