@@ -1040,6 +1040,10 @@ describe('RPC handler fault isolation', function () {
 		// reply — including from a handler that reads no request body (ping, the neighbors
 		// request) and so answers a few ticks later. Not closing at all strands the receiver,
 		// whose own budgeted close waits on our write end.
+		// NOTE: these two lines must stay synchronously adjacent. `readFramed` takes the stream path
+		// and `byteStream` registers its `message` listener before the first `await` inside it, so no
+		// transport dispatch can interleave with the close. Insert an `await` between them and a reply
+		// arriving in that window is dropped, which reads as a flaky `eof`.
 		const closing = stream.close().catch(() => { /* the read outcome is what this reports */ })
 		const reading = readFramed(stream, 1024 * 1024, 3000)
 		try {
