@@ -19,7 +19,7 @@ export async function registerNeighbors(
 	getSnapshot: () => NeighborSnapshotV1 | BusyResponseV1 | Promise<NeighborSnapshotV1 | BusyResponseV1>,
 	onAnnounce?: (from: string, snapshot: NeighborSnapshotV1) => void,
 	protocols = { PROTOCOL_NEIGHBORS, PROTOCOL_NEIGHBORS_ANNOUNCE },
-	maxBytes = 128 * 1024,
+	maxBytes = 16 * 1024,
 	onIdentityMismatch?: (claimed: string, actual: string) => void,
 	onInbound?: (from: string) => void,
 	// Trailing and defaulted so existing positional callers keep compiling (TypeScript forbids a
@@ -111,7 +111,7 @@ export async function fetchNeighbors(
 		signal: opts.signal,
 		timeoutMs: opts.timeoutMs,
 		dial: 'never',
-		maxBytes: 128 * 1024,
+		maxBytes: 16 * 1024,
 		decode: async (b) => parseOrThrow(parse, await decodeJson(b)),
 	});
 }

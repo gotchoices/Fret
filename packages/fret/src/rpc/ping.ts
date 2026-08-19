@@ -85,7 +85,7 @@ export async function sendPing(
 ): Promise<RpcOutcome<{ ok: boolean; size_estimate?: number; confidence?: number }>> {
 	return rpcRequest(node, peer, protocol, {
 		...opts,
-		maxBytes: 1024,
+		maxBytes: 1024, // ping reply is tiny, fixed-shape ({ok, size_estimate?, confidence?}); ample headroom
 		// The parser replaces the old `Boolean(r.ok)` coercion: a legal value always encodes as a
 		// boolean, so the coercion could only ever have hidden a malformed peer. A rejection
 		// throws (see `parseOrThrow`) and surfaces as `decode-error` — proof of life, never a

@@ -19,7 +19,14 @@ import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
-import { makeSnapshotParser, parseRouteAndMaybeAct } from '../rpc/validate.js';
+import {
+	makeSnapshotParser,
+	parseRouteAndMaybeAct,
+	MAX_ACTIVITY_BYTES,
+	MAYBE_ACT_OVERHEAD_BYTES,
+	MAX_SNAPSHOT_METADATA_BYTES_CORE,
+	MAX_SNAPSHOT_METADATA_BYTES_EDGE,
+} from '../rpc/validate.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
 import type { RpcOutcome } from '../rpc/outcome.js';
@@ -1013,8 +1020,8 @@ export class FretService implements IFretService, Startable {
 
 	async ready(): Promise<void> {}
 
-	private maxBytesNeighbors(): number { return this.cfg.profile === 'core' ? 128 * 1024 : 64 * 1024; }
-	private maxBytesMaybeAct(): number { return this.cfg.profile === 'core' ? 512 * 1024 : 256 * 1024; }
+	private maxBytesNeighbors(): number { return this.cfg.profile === 'core' ? 16 * 1024 : 8 * 1024; }
+	private maxBytesMaybeAct(): number { return MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES; }
 
 	// RPC registration
 	private async registerRpcHandlers(): Promise<void> {
@@ -1223,7 +1230,7 @@ export class FretService implements IFretService, Startable {
 
 		// Quick guards
 		if (msg.ttl <= 0) { this.diag.rejected.ttlExpired++; return this.staticReject(); }
-		if (msg.activity && msg.activity.length > 128 * 1024) { this.diag.rejected.payloadTooLarge++; return this.staticReject(); }
+		if (msg.activity && msg.activity.length > MAX_ACTIVITY_BYTES) { this.diag.rejected.payloadTooLarge++; return this.staticReject(); }
 		const limit = this.cfg.profile === 'core' ? 16 : 4;
 		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 		this.inflightAct++;

@@ -30,7 +30,7 @@ export async function registerLeave(
 	// also performs the `replacements` sanitizing this body used to do inline, so `onLeave`
 	// receives an already-normalized notice.
 	await registerJsonHandler(node, protocol, {
-		maxBytes: 4096,
+		maxBytes: 4096, // 12 replacements*64 + from 64 + timestamp 16 + punctuation ~64 ≈ 912 bytes; ~4.5x headroom kept
 		parse: parseLeaveNotice,
 		onMalformed,
 		serve: async (msg, connection) => {
