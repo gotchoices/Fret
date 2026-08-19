@@ -1150,6 +1150,10 @@ export class FretService implements IFretService, Startable {
 		// too, never an unmetered pre-filter) and before every guard below — each of which reads
 		// fields the validator vouches for (`breadcrumbs?.includes` on a number was a throw that
 		// leaked the inbound stream). O(message size): no hashing, no ring walks.
+		// NOTE: the parsed result is discarded and `msg` is used from here down. Correct only
+		// because this is the one parser that normalizes nothing and returns its own argument
+		// (see `parseRouteAndMaybeAct`); the day it normalizes anything, this silently reads the
+		// un-normalized message with no compile error. Bind the result if that rule ever changes.
 		if (!parseRouteAndMaybeAct(msg)) { this.diag.rejected.malformed++; return this.staticReject(); }
 		// The one decode of `key`. Handed down to `routeAct` / `nearAnchorOnly` so neither can
 		// throw on the field the validator just vetted — the double-throw that used to make the
