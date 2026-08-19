@@ -1,0 +1,3 @@
+description: The limit on how big a single routed-message payload (an "activity") can be is the same for both lightweight mobile nodes and full server nodes, even though every other size limit in the system is smaller for the lightweight ones.
+files: packages/fret/src/rpc/validate.ts, packages/fret/src/service/fret-service.ts
+tradeoffs: An Edge node currently accepts the same 128 KiB activity a Core node does, which is generous for Edge's stated "lighter, more conservative" posture, but splitting it means an activity a Core node would perform is refused by an Edge one on the same route — so the fix trades uniform behavior for profile-appropriate behavior, and needs a decision on what an Edge cap should actually be, not just a mechanical split.

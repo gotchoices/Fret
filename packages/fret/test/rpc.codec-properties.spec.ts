@@ -23,6 +23,12 @@ import type { TokenBucket } from '../src/utils/token-bucket.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { PingResponseV1 } from '../src/rpc/ping.js'
 import {
+	MAX_ACTIVITY_BYTES,
+	MAYBE_ACT_OVERHEAD_BYTES,
+	MAX_BREADCRUMBS,
+	MAX_CORRELATION_ID_CHARS,
+	MAX_DIGEST_CHARS,
+	MAX_REPLACEMENTS,
 	makeSnapshotParser,
 	parseLeaveNotice,
 	parseMaybeActReply,
@@ -975,6 +981,127 @@ describe('RPC codec properties', function () {
 				2000,
 				'the under-cap leave was processed'
 			)
+		})
+
+		it('accepts activity at exactly MAX_ACTIVITY_BYTES and refuses one byte over via the service check, not the wire cap', async () => {
+			// Both messages stay well under the 144 KiB wire cap (maybeActBody's overhead is a few
+			// hundred bytes), so this pins `handleMaybeAct`'s own 128 KiB activity check, distinct
+			// from the wire-level refusal the previous test covers.
+			const atCap = await sendRaw(rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, maybeActBody(MAX_ACTIVITY_BYTES))
+			expect(atCap, 'activity at exactly the cap is a genuine answer').to.not.equal(undefined)
+			expect((await decodeJson<NearAnchorV1>(atCap!)).v).to.equal(1)
+
+			const before = { ...rig.svc.getDiagnostics().rejected }
+
+			const overByOne = await sendRaw(rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, maybeActBody(MAX_ACTIVITY_BYTES + 1))
+			expect(overByOne, 'refused by handleMaybeAct, which still replies (unlike the wire-cap abort)').to.not.equal(undefined)
+			expect(
+				rig.svc.getDiagnostics().rejected.payloadTooLarge - before.payloadTooLarge,
+				'the service-level activity check counted the refusal'
+			).to.equal(1)
+			expect(
+				{ ...rig.svc.getDiagnostics().rejected, payloadTooLarge: before.payloadTooLarge },
+				'nothing else moved'
+			).to.deep.equal(before)
+		})
+	})
+
+	describe('the frame prefix alone refuses an over-cap message, per protocol', () => {
+		// Mirrors the `readFramed`-only pattern at lines 724-736 above: no live connection needed,
+		// since the refusal happens inside `readFramed` itself before any body byte is pulled.
+		const cases: Array<{ label: string; cap: number }> = [
+			{ label: 'maybeAct (144 KiB, both profiles)', cap: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES },
+			{ label: 'neighbors announce (8 KiB, edge)', cap: 8 * 1024 },
+			{ label: 'leave (fixed 4096)', cap: 4096 },
+		]
+
+		for (const { label, cap } of cases) {
+			it(`refuses a ${label} frame declaring cap+1 bytes after exactly one pull`, async () => {
+				const { source, pulls } = countingSource(4096, cap + 1)
+
+				let thrown: unknown
+				try { await readFramed(source, cap, 5000) } catch (err) { thrown = err }
+
+				expect((thrown as Error)?.message, 'refused, not truncated').to.include('payload too large')
+				expect(pulls(), 'the prefix alone was enough to know').to.equal(1)
+			})
+		}
+	})
+
+	describe('the largest legal message of each protocol encodes under its wire cap', () => {
+		// Pure encoding checks — no network. A wire cap must never refuse this node's own legal
+		// output, so each case builds the largest message the local profile can legitimately emit
+		// and asserts it encodes smaller than the corresponding cap.
+
+		/** A placeholder id of realistic length (base58btc peer ids run up to ~53 chars). */
+		function fakeId(i: number): string {
+			return `Qm${String(i).padStart(4, '0')}${'x'.repeat(47)}`
+		}
+
+		it('neighbors snapshot at the core merge caps (successors/predecessors 16, sample 8) fits under 16 KiB', async () => {
+			const snapshot = {
+				v: 1,
+				from: fakeId(9999),
+				timestamp: Date.now(),
+				successors: Array.from({ length: 16 }, (_, i) => fakeId(i)),
+				predecessors: Array.from({ length: 16 }, (_, i) => fakeId(i + 100)),
+				sample: Array.from({ length: 8 }, (_, i) => ({
+					id: fakeId(i + 200),
+					coord: coordToBase64url(new Uint8Array(COORD_BYTES)),
+					relevance: 0.123456789,
+				})),
+				size_estimate: 123456,
+				confidence: 0.87654321,
+				sig: 'x'.repeat(256), // reserved for the unimplemented signature field
+			}
+			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(16 * 1024)
+		})
+
+		it('neighbors snapshot at the edge merge caps (successors/predecessors 8, sample 6) fits under 8 KiB', async () => {
+			const snapshot = {
+				v: 1,
+				from: fakeId(9999),
+				timestamp: Date.now(),
+				successors: Array.from({ length: 8 }, (_, i) => fakeId(i)),
+				predecessors: Array.from({ length: 8 }, (_, i) => fakeId(i + 100)),
+				sample: Array.from({ length: 6 }, (_, i) => ({
+					id: fakeId(i + 200),
+					coord: coordToBase64url(new Uint8Array(COORD_BYTES)),
+					relevance: 0.123456789,
+				})),
+				size_estimate: 123456,
+				confidence: 0.87654321,
+				sig: 'x'.repeat(256),
+			}
+			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(8 * 1024)
+		})
+
+		it('leave notice at MAX_REPLACEMENTS (12) fits under the fixed 4096 cap', async () => {
+			const notice = {
+				v: 1,
+				from: fakeId(9999),
+				timestamp: Date.now(),
+				replacements: Array.from({ length: MAX_REPLACEMENTS }, (_, i) => fakeId(i)),
+			}
+			expect((await encodeJson(notice)).byteLength).to.be.lessThan(4096)
+		})
+
+		it('maybeAct at MAX_ACTIVITY_BYTES plus max-length key/correlation_id/digest/breadcrumbs fits under 144 KiB on both profiles', async () => {
+			const msg = {
+				v: 1,
+				key: coordToBase64url(new Uint8Array(COORD_BYTES)),
+				want_k: 15,
+				wants: 15,
+				ttl: 32,
+				min_sigs: 14,
+				digest: 'd'.repeat(MAX_DIGEST_CHARS),
+				activity: 'a'.repeat(MAX_ACTIVITY_BYTES),
+				breadcrumbs: Array.from({ length: MAX_BREADCRUMBS }, (_, i) => fakeId(i)),
+				correlation_id: 'c'.repeat(MAX_CORRELATION_ID_CHARS),
+				timestamp: Date.now(),
+				signature: 'x'.repeat(512), // reserved for the unimplemented signature field
+			}
+			expect((await encodeJson(msg)).byteLength).to.be.lessThan(MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES)
 		})
 	})
 
