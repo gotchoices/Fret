@@ -792,7 +792,8 @@ describe('Ring membership classification (probe-based, no identify)', function (
 
 		// C dials A's net-a ping protocol — something only a net-a peer can do.
 		const res = await sendPing(nodeC, idA, makeProtocols('net-a').PROTOCOL_PING)
-		expect(res.ok).to.equal(true, 'the inbound ping should have been answered')
+		if (res.kind !== 'ok') throw new Error(`expected ok, got ${res.kind}`)
+		expect(res.value.ok).to.equal(true, 'the inbound ping should have been answered')
 
 		await waitFor(() => store.getById(idC)?.membership === 'member')
 		expect(store.getById(idC)?.membership).to.equal('member', 'inbound namespaced RPC must re-admit the sender')
@@ -818,7 +819,8 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		store.setMembership(idC, 'foreign')
 
 		const snap = await fetchNeighbors(nodeC, idA, makeProtocols('net-a').PROTOCOL_NEIGHBORS)
-		expect(snap.from).to.equal(idA, 'the neighbors request should have been served by A')
+		if (snap.kind !== 'ok') throw new Error(`expected ok, got ${snap.kind}`)
+		expect(snap.value.from).to.equal(idA, 'the neighbors request should have been served by A')
 
 		await waitFor(() => store.getById(idC)?.membership === 'member')
 		expect(store.getById(idC)?.membership).to.equal('member')

@@ -150,7 +150,8 @@ describe('Payload bounds and TTL validation', function () {
 				const start = Date.now()
 				const res = await sendPing(b, a.peerId.toString(), PROTOCOL_PING)
 				const elapsed = Date.now() - start
-				expect(res.ok, 'ping answered').to.equal(true)
+				if (res.kind !== 'ok') throw new Error(`expected ok, got ${res.kind}`)
+				expect(res.value.ok, 'ping answered').to.equal(true)
 				expect(elapsed, `round-trip took ${elapsed}ms — read is stalling to its deadline`).to.be.lessThan(1000)
 			} finally {
 				await b.stop(); await a.stop()

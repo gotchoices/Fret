@@ -334,7 +334,8 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		const pingsBefore = svcA.getDiagnostics().pingsSent
 		await b.dial(a.getMultiaddrs()[0]!)
 		const res = await sendPing(b, a.peerId.toString(), makeProtocols('net-test').PROTOCOL_PING)
-		expect(res.ok, 'the inbound ping really reached A').to.equal(true)
+		if (res.kind !== 'ok') throw new Error(`expected ok, got ${res.kind}`)
+		expect(res.value.ok, 'the inbound ping really reached A').to.equal(true)
 
 		const after = entry()!
 		expect(after.state, 'proof of life clears the verdict').to.not.equal('dead')

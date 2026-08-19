@@ -7,7 +7,7 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { createMemNode } from './helpers/libp2p.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService } from '../src/service/fret-service.js'
-import { makeProtocols, isUnsupportedProtocolError } from '../src/rpc/protocols.js'
+import { makeProtocols } from '../src/rpc/protocols.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { hashPeerId } from '../src/ring/hash.js'
 
@@ -224,15 +224,12 @@ describe('FretService start/stop lifecycle', function () {
 			await peer.dial(node.getMultiaddrs()[0]!)
 			await svc.start()
 			const live = await sendPing(peer, node.peerId.toString(), PROTOCOLS.PROTOCOL_PING)
-			expect(live.ok, 'ping answered while running').to.equal(true)
+			if (live.kind !== 'ok') throw new Error(`expected ok, got ${live.kind}`)
+			expect(live.value.ok, 'ping answered while running').to.equal(true)
 
 			await svc.stop()
-			let failure: unknown
-			try {
-				await sendPing(peer, node.peerId.toString(), PROTOCOLS.PROTOCOL_PING)
-			} catch (err) { failure = err }
-			expect(failure, 'ping after stop must not be answered').to.not.equal(undefined)
-			expect(isUnsupportedProtocolError(failure), `unexpected error: ${String(failure)}`).to.equal(true)
+			const after = await sendPing(peer, node.peerId.toString(), PROTOCOLS.PROTOCOL_PING)
+			expect(after.kind, 'ping after stop must not be answered').to.equal('foreign-protocol')
 		} finally {
 			await peer.stop()
 		}
