@@ -773,7 +773,9 @@ After import, the normal stabilization loop probes restored peers to update conn
 
 #### Testing strategy
 - Unit tests: Digitree operations, cohort assembly, relevance scoring
-- Integration tests: Join/leave scenarios, stabilization convergence
+- Integration tests: Join/leave scenarios, stabilization convergence, and real two-node RPC over
+  a live libp2p stream (`test/rpc.two-node-framed.spec.ts`) — a reply actually written is never
+  reported as cut off, across a spread of reply timings.
 - Simulation: Large-scale churn patterns, partition/merge behavior. The deterministic harness
   (`test/simulation/fret-sim.ts`) splits the ring into mutually unreachable groups with
   `partition(groups)` and rejoins them with `heal()`:
