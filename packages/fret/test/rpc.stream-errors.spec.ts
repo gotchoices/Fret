@@ -4,6 +4,7 @@ import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import * as lp from 'it-length-prefixed'
 import { createMemNode, createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
@@ -19,14 +20,15 @@ import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 
 // What each outbound RPC does when the reply fails *partway through*, and what the service records
 // about the peer as a result. The read primitive itself is covered elsewhere
-// (`payload-bounds-ttl.spec.ts` pins the byte cap, the mid-stream stall, deadline-over-truncation
-// and the missed-EOF poll; `rpc.protocols.spec.ts` pins the whole-RPC deadlines). Three failure
+// (`payload-bounds-ttl.spec.ts` pins the declared-length cap, the mid-stream stall and
+// deadline-over-truncation; `rpc.protocols.spec.ts` pins the whole-RPC deadlines). Three failure
 // shapes none of those produce:
 //
 //   1. **Reset mid-stream** — the reply iterator *throws* after some bytes (connection reset, muxer
 //      error, remote abort).
-//   2. **Clean EOF mid-payload** — the peer closes tidily after half a JSON document. Not a
-//      timeout: `readAllBounded` returns a short-but-complete buffer and `decodeJson` throws.
+//   2. **Clean EOF mid-payload** — the peer closes tidily after half a framed message. Not a
+//      timeout: the frame never completes, so `readFramed` throws a truncation error
+//      (`UnexpectedEOFError` for a partial body still buffered) before any decode runs.
 //   3. **Partial then stall** — bytes arrive, then nothing.
 //
 // Two kinds of assertion live here and they are labelled as such:
@@ -35,8 +37,8 @@ import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 //   - A partial payload is never parsed as a whole message.
 //   - The stream is released exactly once — `close()` on the un-aborted path, `abort()` on the
 //     aborted one (`releaseRpcStream`) — even when the read threw.
-//   - No unhandled rejection escapes, including from the abandoned `iter.next()` the poll loop
-//     holds across ticks.
+//   - No unhandled rejection escapes — including from wire bytes queued after the first frame,
+//     which a single-frame read never pulls.
 //   - Our own cancellation is never evidence about the peer: no contact strike, no backoff, no
 //     relevance decay.
 //   - A reset mid-stream is a failed contact; an answered-but-undecodable reply never demotes a
@@ -48,20 +50,41 @@ import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
 
 const enc = new TextEncoder()
 
-/** A complete, decodable ping reply. */
+/** A complete, decodable ping reply (body bytes; frame with `frame()` before serving). */
 const PING_OK = enc.encode(JSON.stringify({ ok: true, ts: 1, size_estimate: 42, confidence: 0.5 }))
-/** Half a ping reply: a clean EOF here makes `decodeJson` throw a `SyntaxError`. */
-const HALF_PING = enc.encode('{"ok":true,"ts":1,"size_estimate":42')
 /**
- * Half a neighbor snapshot. The ids are spelled `ghost-*` so any partial parse is visible by
- * substring rather than only by a shape assertion.
+ * A complete neighbor snapshot. The ids are spelled `ghost-*` so any partial parse of a truncated
+ * frame is visible by substring rather than only by a shape assertion.
  */
-const HALF_SNAPSHOT = enc.encode(
-	'{"v":1,"from":"ghost-from","timestamp":1,"successors":["ghost-succ"],'
-	+ '"predecessors":["ghost-pred"],"sample":[{"id":"ghost-sample"'
-)
-/** Half a NearAnchor reply — what a `maybeAct` forward would be reading. */
-const HALF_NEAR_ANCHOR = enc.encode('{"v":1,"anchors":["ghost-anchor"],"cohort_hint":["ghost-hint"')
+const FULL_SNAPSHOT = enc.encode(JSON.stringify({
+	v: 1, from: 'ghost-from', timestamp: 1, successors: ['ghost-succ'],
+	predecessors: ['ghost-pred'], sample: [{ id: 'ghost-sample', coord: 'AAAA', relevance: 1 }], sig: '',
+}))
+/** A complete NearAnchor reply — what a `maybeAct` forward would be reading. */
+const FULL_NEAR_ANCHOR = enc.encode(JSON.stringify({
+	v: 1, anchors: ['ghost-anchor'], cohort_hint: ['ghost-hint'], estimated_cluster_size: 1, confidence: 0.5,
+}))
+
+/** One whole framed message: varint length prefix + body. */
+function frame(body: Uint8Array): Uint8Array {
+	return lp.encode.single(body).subarray()
+}
+
+/**
+ * Frame `full` and truncate mid-BODY: the prefix (and half the body, ghost strings included) is
+ * on the wire, so the frame can never complete and a lenient partial parse would still have the
+ * ghost bytes to surface.
+ */
+function framedPartial(full: Uint8Array): Uint8Array {
+	const framed = frame(full)
+	const prefixLen = framed.length - full.length
+	return framed.subarray(0, prefixLen + Math.floor(full.length / 2))
+}
+
+/** Framed partials — a clean EOF after any of these is a truncated frame, not a short message. */
+const HALF_PING = framedPartial(PING_OK)
+const HALF_SNAPSHOT = framedPartial(FULL_SNAPSHOT)
+const HALF_NEAR_ANCHOR = framedPartial(FULL_NEAR_ANCHOR)
 
 const PROTOCOL = '/optimystic/net-test/fret/1.0.0/ping'
 
@@ -112,13 +135,6 @@ interface StubStream {
 interface StubStreamOpts {
 	/** Make `send()` throw — the write-side reset for the two write-only RPCs. */
 	sendThrows?: Error
-	/**
-	 * Report libp2p's "remote finished writing" read-end state (`readBufferLength` /
-	 * `remoteWriteStatus`) once this many chunks have been delivered, so `readAllBounded`'s EOF
-	 * poll ends the read. Left unset means "a plain async iterable", which is what every other
-	 * stub here wants.
-	 */
-	endStateAfterChunks?: number
 	/** Fires at the *start* of each `iter.next()`, 1-based — the hook the cancellation cases use. */
 	onNext?: (call: number) => void
 }
@@ -130,18 +146,8 @@ function makeStubStream(steps: ReadStep[], opts: StubStreamOpts = {}): StubStrea
 	}
 	let step = 0
 	let calls = 0
-	const finishedWriting = (): boolean =>
-		opts.endStateAfterChunks !== undefined && rec.delivered >= opts.endStateAfterChunks
 	const stream = {
 		id: 'stub-stream',
-		// `undefined` (not 0) when unconfigured: `remoteFinishedWriting` requires a *number* here,
-		// so an unconfigured stub falls through to ordinary iterator EOF like a plain iterable.
-		get readBufferLength(): number | undefined {
-			return opts.endStateAfterChunks === undefined ? undefined : 0
-		},
-		get remoteWriteStatus(): string {
-			return finishedWriting() ? 'closed' : 'open'
-		},
 		send: (_bytes: Uint8Array): boolean => {
 			rec.sends++
 			if (opts.sendThrows) throw opts.sendThrows
@@ -211,22 +217,18 @@ function elapsedBounded(elapsed: number): void {
 /**
  * The rejection a stalled read produces at a *sender*.
  *
- * Two clocks can end it and both are correct. The whole-RPC deadline is armed first and
- * `readAllBounded`'s own read deadline is computed from the same `timeoutMs` a moment later, so the
- * deadline signal normally wins and the error is a `DeadlineExpiredError` — which carries no byte
- * count. When the two land in the same millisecond the loop can instead reach its own
- * `remaining <= 0` check first and throw the byte-count-bearing message. Assert whichever arm was
- * taken rather than pretending the race does not exist; what matters either way is that the call
- * *rejects* instead of returning the partial buffer as an answer. (The byte-count message is pinned
- * deterministically against the primitive at `payload-bounds-ttl.spec.ts:82`, where the read budget
- * is genuinely the only clock.)
+ * Two clocks can end it and both are correct. The whole-RPC deadline and `readFramed`'s own timer
+ * are armed from the same `timeoutMs` moments apart, so either can fire first: the deadline signal
+ * yields a `DeadlineExpiredError`, the read timer the `read timed out` message. Assert whichever
+ * arm was taken rather than pretending the race does not exist; what matters either way is that
+ * the call *rejects* instead of returning the partial frame as an answer. (The read-timer message
+ * is pinned deterministically against the primitive in `payload-bounds-ttl.spec.ts`, where the
+ * read budget is genuinely the only clock.)
  */
-function expectStallRejection(thrown: unknown, bytesRead: number): void {
-	expect(thrown, 'must reject rather than answer from a partial buffer').to.be.instanceOf(Error)
+function expectStallRejection(thrown: unknown): void {
+	expect(thrown, 'must reject rather than answer from a partial frame').to.be.instanceOf(Error)
 	if (thrown instanceof DeadlineExpiredError) return
-	const message = (thrown as Error).message
-	expect(message, 'read-deadline arm').to.include('read timed out')
-	expect(message, 'the partial buffer is reported, never returned').to.include(`${bytesRead} bytes read`)
+	expect((thrown as Error).message, 'read-deadline arm').to.include('read timed out')
 }
 
 /**
@@ -275,9 +277,10 @@ describe('RPC stream failures', function () {
 	 * `--unhandled-rejections=throw` killing the run rather than as a named test failing — and only
 	 * when the rejection happened to land inside the run at all.
 	 *
-	 * NOTE: no case here currently *arms* it — see the NOTE on "no rejection escapes the abandoned read" for
-	 * why the one sequence that abandons a read promise cannot produce an unhandled rejection today.
-	 * It is kept as a cheap net over every case in the file, not as coverage of a specific line.
+	 * NOTE: no case here currently *arms* it — `readFramed` races every read promise it creates, so
+	 * an abandoned read is already "handled", and the trailing-bytes case never pulls its reject
+	 * step at all. It is kept as a cheap net over every case in the file (a future restructuring of
+	 * that race could re-introduce an unraced promise), not as coverage of a specific line.
 	 *
 	 * Registered on this describe rather than at file top level: a top-level mocha hook is a *root*
 	 * hook and would run against every test in the whole suite run.
@@ -393,8 +396,8 @@ describe('RPC stream failures', function () {
 
 			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: TIMEOUT_MS })
 
-			// Invariant: never a half-populated `PingResponseV1`. `size_estimate` is present in the
-			// truncated bytes, so a lenient decode would surface it here.
+			// Invariant: never a half-populated `PingResponseV1`. The truncated frame's body bytes
+			// name `size_estimate`, so a lenient partial parse would surface it here.
 			expect(res.ok, 'not parsed as an answer').to.equal(false)
 			expect(res.size_estimate, 'nothing salvaged from the partial document').to.equal(undefined)
 			expect(res.confidence).to.equal(undefined)
@@ -424,9 +427,13 @@ describe('RPC stream failures', function () {
 				thrown = err
 			}
 
-			// Invariant: the truncated document is never handed back as an answer.
+			// Invariant: the truncated document is never handed back as an answer. Under framing the
+			// read itself refuses the incomplete frame — no decode ever runs on partial bytes.
 			expect(thrown, 'must reject').to.be.instanceOf(Error)
-			expect((thrown as Error).name, 'the decode is what failed').to.equal('SyntaxError')
+			expect(
+				['FrameTruncationError', 'UnexpectedEOFError'],
+				'the framed read is what failed'
+			).to.include((thrown as Error).name)
 			expect(release(s)).to.deep.equal({ closes: 2, aborts: 0 })
 		})
 
@@ -476,7 +483,7 @@ describe('RPC stream failures', function () {
 			}
 			const elapsed = Date.now() - t0
 
-			expectStallRejection(thrown, HALF_PING.length)
+			expectStallRejection(thrown)
 			// Bounded, not merely eventual: "it rejected" would pass at ten minutes.
 			elapsedBounded(elapsed)
 			expectReleasedOnce(s)
@@ -507,7 +514,7 @@ describe('RPC stream failures', function () {
 			}
 			const elapsed = Date.now() - t0
 
-			expectStallRejection(thrown, HALF_NEAR_ANCHOR.length)
+			expectStallRejection(thrown)
 			elapsedBounded(elapsed)
 			// One of the `close()` calls is always the request flush inside the `try`; exactly one
 			// release follows it, by whichever arm the budget race selected.
@@ -583,47 +590,37 @@ describe('RPC stream failures', function () {
 		})
 	})
 
-	describe('no rejection escapes the abandoned read', () => {
-		// `readAllBounded` holds one outstanding `iter.next()` across poll ticks because re-calling it
-		// would queue a second read and silently drop a chunk. When the read ends via the stream's own
-		// end state that promise is abandoned *unsettled*, so a muxer that rejects it a moment later
-		// has no consumer of its own. This drives exactly that sequence and asserts the read still
-		// answers normally; the suite-wide `unhandledRejection` guard covers the rejection itself.
-		//
-		// NOTE: this case does **not** pin `protocols.ts`'s `pending.catch(() => {})` — verified by
-		// deleting that line, which leaves this test passing. `Promise.race` attaches its own
-		// reject reaction to `pending` in the same iteration, so the abandoned promise is already
-		// "handled" and the explicit catch is belt-and-braces rather than load-bearing. Arming the
-		// guard for real needs a path that creates a read promise it never races, which the current
-		// loop has none of; the guard is kept because a future restructuring of that race (or of
-		// `abortWait`) could introduce one, and it costs one `afterEach`.
-		it('answers normally when the abandoned iter.next() rejects after the reply was read', async () => {
-			const s = makeStubStream(
-				[
-					{ kind: 'chunk', bytes: PING_OK },
-					{ kind: 'reject', error: new Error('muxer reset after EOF'), afterMs: 40 },
-				],
-				{ endStateAfterChunks: 1 }
-			)
+	describe('trailing bytes after the first frame', () => {
+		// A single-frame read ends the moment the counted body arrives, so whatever the peer queues
+		// behind its reply — more bytes, a delayed reset — is never pulled. This pins that at the
+		// sender level: the reject step scripted *after* the complete frame would surface as a read
+		// failure (or an unhandled rejection) if anything ever asked for it; `delivered === 1` plus
+		// the suite-wide `unhandledRejection` guard prove nothing did.
+		it('answers from the first frame and never pulls the reset queued behind it', async () => {
+			const s = makeStubStream([
+				{ kind: 'chunk', bytes: frame(PING_OK) },
+				{ kind: 'reject', error: new Error('muxer reset after the reply'), afterMs: 40 },
+			])
 
 			const res = await sendPing(nodeServing(s.stream), peer, PROTOCOL, { timeoutMs: 2000 })
 
-			expect(res.ok, 'the complete reply was read via the end-state poll').to.equal(true)
+			expect(res.ok, 'the complete framed reply was the answer').to.equal(true)
 			expect(res.size_estimate).to.equal(42)
+			expect(s.delivered, 'exactly one pull — the trailing step never ran').to.equal(1)
 			expect(release(s)).to.deep.equal({ closes: 1, aborts: 0 })
-			// Let the abandoned rejection land while the guard is still armed.
+			// Were the trailing step ever pulled, give its rejection time to land under the guard.
 			await sleep(80)
 		})
 	})
 
 	describe('a reset at the byte cap', () => {
 		// Both failures are available in the same read: `sendPing`'s cap is 1024 bytes and the reset
-		// is queued behind an oversized chunk. `readAllBounded` throws on the cap as soon as it
-		// accounts for that chunk, so the following `iter.next()` is never called and the cap wins
+		// is queued behind a frame whose prefix declares 2048. `readFramed` refuses at the prefix —
+		// before any body byte — so the following `iter.next()` is never called and the cap wins
 		// deterministically. Asserted so the outcome is *stated* rather than incidental.
 		it('reports the payload cap, not the reset', async () => {
 			const s = makeStubStream([
-				{ kind: 'chunk', bytes: new Uint8Array(2048) },
+				{ kind: 'chunk', bytes: frame(new Uint8Array(2048)) },
 				{ kind: 'reject', error: reset() },
 			])
 
@@ -800,9 +797,9 @@ describe('RPC stream failures', function () {
 			const e = store.getById(hop)!
 			// TODAY'S CONTRACT — `15-rpc-shared-helper`, arm "the liveness seam now has to guess
 			// whether a peer was reached". This peer accepted the stream, replied, and merely replied
-			// *badly*: it is demonstrably alive. `decodeJson`'s `SyntaxError` propagates out of
-			// `sendMaybeAct`, and `noteRpcFailure` classifies every non-negotiate error as
-			// unreachability — so three such replies would mark a live peer dead. Under the
+			// *badly*: it is demonstrably alive. The truncation error (`UnexpectedEOFError`)
+			// propagates out of `sendMaybeAct`, and `noteRpcFailure` classifies every non-negotiate
+			// error as unreachability — so three such replies would mark a live peer dead. Under the
 			// discriminated result type this becomes a `decode-error` outcome and the strike goes
 			// away; change this expectation to 0 then, and keep the case.
 			expect(e.contactFailures, 'today: an undecodable reply is booked as unreachability').to.equal(1)
@@ -878,10 +875,10 @@ describe('RPC stream failures', function () {
 		})
 	})
 
-	// The stub shapes above are only worth what they share with the real transport. The missed-EOF
-	// bug (`protocols.ts:130-135`) is the precedent: a stub-only suite agreed with itself and not
+	// The stub shapes above are only worth what they share with the real transport. The old read
+	// primitive's missed-EOF bug is the precedent: a stub-only suite agreed with itself and not
 	// with libp2p. Both stub-only shapes that a live peer *can* be made to produce are re-driven here
-	// over TCP + noise + yamux: a clean EOF mid-JSON, and a reset mid-reply (the responder calls
+	// over TCP + noise + yamux: a clean EOF mid-frame, and a reset mid-reply (the responder calls
 	// `Stream.abort()` after a partial write, which is what a handler throwing mid-reply would do if
 	// it released its stream at all — see `15-rpc-shared-helper`'s "handler error paths leak
 	// streams"). The stall shape has no real-transport counterpart worth the wall time: it is a
@@ -984,9 +981,10 @@ describe('RPC stream failures', function () {
 			}
 			expectPrompt(Date.now() - t0)
 
-			// A live reset surfaces as a read failure, which `sendPing` does *not* catch — its
-			// `try/catch` wraps the decode alone. So the two shapes diverge here in a way the service
-			// cares about: an undecodable reply is `ok: false` (alive, decay only) while a reset
+			// A live reset surfaces as a read failure, which `sendPing` does *not* map to `ok: false`
+			// — it maps exactly the truncation names (`isFrameTruncationError`) and decode failures,
+			// and propagates everything else. So the two shapes diverge here in a way the service
+			// cares about: a truncated reply is `ok: false` (alive, decay only) while a reset
 			// propagates and `noteRpcFailure` books it as a contact strike. Assert whichever arm the
 			// transport produced rather than pretending only one is possible — a muxer that delivers
 			// the buffered bytes before the reset yields the first, one that discards them the second.

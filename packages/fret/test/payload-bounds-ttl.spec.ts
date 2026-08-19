@@ -5,7 +5,8 @@ import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
 import { registerPing, sendPing } from '../src/rpc/ping.js'
 import { PROTOCOL_MAYBE_ACT, PROTOCOL_PING } from '../src/rpc/protocols.js'
-import { validateTimestamp, readAllBounded } from '../src/rpc/protocols.js'
+import { validateTimestamp, readFramed } from '../src/rpc/protocols.js'
+import * as lp from 'it-length-prefixed'
 import { DEDUP_TTL_MS } from '../src/service/dedup-cache.js'
 
 describe('Payload bounds and TTL validation', function () {
@@ -37,30 +38,37 @@ describe('Payload bounds and TTL validation', function () {
 		})
 	})
 
-	describe('readAllBounded', () => {
-		it('reads data within limit', async () => {
+	describe('readFramed', () => {
+		it('reads a framed message within limit', async () => {
 			const data = new Uint8Array([1, 2, 3, 4, 5])
-			async function* gen() { yield data }
-			const result = await readAllBounded(gen(), 10)
+			const framed = lp.encode.single(data).subarray()
+			async function* gen() { yield framed }
+			const result = await readFramed(gen(), 10)
 			expect(result).to.deep.equal(data)
 		})
 
-		it('rejects data exceeding limit', async () => {
-			const chunk = new Uint8Array(100)
-			async function* gen() { yield chunk }
+		it('rejects a frame whose declared length exceeds the limit', async () => {
+			const framed = lp.encode.single(new Uint8Array(100)).subarray()
+			async function* gen() { yield framed }
 			try {
-				await readAllBounded(gen(), 50)
+				await readFramed(gen(), 50)
 				throw new Error('should have thrown')
 			} catch (err: any) {
 				expect(err.message).to.include('payload too large')
 			}
 		})
 
-		it('rejects multi-chunk data exceeding limit', async () => {
-			const chunk = new Uint8Array(30)
-			async function* gen() { yield chunk; yield chunk; yield chunk }
+		it('rejects an over-declared frame arriving in multiple chunks', async () => {
+			// The prefix declares 90 bytes against a 50-byte cap; the refusal fires at the
+			// prefix regardless of how the framed bytes are chunked on the wire.
+			const framed = lp.encode.single(new Uint8Array(90)).subarray()
+			async function* gen() {
+				yield framed.subarray(0, 30)
+				yield framed.subarray(30, 60)
+				yield framed.subarray(60)
+			}
 			try {
-				await readAllBounded(gen(), 50)
+				await readFramed(gen(), 50)
 				throw new Error('should have thrown')
 			} catch (err: any) {
 				expect(err.message).to.include('payload too large')
@@ -68,59 +76,72 @@ describe('Payload bounds and TTL validation', function () {
 		})
 
 		it('reads to completion across a >100ms gap between chunks', async () => {
-			const first = new Uint8Array([1, 2, 3])
-			const second = new Uint8Array([4, 5, 6])
+			const framed = lp.encode.single(new Uint8Array([1, 2, 3, 4, 5, 6])).subarray()
 			async function* gen() {
-				yield first
+				yield framed.subarray(0, 4)
 				await new Promise(r => setTimeout(r, 150))
-				yield second
+				yield framed.subarray(4)
 			}
-			const result = await readAllBounded(gen(), 100)
+			const result = await readFramed(gen(), 100)
 			expect(result).to.deep.equal(new Uint8Array([1, 2, 3, 4, 5, 6]))
 		})
 
 		it('throws when a stalled peer exhausts the overall deadline', async () => {
+			const framed = lp.encode.single(new Uint8Array([1, 2, 3])).subarray()
 			async function* gen() {
-				yield new Uint8Array([1, 2, 3])
+				yield framed.subarray(0, 2) // prefix + first body byte, then stall
 				await new Promise(() => {}) // never yields again, never closes
 			}
 			const start = Date.now()
 			try {
-				await readAllBounded(gen(), 100, 200)
+				await readFramed(gen(), 100, 200)
 				throw new Error('should have thrown')
 			} catch (err: any) {
+				// A timeout must not masquerade as EOF: the partial frame is never returned.
 				expect(err.message).to.include('read timed out')
-				// A timeout must not masquerade as EOF: the partial buffer is never returned.
-				expect(err.message).to.include('3 bytes read')
 			}
 			expect(Date.now() - start).to.be.lessThan(2000)
 		})
 
 		it('throws rather than truncating when the deadline expires mid-stream', async () => {
+			const framed = lp.encode.single(new Uint8Array([1, 2, 3, 4, 5, 6])).subarray()
 			async function* gen() {
-				yield new Uint8Array([1, 2, 3])
+				yield framed.subarray(0, 4)
 				await new Promise(r => setTimeout(r, 300))
-				yield new Uint8Array([4, 5, 6])
+				yield framed.subarray(4)
 			}
 			try {
-				await readAllBounded(gen(), 100, 150)
+				await readFramed(gen(), 100, 150)
 				throw new Error('should have thrown')
 			} catch (err: any) {
 				expect(err.message).to.include('read timed out')
 			}
 		})
 
-		it('returns an empty buffer when the peer closes without sending', async () => {
+		it('throws FrameTruncationError when the peer closes without sending a frame', async () => {
+			// Under framing an immediate EOF is a missing message, not an empty one — the old
+			// read primitive returned an empty buffer here and left the decoder to refuse it.
 			async function* gen(): AsyncGenerator<Uint8Array> { /* immediate EOF */ }
-			const result = await readAllBounded(gen(), 100)
+			try {
+				await readFramed(gen(), 100)
+				throw new Error('should have thrown')
+			} catch (err: any) {
+				expect(err.name).to.equal('FrameTruncationError')
+			}
+		})
+
+		it('returns an empty buffer for a zero-length frame', async () => {
+			// The framed way to say "empty reply": prefix 0x00, no body. Not an error at the
+			// read layer; decodeJson's own `empty response` rejection covers it downstream.
+			async function* gen() { yield new Uint8Array([0x00]) }
+			const result = await readFramed(gen(), 100)
 			expect(result).to.deep.equal(new Uint8Array(0))
 		})
 
 		it('ends a real libp2p read promptly when the responder closes before we subscribe', async () => {
-			// libp2p's async-iterator adaptor subscribes to the one-shot remoteCloseWrite
-			// event when iteration STARTS, so a responder that closes first (the norm for a
-			// small reply) leaves the iterator with no EOF to yield. Without the state poll
-			// this read runs to the full deadline; assert it does not.
+			// End-of-message is carried in the length prefix, so the read completes as soon as
+			// the counted body arrives — a responder that closes its write end first (the norm
+			// for a small reply) costs nothing. Assert the round trip never nears the deadline.
 			const a = await createMemoryNode(); await a.start()
 			const b = await createMemoryNode(); await b.start()
 			try {
@@ -150,8 +171,9 @@ describe('Payload bounds and TTL validation', function () {
 			await b.dial(a.getMultiaddrs()[0]!)
 
 			const stream = await b.dialProtocol(a.peerId, [PROTOCOL_MAYBE_ACT])
-			const oversized = new Uint8Array(512).fill(65)
-			stream.send(oversized)
+			// Framed, so the prefix declares 512 against the handler's 256 cap — the true
+			// over-cap refusal. (Bare bytes would parse byte one as a varint instead.)
+			stream.send(lp.encode.single(new Uint8Array(512).fill(65)))
 			await stream.close()
 			// handler should log error and not crash
 			const timer = setTimeout(() => { try { stream.abort(new Error('timeout')) } catch {} }, 1000)

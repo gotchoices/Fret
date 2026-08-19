@@ -56,8 +56,9 @@ describe('package public surface', () => {
 		// consumer hand-rolls wrongly when only the opener is reachable.
 		expect(fretIndex.openRpcStream).to.be.a('function')
 		expect(fretIndex.releaseRpcStream).to.be.a('function')
-		// The read side those two bracket, already public before this seam was exported.
-		expect(fretIndex.readAllBounded).to.be.a('function')
+		// The framed message codec those two bracket: one length-prefixed write, one framed read.
+		expect(fretIndex.sendFramed).to.be.a('function')
+		expect(fretIndex.readFramed).to.be.a('function')
 	})
 
 	it('exports the types the seam signature needs', () => {
