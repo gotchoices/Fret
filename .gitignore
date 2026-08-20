@@ -4,4 +4,4 @@ dist
 .yarnrc.yml
 
 tasks/.logs/
-packages/fret/test/simulation/output/
+packages/fret/test/simulation/output/tickets/.in-progress
