@@ -2,9 +2,17 @@ import { DeterministicRNG } from './deterministic-rng.js'
 import { EventScheduler, type SimEvent } from './event-scheduler.js'
 import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
 import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
-import { DigitreeStore, type PeerEntry } from '../../src/store/digitree-store.js'
+import { CoordPlacement, type ClusterConfig, type PlacementStrategy } from './placement.js'
+import { PartitionModel } from './reachability.js'
+import { LivenessModel, notDead } from './liveness.js'
+import { SimMeasurement } from './measurement.js'
+import { DigitreeStore } from '../../src/store/digitree-store.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
 import { toCoord } from '../helpers/ring.js'
+
+// Re-exported so spec imports keep coming from this module (a re-export does not bring the
+// names into local scope — the import above does that for SimConfig's own fields).
+export type { PlacementStrategy, ClusterConfig } from './placement.js'
 
 export interface SimPeerConfig {
 	profile: 'edge' | 'core'
@@ -45,23 +53,6 @@ export interface SimPeer {
 	profileConfig: SimPeerConfig
 }
 
-/**
- * How ring coordinates are handed out.
- *
- * `clumped-joiners` is a **deliberate defect**, kept as a negative control: it reproduces the
- * pre-fix joiner placement in which every mid-run joiner landed at `index / (index + 1)` of the
- * ring, so joiners piled into an ever-narrowing sliver near the ring's top instead of spreading
- * out. `test/churn-scenarios.spec.ts` asserts that its placement guard reads *over* threshold
- * under this strategy and under threshold under `uniform`, so the guard proves its own
- * separating power on every run rather than at authoring time only.
- */
-export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed' | 'clumped-joiners'
-
-export interface ClusterConfig {
-	numClusters: number
-	spreadBits: number
-}
-
 export interface SimConfig {
 	seed: number
 	n: number // initial peers
@@ -89,12 +80,12 @@ export interface SimConfig {
 }
 
 /**
- * Ring-shaped reads skip entries the probing peer has marked `dead` in its own store. This is
- * liveness only — the sim does not model `membership` — and it is deliberately *not* the global
- * `alive` oracle: it reads only what this peer's own contact attempts recorded.
+ * The deterministic simulation harness: event dispatch and scheduling, the stabilize tick,
+ * snapshot exchange (bus and direct), churn/join/leave, capacity eviction, and routing —
+ * composing the focused modules beside it: coordinate placement (`CoordPlacement`), the
+ * partition oracle (`PartitionModel`), contact-failure escalation (`LivenessModel`), and
+ * ring-health measures (`SimMeasurement`).
  */
-const notDead = (e: PeerEntry): boolean => e.state !== 'dead'
-
 export class FretSimulation {
 	private readonly rng: DeterministicRNG
 	readonly scheduler: EventScheduler
@@ -105,20 +96,13 @@ export class FretSimulation {
 	private readonly bus: SimMessageBus | undefined
 	private nextPeerIndex: number
 	private readonly lastStabilized = new Map<string, number>()
-	private readonly deadAfterFailures: number
-	private readonly deadReprobePerTick: number
-
-	// Active partition: peer id → group index. Empty map = no partition.
-	private readonly partitionOf = new Map<string, number>()
-	private crossPartitionBlockedCount = 0
-
-	// Placement state for clustered mode
-	private clusterCenters: bigint[] | undefined
+	private readonly placement: CoordPlacement
+	private readonly partitionModel: PartitionModel
+	private readonly liveness: LivenessModel
+	private readonly measurement: SimMeasurement
 
 	constructor(config: SimConfig) {
 		this.config = config
-		this.deadAfterFailures = config.deadAfterFailures ?? 3
-		this.deadReprobePerTick = config.deadReprobePerTick ?? 2
 		this.rng = new DeterministicRNG(config.seed)
 		this.scheduler = new EventScheduler()
 		this.metrics = new MetricsCollector()
@@ -128,12 +112,34 @@ export class FretSimulation {
 			this.bus = new SimMessageBus(this.rng, config.messageBus, this.metrics)
 		}
 
-		if (config.placement === 'clustered' && config.clusterConfig) {
-			this.clusterCenters = []
-			for (let i = 0; i < config.clusterConfig.numClusters; i++) {
-				this.clusterCenters.push(this.rng.nextBigInt(256))
-			}
-		}
+		// Constructed immediately after the bus (which consumes no RNG), so clustered mode
+		// draws its centers at the same RNG position as before the module split — keeping
+		// same-seed replays byte-identical.
+		this.placement = new CoordPlacement(this.rng, {
+			placement: config.placement,
+			clusterConfig: config.clusterConfig,
+			n: config.n,
+		})
+		this.partitionModel = new PartitionModel({ hasPeer: (id) => this.peers.has(id) })
+		this.liveness = new LivenessModel(
+			{
+				deadAfterFailures: config.deadAfterFailures ?? 3,
+				deadReprobePerTick: config.deadReprobePerTick ?? 2,
+			},
+			{
+				contactAllowed: (a, b) => this.partitionModel.contactAllowed(a, b),
+				isAlive: (id) => {
+					const p = this.peers.get(id)
+					return !!p && p.alive
+				},
+			},
+		)
+		this.measurement = new SimMeasurement({
+			peers: this.peers,
+			stores: this.stores,
+			m: config.m,
+			partition: this.partitionModel,
+		})
 	}
 
 	initialize(): void {
@@ -153,58 +159,19 @@ export class FretSimulation {
 		}
 	}
 
-	/**
-	 * Split the network into mutually unreachable groups.
-	 *
-	 * An id absent from every group resolves to group 0, so a peer that joins mid-split lands
-	 * in the first group — the harness's stand-in for "the side the bootstrap list points at".
-	 * Calling again replaces the whole assignment (no throw); a peer listed in more than one
-	 * group keeps its last listing (last write wins — the map cannot be corrupted by a dup).
-	 *
-	 * An id that names no peer throws. It cannot be distinguished from a mid-split joiner at
-	 * read time (both are "absent from the map"), so a typo'd or stale id would silently sort
-	 * every *real* peer into one group and leave the split a no-op that a test still passes.
-	 */
+	/** Split the network into mutually unreachable groups — see `PartitionModel.partition`. */
 	partition(groups: ReadonlyArray<ReadonlyArray<string>>): void {
-		for (const group of groups) {
-			for (const id of group) {
-				if (!this.peers.has(id)) throw new Error(`partition(): unknown peer id ${id}`)
-			}
-		}
-		this.partitionOf.clear()
-		for (let g = 0; g < groups.length; g++) {
-			for (const id of groups[g]!) this.partitionOf.set(id, g)
-		}
+		this.partitionModel.partition(groups)
 	}
 
-	/** Restore full reachability. Calling with no partition active is a defined no-op. */
+	/** Restore full reachability — see `PartitionModel.heal`. */
 	heal(): void {
-		this.partitionOf.clear()
+		this.partitionModel.heal()
 	}
 
-	/** Contacts refused by the reachability predicate since construction (monotonic). */
+	/** Contacts refused by the reachability predicate since construction — see `PartitionModel.blocked`. */
 	crossPartitionBlocked(): number {
-		return this.crossPartitionBlockedCount
-	}
-
-	/**
-	 * The one reachability predicate every cross-peer site consults: true when no partition is
-	 * active, or when both ids resolve to the same group (absent id → group 0).
-	 */
-	private reachable(a: string, b: string): boolean {
-		if (this.partitionOf.size === 0) return true
-		return (this.partitionOf.get(a) ?? 0) === (this.partitionOf.get(b) ?? 0)
-	}
-
-	/**
-	 * `reachable`, counting a refusal. Used at sites that model an actual contact attempt
-	 * (a probe, a send, a delivery); pool-filtering sites (candidate lists, coverage math)
-	 * use `reachable` directly so the counter stays "contacts refused", not "ids filtered".
-	 */
-	private contactAllowed(a: string, b: string): boolean {
-		if (this.reachable(a, b)) return true
-		this.crossPartitionBlockedCount++
-		return false
+		return this.partitionModel.blocked()
 	}
 
 	private addPeer(index: number, isJoin = false): SimPeer {
@@ -227,79 +194,9 @@ export class FretSimulation {
 
 	private createPeer(index: number, isJoin: boolean): SimPeer {
 		const id = `peer-${index.toString().padStart(4, '0')}`
-		const coord = this.generateCoord(index, isJoin)
+		const coord = this.placement.generateCoord(index, isJoin)
 		const profileConfig = this.assignProfile()
 		return { id, coord, alive: true, connected: new Set(), neighbors: new Set(), profileConfig }
-	}
-
-	/** Generate a ring coordinate based on placement strategy. */
-	private generateCoord(index: number, isJoin: boolean): Uint8Array {
-		const placement = this.config.placement ?? 'uniform'
-		switch (placement) {
-			case 'uniform':
-				return isJoin ? this.randomCoord() : this.uniformCoord(index, this.config.n)
-			case 'clumped-joiners':
-				// The pre-fix bug, on purpose. handleJoin does `nextPeerIndex++` before creating
-				// the peer, so the old `uniformCoord(index, this.nextPeerIndex)` was exactly
-				// `index / (index + 1)` of the ring — 40/41, 41/42, ... — all converging on the
-				// same point. Spelled out as `index + 1` rather than read back off the mutable
-				// counter so the intent survives any future change to when the counter is bumped.
-				// Initial peers are placed evenly, exactly as `uniform` does.
-				return isJoin ? this.uniformCoord(index, index + 1) : this.uniformCoord(index, this.config.n)
-			case 'clustered':
-				return this.clusteredCoord()
-			case 'skewed':
-				return this.skewedCoord()
-		}
-	}
-
-	/** Evenly spaced on the 256-bit ring, over a fixed population. */
-	private uniformCoord(index: number, population: number): Uint8Array {
-		const coord = new Uint8Array(32)
-		const bigIndex = BigInt(index)
-		const range = (1n << 256n) / BigInt(Math.max(1, population))
-		const val = bigIndex * range
-		for (let i = 0; i < 32; i++) {
-			coord[31 - i] = Number((val >> BigInt(i * 8)) & 0xffn)
-		}
-		return coord
-	}
-
-	/** Seeded-random ring position for a mid-run joiner — models placement by hash of peer id. */
-	private randomCoord(): Uint8Array {
-		return toCoord(this.rng.nextBigInt(256))
-	}
-
-	/** Gaussian spread around cluster centers. */
-	private clusteredCoord(): Uint8Array {
-		const centers = this.clusterCenters!
-		const center = centers[this.rng.nextInt(0, centers.length)]!
-		const spreadBits = this.config.clusterConfig?.spreadBits ?? 32
-		// NOTE: spread is scaled through a JS float, so it stays exact up to ~52 bits.
-		// Beyond that the offset loses low-bit precision (still wraps correctly); if a
-		// caller ever needs spreadBits > 52, do the scaling in BigInt instead.
-		const offset = BigInt(Math.round(this.rng.nextGaussian() * Number(1n << BigInt(spreadBits))))
-		const ringSize = 1n << 256n
-		// Wrap around ring
-		let val = (center + offset) % ringSize
-		if (val < 0n) val += ringSize
-		return toCoord(val)
-	}
-
-	/** Power-law distribution — some ring regions are dense, most are sparse. */
-	private skewedCoord(): Uint8Array {
-		// Raising a uniform sample to a power > 1 concentrates mass near 0, leaving
-		// most of the ring sparse — a crude model of organically dense/sparse regions.
-		// (The earlier inverse-Pareto form (pareto-1)/pareto algebraically reduces to
-		// 1-u, i.e. uniform, so it produced no skew at all.)
-		const u = this.rng.next() // [0,1); u=0 maps cleanly to coordinate 0 (no NaN)
-		const exponent = 3 // higher → denser near the low end of the ring
-		const normalized = Math.pow(u, exponent) // [0,1), concentrated near 0
-		// Only the top 128 bits carry entropy here (Number can't represent the full
-		// 256-bit range); the low 128 bits stay zero, which is fine for placement.
-		const ringSize = 1n << 256n
-		const val = BigInt(Math.floor(normalized * Number(ringSize >> 128n))) << 128n
-		return toCoord(val % ringSize)
 	}
 
 	private scheduleStabilization(): void {
@@ -425,7 +322,7 @@ export class FretSimulation {
 		// A cut applies to traffic already in flight: a message whose endpoints are no longer
 		// mutually reachable is dropped at delivery (never delivered late), counted as a bus
 		// drop. Healing cannot resurrect it — it left the pending queue here.
-		if (!this.contactAllowed(msg.from, msg.to)) {
+		if (!this.partitionModel.contactAllowed(msg.from, msg.to)) {
 			this.metrics.recordMessageDrop()
 			return
 		}
@@ -476,7 +373,7 @@ export class FretSimulation {
 		// A joiner samples only peers it can reach — a mid-split joiner (group 0 by default)
 		// bootstraps against its own side, never across the cut.
 		const alivePeers = Array.from(this.peers.values())
-			.filter((p) => p.id !== peerId && p.alive && this.reachable(peerId, p.id))
+			.filter((p) => p.id !== peerId && p.alive && this.partitionModel.reachable(peerId, p.id))
 		const sample = this.rng.shuffle(alivePeers).slice(0, Math.min(maxConn, alivePeers.length))
 		for (const other of sample) {
 			store.upsert(other.id, other.coord)
@@ -511,7 +408,7 @@ export class FretSimulation {
 				if (otherId === peerId) continue
 				const otherPeer = this.peers.get(otherId)
 				if (!otherPeer || !otherPeer.alive) continue
-				if (!this.contactAllowed(peerId, otherId)) continue
+				if (!this.partitionModel.contactAllowed(peerId, otherId)) continue
 				this.bus.send(peerId, otherId, 'leave-notice', peerId, time)
 			}
 		} else {
@@ -520,7 +417,7 @@ export class FretSimulation {
 				if (otherId === peerId) continue
 				const otherPeer = this.peers.get(otherId)
 				if (!otherPeer || !otherPeer.alive) continue
-				if (!this.contactAllowed(peerId, otherId)) continue
+				if (!this.partitionModel.contactAllowed(peerId, otherId)) continue
 				otherStore.remove(peerId)
 				otherPeer.connected.delete(peerId)
 				otherPeer.neighbors.delete(peerId)
@@ -582,10 +479,10 @@ export class FretSimulation {
 			}
 
 			// Contact sweep: prune departed peers, escalate unreachable ones toward `dead`.
-			this.contactSweep(peer, store, time)
+			this.liveness.contactSweep(peer.id, store, time)
 
 			// Bounded re-probe of dead entries — the path back after heal().
-			this.reprobeDeadEntries(peer, store, time)
+			this.liveness.reprobeDeadEntries(peer.id, store, time)
 
 			// Enforce capacity
 			if (this.config.capacity) {
@@ -596,95 +493,6 @@ export class FretSimulation {
 		// Record coverage snapshot
 		const coverage = this.snapshotCoverage()
 		this.metrics.recordCoverage(time, coverage)
-	}
-
-	/**
-	 * One contact attempt per store entry per tick: prune peers that left the network, strike
-	 * entries whose peer cannot be reached, and clear the strike run on a successful contact.
-	 * The prune is the one global-`alive` read left here, and it stands in for a departed
-	 * peer's leave notice rather than for knowledge a peer could not have; the strike/clear
-	 * arithmetic itself lives in `recordContactFailure` / `recordContactSuccess`, shared with
-	 * the routing path so the two escalations cannot drift.
-	 * At `deadAfterFailures` strikes the entry is marked `dead` and drops out of every
-	 * ring-shaped read via the `notDead` filter.
-	 *
-	 * Production spaces strikes ≥ 500 ms apart so a burst of concurrent failures counts once
-	 * (docs/fret.md — Ring membership). *This sweep* strikes an entry at most once per tick,
-	 * so within the sweep the independence the spacing rule buys holds by construction and no
-	 * spacing check is re-implemented — a property of the tick, not of the clock: a driver
-	 * that processes several ticks at one simulated timestamp still sweeps once per tick.
-	 * NOTE: that is no longer the whole picture — `handleRoute` strikes through the same
-	 * `recordContactFailure`, so an entry can take a sweep strike and one route strike (and
-	 * one per further route) at the same simulated timestamp, escalating to `dead` faster
-	 * than the sweep alone would. Harmless while routes are scheduled sparsely by the specs;
-	 * if a suite ever fires many routes per tick through the same unreachable window, add the
-	 * production spacing check (≥ 500 ms since `lastContactFailureAt`) inside
-	 * `recordContactFailure` rather than re-deriving it per call site.
-	 * Production also spreads its contacts across budgeted passes (near / classify /
-	 * re-probe) rather than touching every entry each tick; the sim collapses those into one
-	 * per-tick sweep, so a fully unreachable population escalates in `deadAfterFailures`
-	 * ticks flat.
-	 */
-	private contactSweep(peer: SimPeer, store: DigitreeStore, time: number): void {
-		for (const entry of store.list()) {
-			if (entry.id === peer.id) continue
-			const p = this.peers.get(entry.id)
-			if (!p || !p.alive) {
-				store.remove(entry.id)
-				continue
-			}
-			if (entry.state === 'dead') continue // dead entries belong to the re-probe arm
-			if (!this.contactAllowed(peer.id, entry.id)) {
-				this.recordContactFailure(store, entry, time)
-			} else {
-				this.recordContactSuccess(store, entry)
-			}
-		}
-	}
-
-	/**
-	 * One failed contact against a store entry: extend the strike run, and at
-	 * `deadAfterFailures` mark the entry dead. Called from the per-tick `contactSweep` and
-	 * from the routing path's contact attempts, which is the whole point of extracting it —
-	 * two copies of this arithmetic is how the sweep and the router drift apart.
-	 */
-	private recordContactFailure(store: DigitreeStore, entry: PeerEntry, time: number): void {
-		const strikes = Math.min(entry.contactFailures + 1, this.deadAfterFailures)
-		if (strikes >= this.deadAfterFailures) {
-			// lastAccess ← sim time: the re-probe arm orders by ascending lastAccess, and
-			// only sim-clock stamps keep two same-seed runs picking identical candidates
-			// (Date.now() stamps differ between runs and would break deterministic replay).
-			store.update(entry.id, { contactFailures: strikes, state: 'dead', lastAccess: time })
-		} else {
-			store.update(entry.id, { contactFailures: strikes })
-		}
-	}
-
-	/** A successful contact clears the strike run. Written only when there is one to clear. */
-	private recordContactSuccess(store: DigitreeStore, entry: PeerEntry): void {
-		if (entry.contactFailures > 0) store.update(entry.id, { contactFailures: 0 })
-	}
-
-	/**
-	 * Re-probe up to `deadReprobePerTick` of this peer's dead entries; a reachable one returns
-	 * to `disconnected` with its strike run cleared. Without this, nothing would ever contact a
-	 * dead entry again and the merge half of a partition would be untestable — the same trap
-	 * production solves with the dead arm of its re-probe pass. Candidates are ordered by
-	 * ascending lastAccess (id tie-break) so a truncated pass rotates instead of re-deriving
-	 * the same head — the production ordering rule. The sim has no backoff model and does not
-	 * need one: production backs dead re-probes off exponentially; here the tick cadence bounds
-	 * the rate.
-	 */
-	private reprobeDeadEntries(peer: SimPeer, store: DigitreeStore, time: number): void {
-		const dead = store.list().filter((e) => e.state === 'dead')
-		if (dead.length === 0) return
-		dead.sort((a, b) => a.lastAccess - b.lastAccess || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
-		for (const entry of dead.slice(0, this.deadReprobePerTick)) {
-			// Stamp before the outcome so the next pass starts past this candidate either way.
-			store.update(entry.id, { lastAccess: time })
-			if (!this.contactAllowed(peer.id, entry.id)) continue
-			store.update(entry.id, { state: 'disconnected', contactFailures: 0 })
-		}
 	}
 
 	/** Collect snapshot entries for a peer, respecting profile snapshot caps. */
@@ -721,7 +529,7 @@ export class FretSimulation {
 
 			// Gates the whole exchange — including the direct read of the neighbor's store
 			// below, which models the far peer *responding*, not merely our send.
-			if (!this.contactAllowed(peer.id, nid)) continue
+			if (!this.partitionModel.contactAllowed(peer.id, nid)) continue
 
 			// Send our neighbors to the neighbor (capped by sender's profile)
 			this.bus!.send(peer.id, nid, 'neighbor-response', myEntries, time)
@@ -745,7 +553,7 @@ export class FretSimulation {
 			if (!neighbor || !neighbor.alive) continue
 
 			// Gates both directions — reading the neighbor's store models it responding.
-			if (!this.contactAllowed(peer.id, nid)) continue
+			if (!this.partitionModel.contactAllowed(peer.id, nid)) continue
 
 			const nstore = this.stores.get(nid)
 			if (!nstore) continue
@@ -801,8 +609,9 @@ export class FretSimulation {
 	 * the global `alive` flag or the partition map to build a candidate pool: a peer learns a
 	 * neighbour is unreachable only when its own contact attempt fails, exactly as production
 	 * does, and each such failure strikes that entry through the same escalation
-	 * `contactSweep` uses. Consulting the oracle instead is what let this harness report a
-	 * routing-success number that could not fail when the distance math was wrong.
+	 * `LivenessModel.contactSweep` uses. Consulting the oracle instead is what let this
+	 * harness report a routing-success number that could not fail when the distance math was
+	 * wrong.
 	 */
 	private handleRoute(fromPeerId: string, targetCoord: Uint8Array, time: number): void {
 		const from = this.peers.get(fromPeerId)
@@ -898,13 +707,13 @@ export class FretSimulation {
 				tried.add(pick)
 				const entry = store.getById(pick)
 				const target = this.peers.get(pick)
-				if (this.contactAllowed(current, pick) && target?.alive) {
-					if (entry) this.recordContactSuccess(store, entry)
+				if (this.partitionModel.contactAllowed(current, pick) && target?.alive) {
+					if (entry) this.liveness.recordContactSuccess(store, entry)
 					next = pick
 					break
 				}
 				// Failed contact: strike it the way the sweep would, then try the next best.
-				if (entry) this.recordContactFailure(store, entry, time)
+				if (entry) this.liveness.recordContactFailure(store, entry, time)
 			}
 
 			if (!next) break
@@ -942,94 +751,14 @@ export class FretSimulation {
 		return toCoord(raw > halfRing ? halfRing : raw)
 	}
 
-	/**
-	 * Mean fraction of each peer's ideal neighbor window that it actually holds.
-	 *
-	 * NOTE: 1.0 is not reachable. Both walks are anchored *on* the peer's own coordinate, so each
-	 * returns self plus m−1 others, while the denominator asks for 2m — a fully converged ring
-	 * therefore reports exactly (2m−2)/2m (87.5% at the usual m = 8), which is why every suite's
-	 * threshold sits below that and why the partition specs log 87.5% at all three phases. Same
-	 * self-anchored off-by-one docs/fret.md describes for the eviction protection set. Harmless
-	 * as a *relative* measure, which is all any caller uses it for; fix it only alongside
-	 * re-calibrating every threshold that was set against today's numbers.
-	 */
+	/** Mean fraction of each peer's ideal neighbor window it holds — see `SimMeasurement.snapshotCoverage`. */
 	snapshotCoverage(): number {
-		const alivePeers = Array.from(this.peers.values()).filter((p) => p.alive)
-		if (alivePeers.length <= 1) return 1
-
-		// Each peer is measured against the alive population it can actually reach — under a
-		// cut, dividing by the global alive count would cap coverage at the split ratio by
-		// construction and a "the ring healed" assertion would measure the split, not the
-		// healing. With no partition active every peer resolves to one group and the
-		// denominator is the global alive count — today's value, unchanged (the existing
-		// suites' thresholds are calibrated against it).
-		const partitionActive = this.partitionOf.size > 0
-		const aliveByGroup = new Map<number, number>()
-		if (partitionActive) {
-			for (const p of alivePeers) {
-				const g = this.partitionOf.get(p.id) ?? 0
-				aliveByGroup.set(g, (aliveByGroup.get(g) ?? 0) + 1)
-			}
-		}
-
-		let totalCoverage = 0
-		for (const peer of alivePeers) {
-			const store = this.stores.get(peer.id)
-			if (!store) continue
-
-			// `aliveByGroup` was built from this same list, so the lookup always hits.
-			const reachableAlive = partitionActive
-				? aliveByGroup.get(this.partitionOf.get(peer.id) ?? 0)!
-				: alivePeers.length
-			const reachableOthers = reachableAlive - 1
-
-			const liveFilter = (id: string): boolean => {
-				if (id === peer.id) return false
-				if (!this.reachable(peer.id, id)) return false
-				const p = this.peers.get(id)
-				return !!p && p.alive
-			}
-			const right = store.neighborsRight(peer.coord, this.config.m, notDead).filter(liveFilter)
-			const left = store.neighborsLeft(peer.coord, this.config.m, notDead).filter(liveFilter)
-
-			const idealPerSide = Math.min(this.config.m, reachableOthers)
-			const actual = new Set([...right, ...left]).size
-			// A singleton side has reachableOthers = 0 → ideal 0 → contributes 1 (it fully
-			// covers its empty reachable world) — defined, no NaN.
-			const ideal = Math.min(idealPerSide * 2, reachableOthers)
-			totalCoverage += ideal > 0 ? actual / ideal : 1
-		}
-
-		return totalCoverage / alivePeers.length
+		return this.measurement.snapshotCoverage()
 	}
 
+	/** Mean per-peer fraction of neighbor-window entries no longer alive — see `SimMeasurement.deadNeighborRatio`. */
 	deadNeighborRatio(): number {
-		const alivePeers = Array.from(this.peers.values()).filter((p) => p.alive)
-		if (alivePeers.length === 0) return 0
-
-		let totalRatio = 0
-		let count = 0
-		for (const peer of alivePeers) {
-			const store = this.stores.get(peer.id)
-			if (!store) continue
-
-			const right = store.neighborsRight(peer.coord, this.config.m, notDead)
-				.filter((id) => id !== peer.id)
-			const left = store.neighborsLeft(peer.coord, this.config.m, notDead)
-				.filter((id) => id !== peer.id)
-			const all = new Set([...right, ...left])
-			if (all.size === 0) continue
-
-			let dead = 0
-			for (const id of all) {
-				const p = this.peers.get(id)
-				if (!p || !p.alive) dead++
-			}
-			totalRatio += dead / all.size
-			count++
-		}
-
-		return count > 0 ? totalRatio / count : 0
+		return this.measurement.deadNeighborRatio()
 	}
 
 	aliveCount(): number {
