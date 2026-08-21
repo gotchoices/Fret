@@ -4,33 +4,32 @@ difficulty: easy
 prereq:
 ----
 <!-- resume-note -->
-Prior run hit its token budget partway through. No log file — see this note and the diff
-already on disk for what's done.
+Second interruption on this ticket — prior run hit budget partway through item 4 (relevance.ts
+work); this run hit budget again while still reading/designing item 4, before writing any code.
+No log file either time — see this note for state.
 
-## Already done (relevance.ts) — do not redo
+## Already done (relevance.ts) — verified intact this pass, do not redo
 
-1. Inlined `withCounters` — deleted the function, all 3 call sites (`touch`, `recordSuccess`,
-   `recordFailure`) now spread inline: `{ ...entry, lastAccess: now, relevance, ... }`.
-2. Fixed `touch`'s access-count basis: `baseRelevance` now called with
-   `{ ...entry, accessCount: entry.accessCount + 1 }`, matching `recordSuccess`/`recordFailure`'s
-   pattern of computing base relevance off the post-increment entry.
-3. Removed the dead `Math.max(1, halfLifeMs)` clamp — `lambda = Math.log(2) / halfLifeMs`.
+Read `packages/fret/src/store/relevance.ts` top to bottom this pass and confirmed all three land
+cleanly:
 
-Verify these three landed cleanly (read `packages/fret/src/store/relevance.ts` top to bottom —
-it's short) before continuing; don't re-verify by diffing, just confirm the file reads sensibly.
+1. `withCounters` inlined — deleted, all 3 call sites (`touch`, `recordSuccess`, `recordFailure`)
+   spread inline: `{ ...entry, lastAccess: now, relevance, ... }`.
+2. `touch`'s access-count basis fixed: `baseRelevance` called with
+   `{ ...entry, accessCount: entry.accessCount + 1 }`, matching `recordSuccess`/`recordFailure`.
+3. Dead `Math.max(1, halfLifeMs)` clamp removed — `lambda = Math.log(2) / halfLifeMs`.
 
-## Remaining work
+No further verification needed on relevance.ts — just trust this and move on.
 
-### Item 4 — extract shared directional ring walker (digitree-store.ts:385-548, NOTE block at ~456-460)
+## Remaining work — item 4: extract shared directional ring walker
 
-Not started. Full spec (unchanged from original plan, repeated here since it's the substantial
-remaining piece):
+Not started (no edits made to digitree-store.ts across either interrupted run). Full spec:
 
-`digitree-store.ts` carries a NOTE block (~456-460, search for `plan/cleanup-store-ring`) already
-describing this extraction — read it in full before starting; it names the two soundness
-conditions (one-entry-per-id makes a repeat mean "lapped"; a supplied filter must be pure) that
-the new walker must preserve. Five methods today all seek via `ceilPath`/`floorPath` then walk
-`next`/`prior` with a `maxScan` bounded-scan guard when a filter is given:
+`digitree-store.ts` carries a NOTE block at ~456-460 (search `plan/cleanup-store-ring`) describing
+this extraction — read it in full before starting; it names the two soundness conditions
+(one-entry-per-id makes a repeat mean "lapped"; a supplied filter must be pure) the new walker
+must preserve. Five methods today all seek via `ceilPath`/`floorPath` then walk `next`/`prior`
+with a `maxScan` bounded-scan guard when a filter is given:
 
 - `successorOfCoord` / `predecessorOfCoord` (~385-423): find first match, single result.
 - `neighborsRight` / `neighborsLeft` (~462-506): collect into a `Set` up to `count`, with
@@ -51,8 +50,41 @@ of the 5 public methods becomes a thin consumer:
 
 Keep the `neighborsRight`/`neighborsLeft` early-exit-on-repeat behavior and the `walkFrom`
 strictly-after/paging behavior exactly as documented in their existing docblocks — behavior, not
-incidental to the loop shape. Delete the extraction NOTE block once done (it describes work now
-done, not a remaining concern).
+incidental to the loop shape. Delete the extraction NOTE block once done.
+
+**Typing note for next agent** (found this pass, not yet used): the digitree `Path` type lives in
+`packages/fret/node_modules/digitree/dist/path.d.ts` and `.../dist/b-tree.d.ts` — check those
+first for the exported path type before hand-rolling a generator signature; `BTree.first()` /
+`.last()` / `.next(p)` / `.prior(p)` / `.find(k)` all return that same shape. A sketch considered
+but not yet written or validated against the real types:
+
+```ts
+private *walkRing(
+  start: Path, // from digitree, see above
+  direction: 'next' | 'prior',
+  filter?: (e: PeerEntry) => boolean
+): Generator<PeerEntry, void, undefined> {
+  const step = direction === 'next' ? (p: Path) => this.byKey.next(p) : (p: Path) => this.byKey.prior(p);
+  const wrapTo = direction === 'next' ? () => this.byKey.first() : () => this.byKey.last();
+  const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
+  let p = start.on ? start : wrapTo();
+  let scanned = 0;
+  while (scanned < maxScan) {
+    if (!p.on) { p = wrapTo(); if (!p.on) return; }
+    const e = this.byKey.at(p)!;
+    scanned++;
+    if (!filter || filter(e)) yield e;
+    p = step(p);
+  }
+}
+```
+This reproduces `successorOfCoord`'s existing unfiltered short-circuit for free (first yield with
+`maxScan = Infinity` on a non-empty ring is the same as the current "return p.on ? at(p) :
+undefined"), but has NOT been checked against `walkFrom`'s distinct start-position rule (strictly
+after cursor, not at the seek point) — `walkFrom` seeks its own start path before calling in
+(`cursor ? next(find(cursor.key)) : first()`), so the generator itself doesn't need to know about
+cursors; confirm that composition works before committing to this shape. Treat the sketch as a
+starting point, not a settled design — verify it compiles and passes tests, don't just transcribe it.
 
 **Edge cases to preserve (see original ticket history / docs/fret.md for full detail):**
 - Empty store: `successorOfCoord`/`predecessorOfCoord` → `undefined`, `neighborsRight`/`neighborsLeft`
@@ -69,7 +101,7 @@ done, not a remaining concern).
   still land on the right ring position even if that key is gone (the "crack" case) — confirm
   through the extracted walker.
 
-### Item 5 — verify-then-noop items (grep-confirm, don't redo work if still true)
+## Remaining work — item 5: verify-then-noop items (grep-confirm, don't redo work if still true)
 
 Not started. Original plan asserted these are already fixed elsewhere in the codebase; re-run the
 greps below before touching anything — if they still show what's described, these are no-ops:
@@ -91,14 +123,14 @@ unused-export cleanup) belong to the separate `consolidate-ring-distance` ticket
 
 ## TODO
 
-- Confirm the 3 already-done relevance.ts fixes (see above) are intact
 - Extract the shared directional ring walker and rewrite the 5 `digitree-store.ts` consumers to
-  use it (item 4)
+  use it (item 4) — check the digitree `Path` type first, see typing note above
 - Delete the extraction NOTE block at digitree-store.ts (~456-460) once the walker lands
 - Grep-confirm the 4 "already fixed" items are still true; no-op if so, flag in handoff if not
   (item 5)
-- Run `cd packages/fret && npx tsc --noEmit` — **not yet run this pass**, do this before anything
-  else to catch fallout from the relevance.ts edits already made
+- Run `cd packages/fret && npx tsc --noEmit` — still not run across either interrupted pass; do
+  this before anything else to catch fallout from the relevance.ts edits (already landed and
+  content-verified, but never type-checked)
 - Run `cd packages/fret && yarn test` — pay particular attention to
   `test/digitree.invariants.spec.ts`, `test/digitree.neighbors.spec.ts`,
   `test/relevance.eviction.spec.ts` (all three are the regression backstop named in the original
@@ -109,5 +141,6 @@ relevance touch path uses the same access-count basis as the other record paths 
 walker duplication across 5 methods is gone (not done).
 
 References: review store section, cleanup finding "Mechanical cleanups" (digitree-store.ts:208-294)
-and minor finding on relevance (relevance.ts:103-113). Prior ticket `20-cleanup-store-ring` (this
-ticket replaces it after a budget-warning interruption).
+and minor finding on relevance (relevance.ts:103-113). Prior tickets `20-cleanup-store-ring`
+(this ticket replaces it after two budget-warning interruptions in a row — if a third happens,
+consider whether item 4 needs to be split into its own ticket rather than re-attempted whole).
