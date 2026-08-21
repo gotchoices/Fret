@@ -4,33 +4,61 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Prior agent run stopped on a BUDGET_WARNING before any file edit was made — this is a fresh
-restart of the original ticket, not a partial implementation to unwind. No source or test file
-was touched in the interrupted run. Confirmed during that run (safe to trust, no need to re-derive):
+Second interrupted run, again on a BUDGET_WARNING before any file edit — still nothing to unwind,
+still a fresh start. This run additionally read `placement.ts`, `fret-sim.ts` in full, and
+`sim-metrics.ts` in full (all confirmed, safe to trust — no need to re-read those three end to
+end again, though line numbers may drift if a prior task touched them, which none has):
 
-- `packages/fret/test/simulation/fret-sim.ts` line 24: `export type { PlacementStrategy,
-  ClusterConfig } from './placement.js'` — the literal union and `ClusterConfig` shape live in
-  `packages/fret/test/simulation/placement.ts` (not yet read — check it first for the exact
-  strategy name strings and `clusterConfig` field names before writing new sim configs).
-- `packages/fret/test/simulation/sim-metrics.ts`: `SimMetrics` has both `avgRoutingHops` (mean
-  over `routingHops`, all attempts) and `successfulRouteHops: number[]` (hops for successes
-  only, no averaged field precomputed — average it yourself if you pick this one). Matches the
-  ticket's description below exactly.
-- `packages/fret/test/churn-scenarios.spec.ts` lines ~337–453 already has the full pattern to
-  copy: `coordToBigInt`, `maxPeersInOneSpacingArc`, `PlacementCase`, `PLACEMENT_SEEDS = [8008,
-  8009, 8010, 4242, 99]`, `MAX_PEERS_IN_ONE_SPACING_ARC = 7`, `placementReading`,
-  `assertPlacementSeparates`. Read this section directly — it is reproduced in full below too.
-- `packages/fret/test/message-bus.spec.ts` lines ~292–406: the `describe('Placement
-  distributions', ...)` block with the two vacuous cases at ~295–332 (`clustered placement: peers
-  cluster around centers`, using a bare `largestGap > medianGap` check) and ~334–370 (`clustered
-  placement: inter-cluster routing takes more hops`, which never sets `placement: 'clustered'` on
-  its sim config despite the variable name `clusterSim`, and only asserts `routingAttempts === 10`
-  — never reads a hop count). The `skewed placement` case at ~372–405 is already correct, per its
-  own comment — do not touch its assertion, only optionally its inline coord-conversion loop.
+- `packages/fret/test/simulation/placement.ts` — confirmed exact contents:
+  - `export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed' | 'clumped-joiners'`
+  - `export interface ClusterConfig { numClusters: number; spreadBits: number }`
+  - `CoordPlacement.generateCoord(index, isJoin)` switches on `this.placement` (default via
+    `opts.placement ?? 'uniform'`, so omitting `placement` in a sim config IS the uniform arm —
+    no separate `'uniform'` string needs to be passed for the "wrong arm" comparisons the design
+    decisions below call for, though passing it explicitly is equally valid and arguably clearer
+    at each new call site).
+  - `clusteredCoord()` needs `this.clusterCenters`, which is only populated in the constructor
+    when `opts.placement === 'clustered' && opts.clusterConfig` — so a clustered-arm sim config
+    MUST pass both `placement: 'clustered'` and a `clusterConfig`, or `clusterCenters` stays
+    `undefined` and `centers!` throws at runtime.
+- `packages/fret/test/simulation/fret-sim.ts` — confirmed `SimConfig` interface (line ~65) takes
+  `placement?: PlacementStrategy` and `clusterConfig?: ClusterConfig` directly as sim-level
+  fields (not nested under a sub-object), consumed at `FretSimulation` construction (~line 132)
+  to build the one `CoordPlacement` instance for that sim run — so each of the two arms (clustered
+  vs uniform) needs its own separate `new FretSimulation({...})` instance; there is no way to
+  switch strategy mid-run. `SimMetrics` is read via `sim.metrics.finalize()` per `run()` (line
+  293) or manually via `sim.metrics.finalize()` any time (metrics collector accumulates as events
+  process). `avgRoutingHops` and `routingHops`/`successfulRouteHops` are computed in `finalize()`
+  in `sim-metrics.ts`, confirmed below.
+- `packages/fret/test/simulation/sim-metrics.ts` — confirmed in full: `recordRoute(success, hops)`
+  pushes to `routingHops` always and to `successfulRouteHops` only on success;
+  `finalize()` computes `avgRoutingHops` as the mean of all of `routingHops` (successes and
+  failures alike). No precomputed average of `successfulRouteHops` exists — if design decision 3
+  ends up preferring that one, average `metrics.successfulRouteHops` by hand in the test.
+- `packages/fret/test/churn-scenarios.spec.ts` — grep-confirmed exact line numbers at HEAD (no
+  edits landed yet, so still current): `coordToBigInt` L338, `maxPeersInOneSpacingArc` L355,
+  `PlacementCase` interface L373, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]` L379,
+  `MAX_PEERS_IN_ONE_SPACING_ARC = 7` L394, `placementReading` L396, `assertPlacementSeparates`
+  L430. Two call sites of `assertPlacementSeparates`: L326 (`'batch burst'`) and L333
+  (`'steady trickle'`). Full body of this section (L337–453) was NOT re-read this run (grepped
+  only) — read it directly before extracting the shared helper in design decision 1, since exact
+  signatures/types of `coordToBigInt`/`maxPeersInOneSpacingArc`/`PlacementCase` matter for the
+  lift.
+- `packages/fret/test/message-bus.spec.ts` lines ~292–406 (the `describe('Placement
+  distributions', ...)` block) — NOT re-read this run either (no budget left); prior run's notes
+  on it, reproduced from the first resume-note, still stand and are unverified against current
+  line numbers: two vacuous cases (`clustered placement: peers cluster around centers` using a
+  bare `largestGap > medianGap` check; `clustered placement: inter-cluster routing takes more
+  hops` which never sets `placement: 'clustered'` despite the `clusterSim` variable name and only
+  asserts `routingAttempts === 10`), plus one already-correct `skewed placement` case to leave
+  alone.
 
-Nothing else was explored or decided beyond what's already in the original ticket body below,
-which is unchanged. Start by reading `placement.ts` for the strategy names, then follow the TODO
-list at the bottom in order.
+Two runs in a row have now spent their whole budget on re-reading context rather than writing
+code. If a third run picks this up, skip straight to editing — read only
+`churn-scenarios.spec.ts` L337–453 and `message-bus.spec.ts` L292–406 (both still unread in full),
+confirm they match the summaries above, then go straight to the TODO list. Do not re-read
+`placement.ts`, `fret-sim.ts`, or `sim-metrics.ts` again — they are confirmed above and nothing
+in this repo has touched them.
 
 ---
 
