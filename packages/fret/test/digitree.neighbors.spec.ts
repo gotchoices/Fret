@@ -67,20 +67,34 @@ describe('DigitreeStore ring walks exit on a lap', () => {
 
 	// The headline cost case. Old behavior did `count` loop iterations regardless of ring
 	// size, so a million-wide ask on a four-entry ring ran a million tree steps; the exit makes
-	// it ~5. The bound is coarse on purpose — the gap it discriminates is ~5 orders of
-	// magnitude, not a few percent — and it is the only probe available for the *unfiltered*
-	// path, since supplying a counting filter would change which guard is under test (a filter
-	// sets `maxScan` to `size()`, which bounds the lap on its own).
-	it('does work proportional to the ring, not to count', function () {
-		this.timeout(10_000)
+	// it ~5. It is counted rather than timed: a wall-clock assertion cannot discriminate here,
+	// because the old loop is cheap per iteration — measured, the pre-exit walk completed a
+	// million-wide ask on a four-entry ring in 46 ms, so any threshold loose enough to be safe
+	// on shared CI passes at the pre-exit HEAD and guards nothing.
+	//
+	// Counting steps needs no production hook: the walk advances the ordered index one `next`
+	// per iteration, so wrapping that method on the store's own index counts loop iterations
+	// exactly. Reaching past `private` is deliberate — this is a white-box test of the store's
+	// cost, and the alternative was widening the public surface for observability alone.
+	it('does work proportional to the ring, not to count', () => {
 		const store = ringStore(4)
+		const index = (store as unknown as { byKey: { next: (p: unknown) => unknown } }).byKey
+		const next = index.next.bind(index)
+		let steps = 0
+		index.next = (p: unknown) => {
+			steps++
+			return next(p)
+		}
 
-		const started = process.hrtime.bigint()
-		const ids = store.neighborsRight(ZERO, 1_000_000)
-		const elapsedMs = Number(process.hrtime.bigint() - started) / 1e6
+		try {
+			const ids = store.neighborsRight(ZERO, 1_000_000)
+			expect(ids).to.have.length(4)
+		} finally {
+			index.next = next
+		}
 
-		expect(ids).to.have.length(4)
-		expect(elapsedMs, 'a lapping walk must not scale with count').to.be.lessThan(500)
+		// One step per entry plus the one that walks off the last entry and wraps.
+		expect(steps, 'a lapping walk must not scale with count').to.be.at.most(8)
 	})
 
 	// Filed here for adjacency, but it guards `maxScan`, not the lap exit: with a filter
