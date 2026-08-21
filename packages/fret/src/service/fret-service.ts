@@ -2007,8 +2007,19 @@ export class FretService implements IFretService, Startable {
 	 * store. Shared by mergeAnnounceSnapshot and fetchAndMergeSnapshot — both take a peer's
 	 * neighbour list and store it identically; this is that "store it" step in one place so a
 	 * future change to it (a different scoring call, an extra guard) cannot land on one path and
-	 * not the other. RE-HASH, never trust a wire-supplied coord — see the call site comment
-	 * above the sample loop in mergeAnnounceSnapshot for why.
+	 * not the other.
+	 *
+	 * The coordinate is RE-HASHED from the id here and a wire-supplied `coord` is never trusted.
+	 * A ring coordinate is *defined* as SHA-256(peerId.toMultihash().bytes), so it is derivable
+	 * from the id and the wire field is at best a redundant copy — and at worst a free choice of
+	 * ring position for any id the sender names. Trusting it let a transport-authenticated peer
+	 * place *another* peer's id anywhere on the ring with no id grinding, making that id a
+	 * neighbor, anchor and cohort member for keys it must never serve. Taking only the id string
+	 * is what makes that unrepresentable here: the snapshot `sample`'s `{id, coord, relevance}`
+	 * shape is projected to `s.id` by the caller, so no path can hand this method a coord at all.
+	 * The parser still width-checks `s.coord`: the field stays part of the wire shape (removing
+	 * it is a format change), and a sender emitting malformed coordinates is worth dropping the
+	 * entry over even though nothing reads the value.
 	 */
 	private async mergeDiscoveredId(pid: string, into: string[], logLabel: string): Promise<void> {
 		try {
@@ -2052,17 +2063,8 @@ export class FretService implements IFretService, Startable {
 			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 				await this.mergeDiscoveredId(pid, discovered, 'mergeAnnounceSnapshot');
 			}
-			// merge sample if present — truncated by the parser above. RE-HASH, never trust
-			// `s.coord`. A ring coordinate is *defined* as SHA-256(peerId.toMultihash().bytes), so
-			// it is derivable from the id and the wire field is at best a redundant copy — and at
-			// worst a free choice of ring position for any id the sender names. Trusting it let a
-			// transport-authenticated peer place *another* peer's id anywhere on the ring with no
-			// id grinding, making that id a neighbor, anchor and cohort member for keys it must
-			// never serve. The successor/predecessor loop above always re-hashed; only the sample
-			// was ever trusted, and there is no reason for the difference. The parser still checks
-			// `s.coord` decodes to 32 bytes: the field stays part of the wire shape (removing it is
-			// a format change), and a sender emitting malformed coordinates is worth dropping the
-			// entry over even though nothing reads the value.
+			// merge sample if present — truncated by the parser above. Projected to `s.id`, so
+			// `s.coord` is never read: see the re-hash rationale on `mergeDiscoveredId`.
 			for (const s of snap.sample ?? []) {
 				await this.mergeDiscoveredId(s.id, discovered, 'mergeAnnounceSnapshot sample');
 			}
@@ -2666,7 +2668,7 @@ export class FretService implements IFretService, Startable {
 		for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 			await this.mergeDiscoveredId(pid, announced, 'fetchAndMergeSnapshot');
 		}
-		// Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`.
+		// Projected to `s.id`; the coord is re-hashed, never trusted — see `mergeDiscoveredId`.
 		for (const s of snap.sample ?? []) {
 			await this.mergeDiscoveredId(s.id, announced, 'fetchAndMergeSnapshot sample');
 		}
