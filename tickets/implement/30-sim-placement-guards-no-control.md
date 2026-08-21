@@ -4,67 +4,52 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-EIGHTH run continues here. Sections 1 AND 2 are now DONE and confirmed:
+NINTH run stopped here (BUDGET_WARNING fired immediately after the required Read of
+`message-bus.spec.ts`, before any edit). Sections 1 and 2 remain DONE and confirmed (do not
+re-verify, do not re-read their files):
 
-- `packages/fret/test/simulation/placement-assertions.ts` exists (section 1, done several runs
-  ago) exporting `coordToBigInt`, `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS`,
-  `MAX_PEERS_IN_ONE_SPACING_ARC` — verbatim per "1." below. Do not touch.
-- `packages/fret/test/churn-scenarios.spec.ts` (section 2, done THIS run): L3 now has
-  `import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS, MAX_PEERS_IN_ONE_SPACING_ARC } from './simulation/placement-assertions.js'`
-  right after the existing L1–2 imports; the four lifted local definitions (old `coordToBigInt`,
-  `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS`, the measured-table comment + `MAX_PEERS_IN_ONE_SPACING_ARC`)
-  are deleted. `PlacementCase` interface survives untouched, now starting at L338. Confirmed by
-  re-reading L325–354 after the edit: `interface PlacementCase { ... }` sits directly after the
-  `describe` block's closing `})`, followed by `placementReading`. A transient TS2440 "Import
-  declaration conflicts with local declaration" diagnostic appeared between the two edit calls
-  (expected — it's a snapshot taken between deleting the import-adding edit and the
-  local-decl-deleting edit landing) and is gone once both edits are applied; do not re-chase it,
-  it is not a real conflict in the current file.
+- `packages/fret/test/simulation/placement-assertions.ts` exists, verbatim per "1." below.
+- `packages/fret/test/churn-scenarios.spec.ts` has the import added and the four lifted
+  definitions deleted, per "2." below. `PlacementCase` interface survives untouched at L338.
 
-**Ninth run: go straight to section 3 (edit `message-bus.spec.ts`).** Do not re-read
-`churn-scenarios.spec.ts` or `placement-assertions.ts` — both confirmed correct above. Section
-3 needs a Read of `message-bus.spec.ts` first (required by the Edit tool anyway), then the two
-`Edit` calls per "3." below, including the measure-run to fill in
-`CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` (this needs actually running the test file once with a
-loose threshold — a real `node --import ./register.mjs ...mocha.js "test/message-bus.spec.ts"`
-invocation, not a guess). Then the two verification commands at the bottom of the TODO list
-(mocha run + tsc). If BUDGET_WARNING fires again before section 3's edits land, stop immediately
-rather than starting the measure-run mid-budget — a half-applied edit plus an unrun measurement
-is worse than leaving section 3 untouched for the next run.
+**Tenth run: go straight to section 3 (edit `message-bus.spec.ts`). Skip the Read — this run's
+Read (full file, L1–466) already confirmed the file is untouched and matches the description
+below byte-for-byte.** Do not re-read `churn-scenarios.spec.ts` or `placement-assertions.ts`
+either — both confirmed correct across multiple prior runs, see section 1/2 above.
 
-Confirmed exact state as of this run (message-bus.spec.ts untouched across all runs so far):
+Confirmed exact state of `message-bus.spec.ts` this run (full file read, L1–466, unchanged from
+every prior run's description):
 
-- `packages/fret/test/message-bus.spec.ts`: imports at L1–6, including L6
-  `import { FretSimulation } from './simulation/fret-sim.js'`. The `describe('Placement
-  distributions', ...)` block starts L292 (`this.timeout(60000)` at L293). Three cases, exact
-  current bodies:
+- Imports L1–6, including L6 `import { FretSimulation } from './simulation/fret-sim.js'`.
+- `describe('Placement distributions', ...)` block starts L292 (`this.timeout(60000)` at L293).
+  Three cases, exact current bodies (line numbers now reconfirmed against this run's full read):
   - L295–332 `'clustered placement: peers cluster around centers'` — builds one sim with
     `placement: 'clustered', clusterConfig: { numClusters: 3, spreadBits: 32 }` (n:30, k:15, m:8,
     churnRatePerSec:0, stabilizationIntervalMs:500, durationMs:5000), hand-rolls a coord→BigInt
-    loop, sorts, takes gaps, asserts `largestGap > medianGap` — vacuous, true for almost any
-    non-uniform spacing.
+    loop (L310–317), sorts, takes gaps, asserts `largestGap > medianGap` (L331) — vacuous, true
+    for almost any non-uniform spacing.
   - L334–370 `'clustered placement: inter-cluster routing takes more hops'` — builds
     `clusterSim` with **no `placement` field at all** (n:30, k:15, m:8, churnRatePerSec:0,
     stabilizationIntervalMs:500, durationMs:8000) despite the variable name, warms up to t=5000
-    via `clusterSim.scheduler.advanceTo(5000)`, schedules 10 routes via a target-generation loop
-    (`target[j] = (seed * (j + 1) * 37) & 0xff` where `seed = 42 + i * 13`), drains to t=8000,
-    asserts only `metrics.routingAttempts === 10` — never reads a hop count, never sets
+    via `clusterSim.scheduler.advanceTo(5000)` (L347–349), schedules 10 routes via a
+    target-generation loop (L353–359: `target[j] = (seed * (j + 1) * 37) & 0xff` where
+    `seed = 42 + i * 13`), drains to t=8000 (L361–365), asserts only
+    `metrics.routingAttempts === 10` (L369) — never reads a hop count, never sets
     `placement: 'clustered'`.
   - L372–405 `'skewed placement: some regions are denser than others'` — already correct, leave
     untouched (optional cosmetic swap only, see TODO).
-- `packages/fret/test/simulation/sim-metrics.ts` (full file, confirmed complete in a prior run,
-  unchanged): `recordRoute(success, hops)` pushes to `routingHops` always, to
-  `successfulRouteHops` only on success. `finalize()` sets `avgRoutingHops` = mean of all of
-  `routingHops` (every attempt, success or fail) — no precomputed average of
-  `successfulRouteHops` exists; if you need that instead, average `metrics.successfulRouteHops`
-  by hand.
-- `packages/fret/test/simulation/placement.ts` (confirmed in a prior run, unchanged):
+- `packages/fret/test/simulation/sim-metrics.ts` (confirmed complete in prior runs, unchanged):
+  `recordRoute(success, hops)` pushes to `routingHops` always, to `successfulRouteHops` only on
+  success. `finalize()` sets `avgRoutingHops` = mean of all of `routingHops` (every attempt,
+  success or fail) — no precomputed average of `successfulRouteHops` exists; if you need that
+  instead, average `metrics.successfulRouteHops` by hand.
+- `packages/fret/test/simulation/placement.ts` (confirmed in prior runs, unchanged):
   `export type PlacementStrategy = 'uniform' | 'clustered' | 'skewed' | 'clumped-joiners'`;
   `export interface ClusterConfig { numClusters: number; spreadBits: number }`. Omitting
   `placement` in a `SimConfig` defaults to `'uniform'` (`opts.placement ?? 'uniform'`) — no need
   to pass the literal string. A `'clustered'` sim REQUIRES both `placement: 'clustered'` AND
   `clusterConfig`, or a later `centers!` throws.
-- `packages/fret/test/simulation/fret-sim.ts` (confirmed in a prior run, unchanged): `SimConfig`
+- `packages/fret/test/simulation/fret-sim.ts` (confirmed in prior runs, unchanged): `SimConfig`
   takes `placement?: PlacementStrategy` and `clusterConfig?: ClusterConfig` as top-level sim
   fields, consumed once at `FretSimulation` construction — no way to switch strategy mid-run, so
   each comparison arm needs its own `new FretSimulation({...})`.
@@ -73,82 +58,19 @@ Confirmed exact state as of this run (message-bus.spec.ts untouched across all r
 
 ## Exact edits to make (in order)
 
-### 1. New file: `packages/fret/test/simulation/placement-assertions.ts`
+### 1. New file: `packages/fret/test/simulation/placement-assertions.ts` — DONE, do not touch.
 
-Lifted verbatim from `churn-scenarios.spec.ts` L337–394, each export unchanged, just adding
-`export`:
+(Verbatim content confirmed in prior runs; not repeated here since it is already written and
+verified on disk. If for any reason it is missing, recreate from git history of this ticket file
+— prior resume-notes carried the full text.)
 
-```ts
-/** Inverse of toCoord in test/helpers/ring.ts: 32-byte big-endian Uint8Array -> BigInt. */
-export function coordToBigInt(coord: Uint8Array): bigint {
-	let v = 0n
-	for (let i = 0; i < 32; i++) {
-		v = (v << 8n) | BigInt(coord[i]!)
-	}
-	return v
-}
+### 2. `churn-scenarios.spec.ts` — DONE, do not touch.
 
-/**
- * How clumped a ring is: scan an arc one even-spacing wide (ringSize / peers) anchored at each
- * peer in turn, wrapping, and return the most peers any such arc contains.
- *
- * This replaced a largest-gap-over-even-spacing statistic, which was vacuous here: piling every
- * joiner into one sliver makes that sliver denser while the surviving evenly-placed initial
- * population still holds the largest hole down, so the number barely moves — and on the pure
- * batch-join case the buggy and fixed placements produced bit-identical readings.
- */
-export function maxPeersInOneSpacingArc(coords: readonly bigint[]): number {
-	const ringSize = 1n << 256n
-	const sorted = [...coords].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-	if (sorted.length === 0) return 0
-	const arcWidth = ringSize / BigInt(sorted.length)
+Import added, four lifted definitions (`coordToBigInt`, `maxPeersInOneSpacingArc`,
+`PLACEMENT_SEEDS`, `MAX_PEERS_IN_ONE_SPACING_ARC`) deleted and now resolve via the import.
+`PlacementCase`/`placementReading`/`assertPlacementSeparates` untouched in place.
 
-	let worst = 0
-	for (const anchor of sorted) {
-		let inArc = 0
-		for (const other of sorted) {
-			const offset = (other - anchor + ringSize) % ringSize
-			if (offset < arcWidth) inArc++
-		}
-		if (inArc > worst) worst = inArc
-	}
-	return worst
-}
-
-/** Seeds every placement reading below is taken over. */
-export const PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]
-
-/**
- * Peers-in-one-even-spacing-arc readings, over PLACEMENT_SEEDS at n=40 / k=15 / m=8 /
- * stabilize 500ms / 10s:
- *
- *   join pattern     uniform (fixed)   clumped-joiners (the bug)
- *   batch burst      3 3 3 3 3         11 11 11 11 11
- *   steady trickle   3 3 3 4 3         18 18 16 16 16
- *
- * Worst fixed reading 4, best buggy reading 11, nothing in between — so 7 sits 1.75x above
- * everything the fixed placement produced and 1.57x below everything the bug produced. Both
- * arms are asserted below, so the threshold's separating power is re-proved on every run
- * rather than measured once at authoring time.
- */
-export const MAX_PEERS_IN_ONE_SPACING_ARC = 7
-```
-
-### 2. `churn-scenarios.spec.ts`
-
-- Add import (after the existing L2 import):
-  `import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS, MAX_PEERS_IN_ONE_SPACING_ARC } from './simulation/placement-assertions.js'`
-- Delete L337–371 (`coordToBigInt` + `maxPeersInOneSpacingArc` + their doc comments) — now
-  imported.
-- Keep `PlacementCase` interface (was L373–376) unchanged, in place.
-- Delete the `PLACEMENT_SEEDS` const (was L378–379) and the measured-table comment +
-  `MAX_PEERS_IN_ONE_SPACING_ARC` const (was L381–394) — now imported.
-- Keep `placementReading` and `assertPlacementSeparates` (was L396–453) unchanged, in place —
-  they already reference `maxPeersInOneSpacingArc`, `coordToBigInt`, `PLACEMENT_SEEDS`,
-  `MAX_PEERS_IN_ONE_SPACING_ARC` by name, which now resolve via the new import instead of local
-  definitions.
-
-### 3. `message-bus.spec.ts`
+### 3. `message-bus.spec.ts` — NOT STARTED. Do this next.
 
 Add import near the top (after the existing `FretSimulation` import at L6):
 `import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS } from './simulation/placement-assertions.js'`
@@ -297,11 +219,11 @@ which is what the snippets above do, rather than relying on passing `clusterConf
 
 ## TODO
 
-- [x] Create `packages/fret/test/simulation/placement-assertions.ts` — DONE, confirmed written
-      this run, verbatim match to "1." above
+- [x] Create `packages/fret/test/simulation/placement-assertions.ts` — DONE, confirmed on disk,
+      verbatim match to "1." above
 - [x] Edit `churn-scenarios.spec.ts` per "2." above (add import, delete the four lifted
       definitions, keep `PlacementCase`/`placementReading`/`assertPlacementSeparates`) — DONE,
-      confirmed via re-read after edit
+      confirmed via re-read
 - [ ] Edit `message-bus.spec.ts` per "3." above — replace both vacuous cases with the snippets
       given; run once with a loose/zero threshold in case 1 to capture real readings across
       `PLACEMENT_SEEDS`, then fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` with a real
