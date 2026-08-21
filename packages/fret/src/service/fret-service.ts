@@ -2002,6 +2002,23 @@ export class FretService implements IFretService, Startable {
 		this.detach(this.mergeAnnounceSnapshot(from, snap), 'mergeAnnounceSnapshot');
 	}
 
+	/**
+	 * Hash + noteDiscovered one remote-supplied id, appending it to `into` if it was new to the
+	 * store. Shared by mergeAnnounceSnapshot and fetchAndMergeSnapshot — both take a peer's
+	 * neighbour list and store it identically; this is that "store it" step in one place so a
+	 * future change to it (a different scoring call, an extra guard) cannot land on one path and
+	 * not the other. RE-HASH, never trust a wire-supplied coord — see the call site comment
+	 * above the sample loop in mergeAnnounceSnapshot for why.
+	 */
+	private async mergeDiscoveredId(pid: string, into: string[], logLabel: string): Promise<void> {
+		try {
+			const coord = await hashPeerId(peerIdFromString(pid));
+			if (await this.noteDiscovered(pid, coord)) into.push(pid);
+		} catch (err) {
+			log.error('%s: failed for %s - %e', logLabel, pid, err);
+		}
+	}
+
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
 		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		try {
@@ -2033,32 +2050,21 @@ export class FretService implements IFretService, Startable {
 			// these lists to `mergeSnapshotCaps()`. A second slice would be a second copy of the
 			// same bound — the drift this loop's caps were moved to the parser to prevent.
 			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
-				try {
-					const coord = await hashPeerId(peerIdFromString(pid));
-					if (await this.noteDiscovered(pid, coord)) discovered.push(pid);
-				} catch (err) {
-					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
-				}
+				await this.mergeDiscoveredId(pid, discovered, 'mergeAnnounceSnapshot');
 			}
-			// merge sample if present — truncated by the parser above; the try/catch covers the
-			// id parse, the re-hash, and the `noteDiscovered` write.
+			// merge sample if present — truncated by the parser above. RE-HASH, never trust
+			// `s.coord`. A ring coordinate is *defined* as SHA-256(peerId.toMultihash().bytes), so
+			// it is derivable from the id and the wire field is at best a redundant copy — and at
+			// worst a free choice of ring position for any id the sender names. Trusting it let a
+			// transport-authenticated peer place *another* peer's id anywhere on the ring with no
+			// id grinding, making that id a neighbor, anchor and cohort member for keys it must
+			// never serve. The successor/predecessor loop above always re-hashed; only the sample
+			// was ever trusted, and there is no reason for the difference. The parser still checks
+			// `s.coord` decodes to 32 bytes: the field stays part of the wire shape (removing it is
+			// a format change), and a sender emitting malformed coordinates is worth dropping the
+			// entry over even though nothing reads the value.
 			for (const s of snap.sample ?? []) {
-				try {
-					// RE-HASH, never trust `s.coord`. A ring coordinate is *defined* as
-					// SHA-256(peerId.toMultihash().bytes), so it is derivable from the id and the
-					// wire field is at best a redundant copy — and at worst a free choice of ring
-					// position for any id the sender names. Trusting it let a transport-
-					// authenticated peer place *another* peer's id anywhere on the ring with no id
-					// grinding, making that id a neighbor, anchor and cohort member for keys it
-					// must never serve. The successor/predecessor loops above always re-hashed;
-					// only the sample was ever trusted, and there is no reason for the difference.
-					// The parser still checks `s.coord` decodes to 32 bytes: the field stays part
-					// of the wire shape (removing it is a format change), and a sender emitting
-					// malformed coordinates is worth dropping the entry over even though nothing
-					// reads the value.
-					const coord = await hashPeerId(peerIdFromString(s.id));
-					if (await this.noteDiscovered(s.id, coord)) discovered.push(s.id);
-				} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
+				await this.mergeDiscoveredId(s.id, discovered, 'mergeAnnounceSnapshot sample');
 			}
 			// Calibrate local size estimator from snapshot's estimate
 			this.calibrateSizeFromSnapshot(snap, from);
@@ -2658,19 +2664,11 @@ export class FretService implements IFretService, Startable {
 		// No cap here either: `parse` above is `makeSnapshotParser(this.mergeSnapshotCaps())`, so
 		// the reply was already truncated before it was handed back. See `mergeSnapshotCaps`.
 		for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
-			try {
-				const coord = await hashPeerId(peerIdFromString(pid));
-				if (await this.noteDiscovered(pid, coord)) announced.push(pid);
-			} catch (err) {
-				log.error('failed to merge neighbor %s - %e', pid, err);
-			}
+			await this.mergeDiscoveredId(pid, announced, 'fetchAndMergeSnapshot');
 		}
+		// Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`.
 		for (const s of snap.sample ?? []) {
-			try {
-				// Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`.
-				const coord = await hashPeerId(peerIdFromString(s.id));
-				if (await this.noteDiscovered(s.id, coord)) announced.push(s.id);
-			} catch (err) { log.error('fetchAndMergeSnapshot sample upsert failed for %s - %e', s.id, err) }
+			await this.mergeDiscoveredId(s.id, announced, 'fetchAndMergeSnapshot sample');
 		}
 		// Calibrate local size estimator from snapshot's estimate
 		this.calibrateSizeFromSnapshot(snap, id);

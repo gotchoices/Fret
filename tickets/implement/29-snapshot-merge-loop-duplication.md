@@ -3,8 +3,41 @@ files: packages/fret/src/service/fret-service.ts, packages/fret/test/rpc.handler
 difficulty: easy
 
 <!-- resume-note -->
-Prior run hit BUDGET_WARNING before making any edit — pure research/verification only, no code
-touched yet. Log: `tickets/.logs/29-snapshot-merge-loop-duplication.implement.2026-08-21T19-59-48-556Z.log`.
+Second run: made the edit, then hit BUDGET_WARNING before running `tsc`/tests. Code change is
+done and believed correct (mechanical extraction, no logic change) but **unverified** — next
+agent's first job is verification, not more editing.
+
+Done in `packages/fret/src/service/fret-service.ts`:
+- Added private `mergeDiscoveredId(pid, into, logLabel)` right before `mergeAnnounceSnapshot`
+  (~line 2005), matching the ticket's suggested shape exactly.
+- `mergeAnnounceSnapshot`'s two loops (successor/predecessor, sample) now call it, passing
+  `discovered` and labels `'mergeAnnounceSnapshot'` / `'mergeAnnounceSnapshot sample'`. The
+  re-hash-not-trust rationale comment is kept once, on the extracted method's docstring, with a
+  short comment above the sample loop still explaining why the sample specifically needs it
+  (content preserved, not deleted — matches "have comments point at it rather than restate it").
+- `fetchAndMergeSnapshot`'s two loops now call the same method, passing `announced` and labels
+  `'fetchAndMergeSnapshot'` / `'fetchAndMergeSnapshot sample'`, with a one-line pointer comment
+  ("Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`") kept above its
+  sample loop.
+- Did not touch `mergeSnapshotCaps`, the parsers, `calibrateSizeFromSnapshot`, or anything else
+  around the loops.
+
+Not done yet — do these next, in order:
+1. `cd packages/fret && npx tsc --noEmit` — expect clean; only a transient "declared but never
+   read" diagnostic was seen mid-edit (before the second call site was wired in), which should be
+   gone now that both call sites use the method, but confirm.
+2. `cd packages/fret && yarn test` (or targeted: `rpc.handler-fuzz.spec.ts`,
+   `announce-rate-limit.spec.ts`, `rpc.snapshot-merge-cap.spec.ts` — the last counts
+   `store.upsert` calls on both paths, the most direct check the extraction didn't change write
+   counts).
+3. If both pass: write the `tickets/review/` handoff per the Implement stage rules (distilled
+   summary, emphasis on test/validation use cases, honest about what wasn't independently
+   verified beyond the three specs above), then delete this file from `tickets/implement/`.
+4. If either fails: diagnose against this specific diff (it's a small mechanical change — the
+   likely failure mode is a typo or a dropped `await`, not a design issue) and fix before handing
+   off.
+
+Original prior-run research (still valid, no drift found beyond what's documented below):
 
 Confirmed by direct read (not just ticket claim):
 - `mergeAnnounceSnapshot` loops are at `fret-service.ts:2035-2042` (successors/predecessors) and
