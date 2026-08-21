@@ -312,17 +312,22 @@ describe('Relevance scoring properties', function () {
 
 		// Frequency credit: settled by tickets/implement/25-frequency-credit-relevance-core (formerly
 		// tickets/backlog/bug-frequency-credit-only-from-gossip). A completed RPC is an access.
+		it('increments accessCount by 1 (a completed RPC is an access)', () => {
+			const entry = makeEntry({ accessCount: 7 })
+			expect(recordSuccess(entry, undefined, 0.5, createSparsityModel(), FIXED_NOW).accessCount).to.equal(8)
+		})
+
 		it('scores 500 successes strictly above 1 success', () => {
 			const now = FIXED_NOW
 			let one = makeEntry({ lastAccess: now })
 			one = recordSuccess(one, undefined, 0.5, createSparsityModel(), now)
 
-			let five_hundred = makeEntry({ lastAccess: now })
+			let fiveHundred = makeEntry({ lastAccess: now })
 			for (let i = 0; i < 500; i++) {
-				five_hundred = recordSuccess(five_hundred, undefined, 0.5, createSparsityModel(), now)
+				fiveHundred = recordSuccess(fiveHundred, undefined, 0.5, createSparsityModel(), now)
 			}
 
-			expect(five_hundred.relevance).to.be.greaterThan(one.relevance)
+			expect(fiveHundred.relevance).to.be.greaterThan(one.relevance)
 		})
 	})
 
@@ -406,17 +411,22 @@ describe('Relevance scoring properties', function () {
 			expect(recordFailure(stale, 0.5, model, now).lastAccess).to.equal(now)
 		})
 
+		it('leaves accessCount alone (a failed RPC is not an access)', () => {
+			const entry = makeEntry({ accessCount: 7 })
+			expect(recordFailure(entry, 0.5, createSparsityModel(), FIXED_NOW).accessCount).to.equal(7)
+		})
+
 		it('does not score 500 failures above 1 failure', () => {
 			const now = FIXED_NOW
 			let one = makeEntry({ lastAccess: now })
 			one = recordFailure(one, 0.5, createSparsityModel(), now)
 
-			let five_hundred = makeEntry({ lastAccess: now })
+			let fiveHundred = makeEntry({ lastAccess: now })
 			for (let i = 0; i < 500; i++) {
-				five_hundred = recordFailure(five_hundred, 0.5, createSparsityModel(), now)
+				fiveHundred = recordFailure(fiveHundred, 0.5, createSparsityModel(), now)
 			}
 
-			expect(five_hundred.relevance).to.not.be.greaterThan(one.relevance)
+			expect(fiveHundred.relevance).to.not.be.greaterThan(one.relevance)
 		})
 	})
 
