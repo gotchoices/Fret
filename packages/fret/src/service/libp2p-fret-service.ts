@@ -1,30 +1,36 @@
 import type { PeerDiscovery, Startable } from '@libp2p/interface';
 import { peerDiscoverySymbol } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
-import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable, ActivityHandler, LookupOptions, RouteProgress } from '../index.js';
+import type { FretConfig, FretMode, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable, ActivityHandler, LookupOptions, RouteProgress } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
 import { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryConfig } from './peer-discovery.js';
 
 type Components = { libp2p?: Libp2p };
 
 /**
- * The subset of the public {@link FretService} surface this libp2p wrapper re-exposes.
+ * A libp2p-hosted FRET service: a thin facade whose every method below is a hand-written
+ * pass-through to the core service.
  *
- * Declared as a `Pick` rather than left implicit because every method below is a hand-written
- * pass-through: without a structural tie the two surfaces drift silently, which is how the
- * wrapper ended up handing callers `Record<string, any>` metadata after the interface had been
- * tightened. Widening the wrapper means adding a name here, and a signature that no longer
- * matches the interface is now a compile error rather than a difference nobody notices.
+ * It implements the whole of {@link FretService} rather than a `Pick` of chosen names, because
+ * the two surfaces drift in two independent directions and a `Pick` only catches one of them. A
+ * named key list does flag a *signature* that no longer matches — which is how the facade was
+ * caught handing callers `Record<string, any>` metadata after the interface had been tightened.
+ * But it is structurally blind to the interface *growing*: `Pick<FretService, 'a' | 'b'>` keeps
+ * compiling when `FretService` gains a `c`, so a member added to the interface and forgotten here
+ * is silent — which is precisely how six members (network-size reporting, churn, partition
+ * detection, activity handler, iterative lookup) ended up unreachable through the wrapper.
+ * Implementing the interface outright makes that case a compile error at this clause, so both
+ * directions of drift are caught by the same rule and neither depends on anyone remembering to
+ * edit a key list.
+ *
+ * One method sits outside the interface by necessity: `getDiagnostics` is not on the public
+ * {@link FretService} surface at all, so it is tied to the core the other available way —
+ * {@link ensure} is typed as the concrete core class, and the return type is declared as
+ * `ReturnType<CoreFretService['getDiagnostics']>`. Casting the receiver to `any` and calling it
+ * optionally is the same untied-drift bug in a second dress: it compiles whether or not the core
+ * still has the method, and it hands callers an untyped result.
  */
-type FretServiceFacade = Pick<FretService,
-	| 'start' | 'stop' | 'ready' | 'setMode'
-	| 'routeAct' | 'neighborDistance' | 'getNeighbors' | 'assembleCohort' | 'expandCohort'
-	| 'report' | 'setMetadata' | 'getMetadata' | 'listPeers'
-	| 'exportTable' | 'importTable'
-	| 'reportNetworkSize' | 'getNetworkSizeEstimate' | 'getNetworkChurn' | 'detectPartition'
-	| 'setActivityHandler' | 'iterativeLookup'>;
-
-export class Libp2pFretService implements Startable, FretServiceFacade {
+export class Libp2pFretService implements Startable, FretService {
 	private inner: CoreFretService | null = null;
 	private nodeRef: Libp2p | null = null;
 	/**
@@ -157,7 +163,7 @@ export class Libp2pFretService implements Startable, FretServiceFacade {
 		await this.ensure().ready();
 	}
 
-	setMode(mode: 'active' | 'passive'): void {
+	setMode(mode: FretMode): void {
 		this.ensure().setMode(mode);
 	}
 
