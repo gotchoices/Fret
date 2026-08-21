@@ -8,7 +8,6 @@ import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { disable, enable } from '@libp2p/logger'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
-import { sumRateLimited } from './helpers/rate-limited.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import * as lp from 'it-length-prefixed'
 import { decodeJson, encodeJson, makeProtocols, readFramed, sendFramed } from '../src/rpc/protocols.js'
@@ -1432,7 +1431,7 @@ describe('RPC codec properties', function () {
 		// it increments the sibling `rejected.concurrencyLimited`, pinned by
 		// `inflight-concurrency.spec.ts` — so the five sub-fields summed below have exactly the
 		// five bucket paths as contributors, and no other.
-		it('increments rateLimited exactly once per rejection on every bucket path', async () => {
+		it('increments the matching rateLimited field exactly once on every bucket path', async () => {
 			const svc = service()
 			const d = drivable(svc)
 			drain(d.bucketMaybeAct)
@@ -1440,7 +1439,9 @@ describe('RPC codec properties', function () {
 			drain(d.bucketPing)
 			drain(d.bucketLeave)
 			drain(d.bucketAnnounceInbound)
-			const before = sumRateLimited(svc.getDiagnostics().rejected.rateLimited)
+			// Spread the *counter record*, not `rejected` — `{ ...rejected }` shallow-copies and
+			// `before.rateLimited` would alias the live object (same hazard as the wire test below).
+			const before = { ...svc.getDiagnostics().rejected.rateLimited }
 
 			await d.handleMaybeAct(maybeActMsg())
 			await d.handleNeighborsRequest()
@@ -1449,7 +1450,13 @@ describe('RPC codec properties', function () {
 			const announcer = await newPeerIdString()
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
 
-			expect(sumRateLimited(svc.getDiagnostics().rejected.rateLimited) - before, 'five paths, five increments').to.equal(5)
+			// Per field, not summed: a sum of 5 also passes when one path double-counts and another
+			// counts nothing, which is exactly the mis-keying the split makes possible. Attribution is
+			// what the keyed record bought, so assert it.
+			const after = svc.getDiagnostics().rejected.rateLimited
+			for (const path of ['neighbors', 'ping', 'maybeAct', 'leave', 'announce'] as const) {
+				expect(after[path] - before[path], `${path} counted exactly once`).to.equal(1)
+			}
 		})
 
 		it('keeps the buckets independent — draining maybeAct leaves the other four answering', async () => {
