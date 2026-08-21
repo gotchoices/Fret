@@ -9,7 +9,7 @@ import { DigitreeStore, type MembershipState, type PeerPatch } from '../../src/s
 import { encodeJson } from '../../src/rpc/protocols.js'
 import { abortReasonError } from '../../src/utils/deadline.js'
 import { hashPeerId } from '../../src/ring/hash.js'
-import type { NeighborSnapshotV1 } from '../../src/index.js'
+import type { FretConfig, NeighborSnapshotV1 } from '../../src/index.js'
 
 // Shared harness for the maintenance paths that run their outbound RPCs *pooled* at
 // `maintenanceConcurrency` — the stabilization tick and the two connection warm-up passes.
@@ -149,10 +149,15 @@ export interface MaintenanceRig {
 	teardown: () => Promise<void>
 }
 
-export async function buildMaintenanceRig(profile: 'core' | 'edge'): Promise<MaintenanceRig> {
+/**
+ * `cfg` overrides go straight to the service constructor, for the passes whose behaviour depends
+ * on a config knob the rig cannot reach afterwards — capacity enforcement being the case in point
+ * (a tick's `enforceCapacity` is only observable below the 2048 default).
+ */
+export async function buildMaintenanceRig(profile: 'core' | 'edge', cfg?: Partial<FretConfig>): Promise<MaintenanceRig> {
 	const node = await createMemNode()
 	await node.start()
-	const svc = new FretService(node, { profile, networkName: 'net-test' })
+	const svc = new FretService(node, { profile, networkName: 'net-test', ...cfg })
 	const store = svc.getStore()
 	const protocols = (svc as any).protocols as { PROTOCOL_PING: string; PROTOCOL_NEIGHBORS: string }
 	const rig = new PeerRig(protocols.PROTOCOL_PING, protocols.PROTOCOL_NEIGHBORS)
