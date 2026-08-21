@@ -173,10 +173,39 @@ function makeKey(entry: PeerEntry): string {
 export class DigitreeStore {
 	private readonly byKey: BTree<string, PeerEntry>;
 	private readonly byId: Map<string, string>; // id -> key
+	// O(1) per-label tallies over the entries currently in the store, maintained only at the
+	// write seam (`put`) and the delete seam (`remove`) below. A tally over a field the store
+	// already owns is bookkeeping, not policy — the store still never branches on `membership`
+	// or `state`, it just counts them. NOTE: correctness assumes every write goes through those
+	// two seams; an entry mutated any other way (none exists today — verified by grep) would
+	// desync the counts silently.
+	private readonly membershipCounts = new Map<MembershipState, number>();
+	private readonly stateCounts = new Map<PeerState, number>();
 
 	constructor() {
 		this.byKey = new BTree<string, PeerEntry>((e: PeerEntry) => makeKey(e));
 		this.byId = new Map();
+	}
+
+	private bumpCount<K>(counts: Map<K, number>, key: K, delta: number): void {
+		const next = (counts.get(key) ?? 0) + delta;
+		if (next <= 0) counts.delete(key);
+		else counts.set(key, next);
+	}
+
+	private tally(entry: PeerEntry, delta: number): void {
+		this.bumpCount(this.membershipCounts, entry.membership, delta);
+		this.bumpCount(this.stateCounts, entry.state, delta);
+	}
+
+	/** How many entries currently carry membership label `m`. O(1). */
+	countByMembership(m: MembershipState): number {
+		return this.membershipCounts.get(m) ?? 0;
+	}
+
+	/** How many entries currently carry state `s`. O(1). */
+	countByState(s: PeerState): number {
+		return this.stateCounts.get(s) ?? 0;
 	}
 
 	/**
@@ -191,6 +220,7 @@ export class DigitreeStore {
 		assertCoordWidth(entry.coord);
 		const key = makeKey(entry);
 		const prevKey = this.byId.get(entry.id);
+		const prevEntry = this.getById(entry.id);
 		if (prevKey !== undefined && prevKey !== key) {
 			const prev = this.byKey.find(prevKey);
 			if (prev.on) this.byKey.deleteAt(prev);
@@ -200,6 +230,8 @@ export class DigitreeStore {
 		// the delete above, so nothing here can act on a path the tree already invalidated.
 		this.byKey.upsert(entry);
 		this.byId.set(entry.id, key);
+		if (prevEntry) this.tally(prevEntry, -1);
+		this.tally(entry, 1);
 		return entry;
 	}
 
@@ -247,7 +279,10 @@ export class DigitreeStore {
 		const key = this.byId.get(id);
 		if (!key) return;
 		const p = this.byKey.find(key);
-		if (p.on) this.byKey.deleteAt(p);
+		if (p.on) {
+			this.tally(this.byKey.at(p)!, -1);
+			this.byKey.deleteAt(p);
+		}
 		this.byId.delete(id);
 	}
 
