@@ -2059,13 +2059,13 @@ export class FretService implements IFretService, Startable {
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
-			// Selecting phase-2 targets is three full store walks; the pool would only `skip` every
-			// one of them once the budget has gone. This early return does not *cause* the skip —
+			// Selecting phase-2 targets costs at most one store walk, and the pool would only `skip`
+			// every target once the budget has gone. This early return does not *cause* the skip —
 			// phase 2 is behind a barrier on phase 1, and one phase-1 task's worst case (2 s ping +
 			// 5 s fetch) already exceeds the 5 s tick budget, so a single stalled near peer starves
 			// phase 2 for the whole tick. Tracked as `bug-tick-budget-starves-phase-two`.
 			if (budget.signal.aborted) return;
-			const targets = [...this.classifyTargets(), ...this.reprobeExcludedTargets()];
+			const targets = this.phaseTwoTargets();
 			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
 			logRejected(probed, targets, 'probeMembership');
 		} finally {
@@ -2158,6 +2158,34 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * The tick's phase-2 probe targets: the classification arm plus both re-probe arms, selected
+	 * over **one** shared store walk — or over none at all.
+	 *
+	 * The three arms' predicates are each a *narrowing* of one single-field label: the classify arm
+	 * of `membership === 'unknown'`, the foreign arm of `membership === 'foreign'`, the dead arm of
+	 * `state === 'dead'` (every extra condition — non-dead, off-backoff, not self — only removes
+	 * candidates). So a zero count for a label is a proof that the arm narrowing it selects nothing,
+	 * and the store maintains those counts in O(1) at its write seam. In single-network steady state
+	 * all three are zero and the tick walks the table zero times instead of three, at up to ~3
+	 * ticks/second.
+	 *
+	 * Only the *walk* is shared. Each arm keeps its own budget, ordering and predicate — the
+	 * separate budgets are the documented invariant that a large foreign population must not starve
+	 * dead recovery (see {@link reprobeExcludedTargets}) — so the candidate lists stay disjoint and
+	 * no id can reach the pool twice.
+	 *
+	 * The gate lives here rather than inside the selectors so a bare selector call (from a test)
+	 * still exercises the real selection logic against the live table.
+	 */
+	private phaseTwoTargets(): string[] {
+		if (this.store.countByMembership('unknown') === 0
+			&& this.store.countByMembership('foreign') === 0
+			&& this.store.countByState('dead') === 0) return [];
+		const entries = this.store.list();
+		return [...this.classifyTargets(entries), ...this.reprobeExcludedTargets(entries)];
+	}
+
+	/**
 	 * Bounded classification probe pass over `unknown` peers.
 	 *
 	 * Normal traffic only touches peers the ring already selects, but the follow-on
@@ -2178,15 +2206,16 @@ export class FretService implements IFretService, Startable {
 	 * (`applySuccess` bumps `lastAccess`) or records backoff (dropping off this list until the
 	 * window passes), so it rotates to the back with no extra bookkeeping. A fixed store order would
 	 * re-derive the same head every tick — the discovery-scan starvation bug, re-introduced here.
+	 *
+	 * `entries` is the store walk to select from, defaulting to a fresh `store.list()`. The tick
+	 * passes the one walk it shares across all three arms (see {@link phaseTwoTargets}); the
+	 * default keeps a bare call — from a test, or a future caller — selecting over the live table
+	 * without having to know that.
 	 */
-	private classifyTargets(): string[] {
+	private classifyTargets(entries: PeerEntry[] = this.store.list()): string[] {
 		const selfStr = this.node.peerId.toString();
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
-		// NOTE: scans the whole store (O(table size)) every tick to find unknowns, even
-		// once steady state has none — and the two `reprobeOffRingTargets` arms each scan it
-		// again, so a tick is three full walks. Fine at C=2048; if capacity or tick rate grows
-		// a lot, do one walk per tick and partition it into the three candidate sets.
-		const unknown = this.store.list().filter(
+		const unknown = entries.filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && e.state !== 'dead'
 				&& this.getBackoffPenalty(e.id) === 0
 		);
@@ -2220,9 +2249,12 @@ export class FretService implements IFretService, Startable {
 	 * **Separate budgets, not one merged candidate list**, so a large foreign population cannot
 	 * starve dead recovery: the foreign arm is already near saturation at roughly 42 foreign
 	 * peers by its own arithmetic (see the re-probe discussion in `docs/fret.md`), and a merged
-	 * list would put every dead peer behind that queue.
+	 * list would put every dead peer behind that queue. Both arms read the same `entries` walk —
+	 * sharing the *walk* is not merging the *lists*.
+	 *
+	 * `entries` defaults to a fresh `store.list()`, exactly as {@link classifyTargets}'s does.
 	 */
-	private reprobeExcludedTargets(): string[] {
+	private reprobeExcludedTargets(entries: PeerEntry[] = this.store.list()): string[] {
 		// No prune here: sweeping bookkeeping maps is not a probe pass's job, and
 		// `sweepBoundedMaps` at the top of `stabilizeOnce` (this pass's only caller) already ran it
 		// this tick.
@@ -2237,8 +2269,8 @@ export class FretService implements IFretService, Startable {
 		// need independent cadence (e.g. dead recovery made more eager than foreign re-probing),
 		// they need separate backoff maps, not just separate budgets.
 		return [
-			...this.reprobeOffRingTargets((e) => e.membership === 'foreign' && e.state !== 'dead', budget),
-			...this.reprobeOffRingTargets((e) => e.state === 'dead', budget),
+			...this.reprobeOffRingTargets(entries, (e) => e.membership === 'foreign' && e.state !== 'dead', budget),
+			...this.reprobeOffRingTargets(entries, (e) => e.state === 'dead', budget),
 		];
 	}
 
@@ -2254,9 +2286,9 @@ export class FretService implements IFretService, Startable {
 	 * That growing factor is also what rotates the list under tick truncation: a probed peer's
 	 * factor grows, so it sorts behind the ones a truncated tick never reached.
 	 */
-	private reprobeOffRingTargets(isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
+	private reprobeOffRingTargets(entries: PeerEntry[], isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
 		const selfStr = this.node.peerId.toString();
-		const candidates = this.store.list().filter(
+		const candidates = entries.filter(
 			(e) => e.id !== selfStr && this.getBackoffPenalty(e.id) === 0 && isCandidate(e)
 		);
 		if (candidates.length === 0) return [];

@@ -3,6 +3,7 @@ import { expect } from 'chai'
 import { buildMaintenanceRig, type MaintenanceRig, type PeerRig } from './helpers/maintenance-rig.js'
 import type { FretService as CoreFretService } from '../src/service/fret-service.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
+import { hashPeerId } from '../src/ring/hash.js'
 
 // One stabilization tick runs its outbound RPCs *pooled* — at most `maintenanceConcurrency` in
 // flight (Core 6 / Edge 2) — under one tick-wide budget (`STABILIZE_TICK_BUDGET_MS`), instead of
@@ -247,5 +248,101 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		expect(second.slice(0, ids.length - budget), 'the 4 never-probed lead').to.deep.equal(ids.slice(budget))
 		expect(second, 'the rest of the budget is filled from the probed ones').to.have.length(budget)
 		expect(new Set(second).size).to.equal(budget)
+	})
+
+	// ----- phase-2 target selection: shared walk behind an O(1) count gate -----
+
+	// `phaseTwoTargets` is the tick's only phase-2 selector. It asks the store for three O(1)
+	// per-label counts first: every arm's predicate narrows one single-field label (`unknown` /
+	// `foreign` / `state === 'dead'`), so a zero count proves that arm selects nothing and the
+	// tick can skip the walk outright. These tests are aimed at the *low* direction — a gate that
+	// wrongly reads zero makes the pass silently stop selecting, and a dead peer that is never
+	// re-probed never recovers.
+
+	/** Count `store.list()` calls for the duration of `fn`; the walk is what the gate removes. */
+	async function walksDuring<T>(fn: () => T | Promise<T>): Promise<{ result: T, walks: number }> {
+		const real = store.list.bind(store)
+		let walks = 0
+		;(store as any).list = (...args: unknown[]) => { walks++; return (real as any)(...args) }
+		try {
+			return { result: await fn(), walks }
+		} finally {
+			;(store as any).list = real
+		}
+	}
+
+	const phaseTwo = (): string[] => (svc as any).phaseTwoTargets() as string[]
+
+	it('single-node ring: self alone in the table costs zero walks and selects nothing', async () => {
+		// Self is seeded `member` and is never marked dead, so it contributes to none of the three
+		// gated counters — the case the gate must not get wrong on a one-peer ring.
+		const selfId = harness.node.peerId.toString()
+		store.upsert(selfId, await hashPeerId(harness.node.peerId))
+		store.setMembership(selfId, 'member')
+
+		const { result, walks } = await walksDuring(phaseTwo)
+
+		expect(result, 'nothing to probe').to.deep.equal([])
+		expect(walks, 'the table was never walked').to.equal(0)
+	})
+
+	it('steady state — every peer a live member — costs zero store walks', async () => {
+		await seedPeers(6, 'member')
+
+		const { result, walks } = await walksDuring(phaseTwo)
+
+		expect(result).to.deep.equal([])
+		expect(walks, 'all three counts are zero, so no walk').to.equal(0)
+	})
+
+	it('one unknown + one foreign + one dead cost exactly one walk, and the arms select the same ids as before', async () => {
+		const [unknown] = await seedPeers(1, 'unknown')
+		const [foreign] = await seedPeers(1, 'foreign')
+		const [dead] = await seedPeers(1, 'member', { state: 'dead' })
+
+		const { result, walks } = await walksDuring(phaseTwo)
+
+		expect(walks, 'one shared walk, not three').to.equal(1)
+		// Same ids the two selectors return on their own, in the same order: only the walk is
+		// shared, never the candidate lists.
+		const separately = [...(svc as any).classifyTargets(), ...(svc as any).reprobeExcludedTargets()]
+		expect(result).to.deep.equal(separately)
+		expect(result, 'all three arms selected').to.have.members([unknown!, foreign!, dead!])
+		expect(result, 'no id reaches the pool twice').to.have.length(new Set(result).size)
+	})
+
+	it('unknown → member re-arms the early return', async () => {
+		const [unknown] = await seedPeers(1, 'unknown')
+		await seedPeers(3, 'member')
+
+		const first = await walksDuring(phaseTwo)
+		expect(first.result, 'the unknown is selected while it is unclassified').to.deep.equal([unknown!])
+		expect(first.walks).to.equal(1)
+
+		// What a successful classification probe does to the entry.
+		store.setMembership(unknown!, 'member')
+
+		const second = await walksDuring(phaseTwo)
+		expect(second.result, 'nothing left to classify').to.deep.equal([])
+		expect(second.walks, 'the count gate re-arms — no walk at all').to.equal(0)
+	})
+
+	it('member → dead lifts the dead count off zero and the arm selects it on the very next call', async () => {
+		const [peer] = await seedPeers(1, 'member')
+		expect((await walksDuring(phaseTwo)).walks, 'zero walks while the table is all-member').to.equal(0)
+
+		// The real escalation path: `deadAfterFailures` (3) failed contacts. They must be spread
+		// over time to count as independent observations, so the spacing stamp is wound back
+		// between strikes rather than sleeping through it (the spacing itself is pinned by
+		// `dead-state.spec.ts`).
+		for (let i = 0; i < 3; i++) {
+			store.update(peer!, { lastContactFailureAt: 0 })
+			;(svc as any).applyContactStrike(peer!)
+		}
+		expect(store.getById(peer!)!.state, 'the peer really is dead').to.equal('dead')
+
+		const { result, walks } = await walksDuring(phaseTwo)
+		expect(result, 'the dead arm selects it immediately, not one tick later').to.deep.equal([peer!])
+		expect(walks).to.equal(1)
 	})
 })
