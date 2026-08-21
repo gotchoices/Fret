@@ -46,9 +46,16 @@ function isFiniteNumber(value: unknown): value is number {
 	return typeof value === 'number' && Number.isFinite(value);
 }
 
-/** The value when it is a finite number, else `fallback` — the "drop this advisory field" rule. */
-function finiteNumberOr(value: unknown, fallback: number | undefined): number | undefined {
-	return isFiniteNumber(value) ? value : fallback;
+/** The value when it is a finite number within `[min, max]` inclusive, else `fallback` — the
+ *  "drop this advisory field" rule, with a range check folded in (`[-Infinity, Infinity]` for a
+ *  plain finite-number check). */
+function finiteNumberInRangeOr(
+	value: unknown,
+	min: number,
+	max: number,
+	fallback: number | undefined,
+): number | undefined {
+	return isFiniteNumber(value) && value >= min && value <= max ? value : fallback;
 }
 
 /** A string that parses as a peer id. Parse-only — no network, no store. */
@@ -247,10 +254,12 @@ export function makeSnapshotParser(caps: SnapshotCaps): Parser<NeighborSnapshotV
 
 		// Advisory numerics: dropped individually rather than rejected. Both are already gated
 		// downstream ("both positive" before they reach the size estimator), so a missing one
-		// costs the receiver a calibration sample and nothing else.
-		const sizeEstimate = finiteNumberOr(msg.size_estimate, undefined);
+		// costs the receiver a calibration sample and nothing else. `size_estimate` has no fixed
+		// upper bound (cluster size), so only its floor is enforced here; `confidence` is a
+		// probability and must land in [0, 1].
+		const sizeEstimate = finiteNumberInRangeOr(msg.size_estimate, 0, Infinity, undefined);
 		if (sizeEstimate === undefined) delete out.size_estimate; else out.size_estimate = sizeEstimate;
-		const confidence = finiteNumberOr(msg.confidence, undefined);
+		const confidence = finiteNumberInRangeOr(msg.confidence, 0, 1, undefined);
 		if (confidence === undefined) delete out.confidence; else out.confidence = confidence;
 
 		// Matches the receiver's own `isPlainObject` gate before it writes the sender's metadata.
@@ -352,9 +361,9 @@ export const parsePingResponse: Parser<{ ok: boolean; size_estimate?: number; co
 	if (!isPlainObject(msg)) return undefined;
 	if (typeof msg.ok !== 'boolean') return undefined;
 	const out: { ok: boolean; size_estimate?: number; confidence?: number } = { ok: msg.ok };
-	const sizeEstimate = finiteNumberOr(msg.size_estimate, undefined);
+	const sizeEstimate = finiteNumberInRangeOr(msg.size_estimate, 0, Infinity, undefined);
 	if (sizeEstimate !== undefined) out.size_estimate = sizeEstimate;
-	const confidence = finiteNumberOr(msg.confidence, undefined);
+	const confidence = finiteNumberInRangeOr(msg.confidence, 0, 1, undefined);
 	if (confidence !== undefined) out.confidence = confidence;
 	return out;
 };
