@@ -8,6 +8,7 @@ import { DigitreeStore } from '../src/store/digitree-store.js';
 import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
 import { hashPeerId, coordToBase64url } from '../src/ring/hash.js';
 import { createMemNode, stopAll } from './helpers/libp2p.js';
+import { buildMesh, type Mesh } from './helpers/mesh.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
 import { Libp2pFretService, fretService } from '../src/service/libp2p-fret-service.js';
 import type { SerializedPeerEntry, SerializedTable } from '../src/index.js';
@@ -477,35 +478,18 @@ describe('FretPeerDiscovery ring coverage (property)', function () {
 describe('FretPeerDiscovery integration with CoreFretService', function () {
 	this.timeout(20000);
 
-	let nodes: Libp2p[] = [];
-	let services: CoreFretService[] = [];
+	let mesh: Mesh | undefined;
 
 	afterEach(async () => {
-		for (const s of services) {
-			if (!s) continue;
-			try { await s.stop(); } catch {}
-		}
-		await stopAll(nodes.filter(Boolean));
-		nodes = [];
-		services = [];
+		await mesh?.stop();
+		mesh = undefined;
 	});
 
 	it('emits peers discovered by FretService stabilization', async () => {
-		for (let i = 0; i < 3; i++) {
-			const node = await createMemNode();
-			await node.start();
-			nodes.push(node);
-		}
-		for (let i = 0; i < 3; i++) {
-			const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()];
-			const svc = new CoreFretService(nodes[i]!, { profile: 'edge', k: 7, bootstraps: boot });
-			await svc.start();
-			services.push(svc);
-		}
-		for (let i = 1; i < 3; i++) {
-			const ma = nodes[0]!.getMultiaddrs()[0]!;
-			await nodes[i]!.dial(ma);
-		}
+		mesh = await buildMesh(3);
+		await mesh.addServices((i, m) => ({ profile: 'edge', k: 7, bootstraps: i === 0 ? [] : [m.ids[0]!] }));
+		await mesh.connect('star');
+		const { nodes, services } = mesh;
 
 		await new Promise(r => setTimeout(r, 4000));
 
