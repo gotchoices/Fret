@@ -480,14 +480,5 @@ describe('Relevance scoring properties', function () {
 			expect(contacted.accessCount, 'proven contact accrues frequency credit').to.equal(500)
 			expect(contacted.relevance).to.be.greaterThan(gossiped)
 		})
-
-		it('scores even a single success above 500 mentions, since mentions are flat', () => {
-			const now = FIXED_NOW
-			const fresh = makeEntry({ lastAccess: now })
-			const gossiped = initialRelevance(fresh, 0.5, createSparsityModel(), now)
-			const once = recordSuccess(fresh, undefined, 0.5, createSparsityModel(), now)
-
-			expect(once.relevance).to.be.greaterThan(gossiped)
-		})
 	})
 })

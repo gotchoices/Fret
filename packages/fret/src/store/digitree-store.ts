@@ -587,6 +587,11 @@ export class DigitreeStore {
 				// on its very next failure.
 				contactFailures: 0,
 				lastContactFailureAt: 0,
+				// NOTE: a snapshot taken before frequency credit was narrowed to proven contact
+				// carries an accessCount that also counted mentions, so a restored entry can be
+				// over-credited. Self-correcting — the next scoring call rewrites relevance from
+				// the live counters — so it is left as-is; revisit only if a persisted table ever
+				// needs to survive a scoring-rule change without a re-score.
 				accessCount: s.accessCount,
 				successCount: s.successCount,
 				failureCount: s.failureCount,
