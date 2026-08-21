@@ -135,11 +135,12 @@ describe('RPC snapshot merge caps', function () {
 		 * Record every id the merge loop upserts, in order.
 		 *
 		 * `applyTouch` no longer creates on a miss — it returns early when the id isn't already in
-		 * the store (see `docs/fret.md`, *Relevance scoring and table management*). Counted upserts
-		 * still don't double-count for a different reason: every id in a merged snapshot (`from`,
-		 * and each successor/predecessor/sample id) reaches the store through `noteDiscovered`, not
-		 * `applyTouch`, and `noteDiscovered` itself returns early on an id the store already holds —
-		 * so a repeated id upserts at most once, via that guard, not via `applyTouch`.
+		 * the store (see `docs/fret.md`, *Relevance scoring and table management*), so it upserts
+		 * nothing and cannot double-count. What the counted upserts come from instead: on the
+		 * announce path `from` is upserted once, directly and unconditionally, before the list loops
+		 * run (the fetch path upserts no `from` at all — hence its counts are one lower); every
+		 * successor/predecessor/sample id goes through `noteDiscovered`, which returns early on an id
+		 * the store already holds. So a repeated id upserts at most once, via that guard.
 		 *
 		 * NOTE: this **stacks** wrappers rather than replacing them, and nothing restores. A second
 		 * call wraps the first, so a counter installed earlier keeps recording while a later one is
