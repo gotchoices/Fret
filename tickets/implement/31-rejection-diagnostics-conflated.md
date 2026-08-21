@@ -5,30 +5,64 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-Prior run hit BUDGET_WARNING before any code edit landed. No files touched yet — safe to
-resume from scratch, nothing to undo.
+Second run hit BUDGET_WARNING before any code edit landed (investigation-only run again). Still
+zero files touched — safe to resume from scratch, nothing to undo or revert.
 
-Confirmed during this run (no need to re-derive):
-- All six `rejected.rateLimited++` call sites match the ticket's line-number mapping exactly
-  (checked via `Grep rejected` over `fret-service.ts`): 1290 (`handleNeighborsRequest`), 1298
-  (`handlePingRequest`), 1381 (maybeAct token bucket), 1421 (maybeAct concurrency cap, must
-  become `concurrencyLimited++`, NOT `rateLimited.maybeAct`), 1838 (`handleLeave`), 1999
-  (`handleAnnounce`/`mergeAnnounceSnapshot` area).
-- `diag.rejected` type/initializer block read in full: lines 415-424 of `fret-service.ts`.
-- `handleMaybeAct` body read in full (lines 1370-1433): confirms it is the one handler off the
-  `registerJsonHandler` seam per the ticket's second arm — its own `parseRouteAndMaybeAct` call
-  at line 1391 already counts `malformed` correctly and is NOT the gap.
-- **Still unlocated**: the second-arm gap (undecodable maybeAct body silently aborting the
-  stream with no counter). It is NOT inside `handleMaybeAct` itself (msg already decoded by the
-  time that method runs) — it is in the raw `registerRpcHandler(this.protocols.maybeAct, ...)`
-  registration wiring, somewhere in the `registerRpcHandlers` method around lines 1195-1245
-  (grep `registerRpcHandler` + `this.protocols.maybeAct` in that range; the decode call feeding
-  `msg` into `handleMaybeAct(msg)` at line 1238 is the thing to find and wrap in try/catch per
-  the ticket's second-arm fix).
+Confirmed this run, on top of everything the first run already confirmed (six call sites, the
+`diag.rejected` block at 415-424, `handleMaybeAct` 1370-1433 not being the gap):
 
-Next agent: resume directly from the ticket body below — design and TODO list are already
-final, nothing to re-plan. Start by reading `fret-service.ts` lines 1195-1250 to pin the exact
-decode call for the second arm, then work the TODO list top to bottom.
+**Second-arm gap is now precisely located — no more searching needed.** It is
+`packages/fret/src/rpc/maybe-act.ts`, function `registerMaybeAct` (lines 15-32):
+
+```ts
+export async function registerMaybeAct(
+	node: Libp2p,
+	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT,
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES
+): Promise<void> {
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
+		const bytes = await readFramed(stream, maxBytes);
+		const msg = decodeJson<RouteAndMaybeActV1>(bytes);          // <-- line 28, unguarded
+		const res = await handle(msg, connection.remotePeer.toString());
+		sendFramed(stream, encodeJson(res));
+	});
+}
+```
+
+Line 28's `decodeJson` throws on an undecodable/non-object body. That throw propagates out of
+`serve()` into `registerRpcHandler`'s own try/catch (`src/rpc/protocols.ts` ~124-148), which logs
+and `abort()`s the stream — no `diag` counter touched anywhere. Compare
+`registerJsonHandler` (`protocols.ts` ~213-221), which the other four handlers sit on: it wraps
+the same `decodeJson` call in try/catch, calls `opts.onMalformed?.('decode')`, and **returns
+normally** (so the seam's ordinary budgeted `close()` runs, not abort). `registerMaybeAct` needs
+the same shape, by hand, since it deliberately stays off that seam (bucket-before-parse).
+
+**Concrete fix (not yet applied):**
+1. Add an `onMalformed?: () => void` param to `registerMaybeAct` (5th param, after `maxBytes`).
+2. Wrap line 28 in try/catch: on catch, call `onMalformed?.()`, log
+   (`log.error('%s: undecodable body - dropping - %e', protocol, err)` — needs a
+   `createLogger` import in `maybe-act.ts`; check whether one already exists in a sibling rpc
+   file, e.g. `leave.ts` or `neighbors.ts`, before adding a fresh namespace string — reuse the
+   existing house style, likely `optimystic:fret:rpc:maybe-act` or similar, don't invent one
+   inconsistent with siblings), reply with the same static-reject shape `handleMaybeAct` already
+   uses on its own malformed path (`{ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size:
+   0, confidence: 0 } satisfies NearAnchorV1` — copy the literal, don't import
+   `FretService`'s private `staticReject()`), then `return` (no throw) so the seam's normal
+   success-path budgeted close runs instead of abort.
+3. At the call site in `fret-service.ts` `registerRpcHandlers` (~1234-1242), pass
+   `() => { this.diag.rejected.malformed++; }` as the new 5th arg — same counter
+   `handleMaybeAct`'s own parse-failure path already increments, per the ticket's stated design
+   (undecodable body counts under the *existing* `malformed` bucket, not a new one).
+4. Do **not** touch `readFramed`'s own failures (truncation, over-cap) — those stay frame-level
+   and must keep aborting per `registerJsonHandler`'s documented drop/abort split; only the
+   `decodeJson` call is body-level here.
+
+Everything else in this ticket (six rateLimited++ call-site edits, the `diag.rejected` type
+change, both spec files, the three `docs/fret.md` sites, tsc/test run) is **still fully
+untouched** — resume the TODO list top to bottom exactly as written below, this second-arm item
+now has a fully specified fix so it should be fast. Do the `diag.rejected` type change and the
+six call-site edits first (mechanical), then this second-arm fix, then tests/docs.
 <!-- /resume-note -->
 
 ## Resolved design
