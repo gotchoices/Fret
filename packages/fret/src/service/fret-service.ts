@@ -1597,10 +1597,18 @@ export class FretService implements IFretService, Startable {
 	 */
 	private computeReplacements(selfCoord: Uint8Array, spNeighborIds: Set<string>, selfStr: string): string[] {
 		const maxReplacements = 6;
-		const wider = Array.from(new Set([
-			...this.store.neighborsRight(selfCoord, this.cfg.m * 2, isLiveMember),
-			...this.store.neighborsLeft(selfCoord, this.cfg.m * 2, isLiveMember),
-		])).filter((id) => id !== selfStr && !spNeighborIds.has(id));
+		// `spNeighborIds` goes in as the helper's `exclude`, not as a filter on its result: it
+		// holds up to 2m ids, which on this walk blankets one side's whole window. The helper
+		// over-fetches by `exclude.size` for exactly that reason, so the excluded side still
+		// yields `m * 2` candidates instead of starving. Interleaved, so the `maxReplacements`
+		// cap below takes from both sides rather than emptying the clockwise one first.
+		const wider = ringNeighborsBothSides(
+			this.store,
+			selfCoord,
+			this.cfg.m * 2,
+			selfStr,
+			{ filter: isLiveMember, exclude: spNeighborIds }
+		);
 		wider.sort((a, b) => {
 			const connA = this.isConnected(a) ? 1 : 0;
 			const connB = this.isConnected(b) ? 1 : 0;
@@ -1624,10 +1632,24 @@ export class FretService implements IFretService, Startable {
 			const selfStr = this.node.peerId.toString();
 			// Unfiltered store walk: leave notices go to all ring neighbors (matches handleLeave /
 			// computeReplacements). Ring reads elsewhere use member-scoped getNeighbors.
-			const ids = Array.from(new Set([
-				...this.store.neighborsRight(selfCoord, this.cfg.m),
-				...this.store.neighborsLeft(selfCoord, this.cfg.m)
-			])).filter((id) => id !== selfStr).slice(0, 8);
+			//
+			// **One array, two readers.** `ids` is both who we notify and what our own S/P window
+			// *is* — the set `computeReplacements` excludes and the beyond-S/P fan-out below
+			// filters on. Deriving one from a truncated copy of the other is what made the two
+			// diverge: the old walk was side-major and capped the concatenation at 8, so at the
+			// shipped `k: 15` (m 8) it was successors only, the predecessor side got no notice at
+			// all, and `spSet` then declared six genuine predecessors "outside our window" — so a
+			// departing node advertised its own neighbors as replacements for itself.
+			//
+			// There is no target cap here now, and the literal 8 was never the real bound anyway:
+			// the fan-out is clock-bounded by `SHUTDOWN_BUDGET_MS` overall and
+			// `LEAVE_NOTICE_TIMEOUT_MS` per notice, with the `budget.signal.aborted` break below.
+			//
+			// NOTE: notices are sent serially; if departure healing latency ever matters, pool
+			// this through `runPooled` like the stabilization tick. Serial is fine today — 2m = 16
+			// notices at 1.5 s each against a 3 s budget is clock-bound well before it is
+			// target-bound, so the pool would not change what actually goes out.
+			const ids = ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, selfStr);
 			const spSet = new Set(ids);
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
 			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
@@ -1650,6 +1672,11 @@ export class FretService implements IFretService, Startable {
 			const expanded = this.expandCohort(ids, selfCoord, fanOut, new Set([selfStr]));
 			// No `isDoomedDial` here: everything outside `spSet` came from the live-member-scoped
 			// `assembleCohort` inside `expandCohort`, and `isConnected` already implies dialable.
+			//
+			// Third reader of `spSet`. Now that `ids` is the *whole* S/P window rather than a
+			// truncated side, this arm is correctly *smaller*: the peers it used to reach are the
+			// predecessors that now get a notice as S/P members instead. Fewer sends here is the
+			// fix landing, not a regression.
 			const extra = expanded.filter((id) => !spSet.has(id) && this.isConnected(id)).slice(0, fanOut);
 			for (const id of extra) {
 				if (budget.signal.aborted) break;

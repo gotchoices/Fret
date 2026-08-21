@@ -1,4 +1,4 @@
-import { describe, it } from 'mocha'
+import { after, before, describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { buildMesh, type Mesh } from './helpers/mesh.js'
@@ -547,6 +547,8 @@ describe('Leave notice replacements (sender side)', function () {
 		idAt(offset: number): string
 		/** Run one real `sendLeaveToNeighbors` and return the notice the real receiver got. */
 		send(): Promise<LeaveNoticeV1>
+		/** Every notice each real receiver got, by its ring offset — so a missing side is visible. */
+		noticesAt(offset: number): LeaveNoticeV1[]
 		stop(): Promise<void>
 	}
 
@@ -567,24 +569,36 @@ describe('Leave notice replacements (sender side)', function () {
 	 *   intended: they are still live members, so they remain replacement candidates, and the
 	 *   assertions are about what the notice carries rather than about who received it.
 	 */
-	async function makeSenderRig(k: number, count: number): Promise<SenderRig> {
+	async function makeSenderRig(
+		k: number,
+		count: number,
+		realOffsets: number[] = [RECEIVER_OFFSET]
+	): Promise<SenderRig> {
 		const nodes: Libp2p[] = []
 		const departing = await createMemNode(); await departing.start(); nodes.push(departing)
-		const receiver = await createMemNode(); await receiver.start(); nodes.push(receiver)
 
-		let captured: LeaveNoticeV1 | undefined
-		await registerLeave(receiver, (notice) => { captured = notice }, protocols.PROTOCOL_LEAVE)
-		// The dial is what makes the receiver `isConnected`, and therefore dialable. It also makes
-		// the notice's `from` match the transport-authenticated sender, so `registerLeave`'s
-		// identity gate passes rather than being what the spec accidentally exercises.
-		await departing.dial(receiver.getMultiaddrs()[0]!)
+		const received = new Map<number, LeaveNoticeV1[]>()
+		const realIds = new Map<number, string>()
+		for (const offset of realOffsets) {
+			const receiver = await createMemNode(); await receiver.start(); nodes.push(receiver)
+			const log: LeaveNoticeV1[] = []
+			received.set(offset, log)
+			realIds.set(offset, receiver.peerId.toString())
+			await registerLeave(receiver, (notice) => { log.push(notice) }, protocols.PROTOCOL_LEAVE)
+			// The dial is what makes the receiver `isConnected`, and therefore dialable. It also
+			// makes the notice's `from` match the transport-authenticated sender, so
+			// `registerLeave`'s identity gate passes rather than being what the spec accidentally
+			// exercises.
+			await departing.dial(receiver.getMultiaddrs()[0]!)
+		}
+		const primary = received.get(realOffsets[0]!)!
 
 		const svc = new CoreFretService(departing, { profile: 'core', k })
 		const selfCoord = await hashPeerId(departing.peerId)
 		const store = svc.getStore()
 		const byOffset = new Map<number, string>()
 		for (let offset = 1; offset <= count; offset++) {
-			const id = offset === RECEIVER_OFFSET ? receiver.peerId.toString() : await ghostPeerId()
+			const id = realIds.get(offset) ?? await ghostPeerId()
 			byOffset.set(offset, id)
 			store.upsert(id, ringOffset(selfCoord, offset))
 			store.setMembership(id, 'member')
@@ -592,12 +606,13 @@ describe('Leave notice replacements (sender side)', function () {
 		return {
 			svc,
 			idAt: (offset: number) => byOffset.get(offset)!,
+			noticesAt: (offset: number) => received.get(offset) ?? [],
 			async send(): Promise<LeaveNoticeV1> {
 				await (svc as any).sendLeaveToNeighbors()
 				// `sendLeave` is write-only — it closes the stream rather than awaiting a reply —
 				// so the receiver's handler runs after the send resolves.
-				await waitFor(() => captured !== undefined, 5000, 10, 'the real receiver got a leave notice')
-				return captured!
+				await waitFor(() => primary.length > 0, 5000, 10, 'the real receiver got a leave notice')
+				return primary[0]!
 			},
 			async stop(): Promise<void> { await stopAll(nodes) }
 		}
@@ -648,13 +663,107 @@ describe('Leave notice replacements (sender side)', function () {
 
 			const notice = await rig.send()
 
-			// Targets: {+1..+4} and {+20..+17}. Pool: clockwise 2m = {+1..+8}, counter-clockwise
-			// 2m = {+20..+13}; minus the targets that is eight eligible ids for six slots.
-			const eligible = [5, 6, 7, 8, 13, 14, 15, 16].map((o) => rig.idAt(o))
+			// Targets: {+1..+4} and {+20..+17}. The replacement walk asks for 2m = 8 per side
+			// *after* excluding those eight, so the pool reaches out to {+5..+16} — twelve
+			// eligible ids for six slots. The helper interleaves the two sides, so the cap takes
+			// the innermost peers on each side alternately rather than emptying one side first.
+			const innermost = [5, 6, 7, 14, 15, 16].map((o) => rig.idAt(o))
 			expect(notice.replacements!.length, 'maxReplacements, not one per eligible peer').to.equal(6)
 			for (const id of notice.replacements!) {
-				expect(eligible, 'every advertised id comes from the eligible pool').to.include(id)
+				expect(innermost, 'the cap takes the innermost peers on both sides, not one whole side')
+					.to.include(id)
 			}
 		} finally { await rig.stop() }
+	})
+
+	/**
+	 * The shipped default, and the only width at which the old bug bit.
+	 *
+	 * `sendLeaveToNeighbors` used to walk side-major (all successors, then all predecessors) and
+	 * cap the *concatenation* at 8. At `k: 15` the window is m = 8 per side, so those 8 slots were
+	 * spent entirely on the clockwise side: no predecessor was ever notified, and the same
+	 * truncated array was then handed to `computeReplacements` as "our own S/P window", so six
+	 * genuine predecessors read as outside it and were advertised to our own neighbors as
+	 * replacements for us.
+	 *
+	 * The specs above run at `k: 3` / `k: 7`, where m is 2 / 4 and both windows together fit
+	 * inside 8 — the cap never bit, so neither could see any of this.
+	 */
+	describe('at the shipped k of 15', function () {
+		// Windows at m = 8 over 24 seeded peers: clockwise {+1..+8}, counter-clockwise
+		// {+24..+17}. That leaves {+9..+16} outside both — the replacement pool, and where the
+		// one connected non-neighbor sits.
+		const COUNT = 24
+		const SUCC_WINDOW = [1, 2, 3, 4, 5, 6, 7, 8]
+		const PRED_WINDOW = [24, 23, 22, 21, 20, 19, 18, 17]
+		const OUTSIDE = [9, 10, 11, 12, 13, 14, 15, 16]
+		/** One real, dialable node per side of the window, plus one outside it. */
+		const SUCC_RECEIVER = 1
+		const PRED_RECEIVER = 24
+		// Outside the S/P window but still inside the beyond-S/P arm's reach: that arm asks
+		// `expandCohort` for `ids.length + fanOut` = 20 ids around self, which the alternating
+		// walk fills from {+1..+10} and {+24..+15}. A peer past +10 is outside the window *and*
+		// outside the fan-out, so it would test nothing.
+		const OUTSIDE_RECEIVER = 10
+
+		let rig: SenderRig | undefined
+		let notice: LeaveNoticeV1
+		// One departure shared by the four assertions below: `sendLeaveToNeighbors` is a
+		// once-per-lifetime call, and re-running it per case would cost four meshes to observe
+		// the same notice.
+		before(async function () {
+			this.timeout(30000)
+			rig = await makeSenderRig(15, COUNT, [SUCC_RECEIVER, PRED_RECEIVER, OUTSIDE_RECEIVER])
+			expect((rig.svc as any).cfg.m,
+				'premise: m = ceil(k / 2), so k of 15 gives an eight-wide window per side').to.equal(8)
+			notice = await rig.send()
+		})
+		after(async () => { await rig?.stop(); rig = undefined })
+
+		it('notifies the predecessor side, not only the successors', () => {
+			expect(rig!.noticesAt(SUCC_RECEIVER).length,
+				'the clockwise side was reached even under the old cap').to.equal(1)
+			expect(rig!.noticesAt(PRED_RECEIVER).length,
+				'the counter-clockwise side — nothing arrived here under the old side-major slice')
+				.to.equal(1)
+		})
+
+		it('advertises no peer that is inside its own S/P window', () => {
+			const window = [...SUCC_WINDOW, ...PRED_WINDOW].map((o) => rig!.idAt(o))
+			for (const id of notice.replacements ?? []) {
+				expect(window, 'a peer we are notifying is never also advertised as our replacement')
+					.to.not.include(id)
+			}
+		})
+
+		it('draws every replacement from beyond that window, both sides', () => {
+			const outside = OUTSIDE.map((o) => rig!.idAt(o))
+			// 16 ids excluded from a 2m = 16-per-side walk: without the helper's `+ exclude.size`
+			// over-fetch, a side the exclusions blanket yields nothing and the list comes from one
+			// side only.
+			expect(notice.replacements!.length, 'maxReplacements, filled').to.equal(6)
+			for (const id of notice.replacements!) {
+				expect(outside, 'the pool is the wider walk minus the window').to.include(id)
+			}
+			const from = (offsets: number[]) =>
+				notice.replacements!.filter((id) => offsets.map((o) => rig!.idAt(o)).includes(id))
+			expect(from([9, 10, 11, 12]).length,
+				'interleaved, so the cap does not empty the clockwise side first').to.be.greaterThan(0)
+			expect(from([13, 14, 15, 16]).length,
+				'interleaved, so the cap does not empty the counter-clockwise side first').to.be.greaterThan(0)
+		})
+
+		it('sends each peer exactly one notice, S/P and beyond-S/P together', () => {
+			// The third reader of the same array: the beyond-S/P fan-out filters on
+			// `!spSet.has(id)`. Widening `spSet` to the true window *shrinks* that arm — a
+			// connected predecessor is now reached as an S/P member instead of as fan-out. Either
+			// way it must be reached exactly once, which is what one shared array buys and two
+			// divergent copies cannot.
+			expect(rig!.noticesAt(OUTSIDE_RECEIVER).length,
+				'a connected peer outside the window is still reached, by the fan-out arm').to.equal(1)
+			for (const offset of [SUCC_RECEIVER, PRED_RECEIVER, OUTSIDE_RECEIVER]) {
+				expect(rig!.noticesAt(offset).length, `+${offset} got exactly one notice`).to.equal(1)
+			}
+		})
 	})
 })
