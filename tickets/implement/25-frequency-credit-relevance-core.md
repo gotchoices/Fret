@@ -3,11 +3,71 @@ files: packages/fret/src/store/relevance.ts, packages/fret/test/relevance.proper
 difficulty: easy
 
 <!-- resume-note -->
-Fifth run hit BUDGET_WARNING immediately after landing the final test edit — the Edit tool call
-succeeded (confirmed by tool result) before the warning arrived, so no half-applied state. Nothing
-else was touched this run.
+Sixth run: hit BUDGET_WARNING right after finding the one real test failure from the verification
+pass. Source and test-file edits from prior runs are unchanged and still correct — do NOT re-read
+or re-derive them (see "Done" sections below, untouched).
 
-**Everything is now done except running the verification pass and writing the review/ handoff.**
+**Verification pass ACTUALLY RUN this time (first time ever on this file):**
+- `cd packages/fret && npx tsc --noEmit` — clean, no errors.
+- `cd packages/fret && yarn test` — **1199 passing, 1 failing.** Full log saved at
+  `tickets/.logs/25-frequency-credit-relevance-core.test.log` (git-ignored, self-pruning; re-run
+  `yarn test` from `packages/fret` if it's aged out).
+
+**The one failure — root cause identified, fix is a one-line golden-value update, NOT a source bug:**
+
+`test/relevance.properties.spec.ts`, `describe('recordSuccess', ...)`, test at line ~301
+`'scores a success above a failure from the same starting entry'` (lines 301-311):
+
+```
+it('scores a success above a failure from the same starting entry', () => {
+    const now = FIXED_NOW
+    const entry = makeEntry({ lastAccess: now })
+
+    const succeeded = recordSuccess(entry, undefined, 0.5, createSparsityModel(), now)
+    const failed = recordFailure(entry, 0.5, createSparsityModel(), now)
+
+    expect(succeeded.relevance).to.be.greaterThan(failed.relevance)
+    expect(succeeded.relevance, 'measured').to.be.closeTo(1.26, 1e-4)     // <-- line 309, FAILS
+    expect(failed.relevance, 'measured').to.be.closeTo(0.63, 1e-4)        // <-- line 310, PASSES
+})
+```
+
+Failure output:
+```
+AssertionError: measured: expected 1.3099065970003163 to be close to 1.26 +/- 0.0001
+  at test\relevance.properties.spec.ts:309:50
+```
+
+This is a **stale golden value**, not a regression: this ticket's whole point is that `recordSuccess`
+now increments `accessCount` (see "Done" section below, item 2), which correctly raises the
+frequency-score component and therefore raises `succeeded.relevance` from the old pre-fix value
+`1.26` to the new correct value `1.3099065970003163`. The `failed` assertion on line 310 (`0.63`)
+still passes untouched, exactly as expected — `recordFailure` deliberately does not touch
+`accessCount` (rule 2 of "The decision" below), so its relevance is unchanged by this ticket.
+`succeeded.relevance` (1.3099...) is still correctly `greaterThan(failed.relevance)` (line 308
+passes too) — only the hardcoded golden number on line 309 is stale.
+
+**The only remaining work — mechanical, ~2 minutes:**
+
+1. In `test/relevance.properties.spec.ts` line 309, replace `1.26` with `1.3099065970003163`
+   (or round to a sane precision e.g. `1.30991` with a tolerance of `1e-4` — either is fine, just
+   confirm it passes). Do not touch line 310 (`0.63`) — that one already passes.
+2. Re-run `cd packages/fret && yarn test` (or just the one file:
+   `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/relevance.properties.spec.ts" --timeout 30000`)
+   to confirm 1200/1200 green.
+3. Re-run `npx tsc --noEmit` only if the edit above somehow touches types (it won't — it's a
+   numeric literal in a test).
+4. Produce the review/ handoff ticket per the standard implement-stage output (distilled summary,
+   emphasis on test coverage/use cases, honest about this exact gap — a golden value had to be
+   updated to match intended new behavior, call that out explicitly so the reviewer isn't
+   surprised by the diff). Delete this ticket from `tickets/implement/` once the handoff lands in
+   `tickets/review/`.
+
+No other failures. No pre-existing/unrelated failures encountered — the 1199 passing includes
+everything else in the suite (simulation, stabilization, size-estimator, rpc, digitree, etc.), all
+green. `tickets/.pre-existing-known.md` does not need consulting; nothing to report there.
+
+**Everything else is done except the above 4 steps.**
 
 **Done — `packages/fret/src/store/relevance.ts`:** all 5 source edits, confirmed correct across
 multiple prior runs (see git log for `ticket(implement): frequency-credit-relevance-core` for
