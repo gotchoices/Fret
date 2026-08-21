@@ -33,19 +33,53 @@ import { refMinDistance, toCoord } from './helpers/ring.js'
  * Note the success rate barely moved even then: the attempt budget absorbs a bad route until it
  * stumbles onto the target, which is exactly why the hop bound carries the guard.
  *
- * It deliberately does **not** claim to discriminate one plausible ring metric from another.
- * The last two rows are the evidence: substituting clockwise-only distance, or XOR, barely
- * moves either number. That is a property of the harness, not a defect in these assertions.
- * The sim's stores are unbounded and its gossip merges every neighbor's window each tick, so a
- * peer ends up knowing a large, near-uniform slice of the ring (63% at n=200, 19% at n=1000 —
- * each case logs its own figure). Greedy routing over knowledge that dense reaches the target's
- * anchor in one or two hops under *any* metric even loosely monotone in ring position, so there
- * is no gap between plausible metrics left to measure. Discriminating them needs stores that are
- * sparse and finger-shaped, which needs the sim's eviction to stop being degenerate — see the
- * NOTE at `FretSimulation.enforceCapacity`, where every entry ties at relevance 0 and eviction
- * collapses to ring order. That is the prerequisite, and it is also why `capacity` is left unset
- * here rather than used as a sparsity knob: today it would evict a contiguous arc from every
- * store and this spec would measure eviction rather than routing.
+ * ── Telling one plausible ring metric from another ─────────────────────────────────────
+ *
+ * **Retracted 2026-08-21.** This doc-block used to say the spec could not discriminate one
+ * plausible ring metric from another. That is still true of the three *unbounded* cases above —
+ * their stores are unbounded and gossip merges every neighbor's window each tick, so a peer ends
+ * up knowing a large, near-uniform slice of the ring (63% at n=200, 19% at n=1000 — each case
+ * logs its own figure), and greedy routing over knowledge that dense reaches the target's anchor
+ * in one or two hops under *any* metric even loosely monotone in ring position. It is **not**
+ * true of the capacity-bounded case below, which holds each store to 32 entries (3.2% of a
+ * 1000-peer ring) and is genuinely multi-hop.
+ *
+ * Measured 2026-08-21 by substituting `minDistance` in `src/ring/distance.ts` and re-running
+ * this file's config at `n: 1000`, all-edge, 100 routes, `capacity` as shown, seed 4242. p90 and
+ * max are over **successful routes only** (`successfulRouteHops`), which matters below:
+ *
+ * | metric                  | cap | knowledge | success | p90 | max |
+ * |-------------------------|-----|-----------|---------|-----|-----|
+ * | `minDistance` (shipped) | 24  | 2.4%      | 99%     | 14  | 23  |
+ * | `minDistance` (shipped) | 28  | 2.8%      | 100%    | 11  | 15  |
+ * | `minDistance` (shipped) | 32  | 3.2%      | 100%    |  8  | 19  |
+ * | clockwise-only          | 24  | 2.4%      | 83%     | 21  | 23  |
+ * | clockwise-only          | 28  | 2.8%      | 81%     | 19  | 23  |
+ * | clockwise-only          | 32  | 3.2%      | 83%     | 18  | 23  |
+ * | XOR                     | 24  | 2.4%      | 53%     |  8  | 13  |
+ * | XOR                     | 28  | 2.8%      | 60%     |  6  |  9  |
+ * | XOR                     | 32  | 3.2%      | 71%     |  6  |  9  |
+ *
+ * Confirmed across seeds 1 / 4242 / 99 / 20260820 at cap 32: shipped 100% success on all four
+ * at p90 7–8; clockwise-only 83–90% at p90 17–21; XOR 60–77% at p90 5–7.
+ *
+ * **Caveat — those rows are not a pure selector comparison.** There is no injection seam
+ * (`chooseNextHop` imports `minDistance` directly), so the substitution was made in
+ * `src/ring/distance.ts`, and `minDistance` is not selector-only: the relevance sparsity model
+ * reads it too (`normalizedLogDistance` in `src/store/relevance.ts`, which this harness calls
+ * from `scoreMerge`, `touch` and its self-seed). Each substituted row therefore changes eviction
+ * shape as well as hop choice. That is enough to demonstrate a wrong metric is *detectable*, and
+ * it is how the 2026-08-20 table above was produced too, but it does not isolate the selector.
+ * (`nearRadiusFor` is not one of those readers — it is pure ring arithmetic and calls no
+ * distance function; what a substitution changes there is the meaning of the comparison made
+ * against the radius, not the radius itself.)
+ *
+ * **The two wrong metrics are caught by two different assertions, so the case needs both.** A
+ * hop bound alone cannot catch XOR: its p90 is *lower* than the shipped metric's (5–7 vs 7–8 at
+ * cap 32), because p90 is taken over successful routes only and XOR simply *fails* the hard
+ * routes — its survivors are the easy ones, so its hop distribution flatters it. Clockwise-only
+ * fails the other way: it keeps most routes alive (83–90%) but drags them the long way round the
+ * ring. So the p90 upper bound catches clockwise-only, and the success floor catches XOR.
  */
 
 /** Drive every event scheduled up to `uptoMs`, one at a time, then park the clock there. */
@@ -84,6 +118,17 @@ const ROUTE_COUNT = 100
  */
 const MIN_SUCCESS_RATE = 0.9
 const MAX_P90_HOPS = 6
+
+/**
+ * Bounds for the capacity-bounded case alone. Deliberately **separate constants**, not a
+ * loosening of the two above: every unbounded case still asserts p90 ≤ 6, while the shipped
+ * metric measures p90 7–8 on a 32-entry store and so cannot meet that bound. What these two
+ * express is the gap in the substitution table in this file's doc-block, one assertion per wrong
+ * metric — 0.95 sits 5 points below the shipped 100% and 5 above clockwise-only's worst 90%;
+ * 12 sits 50% above the shipped worst p90 of 8 and 5 below clockwise-only's best of 17.
+ */
+const CAPPED_MIN_SUCCESS_RATE = 0.95
+const CAPPED_MAX_P90_HOPS = 12
 
 interface RouteResult {
 	successRate: number
@@ -168,6 +213,31 @@ describe('Ring routing through the shipped selector', function () {
 
 		expect(r.successRate, 'routing success under churn').to.be.at.least(MIN_SUCCESS_RATE)
 		expect(r.p90Hops, 'p90 hop count under churn').to.be.at.most(MAX_P90_HOPS)
+	})
+
+	it('a capacity-bounded sparse ring tells the shipped ring metric from a wrong one', () => {
+		// MEASURED 2026-08-21 (seeds 1 / 4242 / 99 / 20260820): 100% success on all four, p90 7–8,
+		// knowledge 3.2%. Both assertions are load-bearing and each catches a different wrong
+		// metric — see the substitution table in this file's doc-block. `capacity` bounds each
+		// store to 32 entries, which is what makes routing here genuinely multi-hop; the three
+		// cases above leave it unset on purpose, since at their store sizes no metric is
+		// distinguishable from any other.
+		const r = measureRouting(baseConfig({ n: 1000, profileMix: { edge: 1, core: 0 }, capacity: 32 }))
+		report('capped n=1000, capacity 32', r)
+
+		expect(r.attempts, 'every scheduled route must have fired').to.equal(ROUTE_COUNT)
+		// Every store saturates at the cap, so knowledge is capacity/n = 3.2% by construction.
+		expect(r.knowledgeFraction, 'the cap is what makes this case sparse').to.be.below(0.05)
+		// Catches XOR (60–77% success), and clockwise-only (83–90%) a second time.
+		expect(r.successRate, 'capacity-bounded sparse routing success')
+			.to.be.at.least(CAPPED_MIN_SUCCESS_RATE)
+		// Catches clockwise-only (p90 17–21). Deliberately vacuous for XOR, whose p90 sits *below*
+		// the shipped metric's — the success floor is the only assertion holding that one.
+		expect(r.p90Hops, 'p90 hop count on a capacity-bounded 1000-peer ring')
+			.to.be.at.most(CAPPED_MAX_P90_HOPS)
+		// Headroom claim, not a guard: a worse metric moves p90 *up*, away from this. It states
+		// that the case is multi-hop at all — the role `knowledgeFraction < 0.5` plays above.
+		expect(r.p90Hops, 'this case is only interesting while routing is multi-hop').to.be.at.least(3)
 	})
 
 	it('an originator already nearest the key has no strictly-improving first hop', () => {

@@ -117,16 +117,23 @@ function farWeights(confidence: number): CostWeights {
  * farther" means.
  *
  * NOTE: 8 ± 4 is reasoned from that legacy correspondence, and is still not measured.
- * `test/simulation.routing.spec.ts` now drives this selector for real — the sim routes hop by
- * hop through `chooseNextHop` over each peer's own store — but it cannot tune these constants,
- * and that is a measured finding rather than an untried idea. Its break-test table records the
- * reason: substituting clockwise-only distance, or XOR, for `minDistance` moves neither the
- * routing-success rate nor the p90 hop count, because the sim's stores are unbounded and
- * near-uniform, so greedy routing reaches the target's anchor in one or two hops under any
- * roughly-monotone metric. A slack constant is a tie-break between candidates that are close
- * in distance; with routes this short there are no such ties to break. Tuning needs sparse,
- * finger-shaped stores first (see the NOTE at `FretSimulation.enforceCapacity`). What the spec
- * *does* guard is direction: inverting the preference moves p90 hops from 2 to ~19.
+ * `test/simulation.routing.spec.ts` drives this selector for real — the sim routes hop by hop
+ * through `chooseNextHop` over each peer's own store — and as of 2026-08-21 it *does*
+ * discriminate the distance **metric**: its capacity-bounded case (`capacity: 32`, n=1000,
+ * all-edge) measures 100% success at p90 7–8 hops for `minDistance`, against 83–90% success at
+ * p90 17–21 for clockwise-only distance and 60–77% success for XOR. The claim that used to sit
+ * here — that substituting either moves neither number — was measured on that spec's *unbounded*
+ * cases only, and is retracted; see the substitution table in that file.
+ *
+ * These two constants are still not tunable there, for a different reason that is now measured
+ * rather than assumed. The sim's near radius is `2·k·2^256/store.size()`
+ * (`FretSimulation.nearRadiusFor`), so `store.size()` is its own denominator: a 32-entry store
+ * at k=15 puts the radius at 60/32 of the maximum ring distance, which clamps to half the ring,
+ * and *every* candidate then takes the near branch — where ordering is by distance alone and
+ * both this allowance and the backoff term are inert. A slack constant is a tie-break between
+ * candidates close in distance, so tuning it needs a case whose candidates are genuinely far:
+ * a larger capacity or a smaller β, not a sparser store. What the spec also guards is direction:
+ * inverting the preference moves p90 hops from 2 to ~19 on the dense cases.
  */
 const CONNECTED_SLACK_ORDERS = 8;
 const CONNECTED_SLACK_CONFIDENCE_SWING = 4;

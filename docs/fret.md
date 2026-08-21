@@ -917,15 +917,26 @@ After import, the normal stabilization loop probes restored peers to update conn
     partition-shaped case rather than a routing one. The thresholds are set from measured runs across four seeds
     (95–100% success, p90 2 hops) and shown to bite: inverting the selector's preference moves
     p90 from 2 to ~19. **The hop bound is the sensitive measure, not the success rate** — the
-    attempt budget absorbs a bad route until it stumbles onto the target. The spec deliberately
-    does not claim to discriminate one plausible ring metric from another: substituting
-    clockwise-only distance, or XOR, for `minDistance` moves neither number, because the sim's
-    stores are unbounded and its gossip merges every neighbor's window each tick, leaving each
-    peer a large near-uniform slice of the ring (63% at n=200, 19% at n=1000) over which greedy
-    routing arrives in one or two hops under any roughly-monotone metric. Making metric quality
-    measurable needs sparse, finger-shaped stores, which needs the sim's eviction to stop being
-    degenerate — until then `capacity` is left unset in that spec, since setting it would
-    measure eviction instead. Note the *reason* eviction is degenerate has moved: entries no longer
+    attempt budget absorbs a bad route until it stumbles onto the target. A fourth case bounds each
+    store to `capacity: 32` — 3.2% of a 1000-peer ring — and **does** discriminate one plausible
+    ring metric from another. Measured 2026-08-21 across four seeds: the shipped `minDistance`
+    completes 100% of routes at p90 7–8 hops, substituting clockwise-only distance drops that to
+    83–90% success at p90 17–21, and substituting XOR drops it to 60–77% success. It takes *two*
+    assertions because the two wrong metrics fail differently — a p90 hop bound catches
+    clockwise-only, which keeps routes alive but drags them the long way round the ring, while
+    XOR's p90 is *lower* than the shipped metric's (p90 is over successful routes only, and XOR
+    fails the hard routes, so its survivors flatter it), leaving a success floor as the only
+    thing that catches it. Two caveats: the substitution was made in `src/ring/distance.ts` for
+    want of an injection seam, and the relevance sparsity model reads `minDistance` too, so each
+    substituted run changes eviction shape as well as hop choice — it demonstrates a wrong metric
+    is detectable, it does not isolate the selector. And the sim's near radius is
+    `2·k·2^256/store.size()`, which at a 32-entry store clamps to half the ring, so every
+    candidate takes the near branch: what is discriminated is the distance metric, not the cost
+    function's slack constants. The three unbounded cases still discriminate nothing — their
+    stores are unbounded and gossip merges every neighbor's window each tick, leaving each peer a
+    large near-uniform slice of the ring (63% at n=200, 19% at n=1000) over which greedy routing
+    arrives in one or two hops under any roughly-monotone metric, which is why `capacity` is left
+    unset in those three. Note the *reason* eviction is degenerate has moved: entries no longer
     all tie at relevance 0, because **every entry is scored at the site that put it there** —
     the self-seed in `addPeer`, the bootstrap dials in `handleConnect` (production's `touch`,
     since a dial is proven contact), the three merge sites through `scoreMerge`, and the

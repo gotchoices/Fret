@@ -866,15 +866,19 @@ export class FretSimulation {
 	 * peer could actually know.
 	 *
 	 * NOTE: as a fraction of the maximum ring distance this radius is exactly `4k/store.size()`
-	 * (2·k·2^256/size ÷ 2^255). The sim's stores are unbounded and its gossip merges every
-	 * neighbour's window each tick, so `size()` stays within an order of the population and the
-	 * radius lands around a third of maximum distance at the routing spec's sizes — most
-	 * candidates therefore take the selector's *near* branch, where ordering is by distance
+	 * (2·k·2^256/size ÷ 2^255), so `size()` is its own denominator and a *smaller* store makes
+	 * the radius larger. On the routing spec's unbounded cases `size()` stays within an order of
+	 * the population and the radius lands around a third of maximum distance; on its
+	 * capacity-bounded case (`capacity: 32`, k=15) the fraction is 60/32 > 1 and the radius clamps
+	 * to half the ring, the largest a ring distance can be. Either way most candidates — on the
+	 * bounded case, all of them — take the selector's *near* branch, where ordering is by distance
 	 * alone and both the connected allowance and the backoff arm of the cost path are inert.
-	 * That is production's own arithmetic, not a sim defect, but it bounds the claim: this
-	 * harness exercises chiefly the near branch. Exercising the far branch needs sparse,
-	 * finger-shaped stores, which needs sim eviction to stop being degenerate — see the
-	 * `enforceCapacity` NOTE and `backlog/debt-sim-eviction-degenerate-blocks-metric-guard`.
+	 *
+	 * That is production's own arithmetic, not a sim defect, but it bounds the claim in a way
+	 * worth stating precisely: this harness exercises chiefly the near branch, so it can
+	 * discriminate the distance *metric* (it does — see the substitution table in
+	 * `test/simulation.routing.spec.ts`) and not the cost function's slack constants. Exercising
+	 * the far branch needs a larger capacity or a smaller β, not a sparser store.
 	 */
 	private nearRadiusFor(store: DigitreeStore): Uint8Array {
 		const span = (1n << 256n) / BigInt(Math.max(1, store.size()))
