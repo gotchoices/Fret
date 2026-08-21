@@ -37,12 +37,6 @@ export interface LivenessDeps {
 	modelFor: (selfId: string) => SparsityModel
 	/** Ring coordinate of a peer id — the self-to-peer distance every scoring call takes. */
 	coordOf: (id: string) => Uint8Array
-	/**
-	 * Sim clock. Every scoring call must be handed sim time explicitly: the scoring helpers
-	 * default `now` to `Date.now()`, and a wall-clock stamp makes two same-seed replays diverge
-	 * (recency's half-life is 60 s against sim runs of 4-60 s, so the term is live).
-	 */
-	now: () => number
 }
 
 /**
@@ -58,7 +52,6 @@ export class LivenessModel {
 	private readonly isAlive: (id: string) => boolean
 	private readonly modelFor: (selfId: string) => SparsityModel
 	private readonly coordOf: (id: string) => Uint8Array
-	private readonly now: () => number
 
 	constructor(cfg: LivenessConfig, deps: LivenessDeps) {
 		this.deadAfterFailures = cfg.deadAfterFailures
@@ -67,7 +60,6 @@ export class LivenessModel {
 		this.isAlive = deps.isAlive
 		this.modelFor = deps.modelFor
 		this.coordOf = deps.coordOf
-		this.now = deps.now
 	}
 
 	/**
@@ -108,7 +100,7 @@ export class LivenessModel {
 			if (!this.contactAllowed(selfId, entry.id)) {
 				this.recordContactFailure(selfId, store, entry, time)
 			} else {
-				this.recordContactSuccess(selfId, store, entry)
+				this.recordContactSuccess(selfId, store, entry, time)
 			}
 		}
 	}
@@ -148,6 +140,12 @@ export class LivenessModel {
 	 * `undefined`: the sim models no link latency, so there is no sample to blend and
 	 * `avgLatencyMs` must stay `null` rather than be fabricated as a 0 ms measurement.
 	 *
+	 * `time` is sim time, passed by the caller exactly as `recordContactFailure` takes it —
+	 * the scoring helpers default `now` to `Date.now()`, and a wall-clock stamp would make two
+	 * same-seed replays diverge (recency's half-life is 60 s against sim runs of 4-60 s). It is
+	 * a parameter rather than an injected clock because the scheduler's `getCurrentTime()` and
+	 * the event's own `time` are not the same number on the `processEvent` / `advanceTo` paths.
+	 *
 	 * NOTE: `contactSweep` calls this for every reachable non-dead entry on every tick, so
 	 * `accessCount` and the KDE occupancy each grow by one per entry per tick - O(store size)
 	 * scoring writes per peer per tick, not one per real RPC. That is intended shared-seam
@@ -155,9 +153,9 @@ export class LivenessModel {
 	 * on long runs; if a suite ever needs frequency to discriminate, give the sweep its own
 	 * cadence rather than scoring per tick.
 	 */
-	recordContactSuccess(selfId: string, store: DigitreeStore, entry: PeerEntry): void {
+	recordContactSuccess(selfId: string, store: DigitreeStore, entry: PeerEntry, time: number): void {
 		const x = normalizedLogDistance(this.coordOf(selfId), entry.coord)
-		const scored = recordSuccess(entry, undefined, x, this.modelFor(selfId), this.now())
+		const scored = recordSuccess(entry, undefined, x, this.modelFor(selfId), time)
 		store.update(entry.id, {
 			relevance: scored.relevance,
 			lastAccess: scored.lastAccess,

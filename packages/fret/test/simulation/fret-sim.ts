@@ -142,7 +142,6 @@ export class FretSimulation {
 				},
 				modelFor: (selfId) => this.models.get(selfId)!,
 				coordOf: (id) => this.peers.get(id)!.coord,
-				now: () => this.scheduler.getCurrentTime(),
 			},
 		)
 		this.measurement = new SimMeasurement({
@@ -743,7 +742,7 @@ export class FretSimulation {
 				const entry = store.getById(pick)
 				const target = this.peers.get(pick)
 				if (this.partitionModel.contactAllowed(current, pick) && target?.alive) {
-					if (entry) this.liveness.recordContactSuccess(current, store, entry)
+					if (entry) this.liveness.recordContactSuccess(current, store, entry, time)
 					next = pick
 					break
 				}
