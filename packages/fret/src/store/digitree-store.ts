@@ -402,6 +402,13 @@ export class DigitreeStore {
 	 * wrap-around forever. Callers that must terminate on ring size pass `size()`; the two
 	 * neighbor walks pass `Infinity` when unfiltered, where the ring-lapped exit in
 	 * {@link collectRing} is what stops them and today's behavior is byte-for-byte preserved.
+	 *
+	 * NOTE: this holds a live tree `Path` across every `yield`, and digitree paths are invalid
+	 * after any mutation. Being a generator makes that reachable in a way the previous inline
+	 * loops were not — a consumer can now run arbitrary code, including a write, between
+	 * entries. Every consumer today materializes eagerly and mutates nothing, so it is sound as
+	 * written; keep it private and keep it that way. If a walk ever needs to interleave with
+	 * writes, snapshot the ids first and re-seek per entry rather than resuming a stale path.
 	 */
 	private *walkRing(
 		start: EntryPath,

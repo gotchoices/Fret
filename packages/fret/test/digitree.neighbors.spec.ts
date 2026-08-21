@@ -248,3 +248,65 @@ describe('DigitreeStore tree-key cache', () => {
 })
 
 
+
+// `successorOfCoord` / `predecessorOfCoord` are the two single-entry walks. Their filtered
+// branch is the one the shared-walker extraction rewrote most, and it had no direct coverage:
+// the only callers today are the simulator (`test/simulation/fret-sim.ts`), which passes no
+// filter. These pin the four behaviors the extraction has to preserve — wrap, empty ring,
+// skip-and-keep-advancing, and terminate-on-zero-match.
+describe('DigitreeStore single-entry ring walks', () => {
+	const HIGH = new Uint8Array(32).fill(255)
+
+	it('wraps past the end of the ring', () => {
+		const store = ringStore(4)
+		const order = store.list().map((e) => e.id)
+
+		// HIGH sits past every entry, so the successor walk wraps to the ring start and the
+		// predecessor walk starts on the ring end without wrapping.
+		expect(store.successorOfCoord(HIGH)?.id).to.equal(order[0]!)
+		expect(store.predecessorOfCoord(HIGH)?.id).to.equal(order[order.length - 1]!)
+
+		// ZERO is exactly p0's coordinate, so both walks start *on* p0.
+		expect(store.successorOfCoord(ZERO)?.id).to.equal('p0')
+		expect(store.predecessorOfCoord(ZERO)?.id).to.equal('p0')
+	})
+
+	it('returns undefined on an empty store, filtered or not', () => {
+		const store = new DigitreeStore()
+		expect(store.successorOfCoord(ZERO)).to.equal(undefined)
+		expect(store.predecessorOfCoord(ZERO)).to.equal(undefined)
+		expect(store.successorOfCoord(ZERO, () => true)).to.equal(undefined)
+		expect(store.predecessorOfCoord(ZERO, () => true)).to.equal(undefined)
+	})
+
+	it('skips filter misses rather than stopping on the first one', () => {
+		const store = ringStore(6)
+		const wanted = (e: PeerEntry) => e.id === 'p4'
+
+		// p4 is four entries clockwise of ZERO and two counter-clockwise of it (via the wrap),
+		// so both directions must skip past non-matches — and the left walk must wrap to do it.
+		expect(store.successorOfCoord(ZERO, wanted)?.id).to.equal('p4')
+		expect(store.predecessorOfCoord(ZERO, wanted)?.id).to.equal('p4')
+	})
+
+	// The bounded-scan guard: nothing ever matches, so only `maxScan` stops the wrap-around.
+	// Deleting it here spins forever rather than failing an assertion, hence the timeout.
+	it('terminates in one lap when a filter matches nothing', function () {
+		this.timeout(5000)
+		const store = ringStore(200)
+		const never = () => false
+		expect(store.successorOfCoord(ZERO, never)).to.equal(undefined)
+		expect(store.predecessorOfCoord(ZERO, never)).to.equal(undefined)
+	})
+
+	// Each visited entry counts toward the scan bound, match or miss, so a lone match anywhere
+	// on the ring is still found — the bound is one lap, not one lap of *matches*.
+	it('finds a lone match at the far end of the lap', () => {
+		const store = ringStore(200)
+		const order = store.list().map((e) => e.id)
+		const last = order[order.length - 1]!
+
+		expect(store.successorOfCoord(ZERO, (e) => e.id === last)?.id).to.equal(last)
+		expect(store.predecessorOfCoord(ZERO, (e) => e.id === order[1]!)?.id).to.equal(order[1]!)
+	})
+})
