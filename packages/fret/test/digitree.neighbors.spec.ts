@@ -83,7 +83,11 @@ describe('DigitreeStore ring walks exit on a lap', () => {
 		expect(elapsedMs, 'a lapping walk must not scale with count').to.be.lessThan(500)
 	})
 
-	it('visits each entry at most once when a pass-all filter is supplied', () => {
+	// Filed here for adjacency, but it guards `maxScan`, not the lap exit: with a filter
+	// `maxScan` is `size()` and `scanned` counts every visit, so the walk is cut off at one lap
+	// before any id can repeat and the exit never fires. It passes unchanged at the pre-exit
+	// HEAD. Keep it — it is the regression test for the filtered walk's bound.
+	it('visits each entry at most once when a pass-all filter is supplied (bounded by maxScan, not the lap exit)', () => {
 		const store = ringStore(6)
 		const visits = new Map<string, number>()
 		const counting = (e: PeerEntry) => {

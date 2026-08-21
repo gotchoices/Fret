@@ -1,34 +1,25 @@
-description: The peer routing table used to rebuild a 64-character text key every time it looked a peer up, and its ring walks kept circling a small ring long after seeing every peer. Both are fixed; this is the review pass over that work.
+description: A routing-table speed-up already shipped and has been reviewed; the code fixes it needed are applied. What remains is running the build and test suite over it, and making two judgement calls the reviewer deliberately left open.
 files: packages/fret/src/store/digitree-store.ts, packages/fret/test/digitree.neighbors.spec.ts, packages/fret/test/digitree.invariants.spec.ts, docs/fret.md
-difficulty: medium
+difficulty: easy
 ----
 
-Two independent allocation problems in `DigitreeStore`, landed together (implement commit
-`94cd6e7`). Both change **cost, not results** — that claim is the thing to attack hardest.
+Continuation of the review pass over implement commit `94cd6e7` (two prior review runs plus this
+one were each cut short by the token budget). **The review analysis is finished and its code
+findings are applied — this ticket exists only to run the gate and settle two open decisions.**
 
-## What landed
+## What landed in the implementation
 
 **Arm A — tree keys cached per entry object.** A module-level `WeakMap<PeerEntry, string>` in
-`src/store/digitree-store.ts`, consulted and populated *inside* `makeKey` itself, so `put`'s own
-`makeKey(entry)` call primes it before the entry reaches the tree. Keyed on object identity, not
-peer id: every write path spreads the old entry into a new object, so a re-key is a cache miss by
-construction and a stale key is unrepresentable.
+`src/store/digitree-store.ts`, consulted and populated inside `makeKey` itself. Keyed on object
+identity, not peer id: every write path spreads the old entry into a new object, so a re-key is a
+cache miss by construction and a stale key is unrepresentable.
 
 **Arm B — walks exit on a lap.** `neighborsRight` / `neighborsLeft` collect into a `Set<string>`
 and `break` on the first id already present. The `maxScan` bounded-scan guard is unchanged.
 
 **Docs.** Two bullets in the *Routing store (Digitree) & indices (A2)* section of `docs/fret.md`.
 
-Measured numbers, new tests, and the implementer's own honest gap list are in the implement
-commit message and in the two doc bullets — not restated here.
-
-<!-- resume-note -->
-## Review progress (two runs, both cut short by budget — resume here)
-
-**No code has been changed by either review run.** The working tree is exactly the implement
-commit's. Everything under *Open findings* below is still unfixed.
-
-### Checked and settled
+## Review conclusions so far — settled, carry these into the complete ticket verbatim
 
 **Arm A (tree-key cache) — sound, no defect.**
 
@@ -55,59 +46,63 @@ commit's. Everything under *Open findings* below is still unfixed.
   `src/estimate/size-estimator.ts:82-83`, `src/service/cohort.ts:39-40`, and
   `src/service/fret-service.ts` lines 1421, 1495, 1534, 1561, 1588, 1748, 2524, 2526. Every
   filtered call passes `isLiveMember`; the rest pass no filter. All pure.
-- **`successorOfCoord` / `predecessorOfCoord` confirmed unaffected** by reading them
-  (`digitree-store.ts` ~583-620): each returns on the first match and cannot lap, so Arm B does
-  not apply. Both do benefit from Arm A.
+- **`successorOfCoord` / `predecessorOfCoord` confirmed unaffected**: each returns on the first
+  match and cannot lap, so Arm B does not apply. Both do benefit from Arm A.
 
 **`docs/fret.md` verified against the code.** Both new bullets read correctly against the shipped
-`makeKey` / walk bodies. One number disagrees — see finding 2.
+`makeKey` / walk bodies; the one number that disagreed is fixed below.
 
-### Open findings — all minor, all to be fixed in this pass
+## Findings applied in this pass — already in the working tree, do not redo
 
-1. **Filter-purity note is vacuous as the code stands** (`digitree-store.ts`, the `NOTE:` block
-   above `neighborsRight`, condition (2)). With a filter, `maxScan = this.size()` and `scanned`
-   increments on *every* entry visited, match or miss. A forward walk visits `size()` distinct
-   tree positions before it can revisit one, and the store holds exactly one entry per id, so
-   `out.has(e.id)` can never be true on the filtered path — the exit is reachable **only**
-   unfiltered. The comment is defensive rather than wrong, but it presents a live condition where
-   there is none, and a future reader weakening `maxScan` would be relying on an exit that has
-   never actually run. Fix: keep the purity note (it becomes live the moment `maxScan` changes)
-   and say plainly that the exit is today reachable only on the unfiltered path, and that
-   `maxScan` is what makes it so.
+Three minor, comment/text-only edits (`git diff` against `94cd6e7` shows exactly these):
 
-2. **Stale measurement in the source doc comment.** The `keyCache` doc comment says
-   "39.0 ms rebuilding vs 6.4 ms cached"; 6.4 ms was the *predicted* figure from the plan ticket.
-   The measured value is 4.4 ms, which is what `docs/fret.md` and the implement handoff both
-   carry. One-number fix so the two do not disagree.
+- **The filter-purity note was vacuous as the code stands.** With a filter, `maxScan = size()` and
+  `scanned` increments on every entry visited, match or miss, so a walk is cut off at exactly one
+  lap and `out.has(e.id)` can never be true — the exit is reachable **only** on the unfiltered
+  path. The `NOTE:` above `neighborsRight` now says that plainly, keeps the purity condition (it
+  goes live the moment `maxScan` is weakened), and names `maxScan` as what makes the exit
+  unreachable today.
+- **Stale measurement in the `keyCache` doc comment.** It said "39.0 ms rebuilding vs 6.4 ms
+  cached"; 6.4 ms was the *predicted* figure from the plan ticket. Corrected to the measured
+  4.4 ms, which `docs/fret.md` and the implement handoff both already carry.
+- **A test was filed under the wrong guard.** `test/digitree.neighbors.spec.ts`, "visits each entry
+  at most once when a pass-all filter is supplied", sits inside the *ring walks exit on a lap*
+  describe block but by the point above the exit never fires on a filtered walk — `maxScan` is
+  what bounds it, and the test passes unchanged at the pre-Arm-B HEAD. Retitled and given a
+  comment saying so. It is a genuine regression test for the filtered walk's bound; kept.
 
-3. **A test is filed under the wrong guard.** `test/digitree.neighbors.spec.ts`, "visits each
-   entry at most once when a pass-all filter is supplied", sits inside the *ring walks exit on a
-   lap* describe block, but by finding 1 the exit never fires on a filtered walk — what bounds it
-   is `maxScan`. The test passes unchanged at the pre-Arm-B HEAD, so it guards the bounded-scan
-   guard, not the lap exit. Fix: one clarifying comment (or a rename) so a reader does not take
-   it as coverage of the exit. It is a genuine regression test; do not delete it.
+## Remaining work
 
-### Still to do
+**Run the gate.** From `packages/fret/`: `npx tsc --noEmit`, `yarn build`, `yarn test`. No review
+run has managed this yet, so the gate is unmet — it is the one hard blocker on completing. The
+applied edits are comment-only plus one test title string, so a failure would be pre-existing;
+handle any such failure per the pre-existing-test-failure rules rather than chasing it here. Note
+there is no lint step — per `AGENTS.md`, `yarn check` is the gate and `yarn format` must **not**
+be run.
 
-- **Apply findings 1–3** (three small comment/text edits, all in-pass minor).
-- **Run the gate**: `npx tsc --noEmit`, `yarn build`, `yarn test` from `packages/fret/`. Neither
-  review run has run it, so the gate is unmet. Note there is no lint step — per `AGENTS.md`,
-  `yarn check` is the gate and `yarn format` must **not** be run.
-- **Decide the wall-clock-test question.** The implementer flagged it himself: the lap test
-  asserts `neighborsRight(ZERO, 1_000_000)` on a 4-entry ring finishes under 500 ms. It is the
-  only probe available for the *unfiltered* path (a counting filter changes which guard is under
-  test, per finding 1), and it discriminates ~5 orders of magnitude, so flakiness is unlikely —
-  but it is a timing assertion on shared CI. Decide: keep as-is with the reasoning recorded, or
-  replace with an injectable visit counter. A reviewer may reasonably want either; this call has
-  not been made.
-- **Confirm nothing can reintroduce a duplicate tree id** (soundness condition 1). The write seam
-  and its property test were read but the claim was not probed independently.
-- **The `plan/cleanup-store-ring` interaction is a comment, not an enforcement.** Nothing stops
-  that later ticket from copying the set/exit logic per call site instead of absorbing it into the
-  shared walker. Decide whether that is worth more than the `NOTE:` already at the site.
+**Decide the wall-clock-test question.** The implementer flagged it himself: the lap test
+`does work proportional to the ring, not to count` asserts `neighborsRight(ZERO, 1_000_000)` on a
+4-entry ring finishes under 500 ms. It is the only probe available for the *unfiltered* path (a
+counting filter changes which guard is under test, per the applied finding above), and it
+discriminates roughly five orders of magnitude, so flakiness is unlikely — but it is still a
+timing assertion on shared CI. Decide one way or the other: keep as-is with that reasoning
+recorded at the test, or replace it with an injectable visit counter on the store. Either is
+defensible; the call has simply not been made.
 
-### Output when done
+**Confirm nothing can reintroduce a duplicate tree id** (Arm B soundness condition 1). The write
+seam (`DigitreeStore.put`) and its property test were read and look right, but the claim was not
+probed independently — the seam deletes the entry under the old key before upserting at the new
+one, and the model-based property test in `test/digitree.invariants.spec.ts` recounts after every
+op. A short independent read of those two is enough; no new test is expected.
+
+**Decide whether the `plan/cleanup-store-ring` interaction needs more than a comment.** A `NOTE:`
+at the walk site asks that later ticket to absorb the set/exit logic into the shared directional
+walker rather than copy it per call site. Nothing enforces that. Judge whether it is worth more
+than the comment already there; "the comment is enough" is a fine answer to record.
+
+## Output when done
 
 A `complete/` ticket with a `## Review findings` section: what was checked, what was found, what
-was done. Carry forward the settled sections above verbatim — they are checked work, not
-speculation — and state empty categories explicitly with a reason.
+was done. Carry the *Review conclusions so far* and *Findings applied* sections above forward —
+they are checked work, not speculation — and state empty categories explicitly with a reason
+(there were no major findings and no tripwires beyond the `NOTE:`s already at the walk site).

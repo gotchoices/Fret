@@ -156,7 +156,7 @@ function assertCoordWidth(coord: Uint8Array): void {
  * once per binary-search probe inside a leaf node — measured 5 calls per `find`, 6 per seek.
  * Every one of those calls ran `coordToHex` (a 32-iteration loop building a 64-character
  * string) plus a concatenation, which measured ~83% of a `find` (20 000 `find` calls over a
- * 2048-entry store: 39.0 ms rebuilding vs 6.4 ms cached). `find` is not a rare call —
+ * 2048-entry store: 39.0 ms rebuilding vs 4.4 ms cached). `find` is not a rare call —
  * `getById`, `remove`, `update`, `put`, and the seek that starts every ring walk each perform
  * one.
  *
@@ -441,10 +441,14 @@ export class DigitreeStore {
 	//     (`store-index-tree-invariant`) a duplicated id could appear mid-walk with no wrap, and
 	//     this exit would silently truncate the walk. If that invariant is ever weakened, this
 	//     exit must go with it.
-	// (2) With a filter supplied a skipped entry is never added, so the exit only fires on a
-	//     *matching* entry — but if the walk laps, the first matching entry re-matches and the
-	//     exit still fires within one lap. That assumes the filter is **pure** (same entry, same
-	//     answer). Every caller today passes `isLiveMember` or a plain field comparison.
+	// (2) A supplied `filter` must be **pure** (same entry, same answer), because the exit fires
+	//     only on a *matching* entry and so relies on the first match re-matching after a lap.
+	//     Every caller today passes `isLiveMember` or a plain field comparison. Note this
+	//     condition is dormant as the code stands: with a filter `maxScan` is `size()` and
+	//     `scanned` counts every entry visited, match or miss, so a walk is cut off at exactly
+	//     one lap and can never reach a repeat. The exit is therefore reachable **only** on the
+	//     unfiltered path today, and `maxScan` is what makes that so — the purity condition goes
+	//     live the moment `maxScan` is weakened or removed, which is why it is recorded here.
 	// The `maxScan` guard stays: it is the guard for the *filtered zero-match* case, where
 	// nothing is ever added and the early exit therefore never fires. Neither subsumes the
 	// other — deleting either one reopens a spin.
