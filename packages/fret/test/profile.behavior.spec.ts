@@ -387,35 +387,42 @@ describe('Profile behavior tests', function () {
 			const { svc } = await createService('core')
 
 			let clockNow = Date.now()
-			const clock = { now: () => clockNow, advance: (ms: number) => { clockNow += ms } }
+			const now = () => clockNow
+			const advance = (ms: number) => { clockNow += ms }
 
 			const backoffTtl = (CoreFretService as any).BACKOFF_RETAIN_MS
 			const departureTtl = (CoreFretService as any).DEPARTURE_DEBOUNCE_MS
+			;(svc as any).backoffMap = new ExpiringMap({ capacity: 8, ttlMs: backoffTtl, now })
+			;(svc as any).departureDebounce = new ExpiringMap({ capacity: 8, ttlMs: departureTtl, now })
+			const backoff = (svc as any).backoffMap as ExpiringMap<{ until: number, factor: number }>
+			const departure = (svc as any).departureDebounce as ExpiringMap<number>
 
-			;(svc as any).backoffMap = new ExpiringMap({ capacity: 8, ttlMs: backoffTtl, now: clock.now })
-			;(svc as any).departureDebounce = new ExpiringMap({ capacity: 8, ttlMs: departureTtl, now: clock.now })
-
-			// backoffMap survivor must already be a store member, or pruneBackoffMap (which runs
-			// inside the same sweepBoundedMaps call) drops it regardless of expiry.
+			// The backoff entry uses the service's own id because `pruneBackoffMap` runs inside the
+			// same `sweepBoundedMaps` call and drops entries for peers absent from the routing store.
+			// Self is always in the store, so the sweep is the only thing that can remove it.
 			const selfId: string = (svc as any).selfIdStr
-			const backoffExpiredId = 'backoff-expired-peer'
-			const departureExpiredId = 'departure-expired-peer'
-			const departureLiveId = 'departure-live-peer'
+			backoff.set(selfId, { until: clockNow, factor: 1 })
+			departure.set('departure-expired-peer', clockNow)
 
-			;(svc as any).backoffMap.set(backoffExpiredId, { until: clockNow, factor: 1 })
-			;(svc as any).departureDebounce.set(departureExpiredId, clockNow)
-
-			clock.advance(Math.min(backoffTtl, departureTtl) + 1)
-
-			;(svc as any).backoffMap.set(selfId, { until: clockNow, factor: 1 })
-			;(svc as any).departureDebounce.set(departureLiveId, clockNow)
+			// Past *both* lifetimes: the two differ by two orders of magnitude (5 min vs 2 s), so a
+			// step sized to the shorter one leaves the backoff entry live and tests nothing.
+			advance(Math.max(backoffTtl, departureTtl) + 1)
+			// Written after the step, so it is still live — rules out a sweep that clears the map
+			// unconditionally, which asserting only on the expired entries would not catch.
+			departure.set('departure-live-peer', clockNow)
 
 			await (svc as any).stabilizeOnce()
 
-			expect((svc as any).backoffMap.has(backoffExpiredId)).to.equal(false)
-			expect((svc as any).departureDebounce.has(departureExpiredId)).to.equal(false)
-			expect((svc as any).backoffMap.has(selfId)).to.equal(true)
-			expect((svc as any).departureDebounce.has(departureLiveId)).to.equal(true)
+			// `size` counts *retained* entries. `has` / `get` / `keys` all filter expired entries
+			// lazily, so an assertion through them passes whether or not the sweep ever ran.
+			expect(backoff.size).to.equal(0)
+			expect(departure.size).to.equal(1)
+			expect(departure.has('departure-live-peer')).to.equal(true)
+
+			// The other half for backoffMap, which has no survivor above: a live entry is kept.
+			backoff.set(selfId, { until: clockNow, factor: 1 })
+			await (svc as any).stabilizeOnce()
+			expect(backoff.size).to.equal(1)
 		})
 	})
 })
