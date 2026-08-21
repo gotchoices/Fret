@@ -2,6 +2,25 @@ description: Add a test proving the service actually detaches its four network e
 files: packages/fret/src/service/fret-service.ts, packages/fret/test/service-lifecycle.spec.ts
 difficulty: easy
 
+<!-- resume-note -->
+Prior run stopped on BUDGET_WARNING before writing any code — only read `fret-service.ts` (confirmed
+`addNodeListener`/`removeNodeListeners` unchanged at lines 1203-1215, matching this ticket's line
+numbers exactly) and read `test/service-lifecycle.spec.ts` in full. No edits made, nothing to revert.
+Confirmed useful details for the next run:
+- `addNodeListener<K extends keyof Libp2pEvents>(type, handler)` at fret-service.ts:1204 calls
+  `this.node.addEventListener(type, handler)` then pushes `() => this.node.removeEventListener(type, handler)`.
+  `removeNodeListeners()` at :1212 runs every pushed closure and clears the array.
+- `service-lifecycle.spec.ts` `beforeEach` (line 106) creates a **fresh `node`/`svc` per test** via
+  `createMemNode()`; `afterEach` (line 112) stops both. So a spy installed on `node.addEventListener`/
+  `node.removeEventListener` does NOT need to survive into other tests, but the file's existing
+  convention (see `hangGhostDials`, line 76, and its manual `dials.restore()` in a `finally` at
+  line 322/357) is to still wrap/restore explicitly rather than rely on `afterEach` — follow that
+  same pattern here for consistency, restoring in a `finally`.
+- `svc` is constructed as `new FretService(node, { networkName: NETWORK })` — no start yet — so the
+  spy must be installed on `node.addEventListener`/`node.removeEventListener` **before** `svc.start()`.
+No further investigation needed; proceed straight to writing the spec below.
+<!-- /resume-note -->
+
 ## Background
 
 `FretService.addNodeListener` (fret-service.ts:1203-1209) wraps `node.addEventListener(type, handler)`
@@ -35,16 +54,15 @@ Add a spec to `test/service-lifecycle.spec.ts` (alongside the existing `addNodeL
    `peer:update`) all appear among the recorded adds — so the test also catches a listener quietly
    dropped from registration, not only a leaked one.
 
-Restore the original `addEventListener`/`removeEventListener` in a `finally` (or rely on `afterEach`
-recreating `node` — check which the file already does for its other node-method wraps) so the spy
-doesn't leak into later tests.
+Restore the original `addEventListener`/`removeEventListener` in a `finally` (matching the
+`hangGhostDials`/`dials.restore()` convention already in this file) so the spy doesn't leak into
+later tests, even though `beforeEach` also creates a fresh `node` per test.
 
 ## Edge cases & interactions
 
 - Must assert handler **identity** (`===`), not just event-name match — a name-only check would
   pass even if the code regressed to reconstructing a fresh closure per detach call (the exact
-  historical bug shape this ticket exists to catch, per the design doc's `docs/fret.md` note on
-  `accessCount`-style drift... N/A here, but same "two copies of one rule drift apart" class).
+  historical bug shape this ticket exists to catch).
 - Don't assert an exact call count beyond "every add has a matching remove" — the test should not
   need updating if a fifth listener type is added later; it should still catch that fifth listener
   leaking on detach.
