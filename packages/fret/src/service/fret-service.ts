@@ -547,9 +547,26 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	private async applyTouch(id: string, coord: Uint8Array): Promise<void> {
-		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
-		const x = normalizedLogDistance(await this.selfCoord(), coord);
+	/**
+	 * Score a direct interaction with `id`.
+	 *
+	 * **Scoring never creates.** A peer we hold no entry for is not scored — bookkeeping *about* a
+	 * peer must not be able to re-admit it, or removing a peer would not stick: `handleLeave` drops
+	 * a departing peer, its connection closes a moment later, and the `peer:disconnect` listener's
+	 * `applyFailure` would resurrect it as an unclassified stranger the classification pass then
+	 * spends probes on. That is why the helper takes no coordinate: with the entry required to
+	 * exist, `entry.coord` *is* the value every caller used to compute, so "create this peer at
+	 * coordinate X while scoring it" is not expressible rather than merely guarded. Creation
+	 * belongs to {@link noteDiscovered} and to the explicit `upsert` sites (`peer:connect`,
+	 * `peer:identify`, `noteInboundRpc`, the seed paths).
+	 *
+	 * The early return sits before `await this.selfCoord()`, so a call about an unknown peer costs
+	 * one map lookup and no await.
+	 */
+	private async applyTouch(id: string): Promise<void> {
+		const entry = this.store.getById(id);
+		if (!entry) return;
+		const x = normalizedLogDistance(await this.selfCoord(), entry.coord);
 		const next = scoreTouch(entry, x, this.sparsity);
 		this.store.update(id, {
 			lastAccess: next.lastAccess,
@@ -598,6 +615,11 @@ export class FretService implements IFretService, Startable {
 	/**
 	 * Record a completed namespaced RPC against `id`.
 	 *
+	 * **Scoring never creates** — a peer we hold no entry for is not scored, and the call returns
+	 * before the `selfCoord()` await. See {@link applyTouch} for why, and for where creation does
+	 * belong. The trailing `applyMembershipSignal` / `noteProofOfLife` land inside that guard and
+	 * so stop running for a missing peer, which loses nothing: both already no-op on one.
+	 *
 	 * `latencyMs` is optional and must be supplied **only** when the caller timed a round trip
 	 * to this peer alone — today that is the ping paths. A caller with no such measurement omits
 	 * it and the peer's `avgLatencyMs` is left untouched, rather than writing a placeholder that
@@ -612,9 +634,10 @@ export class FretService implements IFretService, Startable {
 	 * become load-bearing (quorum, fairness accounting), make the update read-modify-write
 	 * inside the store instead of patching a value derived outside it.
 	 */
-	private async applySuccess(id: string, coord: Uint8Array, latencyMs?: number): Promise<void> {
-		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
-		const x = normalizedLogDistance(await this.selfCoord(), coord);
+	private async applySuccess(id: string, latencyMs?: number): Promise<void> {
+		const entry = this.store.getById(id);
+		if (!entry) return;
+		const x = normalizedLogDistance(await this.selfCoord(), entry.coord);
 		const next = scoreSuccess(entry, latencyMs, x, this.sparsity);
 		this.store.update(id, {
 			lastAccess: next.lastAccess,
@@ -637,9 +660,17 @@ export class FretService implements IFretService, Startable {
 		this.noteProofOfLife(id);
 	}
 
-	private async applyFailure(id: string, coord: Uint8Array): Promise<void> {
-		const entry = this.store.getById(id) ?? this.store.upsert(id, coord);
-		const x = normalizedLogDistance(await this.selfCoord(), coord);
+	/**
+	 * Record a failed interaction with `id`.
+	 *
+	 * **Scoring never creates** — see {@link applyTouch}. This is the helper the rule exists for:
+	 * the `peer:disconnect` listener calls it for a peer `handleLeave` has just removed, and the
+	 * old create-on-miss arm brought that peer straight back.
+	 */
+	private async applyFailure(id: string): Promise<void> {
+		const entry = this.store.getById(id);
+		if (!entry) return;
+		const x = normalizedLogDistance(await this.selfCoord(), entry.coord);
 		const next = scoreFailure(entry, x, this.sparsity);
 		this.store.update(id, {
 			lastAccess: next.lastAccess,
@@ -662,8 +693,8 @@ export class FretService implements IFretService, Startable {
 	 * peer that replied `ok: false`, and an idle `peer:disconnect` all prove the remote is alive
 	 * or say nothing about it, so they keep their relevance decay and nothing more.
 	 */
-	private async applyContactFailure(id: string, coord: Uint8Array): Promise<void> {
-		await this.applyFailure(id, coord);
+	private async applyContactFailure(id: string): Promise<void> {
+		await this.applyFailure(id);
 		this.applyContactStrike(id);
 	}
 
@@ -796,14 +827,14 @@ export class FretService implements IFretService, Startable {
 					return;
 				case 'unreachable':
 				case 'timeout':
-					await this.applyContactFailure(id, await this.coordOf(id));
+					await this.applyContactFailure(id);
 					return;
 				case 'decode-error':
 					// Answering badly is still answering: relevance decays, but the reply reached us
 					// over our own namespaced protocol, so it is membership proof and proof of life
 					// alike — never a strike.
 					this.noteAnsweredOnProtocol(id);
-					await this.applyFailure(id, await this.coordOf(id));
+					await this.applyFailure(id);
 					return;
 				default:
 					return; // ok / busy / cancelled / skipped are the callers' to handle
@@ -1009,7 +1040,7 @@ export class FretService implements IFretService, Startable {
 				// cleared any `dead` label; this clears the counter behind it, which would otherwise
 				// stay clamped at the threshold and let the very next failure re-kill the peer.
 				this.noteProofOfLife(id);
-				await this.applyTouch(id, coord);
+				await this.applyTouch(id);
 			} catch (err) { log.error('peer:connect handler failed - %e', err) }
 			if (!this.stopped && !this.postBootstrapAnnounced) {
 				this.postBootstrapAnnounced = true;
@@ -1024,7 +1055,7 @@ export class FretService implements IFretService, Startable {
 				const coord = await this.coordOf(id);
 				const wasNear = this.isNearNeighbor(id, coord);
 				this.noteDisconnected(id);
-				await this.applyFailure(id, coord);
+				await this.applyFailure(id);
 				// Proactive: announce to neighbors around departed peer if it was a near neighbor
 				if (wasNear && !this.stopped) {
 					this.detach(this.announceOnDeparture(id, coord), 'announceOnDeparture');
@@ -1949,7 +1980,7 @@ export class FretService implements IFretService, Startable {
 			const discovered: string[] = [];
 			if (!this.store.getById(from)) discovered.push(from);
 			this.store.upsert(from, senderCoord);
-			await this.applyTouch(from, senderCoord);
+			await this.applyTouch(from);
 			// `from` is transport-authenticated (the handler drops any mismatch) and it dialed
 			// our namespaced announce protocol — strongest possible membership proof.
 			this.applyMembershipSignal(from, 'rpc-inbound');
@@ -2251,13 +2282,13 @@ export class FretService implements IFretService, Startable {
 				case 'ok':
 					this.diag.pingsSent++;
 					if (out.value.ok) {
-						await this.applySuccess(id, await this.coordOf(id), out.rttMs);
+						await this.applySuccess(id, out.rttMs);
 						this.diag.pingsOk++;
 					} else {
 						// The peer's own negative pong: alive and on our protocol — decay relevance
 						// only, never a strike.
 						this.noteAnsweredOnProtocol(id);
-						await this.applyFailure(id, await this.coordOf(id));
+						await this.applyFailure(id);
 						this.diag.pingsFail++;
 					}
 					return;
@@ -2463,7 +2494,7 @@ export class FretService implements IFretService, Startable {
 				case 'ok':
 					this.diag.pingsSent++;
 					if (out.value.ok) {
-						await this.applySuccess(id, await this.coordOf(id), out.rttMs); // marks member, clears contact run
+						await this.applySuccess(id, out.rttMs); // marks member, clears contact run
 						this.diag.pingsOk++;
 						this.clearBackoff(id);
 					} else {
@@ -2850,13 +2881,12 @@ export class FretService implements IFretService, Startable {
 					const out = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
 					switch (out.kind) {
 						case 'ok': {
-							const nextCoord = await this.coordOf(next);
 							// No latency sample: `sendMaybeAct` on the forward path returns only once
 							// the *entire remaining route* has completed downstream, so its wall time
 							// is the cost of the whole subtree, not of the link to `next`. Recording
 							// it would penalize a perfectly healthy adjacent hop for a long path
 							// behind it. Latency belongs to the ping paths, which measure one hop.
-							await this.applySuccess(next, nextCoord);
+							await this.applySuccess(next);
 							this.clearBackoff(next);
 							return out.value;
 						}
