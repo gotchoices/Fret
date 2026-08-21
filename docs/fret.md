@@ -364,7 +364,11 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
 #### Not yet implemented (planned — see tickets/)
 - Message authentication:
   - Sign all messages with sender's private key; verify on receipt
-  - Verify ring coordinates in sample entries (re-hash rather than trust provided coords)
+  - (Re-hashing a sample entry's ring coordinate from its id rather than trusting the wire
+    field is **done** — both merge loops derive `coord` from `s.id`, so `s.coord` is a wire-shape
+    field the parser width-checks and nothing reads. A sample entry whose id will not parse is
+    therefore skipped by the merge loop's per-entry `try/catch`, which is that guard's remaining
+    arm.)
 - Replay hardening:
   - Dedup protection for leave notices (the TTL/timestamp alignment, strong correlation IDs, and profile-tuned dedup capacity are done — see Current state above)
 - Leave authentication:

@@ -10,7 +10,8 @@ import { makeSnapshotParser, parseRouteAndMaybeAct } from '../src/rpc/validate.j
 import { registerLeave } from '../src/rpc/leave.js'
 import { registerPing } from '../src/rpc/ping.js'
 import { registerNeighbors } from '../src/rpc/neighbors.js'
-import { coordToBase64url, hashKey } from '../src/ring/hash.js'
+import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
+import { peerIdFromString } from '@libp2p/peer-id'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { NearAnchorV1, NeighborSnapshotV1 } from '../src/index.js'
 import * as lp from 'it-length-prefixed'
@@ -1584,12 +1585,21 @@ describe('RPC handler fault isolation', function () {
 			return { v: 1, from: FROM, timestamp: Date.now(), successors: OVER_SUCC, predecessors: OVER_PRED, sample: OVER_SAMPLE, sig: '' }
 		}
 
+		/**
+		 * Two usable sample ids for the per-entry tests below. Parseable, because the merge loops
+		 * re-hash a sample entry's coordinate from its *id* rather than trusting `coord` — a
+		 * synthetic non-peer-id string is dropped by that re-hash before any of the rules these
+		 * tests are about can be observed.
+		 */
+		const GOOD_1 = peerIdStr(181)
+		const GOOD_2 = peerIdStr(182)
+
 		/** A three-entry sample whose middle coord decodes to 16 bytes instead of 32. */
 		function shortCoordSample(): Array<Record<string, unknown>> {
 			return [
-				{ id: 'good-1', coord: sampleCoord(4), relevance: 0.5 },
+				{ id: GOOD_1, coord: sampleCoord(4), relevance: 0.5 },
 				{ id: 'short-coord', coord: wrongWidthCoord(16), relevance: 0.5 },
-				{ id: 'good-2', coord: sampleCoord(5), relevance: 0.5 },
+				{ id: GOOD_2, coord: sampleCoord(5), relevance: 0.5 },
 			]
 		}
 
@@ -1792,13 +1802,13 @@ describe('RPC handler fault isolation', function () {
 					const out = parsed(svc, {
 						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
 						sample: [
-							{ id: 'good-1', coord: sampleCoord(6), relevance: 0.5 },
+							{ id: GOOD_1, coord: sampleCoord(6), relevance: 0.5 },
 							{ id: 'null-relevance', coord: sampleCoord(7), relevance: null },
-							{ id: 'good-2', coord: sampleCoord(8), relevance: 0 },
+							{ id: GOOD_2, coord: sampleCoord(8), relevance: 0 },
 						],
 					})
 
-					expect(out.sample?.map((e) => e.id), 'the unusable entry is gone; a relevance of 0 is fine').to.deep.equal(['good-1', 'good-2'])
+					expect(out.sample?.map((e) => e.id), 'the unusable entry is gone; a relevance of 0 is fine').to.deep.equal([GOOD_1, GOOD_2])
 				})
 
 				it('drops a wrong-width sample coord at the parser, so it never reaches onAnnounce', () => {
@@ -1808,26 +1818,53 @@ describe('RPC handler fault isolation', function () {
 					})
 
 					expect(out.sample, 'the unusable entry is gone; the good ones survive, in order').to.deep.equal([
-						{ id: 'good-1', coord: sampleCoord(4), relevance: 0.5 },
-						{ id: 'good-2', coord: sampleCoord(5), relevance: 0.5 },
+						{ id: GOOD_1, coord: sampleCoord(4), relevance: 0.5 },
+						{ id: GOOD_2, coord: sampleCoord(5), relevance: 0.5 },
 					])
 				})
 
-				it('skips a wrong-width sample coord in the merge loop when the parser is bypassed', async () => {
-					// The arm the merge loop's own per-entry try/catch exists for: `base64urlToCoord`
-					// throws on a 16-byte coordinate, and that entry must drop without costing the
-					// message its remaining ids or failing the merge.
+				it('re-hashes a sample coordinate from the id, so a bypassed wrong-width coord is merged and ignored', async () => {
+					// The coord-width rule is the *parser's* alone. The merge loop never reads
+					// `s.coord` — a ring coordinate is derivable from the id, so trusting the wire
+					// field would let an authenticated sender place another peer's id anywhere on
+					// the ring. Bypassing the parser therefore merges the short-coord entry like
+					// any other, at the coordinate its id hashes to.
+					const shortId = peerIdStr(183)
+					const snap = {
+						v: 1, from: FROM, timestamp: Date.now(), sig: '',
+						successors: [], predecessors: [],
+						sample: [{ id: shortId, coord: wrongWidthCoord(16), relevance: 0.5 }],
+					}
+
+					await merge(svc, FROM, snap as unknown as NeighborSnapshotV1)
+
+					const stored = svc.getStore().getById(shortId)
+					expect(stored, 'the entry merged; the coordinate was never read').to.not.equal(undefined)
+					expect(stored!.coord, 're-hashed from the id, not decoded from the wire').to.deep.equal(
+						await hashPeerId(peerIdFromString(shortId))
+					)
+				})
+
+				it('skips a sample entry whose id will not parse, without costing the message its other ids', async () => {
+					// The arm the merge loop's own per-entry try/catch exists for now that the
+					// coordinate is re-hashed: `peerIdFromString` throws on an id that is not one,
+					// and that entry must drop without costing the message its remaining ids or
+					// failing the merge.
 					const snap = {
 						v: 1, from: FROM, timestamp: Date.now(), sig: '',
 						successors: [OVER_SUCC[0]!], predecessors: [OVER_PRED[0]!],
-						sample: shortCoordSample(),
+						sample: [
+							{ id: GOOD_1, coord: sampleCoord(4), relevance: 0.5 },
+							{ id: 'not-a-peer-id', coord: sampleCoord(5), relevance: 0.5 },
+							{ id: GOOD_2, coord: sampleCoord(6), relevance: 0.5 },
+						],
 					}
 					const ids = countUpserts(svc)
 
 					await merge(svc, FROM, snap as unknown as NeighborSnapshotV1)
 
-					expect(ids, 'only the unusable entry is skipped').to.deep.equal([FROM, OVER_SUCC[0]!, OVER_PRED[0]!, 'good-1', 'good-2'])
-					expect(svc.getStore().getById('short-coord'), 'never reached the store write seam').to.equal(undefined)
+					expect(ids, 'only the unusable entry is skipped').to.deep.equal([FROM, OVER_SUCC[0]!, OVER_PRED[0]!, GOOD_1, GOOD_2])
+					expect(svc.getStore().getById('not-a-peer-id'), 'never reached the store write seam').to.equal(undefined)
 				})
 
 				it('applies the cap through the handler the service actually registers', async () => {
@@ -1940,9 +1977,9 @@ describe('RPC handler fault isolation', function () {
 					const body = {
 						v: 1, from: FROM, timestamp: Date.now(), successors: [], predecessors: [], sig: '',
 						sample: [
-							{ id: 'good-1', coord: sampleCoord(6), relevance: 0.5 },
+							{ id: GOOD_1, coord: sampleCoord(6), relevance: 0.5 },
 							{ id: 'null-relevance', coord: sampleCoord(7), relevance: null },
-							{ id: 'good-2', coord: sampleCoord(8), relevance: 0 },
+							{ id: GOOD_2, coord: sampleCoord(8), relevance: 0 },
 						],
 					}
 
@@ -1952,10 +1989,10 @@ describe('RPC handler fault isolation', function () {
 					// than replacing them, so a counter installed earlier keeps recording while a
 					// later one is live.
 					const announceIds = [...counted]
-					expect(announceIds, 'announce: the sender, then the two usable entries').to.deep.equal([FROM, 'good-1', 'good-2'])
+					expect(announceIds, 'announce: the sender, then the two usable entries').to.deep.equal([FROM, GOOD_1, GOOD_2])
 
 					const { ids: fetchIds } = await fetchMerged(node, svc, body)
-					expect(fetchIds, 'fetch: the two usable entries, and no sender').to.deep.equal(['good-1', 'good-2'])
+					expect(fetchIds, 'fetch: the two usable entries, and no sender').to.deep.equal([GOOD_1, GOOD_2])
 
 					expect(svc.getStore().getById('null-relevance'), 'reached the store on neither path').to.equal(undefined)
 				})

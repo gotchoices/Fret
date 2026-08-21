@@ -40,9 +40,14 @@ function coord32(seed: number): string {
 	return u8ToString(b, 'base64url')
 }
 
-function makeSnapshot(from: string, opts: { successors?: string[]; predecessors?: string[]; sampleCount?: number } = {}): NeighborSnapshotV1 {
-	const sample = Array.from({ length: opts.sampleCount ?? 0 }, (_v, i) => ({
-		id: `sample-${from.slice(-6)}-${i}`,
+/**
+ * `sampleIds` must be real peer ids: both merge loops re-hash a sample entry's coordinate from
+ * its id (`coord` on the wire is never trusted), so a synthetic string is dropped by the id parse
+ * before the caps under test can be observed.
+ */
+function makeSnapshot(from: string, opts: { successors?: string[]; predecessors?: string[]; sampleIds?: string[] } = {}): NeighborSnapshotV1 {
+	const sample = (opts.sampleIds ?? []).map((id, i) => ({
+		id,
 		coord: coord32(i),
 		relevance: 0,
 	}))
@@ -82,7 +87,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 			const before = svc.getDiagnostics().rejected.rateLimited
 			const sizeBefore = svc.getStore().size()
 
-			;(svc as any).handleAnnounce('some-peer', makeSnapshot('some-peer', { sampleCount: 4 }))
+			;(svc as any).handleAnnounce('some-peer', makeSnapshot('some-peer', { sampleIds: await makePeerIds(4) }))
 			// Merge is skipped synchronously on rejection; allow any (non-)microtasks to settle.
 			await delay(50)
 
@@ -134,7 +139,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 			const [from] = await makePeerIds(1)
 			const succ = await makePeerIds(30)
 			const pred = await makePeerIds(30)
-			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleCount: 20 })
+			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleIds: await makePeerIds(20) })
 
 			await (svc as any).mergeAnnounceSnapshot(from, throughParser(svc, snap))
 
@@ -152,7 +157,7 @@ describe('inbound announce rate limiting + merge caps', function () {
 			const [from] = await makePeerIds(1)
 			const succ = await makePeerIds(30)
 			const pred = await makePeerIds(30)
-			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleCount: 20 })
+			const snap = makeSnapshot(from, { successors: succ, predecessors: pred, sampleIds: await makePeerIds(20) })
 
 			await (svc as any).mergeAnnounceSnapshot(from, throughParser(svc, snap))
 
