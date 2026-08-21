@@ -4,17 +4,22 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-FIFTH interrupted run — BUDGET_WARNING hit immediately after step 1 completed. Skipped all
-re-reading per prior note, went straight to Write. **Section 1 is DONE and confirmed written**:
-`packages/fret/test/simulation/placement-assertions.ts` now exists with exactly the content
-under "1." below (coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS,
+SIXTH interrupted run — BUDGET_WARNING hit before any edit, only ran `ls`/`wc -l` (no file
+content read/write). Confirmed by byte/line count, nothing has changed: `placement-assertions.ts`
+still exists (2103 bytes); `churn-scenarios.spec.ts` still 453 lines; `message-bus.spec.ts` still
+465 lines — matching the line numbers this note already cites below. **Section 1 is DONE and
+confirmed written**: `packages/fret/test/simulation/placement-assertions.ts` now exists with
+exactly the content under "1." below (coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS,
 MAX_PEERS_IN_ONE_SPACING_ARC, all exported, verbatim). Do NOT rewrite it, do NOT re-read it to
-confirm — it is correct. Sixth run: skip section 1 entirely, go straight to section 2 (edit
+confirm — it is correct. **Seventh run: do not run any exploratory command at all before editing
+— not `ls`, not `wc`, not `Read`.** Go straight to the first `Edit` call for section 2 (edit
 `churn-scenarios.spec.ts`), then section 3 (edit `message-bus.spec.ts`, including the measure-run
 to fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC`), then the two verification commands at the
 bottom of the TODO list. Do not open `placement.ts` / `fret-sim.ts` / `sim-metrics.ts` / either
 spec file to "confirm" anything first — the snippets below are verified current-state quotes, not
-paraphrases, and nothing has touched those files across five runs now.
+paraphrases, and nothing has touched those files across six runs now. If BUDGET_WARNING fires
+again before section 2's Edit call completes, do not spend the remaining turn on any read-only
+command — either make the edit or stop immediately and leave this note as-is.
 
 Confirmed exact state as of this run (nothing has touched these files):
 
