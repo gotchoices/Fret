@@ -3,6 +3,7 @@ import { EventScheduler, type SimEvent } from './event-scheduler.js'
 import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
 import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
 import { DigitreeStore, type PeerEntry } from '../../src/store/digitree-store.js'
+import { chooseNextHop } from '../../src/selector/next-hop.js'
 
 export interface SimPeerConfig {
 	profile: 'edge' | 'core'
@@ -391,7 +392,7 @@ export class FretSimulation {
 				this.handleStabilize()
 				break
 			case 'route':
-				if (evt.peerId && evt.targetCoord) this.handleRoute(evt.peerId, evt.targetCoord)
+				if (evt.peerId && evt.targetCoord) this.handleRoute(evt.peerId, evt.targetCoord, evt.time)
 				break
 		}
 
@@ -597,9 +598,12 @@ export class FretSimulation {
 	}
 
 	/**
-	 * One contact attempt per store entry per tick: prune peers that left the network (the
-	 * global-`alive` oracle prune — retiring it belongs to 24-sim-router-realism), strike
+	 * One contact attempt per store entry per tick: prune peers that left the network, strike
 	 * entries whose peer cannot be reached, and clear the strike run on a successful contact.
+	 * The prune is the one global-`alive` read left here, and it stands in for a departed
+	 * peer's leave notice rather than for knowledge a peer could not have; the strike/clear
+	 * arithmetic itself lives in `recordContactFailure` / `recordContactSuccess`, shared with
+	 * the routing path so the two escalations cannot drift.
 	 * At `deadAfterFailures` strikes the entry is marked `dead` and drops out of every
 	 * ring-shaped read via the `notDead` filter.
 	 *
@@ -623,20 +627,34 @@ export class FretSimulation {
 			}
 			if (entry.state === 'dead') continue // dead entries belong to the re-probe arm
 			if (!this.contactAllowed(peer.id, entry.id)) {
-				const strikes = Math.min(entry.contactFailures + 1, this.deadAfterFailures)
-				if (strikes >= this.deadAfterFailures) {
-					// lastAccess ← sim time: the re-probe arm orders by ascending lastAccess, and
-					// only sim-clock stamps keep two same-seed runs picking identical candidates
-					// (Date.now() stamps differ between runs and would break deterministic replay).
-					store.update(entry.id, { contactFailures: strikes, state: 'dead', lastAccess: time })
-				} else {
-					store.update(entry.id, { contactFailures: strikes })
-				}
-			} else if (entry.contactFailures > 0) {
-				// A successful contact resets the run.
-				store.update(entry.id, { contactFailures: 0 })
+				this.recordContactFailure(store, entry, time)
+			} else {
+				this.recordContactSuccess(store, entry)
 			}
 		}
+	}
+
+	/**
+	 * One failed contact against a store entry: extend the strike run, and at
+	 * `deadAfterFailures` mark the entry dead. Called from the per-tick `contactSweep` and
+	 * from the routing path's contact attempts, which is the whole point of extracting it —
+	 * two copies of this arithmetic is how the sweep and the router drift apart.
+	 */
+	private recordContactFailure(store: DigitreeStore, entry: PeerEntry, time: number): void {
+		const strikes = Math.min(entry.contactFailures + 1, this.deadAfterFailures)
+		if (strikes >= this.deadAfterFailures) {
+			// lastAccess ← sim time: the re-probe arm orders by ascending lastAccess, and
+			// only sim-clock stamps keep two same-seed runs picking identical candidates
+			// (Date.now() stamps differ between runs and would break deterministic replay).
+			store.update(entry.id, { contactFailures: strikes, state: 'dead', lastAccess: time })
+		} else {
+			store.update(entry.id, { contactFailures: strikes })
+		}
+	}
+
+	/** A successful contact clears the strike run. Written only when there is one to clear. */
+	private recordContactSuccess(store: DigitreeStore, entry: PeerEntry): void {
+		if (entry.contactFailures > 0) store.update(entry.id, { contactFailures: 0 })
 	}
 
 	/**
@@ -769,7 +787,16 @@ export class FretSimulation {
 		}
 	}
 
-	private handleRoute(fromPeerId: string, targetCoord: Uint8Array): void {
+	/**
+	 * Route one message hop by hop, choosing every hop with the shipped selector
+	 * (`chooseNextHop`, cost path) over the *deciding peer's own store*. Nothing here reads
+	 * the global `alive` flag or the partition map to build a candidate pool: a peer learns a
+	 * neighbour is unreachable only when its own contact attempt fails, exactly as production
+	 * does, and each such failure strikes that entry through the same escalation
+	 * `contactSweep` uses. Consulting the oracle instead is what let this harness report a
+	 * routing-success number that could not fail when the distance math was wrong.
+	 */
+	private handleRoute(fromPeerId: string, targetCoord: Uint8Array, time: number): void {
 		const from = this.peers.get(fromPeerId)
 		if (!from || !from.alive) {
 			this.metrics.recordRoute(false, 0)
@@ -779,12 +806,19 @@ export class FretSimulation {
 		let current = fromPeerId
 		const visited = new Set<string>()
 		let hops = 0
+		// Bounds hops taken *and* contact attempts spent, so a route into a fully
+		// partitioned-away window terminates. It keeps reading the global alive count on
+		// purpose: this is a harness cutoff rather than a decision a peer makes, and deriving
+		// it from a peer's own store size would make the budget vary per hop and per partition
+		// side. Every routing *decision* below is local.
 		const maxHops = Math.ceil(Math.log2(this.aliveCount()) * 2) + 4
+		let attempts = 0
 
-		while (hops < maxHops) {
+		while (hops < maxHops && attempts < maxHops) {
 			visited.add(current)
 			const store = this.stores.get(current)
-			if (!store) break
+			const currentPeer = this.peers.get(current)
+			if (!store || !currentPeer) break
 
 			// Check if current peer is the closest to the target. These reads are deliberately
 			// UNfiltered (dead entries stay visible): a peer nearest a partitioned-away
@@ -802,37 +836,87 @@ export class FretSimulation {
 			if (!succ && !pred) break
 
 			// If we're the successor or predecessor of the target, we found it
-			const currentPeer = this.peers.get(current)
-			if (currentPeer) {
-				const right = store.neighborsRight(targetCoord, 1)
-				const left = store.neighborsLeft(targetCoord, 1)
-				const anchor = right[0] ?? left[0]
-				if (anchor === current || (succ && succ.id === current) || (pred && pred.id === current)) {
-					this.metrics.recordRoute(true, hops)
-					return
-				}
+			const right = store.neighborsRight(targetCoord, 1)
+			const left = store.neighborsLeft(targetCoord, 1)
+			const anchor = right[0] ?? left[0]
+			if (anchor === current || (succ && succ.id === current) || (pred && pred.id === current)) {
+				this.metrics.recordRoute(true, hops)
+				return
 			}
 
-			// Find next hop: closest alive, reachable, non-dead peer to target that we haven't
-			// visited. `reachable` is the seam 24-sim-router-realism's local-knowledge routing
-			// must also honour — a hop is only a hop if the two peers can contact each other.
-			const candidates = [
+			// Candidate pool — this peer's own store and nothing else. `notDead` is the only
+			// filter with any partition awareness in it, and it reads what *this* peer's own
+			// failed contacts recorded.
+			const pool = [
 				...store.neighborsRight(targetCoord, this.config.m, notDead),
 				...store.neighborsLeft(targetCoord, this.config.m, notDead),
-			].filter((id) => {
-				if (visited.has(id)) return false
-				if (!this.reachable(current, id)) return false
-				const p = this.peers.get(id)
-				return p && p.alive
-			})
+			].filter((id) => id !== current && !visited.has(id))
 
-			if (candidates.length === 0) break
+			// Choose, attempt contact, and on failure choose again from what is left. A chosen
+			// hop is a *candidate*, not a delivered message.
+			const tried = new Set<string>()
+			let next: string | undefined
+			while (attempts < maxHops) {
+				const candidates = pool.filter((id) => !tried.has(id))
+				if (candidates.length === 0) break
 
-			current = candidates[0]!
+				// Candidates resolve through `store.getById`; one absent from this peer's store
+				// is silently skipped — none is here, since the pool came from that store's own
+				// walks. `selfCoord` is supplied from the second hop onward only: production
+				// passes it when *forwarding*, and an originator aiming at a key's cluster is
+				// legitimately farther from the key than every member of that cluster.
+				const pick = chooseNextHop(
+					store,
+					targetCoord,
+					candidates,
+					(id) => currentPeer.connected.has(id),
+					() => 0, // sim models no link latency; a constant keeps runs deterministic
+					{
+						nearRadius: this.nearRadiusFor(store),
+						selfCoord: hops > 0 ? currentPeer.coord : undefined,
+						confidence: 0.5,
+					},
+				)
+				// No strictly-improving candidate left. Stopping is the production outcome; a
+				// "closest anyway" fallback would reintroduce the backwards drift the
+				// strict-improvement floor exists to prevent.
+				if (!pick) break
+
+				attempts++
+				tried.add(pick)
+				const entry = store.getById(pick)
+				const target = this.peers.get(pick)
+				if (this.contactAllowed(current, pick) && target?.alive) {
+					if (entry) this.recordContactSuccess(store, entry)
+					next = pick
+					break
+				}
+				// Failed contact: strike it the way the sweep would, then try the next best.
+				if (entry) this.recordContactFailure(store, entry, time)
+			}
+
+			if (!next) break
+			// Only a delivered hop counts, so `avgRoutingHops` stays a path-length measure and
+			// failed attempts spend attempt budget instead.
+			current = next
 			hops++
 		}
 
 		this.metrics.recordRoute(false, hops)
+	}
+
+	/**
+	 * Near-radius for the cost-path selector, derived from **local** information only:
+	 * β·k·(2^256 / store.size()) with β = 2, clamped to half the ring (ring distance is the
+	 * shorter arc, so it cannot exceed 2^255). Using `aliveCount()` would put the oracle back
+	 * in a new place — the point of this path is that every input is something the deciding
+	 * peer could actually know.
+	 */
+	private nearRadiusFor(store: DigitreeStore): Uint8Array {
+		const span = (1n << 256n) / BigInt(Math.max(1, store.size()))
+		const raw = span * BigInt(this.config.k) * 2n
+		const halfRing = 1n << 255n
+		return bigintToCoord(raw > halfRing ? halfRing : raw)
 	}
 
 	/**

@@ -178,6 +178,56 @@ describe('Partition and merge simulation', function () {
 		expect(routeOnce(sim, fromA, coordOf(sim, interiorB), 15600), 'post-heal A→B route').to.be.true
 	})
 
+	it('a route across a fresh cut fails by refused contacts, not by an oracle filter', () => {
+		// The lifecycle test above asserts the A→B route fails *after* escalation, by which
+		// point every cross entry is already dead and the pool is empty — a correct outcome
+		// that would also hold if the router filtered candidates by the global partition map.
+		// This one routes in the window between the cut and escalation, where the cross
+		// entries are still alive in the store, so the only way the route can fail is by
+		// attempting contacts and having them refused. That is what pins the router to local
+		// knowledge.
+		const sim = new FretSimulation({
+			seed: 4242,
+			n: 40,
+			k: 15,
+			m: 8,
+			churnRatePerSec: 0,
+			stabilizationIntervalMs: 500,
+			durationMs: 20000,
+		})
+		sim.initialize()
+		pump(sim, 3000)
+
+		const [groupA, groupB] = contiguousHalves(sim)
+		const fromA = groupA[Math.floor(groupA.length / 2)]!
+		const interiorB = groupB[Math.floor(groupB.length / 2)]!
+		expect(routeOnce(sim, fromA, coordOf(sim, interiorB), 3010), 'pre-cut A→B route').to.be.true
+
+		sim.partition([groupA, groupB])
+		const blockedBefore = sim.crossPartitionBlocked()
+
+		// No pump between the cut and the route: nothing has struck a cross entry yet.
+		const store = sim.getStores().get(fromA)!
+		const liveCross = groupB.filter((id) => {
+			const e = store.getById(id)
+			return e !== undefined && e.state !== 'dead'
+		})
+		expect(liveCross.length, 'cross entries must still be live for this to prove anything')
+			.to.be.greaterThan(0)
+
+		expect(routeOnce(sim, fromA, coordOf(sim, interiorB), 3020), 'A→B route across a fresh cut')
+			.to.be.false
+		expect(
+			sim.crossPartitionBlocked() - blockedBefore,
+			'the route itself must have attempted contacts and had them refused',
+		).to.be.greaterThan(0)
+
+		// Each refusal struck exactly one entry, so a cross entry the route actually tried now
+		// carries a strike it did not carry before.
+		const struck = groupB.filter((id) => (store.getById(id)?.contactFailures ?? 0) > 0)
+		expect(struck.length, 'a refused contact must strike that entry').to.be.greaterThan(0)
+	})
+
 	it('singleton split: coverage stays defined and the peer recovers after heal', () => {
 		const sim = new FretSimulation({
 			seed: 909,
