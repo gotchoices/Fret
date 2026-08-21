@@ -21,11 +21,13 @@ import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../src/in
 //     `handleMaybeAct` N times in a plain loop *without awaiting* leaves the counter at exactly
 //     the cap when the loop returns, with the surplus already resolved busy. No sleeps, no
 //     polling, no timing assumptions — and no `setTimeout` anywhere in this file.
-//  3. The maybeAct token bucket (Core 32 / Edge 8) is taken *before* the inflight check and a
-//     bucket rejection increments the same `diag.rejected.rateLimited` counter, so the two kinds
-//     of busy are indistinguishable in diagnostics. Keeping each fan-out inside bucket capacity
-//     is therefore load-bearing for the diagnostic assertion, not a convenience. That fixes the
-//     sizes below: Edge 6 (cap 4, 8 tokens) and Core 20 (cap 16, 32 tokens).
+//  3. The maybeAct token bucket (Core 32 / Edge 8) is taken *before* the inflight check, and the
+//     two rejections are counted apart: a bucket rejection increments
+//     `diag.rejected.rateLimited.maybeAct`, an inflight-cap rejection increments the sibling
+//     `diag.rejected.concurrencyLimited`. So the assertion below is attributable to the cap by
+//     the counter it reads, not by fan-out sizing. Each fan-out is still kept inside bucket
+//     capacity so the *reply* counts (busy vs certificate) stay unambiguous: Edge 6 (cap 4,
+//     8 tokens) and Core 20 (cap 16, 32 tokens).
 //
 // Deliberate boundary: these cases call `handleMaybeAct` directly rather than driving real
 // streams between two nodes. The counter and its guard live entirely inside that method; the
@@ -163,7 +165,7 @@ describe('inbound maybeAct inflight cap', function () {
 			const rig = await buildRig(p.profile)
 			try {
 				const seen = installGatedHandler(rig, 'certificate')
-				const rateLimitedBefore = rig.svc.getDiagnostics().rejected.rateLimited
+				const concurrencyLimitedBefore = rig.svc.getDiagnostics().rejected.concurrencyLimited
 
 				const wave = rig.fanOut(p.fanOut)
 				// Still inside the same synchronous turn: no microtask has run, so the counter
@@ -194,8 +196,9 @@ describe('inbound maybeAct inflight cap', function () {
 				// is run where the hash resolves off a macrotask (the browser WebCrypto path), the
 				// fix is an explicit "all handlers entered" barrier before `openGate` — not a sleep.
 				expect(seen.peak).to.equal(p.limit)
-				// Attributable to the inflight cap because the fan-out stayed inside the bucket.
-				expect(rig.svc.getDiagnostics().rejected.rateLimited - rateLimitedBefore)
+				// Attributable to the inflight cap by the counter itself: a token-bucket rejection
+				// lands on `rateLimited.maybeAct`, a cap rejection on `concurrencyLimited`.
+				expect(rig.svc.getDiagnostics().rejected.concurrencyLimited - concurrencyLimitedBefore)
 					.to.equal(p.fanOut - p.limit)
 			} finally {
 				await rig.teardown()

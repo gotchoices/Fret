@@ -84,14 +84,14 @@ describe('inbound announce rate limiting + merge caps', function () {
 			// Exhaust the inbound-announce bucket directly, then the next announce must be dropped.
 			drainBucket((svc as any).bucketAnnounceInbound)
 
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.announce
 			const sizeBefore = svc.getStore().size()
 
 			;(svc as any).handleAnnounce('some-peer', makeSnapshot('some-peer', { sampleIds: await makePeerIds(4) }))
 			// Merge is skipped synchronously on rejection; allow any (non-)microtasks to settle.
 			await delay(50)
 
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'rateLimited delta').to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.announce - before, 'rateLimited delta').to.equal(1)
 			expect(svc.getStore().size(), 'store must not grow when dropped').to.equal(sizeBefore)
 		} finally {
 			await stopAll([node])
@@ -104,13 +104,13 @@ describe('inbound announce rate limiting + merge caps', function () {
 		try {
 			const [from] = await makePeerIds(1)
 			const succ = await makePeerIds(2)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.announce
 			const sizeBefore = svc.getStore().size()
 
 			;(svc as any).handleAnnounce(from, makeSnapshot(from, { successors: succ }))
 			await delay(50)
 
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'no rate-limited increment').to.equal(0)
+			expect(svc.getDiagnostics().rejected.rateLimited.announce - before, 'no rate-limited increment').to.equal(0)
 			// from + 2 successors ingested
 			expect(svc.getStore().size() - sizeBefore, 'entries merged').to.equal(3)
 		} finally {
