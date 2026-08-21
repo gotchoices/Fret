@@ -4,83 +4,61 @@ difficulty: easy
 tradeoffs: n/a (implement ticket)
 ---
 
-**Rewritten 2026-08-21 by an interrupted run (BUDGET_WARNING), replacing the prior handoff.**
-Step 1 is done (measured, not guessed) — do not re-verify it, no further action there. Step 2 was
-reached this run but not finished: the test currently passes unmodified, but the margin is thin
-and was not checked for robustness across seeds before budget ran out. Do not re-read this file's
-own history further than what's below; it is complete.
+<!-- resume-note -->
+**Rewritten 2026-08-21 by a second interrupted run (BUDGET_WARNING).** This run only re-read
+files — it ran no script and no test — and hit budget before doing new work. Do not re-read this
+file's own history further than what's below; it is complete. Step 1 is done (measured, not
+guessed) — do not re-verify it, no further action there. Step 2 is exactly where the prior run
+left it: reachable, understood, but the seed-robustness check has still never been run.
 
-## Verified state (this run confirmed by reading files directly and running tests)
+## Verified state (this run re-confirmed by reading files directly; ran nothing)
 
 - `test/simulation/placement-assertions.ts` exists and exports `coordToBigInt`,
   `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
   `MAX_PEERS_IN_ONE_SPACING_ARC = 7`. Unchanged, correct, done — no further action.
-- `test/message-bus.spec.ts` imports all three at L7 and both replacement cases are written into
-  `describe('Placement distributions', ...)` (starts ~L293).
-- `test/churn-scenarios.spec.ts` edit landed (per earlier handoff; not re-verified this run — no
-  reason to doubt it, out of scope for this run's budget).
+- `test/message-bus.spec.ts` imports all three at L7. `describe('Placement distributions', ...)`
+  starts at L293.
+- Step 1 test (`'clustered placement: peers cluster around centers'`, L296-345) has
+  `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5` with a measured-table comment (worst uniform 1,
+  best clustered 12 across all 5 `PLACEMENT_SEEDS` — 5 sits 5x above worst / 2.4x below best) and
+  asserts both directions in a loop over `PLACEMENT_SEEDS`. Leave as-is.
+- Step 2 test (`'clustered placement: inter-cluster routing takes more hops'`, L347-395) is
+  UNCHANGED from the prior run's description: single hardcoded `seed: 42` (L350), returns
+  `metrics.avgRoutingHops` (L389), asserts only `clustered > uniform` with no numeric margin
+  (L394). `n: 30, k: 15` (half the ring in-cluster). Prior run's measured single-seed result
+  (not re-run this session): clustered avgRoutingHops 1 vs uniform 0.9 — a one-hop gap out of 10
+  routes, all 10 succeeding both times.
+- `test/churn-scenarios.spec.ts` edit landed per earlier handoffs; still not re-verified this run
+  — no reason to doubt it, out of scope for this ticket's remaining budget.
 
-## Step 1 — DONE. Real measured threshold, not a guess
+## Step 2 — hop statistic for case 2, still not seed-verified
 
-`test/message-bus.spec.ts` has `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5` with a real
-measured-table comment (worst uniform 1, best clustered 12 across all 5 `PLACEMENT_SEEDS` — 5
-sits 5x above worst / 2.4x below best). Confirmed still passing this run:
+**Next agent, do this — no further investigation needed, just execute:**
 
-```
-node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" --grep "peers cluster around centers" --timeout 60000
-```
-
-from `packages/fret/`. Passed. Leave as-is.
-
-## Step 2 — hop statistic for case 2, reached but NOT finished this run
-
-Test: `'clustered placement: inter-cluster routing takes more hops'` (~L347-395 in
-`test/message-bus.spec.ts`). Ran this run:
-
-```
-node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" --grep "inter-cluster routing takes more hops" --timeout 60000
-```
-
-from `packages/fret/`. Result: **passed**, but margin is thin:
-
-```
-clustered: avgRoutingHops 1, successfulRouteHops avg 1
-uniform: avgRoutingHops 0.9, successfulRouteHops avg 0.9
-```
-
-10 routing attempts each, all 10 succeeded both times (so `avgRoutingHops` ==
-`successfulRouteHops` average in this run — they only diverge when some attempts fail). The gap
-is 10 total hops vs 9 total hops across 10 routes — i.e. exactly one route differing by one hop.
-Unlike step 1 (which was checked across all 5 `PLACEMENT_SEEDS` and showed a clean worst-case/
-best-case gap), **this test uses only one hardcoded seed (`seed: 42`) and was not checked for
-robustness across seeds this run** — budget ran out before that check happened. A single-seed,
-one-hop margin is exactly the kind of thing that can flip on unrelated changes or different seeds,
-so do not treat this run's single green result as confirmation that the check is real.
-
-**Next agent, do this:**
-
-1. Write a throwaway script (scratchpad, not committed) that runs the same `avgHopsFor` logic
-   from the test (lines ~348-390) across `PLACEMENT_SEEDS` (or several arbitrary seeds) instead of
-   the single hardcoded `seed: 42`, and prints `clustered` vs `uniform` avgRoutingHops per seed —
-   mirroring exactly what step 1's diagnostic run already proved out for the other test.
-   - Note `n: 30, k: 15` in this test means half the ring is in-cluster, which is a weak setup for
-     hop-count discrimination (most routes complete in 0-1 hops) — that may be *why* the margin is
-     thin, not a fluke of seed 42 specifically.
-2. **If separation holds cleanly across seeds** (clustered consistently > uniform, comfortable
-   margin, not 1-vs-0 flukes): the test is fine as shipped — leave the code untouched, just note in
-   the review ticket (see Handoff below) that the margin was checked and is real, with the numbers.
-3. **If it does not hold** (flips sign on some seeds, or margin is inconsistently 0-1 hops): follow
-   the original plan —
+1. Write a throwaway script (scratchpad, not committed — do NOT put it under `packages/fret/`)
+   that imports `FretSimulation` from `test/simulation/fret-sim.ts` and reproduces `avgHopsFor`
+   exactly as written at `test/message-bus.spec.ts` L348-390, but looping over
+   `PLACEMENT_SEEDS` (imported from `test/simulation/placement-assertions.ts`) instead of the
+   hardcoded `seed: 42`. Print `clustered` vs `uniform` `avgRoutingHops` (and the
+   `successfulRouteHops` average) per seed — mirroring exactly what step 1's diagnostic run
+   already proved out for the other test. Run it with the project's TS loader:
+   `node --import ./register.mjs <script>.ts` from `packages/fret/`.
+2. **If separation holds cleanly across all 5 seeds** (clustered consistently > uniform,
+   comfortable margin, not 1-vs-0 flukes): the test is fine as shipped — leave the code
+   untouched. Just record in the review ticket (see Handoff below) that the margin was checked
+   and is real, with the per-seed numbers.
+3. **If it does not hold** (flips sign on some seeds, or margin is inconsistently 0-1 hops):
    - First try returning `successfulRouteHops` average instead of `metrics.avgRoutingHops`
-     (already computed in the log line) as the returned/asserted statistic; add a one-line comment
-     saying why, mirroring the `successfulRouteHops` doc comment in `sim-metrics.ts`; re-run across
-     seeds again.
-   - If **neither statistic separates**: the target loop (`target[j] = (seed * (j + 1) * 37) &
-     0xff`) is not landing targets across cluster boundaries. Read `test/simulation/placement.ts`
-     for where cluster centers come from (`clusterConfig: { numClusters: 3, spreadBits: 32 }`) and
-     aim each target near a *different* cluster (e.g. bucket by `i % numClusters`). **Do not ship
-     the case unseparating.** This is real investigation — if budget is short again, split it into
-     its own follow-up ticket rather than rushing it.
+     (already computed in the existing log line at L384-388) as the returned/asserted statistic;
+     add a one-line comment saying why, mirroring the `successfulRouteHops` doc comment in
+     `sim-metrics.ts`; re-run across seeds again.
+   - If **neither statistic separates**: the target-generation loop (`target[j] = (seed * (j + 1)
+     * 37) & 0xff`, L372) is not reliably landing targets across cluster boundaries. Read
+     `test/simulation/placement.ts` for where cluster centers come from (`clusterConfig: {
+     numClusters: 3, spreadBits: 32 }`) and aim each target near a *different* cluster (e.g.
+     bucket by `i % numClusters`). **Do not ship the case unseparating.** This is real
+     investigation — if budget is short again, split it into its own follow-up ticket rather
+     than rushing it, and say so plainly in the handoff.
 
 ## Step 3 — gate (only after step 2 is genuinely resolved, not left on an unchecked single-seed pass)
 
