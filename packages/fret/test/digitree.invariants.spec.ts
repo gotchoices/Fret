@@ -387,14 +387,17 @@ describe('DigitreeStore index/tree invariant', () => {
 		it('importEntries replacing an existing id recounts rather than summing old and new labels', () => {
 			const store = new DigitreeStore()
 			store.upsert('p1', coords[1]!) // 'unknown' / 'disconnected'
-			store.update('p1', { membership: 'unknown', state: 'disconnected' })
+			store.setState('p1', 'dead')
 
+			// importEntries always forces state to 'disconnected' regardless of the serialized
+			// state field (connection liveness cannot survive a restart — see docs/fret.md), so
+			// 'dead' -> 'disconnected' is what exercises the state recount here.
 			store.importEntries([serialized('p1', coords[2]!, { membership: 'member', state: 'connected' })])
 
 			if (store.countByMembership('unknown') !== 0) throw new Error('old membership count not decremented on replace')
-			if (store.countByState('disconnected') !== 0) throw new Error('old state count not decremented on replace')
+			if (store.countByState('dead') !== 0) throw new Error('old state count not decremented on replace')
 			if (store.countByMembership('member') !== 1) throw new Error('new membership count not incremented on replace')
-			if (store.countByState('connected') !== 1) throw new Error('new state count not incremented on replace')
+			if (store.countByState('disconnected') !== 1) throw new Error('new state count not incremented on replace')
 		})
 
 		it('never goes negative when removing an id twice, or an id never inserted', () => {
