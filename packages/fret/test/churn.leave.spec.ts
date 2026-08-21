@@ -259,9 +259,13 @@ describe('Leave amplification cap', function () {
 	})
 
 	// A replacement is a name we were handed, not a peer we contacted. It must arrive
-	// unclassified (so the ring views exclude it until vetted) and at relevance 0 (so an
-	// attacker-named id cannot outrank a genuine peer when `enforceCapacity` evicts by relevance).
-	it('records a dialable replacement as an unclassified, zero-relevance entry', async () => {
+	// unclassified (so the ring views exclude it until vetted) and take the general hearsay
+	// score: a one-off baseline from its own empty counters, and *flat in mention count* — being
+	// named again buys nothing, so an attacker cannot pump a named id past a genuine peer when
+	// `enforceCapacity` evicts by relevance. The baseline itself is not zero on purpose: a
+	// zero-relevance entry is the first thing evicted on a full table, so a never-scored
+	// replacement would be dropped before any pass could probe it.
+	it('records a dialable replacement as an unclassified entry, scored once and only once', async () => {
 		const rig = await makeLeaveRig()
 		try {
 			const replacement = await dialableReplacement(rig)
@@ -271,7 +275,17 @@ describe('Leave amplification cap', function () {
 			const entry = rig.svc.getStore().getById(replacement)
 			expect(entry, 'replacement recorded').to.not.equal(undefined)
 			expect(entry!.membership, 'recorded as an untrusted hint, not as a member').to.equal('unknown')
-			expect(entry!.relevance, 'no relevance credit for a peer we never contacted').to.equal(0)
+			expect(entry!.relevance, 'scored, so it is not the first eviction victim').to.be.greaterThan(0)
+			expect(entry!.accessCount, 'no frequency credit for a peer we never contacted').to.equal(0)
+
+			// Naming it again must move nothing at all — the property the whole rule exists for.
+			await rig.leave([replacement])
+			await rig.leave([replacement])
+
+			const after = rig.svc.getStore().getById(replacement)!
+			expect(after.relevance, 'flat in mention count').to.equal(entry!.relevance)
+			expect(after.accessCount, 'still no frequency credit').to.equal(0)
+			expect(after.lastAccess, 'not even lastAccess is refreshed').to.equal(entry!.lastAccess)
 		} finally { await rig.stop() }
 	})
 

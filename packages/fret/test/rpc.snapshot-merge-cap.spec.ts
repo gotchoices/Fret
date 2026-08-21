@@ -101,6 +101,10 @@ describe('RPC snapshot merge caps', function () {
 		 */
 		const GOOD_1 = peerIdStr(181)
 		const GOOD_2 = peerIdStr(182)
+		// A second usable pair, for a test that must exercise both merge paths against ids
+		// neither path has seen — see the `relevance: null` case below.
+		const GOOD_3 = peerIdStr(183)
+		const GOOD_4 = peerIdStr(184)
 
 		/** A three-entry sample whose middle coord decodes to 16 bytes instead of 32. */
 		function shortCoordSample(): Array<Record<string, unknown>> {
@@ -499,10 +503,25 @@ describe('RPC snapshot merge caps', function () {
 					const announceIds = [...counted]
 					expect(announceIds, 'announce: the sender, then the two usable entries').to.deep.equal([FROM, GOOD_1, GOOD_2])
 
-					const { ids: fetchIds } = await fetchMerged(node, svc, body)
-					expect(fetchIds, 'fetch: the two usable entries, and no sender').to.deep.equal([GOOD_1, GOOD_2])
+					// The fetch phase names a *fresh* pair on purpose. Both merge paths record a
+					// hearsay id through `noteDiscovered`, which writes only for an id the store
+					// does not already hold — so re-merging the announce body would upsert
+					// nothing and the assertion below would be measuring that rule instead of the
+					// parser's drop, which is what this test is about.
+					const fetchBody = {
+						...body,
+						sample: [
+							{ id: GOOD_3, coord: sampleCoord(6), relevance: 0.5 },
+							{ id: 'null-relevance-2', coord: sampleCoord(7), relevance: null },
+							{ id: GOOD_4, coord: sampleCoord(8), relevance: 0 },
+						],
+					}
+					const { ids: fetchIds } = await fetchMerged(node, svc, fetchBody)
+					expect(fetchIds, 'fetch: the two usable entries, and no sender').to.deep.equal([GOOD_3, GOOD_4])
 
-					expect(svc.getStore().getById('null-relevance'), 'reached the store on neither path').to.equal(undefined)
+					const store = svc.getStore()
+					expect(store.getById('null-relevance'), 'announce: never reached the store').to.equal(undefined)
+					expect(store.getById('null-relevance-2'), 'fetch: never reached the store').to.equal(undefined)
 				})
 			})
 		}

@@ -55,6 +55,7 @@ import {
 	touch as scoreTouch,
 	recordSuccess as scoreSuccess,
 	recordFailure as scoreFailure,
+	initialRelevance,
 	type SparsityModel,
 } from '../store/relevance.js';
 import { createLogger } from '../logger.js';
@@ -558,6 +559,43 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * Record that some *other* peer named this id — a merged snapshot, a configured bootstrap, a
+	 * replacement hint on a leave notice. Creates the entry with a one-off baseline score from
+	 * its own (empty) counters; an id we already hold is left **completely alone**, so it has the
+	 * same score after a thousand mentions as after one and mention count is not a score lever an
+	 * attacker (or a chatty honest peer) can pull.
+	 *
+	 * Deliberately not `applyTouch`: frequency credit counts *proven contact*, and being named by
+	 * someone else is not contact. Deliberately not a bare `upsert` on the already-held arm
+	 * either — `upsert` refreshes `lastAccess`, which is both the recency input *and* the
+	 * ordering key for the unknown-classification probe rotation (ascending `lastAccess`), so
+	 * refreshing it on gossip would sink a heavily-gossiped unknown peer to the back of its own
+	 * probe queue.
+	 *
+	 * It scores a baseline rather than nothing at all because stored relevance is only ever
+	 * written by a scoring call: a never-scored entry sits at relevance 0, and `enforceCapacity`
+	 * evicts the lowest unprotected entry — so on a full table every newly discovered peer would
+	 * be evicted before the classification pass could probe it, and the table could never learn a
+	 * new peer again. A fixed baseline avoids that while staying flat in mention count.
+	 *
+	 * No `try`/`catch`: a wrong-width coordinate throws at the store's write seam by design, and
+	 * the merge loops' own per-entry `try`/`catch` must still see it.
+	 *
+	 * @returns whether this call created the entry — the callers' "newly discovered" test, folded
+	 * in so a merge loop needs one id lookup rather than two.
+	 */
+	private async noteDiscovered(id: string, coord: Uint8Array): Promise<boolean> {
+		// Self is seeded `member` and its local entry is authoritative — the same reasoning that
+		// makes `importTable` drop a snapshot's record for self.
+		if (id === this.selfIdStr) return false;
+		if (this.store.getById(id)) return false;
+		const entry = this.store.upsert(id, coord);
+		const x = normalizedLogDistance(await this.selfCoord(), coord);
+		this.store.update(id, { relevance: initialRelevance(entry, x, this.sparsity) });
+		return true;
+	}
+
+	/**
 	 * Record a completed namespaced RPC against `id`.
 	 *
 	 * `latencyMs` is optional and must be supplied **only** when the caller timed a round trip
@@ -567,7 +605,9 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * NOTE: this reads the entry, awaits `selfCoord()`, then writes — as do `applyTouch` /
 	 * `applyFailure`. Two chains scoring the same peer across that await both derive
-	 * `successCount + 1` from the same base, so one increment is lost. Harmless while the
+	 * `successCount + 1` and `accessCount + 1` from the same base, so one increment of each is
+	 * lost. (`accessCount` rides this path because a completed RPC is what frequency credit now
+	 * counts — being *named* by another peer accrues none; see `noteDiscovered`.) Harmless while the
 	 * counters only feed a relevance score that is recomputed on every call; if they ever
 	 * become load-bearing (quorum, fairness accounting), make the update read-modify-write
 	 * inside the store instead of patching a value derived outside it.
@@ -580,6 +620,10 @@ export class FretService implements IFretService, Startable {
 			lastAccess: next.lastAccess,
 			relevance: next.relevance,
 			successCount: next.successCount,
+			// Frequency credit for proven contact. This patch is built field-by-field, so a field
+			// not listed here is silently not written — `scoreSuccess` incrementing it internally
+			// is not enough on its own.
+			accessCount: next.accessCount,
 			// Omitted entirely with no sample, so the patch never speaks for a field this call
 			// has nothing to say about.
 			...(latencyMs === undefined ? {} : { avgLatencyMs: next.avgLatencyMs }),
@@ -1799,22 +1843,15 @@ export class FretService implements IFretService, Startable {
 				log.error('handleLeave: could not hash replacement id %s - %e', id, err);
 				continue;
 			}
-			// Bare `upsert`, deliberately *no* `applyTouch` — unlike the two snapshot-merge paths
-			// (`fetchAndMergeSnapshot` / `mergeAnnounceSnapshot`). `applyTouch` writes a
-			// sparsity-weighted relevance score, and giving an attacker-named id a non-zero score
-			// lets it outrank a genuine but not-yet-contacted peer when `enforceCapacity` evicts by
-			// relevance. A replacement is a name we were handed, not a peer we contacted: it starts
-			// at relevance 0 and earns a score once the classification pass actually reaches it.
+			// A name we were handed, not a peer we contacted — so it is scored by the general
+			// hearsay rule, `noteDiscovered`, exactly like an id in a merged snapshot or a
+			// configured bootstrap: created with a one-off baseline score from its own empty
+			// counters, and left completely alone if we already hold it, so repeating the name
+			// cannot raise its score. Never `applyTouch`, which would hand an attacker-named id
+			// frequency credit it could pump to outrank a genuine but not-yet-contacted peer when
+			// `enforceCapacity` evicts by relevance.
 			//
-			// NOTE: on an id *already* in the store, `upsert` refreshes `lastAccess` (relevance,
-			// health, state and membership are all preserved). `lastAccess` feeds the recency term
-			// the next time that peer is scored, so naming a peer here nudges its future relevance
-			// up a little without any contact having happened. Harmless today — eviction sorts on
-			// relevance alone, and the nudge helps the *named* peer, not the namer. Revisit if
-			// eviction ever sorts on `lastAccess`, or if the recency weight grows enough that a
-			// repeat-named id could out-survive a genuine peer: the fix is a
-			// `refreshLastAccess: false` upsert variant, not a filter here.
-			this.store.upsert(id, coord);
+			await this.noteDiscovered(id, coord);
 			this.diag.leaveReplacementsRecorded++;
 		}
 		// Once, after the loop rather than per insert: `enforceCapacity` lists and fully sorts the
@@ -1934,15 +1971,13 @@ export class FretService implements IFretService, Startable {
 			for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 				try {
 					const coord = await hashPeerId(peerIdFromString(pid));
-					if (!this.store.getById(pid)) discovered.push(pid);
-					this.store.upsert(pid, coord);
-					await this.applyTouch(pid, coord);
+					if (await this.noteDiscovered(pid, coord)) discovered.push(pid);
 				} catch (err) {
 					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
 				}
 			}
 			// merge sample if present — truncated by the parser above; the try/catch covers the
-			// id parse, the re-hash, and `upsert` / `applyTouch`.
+			// id parse, the re-hash, and the `noteDiscovered` write.
 			for (const s of snap.sample ?? []) {
 				try {
 					// RE-HASH, never trust `s.coord`. A ring coordinate is *defined* as
@@ -1958,9 +1993,7 @@ export class FretService implements IFretService, Startable {
 					// malformed coordinates is worth dropping the entry over even though nothing
 					// reads the value.
 					const coord = await hashPeerId(peerIdFromString(s.id));
-					if (!this.store.getById(s.id)) discovered.push(s.id);
-					this.store.upsert(s.id, coord);
-					await this.applyTouch(s.id, coord);
+					if (await this.noteDiscovered(s.id, coord)) discovered.push(s.id);
 				} catch (err) { log.error('mergeAnnounceSnapshot sample upsert failed for %s - %e', s.id, err) }
 			}
 			// Calibrate local size estimator from snapshot's estimate
@@ -2085,8 +2118,10 @@ export class FretService implements IFretService, Startable {
 				}
 				const pid = peerIdFromString(id);
 				const coord = await hashPeerId(pid);
-				this.store.upsert(id, coord);
-				await this.applyTouch(id, coord);
+				// A configured *name*, not a peer we contacted — so it takes the same hearsay
+				// baseline as any other id we were told about. It is pinged moments later by the
+				// warm-up and classification passes, and scores properly then.
+				await this.noteDiscovered(id, coord);
 			} catch (err) {
 				log.error('seedFromBootstraps failed for %s - %e', bootstrapEntry, err);
 			}
@@ -2483,13 +2518,15 @@ export class FretService implements IFretService, Startable {
 	 * nothing: our own cancellation is not evidence about the peer. `snapshotsFetched` counts only
 	 * `ok` replies.
 	 *
-	 * NOTE: pooling makes concurrent scoring of one peer genuinely possible, in two ways — two near
-	 * peers' snapshots naming the **same** third peer (`applyTouch` against `applyTouch`), and a
-	 * snapshot naming a near peer another task is pinging (`applyTouch` against `applySuccess`).
-	 * The tick's four candidate sets being disjoint does not cover the second: the ids a snapshot
-	 * *names* are not one of those sets. Harmless either way — the fields the race can lose
-	 * (`accessCount`, `successCount`) only feed a relevance score recomputed on every call (see the
-	 * NOTE on `applySuccess`).
+	 * NOTE: pooling makes concurrent writes for one peer genuinely possible, in two ways — two near
+	 * peers' snapshots naming the **same** third peer (`noteDiscovered` against `noteDiscovered`),
+	 * and a snapshot naming a near peer another task is pinging (`noteDiscovered` against
+	 * `applySuccess`). The tick's four candidate sets being disjoint does not cover the second: the
+	 * ids a snapshot *names* are not one of those sets. Harmless either way — `noteDiscovered`
+	 * writes only for an id it just created, so the loser of that race either writes a baseline
+	 * over an identical baseline or returns without writing at all; and the counters
+	 * `applySuccess` can lose an increment of only feed a relevance score recomputed on every
+	 * call (see the NOTE there).
 	 */
 	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		const announced: string[] = [];
@@ -2524,9 +2561,7 @@ export class FretService implements IFretService, Startable {
 		for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
 			try {
 				const coord = await hashPeerId(peerIdFromString(pid));
-				if (!this.store.getById(pid)) announced.push(pid);
-				this.store.upsert(pid, coord);
-				await this.applyTouch(pid, coord);
+				if (await this.noteDiscovered(pid, coord)) announced.push(pid);
 			} catch (err) {
 				log.error('failed to merge neighbor %s - %e', pid, err);
 			}
@@ -2535,9 +2570,7 @@ export class FretService implements IFretService, Startable {
 			try {
 				// Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`.
 				const coord = await hashPeerId(peerIdFromString(s.id));
-				if (!this.store.getById(s.id)) announced.push(s.id);
-				this.store.upsert(s.id, coord);
-				await this.applyTouch(s.id, coord);
+				if (await this.noteDiscovered(s.id, coord)) announced.push(s.id);
 			} catch (err) { log.error('fetchAndMergeSnapshot sample upsert failed for %s - %e', s.id, err) }
 		}
 		// Calibrate local size estimator from snapshot's estimate

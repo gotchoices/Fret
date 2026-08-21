@@ -69,8 +69,9 @@ function recencyScore(entry: PeerEntry, now: number): number {
 
 // NOTE: log1p slows but does not cap — frequency is unbounded in principle. At accessCount 1e6
 // the weighted term contributes 0.55 against recency/health ceilings of 0.4 each, so a
-// high-traffic peer can outweigh both. Accrual is still driven by `touch` on the snapshot-merge
-// paths as well as by `recordSuccess`, so it is not yet bounded by proven contact alone. Not a
+// high-traffic peer can outweigh both. Accrual is now bounded by proven contact — only `touch`
+// and `recordSuccess` increment it, and the service calls neither for an id it was merely told
+// about (see `FretService.noteDiscovered`) — so reaching 1e6 takes 1e6 real round trips. Not a
 // defect today; if it ever shows up as a problem, cap or re-scale the term.
 function frequencyScore(entry: PeerEntry): number {
 	return Math.log1p(entry.accessCount) / 5; // saturates slowly
@@ -157,10 +158,9 @@ function blendLatency(avg: number | null, sample: number | undefined): number | 
  * Frequency credit rule (settled): a completed RPC counts as an access, so `accessCount` is
  * incremented here exactly as `touch` increments it — repeated proven contact now raises
  * relevance instead of saturating after the first success. `recordFailure` does not accrue
- * frequency. {@link initialRelevance} exists so a peer we were merely *told about* can be scored
- * once at creation instead; wiring it into the gossip-ingestion path is the companion ticket
- * `frequency-credit-service-gossip`. Until that lands, `touch` still accrues frequency on every
- * snapshot merge, so a peer named repeatedly in gossip does still gain frequency credit.
+ * frequency, and neither does being *named* by another peer: the gossip-ingestion paths score a
+ * newly-created entry once with {@link initialRelevance} and leave an id they already hold
+ * completely alone (`FretService.noteDiscovered`), so mention count is flat in relevance.
  */
 export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
 	observeDistance(model, x);
