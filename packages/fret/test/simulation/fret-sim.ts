@@ -901,6 +901,14 @@ export class FretSimulation {
 		return Array.from(this.peers.values()).filter((p) => p.alive).length
 	}
 
+	/**
+	 * Cluster centers of `clustered` placement, or `undefined` in every other mode — see
+	 * `CoordPlacement.centers`.
+	 */
+	getClusterCenters(): readonly bigint[] | undefined {
+		return this.placement.centers
+	}
+
 	getPeers(): ReadonlyMap<string, SimPeer> {
 		return this.peers
 	}

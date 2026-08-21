@@ -57,6 +57,19 @@ export class CoordPlacement {
 		}
 	}
 
+	/**
+	 * The cluster centers `clustered` mode draws around, or `undefined` in every other mode.
+	 *
+	 * Exposed so a caller can aim a coordinate at a *specific* cluster. Without it the only way
+	 * to build an "inter-cluster" target was to hash one out of thin air and hope it landed on
+	 * the far side of a cluster boundary, which it did not reliably do — see the routing
+	 * measurement in `placement-assertions.ts`. Returned read-only because the array is the
+	 * placement's own state; a caller that mutated it would move every subsequently placed peer.
+	 */
+	get centers(): readonly bigint[] | undefined {
+		return this.clusterCenters
+	}
+
 	/** Generate a ring coordinate based on placement strategy. */
 	generateCoord(index: number, isJoin: boolean): Uint8Array {
 		switch (this.placement) {
