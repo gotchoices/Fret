@@ -1,16 +1,32 @@
----
 description: Two tests that prove a stalled neighbour can no longer eat a whole background maintenance cycle are now written and green; what is left is proving they would actually fail against the old code, running the full test suite, and handing the work to review.
-files: packages/fret/test/stabilize-concurrency.spec.ts, packages/fret/src/service/fret-service.ts, tickets/.logs/
+files: packages/fret/test/stabilize-concurrency.spec.ts, packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/neighbors.ts, tickets/.logs/
 difficulty: easy
 ---
 
-## What landed this run (do not redo)
+<!-- resume-note -->
+Prior run stopped on a BUDGET_WARNING before touching any code or running anything. Nothing
+changed this run — resume from the same TODO list as before. The one new fact: confirmed the two
+flip sites exist exactly where the previous handoff said —
+
+- Case 1's line: `packages/fret/src/service/fret-service.ts:2634`, inside
+  `fetchAndMergeSnapshot` — `timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,` (part of the
+  options object passed to `fetchNeighbors` at line 2632).
+- Case 2's line: `packages/fret/src/service/fret-service.ts:2323`, inside `probeAndFetch` —
+  `if (!answered) return [];`.
+
+Not yet confirmed: what `fetchNeighbors` (`packages/fret/src/rpc/neighbors.ts:102`) actually
+falls back to when `timeoutMs` is omitted from its options — the handoff below asserts it is the
+route-sized `RPC_TIMEOUT_MS` (5000ms) default from `src/rpc/protocols.ts`, inherited via
+`rpcRequest`. Worth a quick read of `fetchNeighbors`'s options handling before doing the flip, so
+the predicted ~5000ms-vs-1000ms timing difference is not a surprise mid-run.
+<!-- /resume-note -->
+
+## What landed earlier (do not redo)
 
 The two regression cases the ticket asked for are **written, type-checked and passing**, in
-`packages/fret/test/stabilize-concurrency.spec.ts` under a new `// ----- phase-2 reserve -----`
-section placed immediately after the headline-regression case. The file-header bullet list gained
-the two new properties. Nothing else in the tree changed (`git status` also shows the untracked
-`tickets/.in-progress`, which is not ours).
+`packages/fret/test/stabilize-concurrency.spec.ts` under a `// ----- phase-2 reserve -----`
+section placed immediately after the headline-regression case. The file-header bullet list has
+the two new properties. Nothing else in the tree has changed across any run of this ticket so far.
 
 Three cases, not two — case 1 is run under both profiles:
 
@@ -29,7 +45,7 @@ Design decisions already made and worth not relitigating:
 - Per-case `this.timeout(20000)` with `function` callbacks (arrows have no `this`), as insurance
   on a slow CI box.
 
-Measured, ran from `packages/fret/`:
+Last measured (from an earlier run, not this one — re-verify if in doubt), from `packages/fret/`:
 
 ```
 npx tsc --noEmit                                  # clean
@@ -37,25 +53,24 @@ node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/stabilize-con
 # 16 passing (7s) — the 3 new cases at 2024ms / 2020ms / 2004ms
 ```
 
-A tick costs ~1.0s (phase 1 ends on `MAINTENANCE_SNAPSHOT_TIMEOUT_MS` = 1000ms, well inside its
-own 3000ms sub-budget), so case 1s two ticks are ~2.0s. That is the measured cost, replacing the
-~1.1s-per-tick estimate an earlier run predicted.
-
 ## What is left
 
 **Confirm each case bites.** The fix is already committed, so the evidence comes from temporarily
-undoing the one line each case depends on, running that case, and putting it back. This was
-deliberately **not** attempted last run: a run killed between the flip and the restore leaves the
-shipped fix reverted in the working tree, which is worse than an unproven test. Do the flip and
-the restore in **one shell invocation** so an interrupt cannot separate them, e.g. sed the line
-out, run mocha with `--grep`, sed it back, all chained with `;` in a single command.
+undoing the one line each case depends on, running that case, and putting it back. This must be
+done as the flip and the restore in **one shell invocation** so an interrupt cannot separate them
+— e.g. sed the line out, run mocha with `--grep`, sed it back, all chained with `;` in a single
+command. This was deliberately not attempted across two prior runs now (once killed mid-plan by
+context pressure, once stopped by budget warning before starting) — both times specifically to
+avoid leaving the shipped fix reverted in the working tree.
 
-- **Case 1s line** is the `timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS` on the
-  `fetchNeighbors` call inside `fetchAndMergeSnapshot` (`src/service/fret-service.ts`, grep the
-  symbol). Removing it falls back to the route-sized `RPC_TIMEOUT_MS` (5000), so the stalled fetch
-  outruns the 5000ms tick budget, phase 2 hits its `budget.signal.aborted` early return, and the
-  phase-2 peers are never opened.
-- **Case 2s line** is `probeAndFetch`s `if (!answered) return []` gate.
+- **Case 1's line** is the `timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS` on the
+  `fetchNeighbors` call inside `fetchAndMergeSnapshot` (`src/service/fret-service.ts:2634`).
+  Removing it falls back to the route-sized `RPC_TIMEOUT_MS` (5000), so the stalled fetch outruns
+  the 5000ms tick budget, phase 2 hits its `budget.signal.aborted` early return, and the phase-2
+  peers are never opened. Confirm the fallback value by reading `fetchNeighbors`'s options
+  handling (`src/rpc/neighbors.ts:102`) first — see resume-note above.
+- **Case 2's line** is `probeAndFetch`s `if (!answered) return [];` gate
+  (`src/service/fret-service.ts:2323`).
 - It is **not** the phase-1 sub-budget signal. Swapping that does not bite, because per-RPC
   timeouts already cap a phase-1 task at ~3000ms — see the handoff finding below.
 
@@ -82,8 +97,8 @@ it that a reader will not otherwise reconstruct:
   (10s grace, no `--exit`) is the detector — if the full run hangs at the end, that is the signal,
   not a flake.
 - The existing high-water-mark assertion (pool concurrency *equals* the cap) and the
-  four-candidate-set disjointness assertion still pass — verified in the 16-passing run above; keep
-  them that way.
+  four-candidate-set disjointness assertion should still pass (verified in an earlier, not this,
+  run) — keep them that way.
 
 ## TODO
 
