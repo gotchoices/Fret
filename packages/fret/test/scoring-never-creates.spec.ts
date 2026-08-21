@@ -28,6 +28,17 @@ import type { DigitreeStore } from '../src/store/digitree-store.js'
 // entry-exists arm. The two helpers whose callers *can* present an absent id — `applyFailure`
 // from `peer:disconnect`, and `applySuccess` from a probe whose target was removed mid-flight —
 // are covered directly.
+//
+// The same reasoning covers the two guards behind those helpers, which is why neither gets an arm
+// of its own here. `applyContactStrike` has exactly one caller, `applyContactFailure`, which
+// reaches it *past* `applyFailure`'s guard and so must carry the rule itself — but only for an id
+// `applyContactFailure` was handed, and every one of those comes from a store-derived probe target.
+// `noteProofOfLife`'s four callers likewise cannot present an absent id: `applySuccess` calls it
+// from inside its own guard, `noteInboundRpc` and the `peer:connect` listener each `upsert`
+// synchronously one line before, and `noteAnsweredOnProtocol` is only ever reached from an RPC
+// outcome whose target came out of the store. Both guards are the same defence-in-depth against a
+// mid-flight removal that `applyTouch`'s is. Do not file a coverage finding against either without
+// first showing a caller that can present an id the store does not hold.
 
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
