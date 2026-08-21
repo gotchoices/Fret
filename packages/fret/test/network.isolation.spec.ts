@@ -34,8 +34,8 @@ describe('Network isolation', function () {
 		await new Promise((r) => setTimeout(r, 1000))
 
 		// Nodes should not have discovered each other due to protocol mismatch
-		const diagA = (mesh.services[0] as any).getDiagnostics?.()
-		const diagB = (mesh.services[1] as any).getDiagnostics?.()
+		const diagA = mesh.services[0]!.getDiagnostics()
+		const diagB = mesh.services[1]!.getDiagnostics()
 
 		// No snapshots should be fetched across networks
 		if ((diagA.snapshotsFetched ?? 0) > 0 || (diagB.snapshotsFetched ?? 0) > 0) {
