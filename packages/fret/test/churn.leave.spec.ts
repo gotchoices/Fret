@@ -365,11 +365,12 @@ describe('Leave amplification cap', function () {
 		} finally { await rig.stop() }
 	})
 
-	// `handleLeave` calls `store.remove(notice.from)`, and until now nothing asserted it. The mesh
-	// test that used to try could not: a graceful stop is followed by the `peer:disconnect` whose
-	// `applyFailure` re-creates the entry (`backlog/debt-scoring-resurrects-removed-peers`). This
-	// rig's receiver service is never started, so no disconnect listener exists to resurrect it and
-	// the removal is observable on its own.
+	// `handleLeave` calls `store.remove(notice.from)`. Scoring helpers no longer resurrect a
+	// removed peer (`applyTouch`/`applySuccess`/`applyFailure` return early on a miss — see
+	// `docs/fret.md`, *Relevance scoring and table management*), so removal is durable through the
+	// `peer:disconnect` that follows a graceful departure too, not just observable in isolation.
+	// This rig's receiver service is never started, so this test covers the leave notice alone;
+	// a real-`peer:disconnect` sibling case is still owed (see `tickets/implement/`).
 	it('removes the departing peer from the id map and from the ring window', async () => {
 		const rig = await makeLeaveRig()
 		try {
