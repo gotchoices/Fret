@@ -471,8 +471,8 @@ export class FretService implements IFretService, Startable {
 		// Inbound-announce gate: guards *processing* of received announces (bucketAnnounce
 		// guards our *outbound* sends). Profile-tuned Edge < Core; checked before any merge.
 		// NOTE: capacity/refill are first-cut. On a large Core ring, churn can trigger many
-		// legit announces from distinct neighbors at once; if diag.rejected.rateLimited climbs
-		// in normal operation, raise these before assuming an attack.
+		// legit announces from distinct neighbors at once; if diag.rejected.rateLimited.announce
+		// climbs in normal operation, raise these before assuming an attack.
 		this.bucketAnnounceInbound = new TokenBucket(
 			this.cfg.profile === 'core' ? 20 : 6,
 			this.cfg.profile === 'core' ? 10 : 2

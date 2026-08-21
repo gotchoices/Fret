@@ -1427,11 +1427,11 @@ describe('RPC codec properties', function () {
 			expect(svc.getDiagnostics().rejected.rateLimited.announce - before).to.equal(1)
 		})
 
-		// `rejected.rateLimited` has one more contributor than the five buckets: the maybeAct
-		// in-flight concurrency cap (Core 16 / Edge 4), which returns busy with a fixed
-		// `retry_after_ms` of 500. It is not a bucket and is pinned by `profile.behavior.spec.ts`,
-		// so it is out of scope here — but the counter is shared, which is why this test says
-		// "bucket path" rather than "every path".
+		// The maybeAct in-flight concurrency cap (Core 16 / Edge 4) also answers busy, with a
+		// fixed `retry_after_ms` of 500. It is not a bucket and no longer shares this counter —
+		// it increments the sibling `rejected.concurrencyLimited`, pinned by
+		// `inflight-concurrency.spec.ts` — so the five sub-fields summed below have exactly the
+		// five bucket paths as contributors, and no other.
 		it('increments rateLimited exactly once per rejection on every bucket path', async () => {
 			const svc = service()
 			const d = drivable(svc)
