@@ -1,92 +1,111 @@
-description: Four small, low-risk tidy-ups landed in the RPC network-message code — dropped needless async, deduped protocol-id constants, stopped two handlers sending unread acknowledgement bytes, and made NUL-byte stripping in message decoding visible in logs instead of silent.
-files: packages/fret/src/rpc/protocols.ts, packages/fret/src/rpc/leave.ts, packages/fret/src/rpc/neighbors.ts, packages/fret/src/rpc/request.ts, packages/fret/src/rpc/maybe-act.ts, packages/fret/src/rpc/ping.ts
-difficulty: easy
+description: A recent tidy-up of the network-message code stopped two message handlers from sending a short acknowledgement back to the sender, which broke 76 tests; the review pass needs to finish deciding whether to keep the new no-reply behaviour and update the tests, or put the acknowledgement back.
+files: packages/fret/src/rpc/protocols.ts, packages/fret/src/rpc/leave.ts, packages/fret/src/rpc/neighbors.ts, packages/fret/test/rpc.codec-properties.spec.ts, packages/fret/test/rpc.handler-fuzz.spec.ts, docs/fret.md
+difficulty: medium
 ----
 
-## What changed
+## Why this ticket exists
 
-All four items from the implement ticket landed, confirmed against `git diff --stat`
-(6 files, +32/-21 — exactly the `files:` list, nothing else touched):
+This is a **continuation of the review pass** on `cleanup-rpc-layer` (implement commit
+`547d506`). The prior run hit its token budget after reading the diff and running the suite once.
+Everything already established is recorded below so the next run does not re-derive it. Resume at
+*Remaining work*.
 
-1. **Needless async** — `encodeJson`/`decodeJson` (`protocols.ts`) dropped `async`; both were
-   100%-synchronous bodies. Every `await encodeJson(`/`await decodeJson(` call site in
-   production code lost its `await` to match: `protocols.ts` (inside `registerJsonHandler`,
-   both overloads, ×4 call sites), `request.ts:148,177`, `neighbors.ts:115`, `maybe-act.ts`
-   (×3), `ping.ts:93`. Test-only `await`s on these functions were deliberately left alone per
-   the prior run's discovery — `await nonPromiseValue` is legal JS, no behavior change, not
-   worth touching files outside `files:`.
-2. **Duplicated protocol-id constants** — `PROTOCOL_NEIGHBORS` etc. (`protocols.ts:44-49`) now
-   derive from `makeProtocols('default')` instead of restating the literal strings.
-3. **Unread ok-true acknowledgements** — `registerLeave`'s success reply (`leave.ts:51`) and
-   `registerNeighbors`'s announce-handler success reply (`neighbors.ts:78`) changed from
-   `return { ok: true };` to `return undefined;`. `registerJsonHandler` already treats
-   `undefined` as "drop without replying; seam still closes" (the existing identity-mismatch
-   branch in both files already did this) — so both handlers' success and mismatch paths now
-   return the same shape, and no reply bytes are sent for something neither `sendLeave` nor
-   `announceNeighbors` ever reads.
-4. **Silent NUL-byte stripping** — `decodeJson` (`protocols.ts`) now counts bytes stripped
-   from either end during the interop-defensive trim that were specifically `0` (NUL), as
-   opposed to ordinary whitespace (9/10/13/32). If any were stripped, one `log.error` fires
-   after the loop, before `JSON.parse`, naming the count. Kept cheap: no byte dump, one log
-   call per `decodeJson` invocation, trim behavior itself unchanged.
+## What the implement stage changed (already reviewed, diff read)
 
-**Deviation from the ticket's literal wording**: the ticket said "call `log.warn`", but
-`@libp2p/logger`'s `Logger` type (used throughout this codebase via `createLogger`) has no
-`warn` method — only the base callable (debug-level) and `.error`. Every existing log call in
-`fret-service.ts` uses `log.error` for exactly this kind of "notable but non-fatal" condition,
-so this uses `log.error` too, for consistency with the rest of the codebase. Confirmed by
-reading `node_modules/@libp2p/logger/dist/src/index.d.ts` — `Logger` re-exports `@libp2p/interface`'s
-type, which is base-callable + `.error` only.
+Four items, 6 files, +32/-21 — the diff matches the `files:` list, nothing else touched.
 
-## Verification done
+1. `encodeJson` / `decodeJson` (`src/rpc/protocols.ts`) dropped `async`; every production call site
+   dropped its `await`.
+2. `PROTOCOL_*` constants derive from `makeProtocols('default')` instead of restating literals.
+3. `registerLeave`'s success reply and `registerNeighbors`' announce-handler success reply changed
+   from `return { ok: true }` to `return undefined` — so the seam closes the stream without
+   writing any reply bytes.
+4. `decodeJson` counts NUL bytes stripped by its interop-defensive trim and emits one `log.error`
+   when the count is non-zero.
 
-- `cd packages/fret && npx tsc --noEmit` — **clean, no errors.** This also exercises item 1's
-  return-type change (`Promise<Uint8Array>` → `Uint8Array`, `Promise<T>` → `T`): every `decode`
-  callback shape in `request.ts`/`validate.ts` (`(bytes) => T | Promise<T>`) already accepted a
-  non-Promise return, confirmed rather than assumed.
+## Established findings
 
-## Gaps — not verified this run
+### Confirmed regression — item 3 breaks a pinned wire contract (76 failing tests)
 
-**The full test suite (`yarn test`) was not run.** This run hit its token budget immediately
-after the edits landed and typecheck passed; there was no budget left for a full test pass.
-This is the single biggest gap for review to close before this ticket can be considered done:
+`cd packages/fret && yarn test` → **1040 passing, 76 failing** (log at
+`tickets/.logs/19-cleanup-rpc-layer.test.log`). All failures live in `test/rpc.handler-fuzz.spec.ts`
+and `test/rpc.codec-properties.spec.ts` — both on the leave / announce reply path item 3 changed.
+Two failure shapes:
 
-- **Item 1 concern from the ticket's edge-case list, unverified**: confirm no caller relies on
-  `encodeJson`/`decodeJson` returning a `Promise` via `Promise.all([...])` or `.then()`
-  chaining. A grep across `src/` and `test/` for both names was done in a prior run's discovery
-  (see the ticket's resume-note history) and found none, but that grep result was not
-  re-verified against the final diff.
-- **Item 3 concern, unverified**: `test/rpc.codec-properties.spec.ts` and
-  `test/rpc.handler-fuzz.spec.ts` were flagged as likely asserting on `sendLeave`/
-  `announceNeighbors` reply shapes or literal `{ok: true}` bodies. These were **not run** this
-  session. If either asserts the old reply body, that is an expected/needed test update to
-  match the new write-only contract — not a regression — but it has not been confirmed either
-  way.
-- **Item 4 concern, unverified**: the requirement that `log.error` fires only when a NUL byte
-  specifically was stripped (never on ordinary whitespace-only padding) was implemented per the
-  code (count only increments on byte `=== 0`, checked separately from the trim condition) but
-  has **no test written or run** confirming both cases (whitespace-only: no log; NUL padding:
-  one log call, `count` correct for a NUL at each end independently and both ends together).
-- **Item 2 concern, unverified**: byte-identical string equality between the old literals and
-  `makeProtocols('default')`'s output was not diffed programmatically — it's true by
-  construction (same template literal, same `networkName` argument), but nothing exercised it
-  at runtime this session.
+- `leave: ...: expected a reply frame, got eof` — the test asked for the reply the handler no
+  longer sends.
+- `Error: Could not append value, must be an Uint8Array or a Uint8ArrayList` (~60 cases, the
+  "announce snapshot field matrix") — the fuzz harness feeds the absent reply into
+  `it-length-prefixed`'s decoder. Root cause not yet traced to a line; assumed to be the same
+  missing reply, **not yet confirmed**.
 
-## Suggested test to run first
+These are **not pre-existing** — they are on exactly the code path the diff changed, and the
+assertions read as deliberate contracts, e.g.
+`test/rpc.codec-properties.spec.ts:1553`:
 
 ```
-cd packages/fret && yarn test
+expect((await decodeJson<{ ok: boolean }>(reply!)).ok, 'answered ok despite being dropped').to.equal(true)
 ```
 
-If anything fails, cross-check against the two spec files named above before treating it as a
-regression — those are the files most likely to need an assertion updated to match item 3's new
-write-only reply contract, which is expected, not a bug.
+which is the body of the test *named* `makes a rate-limited leave indistinguishable from an
+accepted one on the wire`, and `test/rpc.codec-properties.spec.ts:~993`
+(`accepts an under-cap leave and refuses one past the fixed 4096-byte cap`).
 
-## Use cases / what to spot-check in review
+**The open question is which side is right, and that is the substance of the remaining review.**
+Arguments both ways:
 
-- A leave notice and a neighbors-announce, sent and received between two real nodes (or via
-  the existing two-node framed test), still complete normally with no reply bytes on the wire
-  for the success path — only a stream close.
-- A crafted/corrupted inbound message with NUL padding around the JSON body triggers exactly
-  one `log.error` call and still parses successfully (trim behavior unchanged).
-- A message with only ordinary whitespace padding (no NUL) produces no NUL-stripped log line.
+- *Keep the change, update the tests.* Neither `sendLeave` nor `announceNeighbors` ever reads a
+  reply — both are write-only through `rpcRequest`, which returns `ok` straight after the write.
+  So the acknowledgement bytes are provably unread by any FRET sender, and the design doc's stated
+  asymmetry (a rate-limited leave being indistinguishable from an accepted one) survives: both
+  outcomes now produce *no* reply rather than both producing `{ok: true}`.
+- *Revert item 3.* The acknowledgement is observable by a **non-FRET consumer** — the protocols and
+  the `registerRpcHandler` / `registerJsonHandler` seam are exported from the package root, so a
+  third party may be reading it. Removing it is a wire-format change, not a tidy-up, and the ticket
+  was scoped as low-risk cleanup. It also collapses the seam's `undefined` return, which until now
+  meant *only* "identity mismatch, drop", into meaning both "drop" and "success" — a real loss of
+  distinguishability inside the handler.
+
+A middle option: keep the change but treat it as a **wire-format decision**, which under the ticket
+rules is a `blocked/` question for a human rather than something a review pass decides alone.
+
+### Confirmed — documentation is now stale (`docs/fret.md`)
+
+Whatever is decided about item 3, these passages describe the old behaviour and must be corrected
+if it is kept:
+
+- In *Leave*: "the handler around it (`registerLeave`) has already committed to replying
+  `{ok: true}`" and "`registerLeave` commits to `{ok: true}` before `handleLeave` takes the bucket,
+  so today there is no busy answer to read."
+- In *Wire formats*, the `decodeJson` paragraph: the trim is described as silent; item 4 now logs.
+
+### Noted, not yet dispositioned — item 4 logs on attacker-controlled input
+
+`decodeJson` runs **before** the maybeAct token bucket (`registerMaybeAct` reads and decodes in its
+own handler body, then `handle()` takes the bucket). So a peer can drive one `log.error` per
+NUL-padded message with no rate limit in front of it. Whether that matters depends on whether
+`@libp2p/logger`'s `.error` writes unconditionally or only under an enabled `DEBUG` namespace —
+**not checked**. If it writes unconditionally this is a log-amplification finding; if it is
+namespace-gated it is a tripwire (`NOTE:` at the site) at most.
+
+### Reviewed and clean
+
+- Items 1 and 2 read correct. `npx tsc --noEmit` was clean at the implement stage; test-only
+  `await`s on the now-sync functions are legal and harmless.
+- No test covers item 4's two cases (NUL padding logs once with the right count; whitespace-only
+  padding logs nothing). Missing coverage, not a defect.
+
+## Remaining work
+
+- Decide item 3: keep-and-update-tests, revert, or escalate the wire-format question to `blocked/`.
+  Weigh the exported-seam argument above. Whichever way it goes, `yarn test` must be green before
+  this reaches `complete/`.
+- If item 3 is kept: update the 76 assertions and the two `docs/fret.md` passages, and trace the
+  `Could not append value` failures to their actual line rather than assuming they share the cause.
+- Check `@libp2p/logger`'s `.error` gating, then either file the log-amplification finding or park
+  item 4's concern as a `NOTE:` tripwire at `decodeJson`.
+- Add the two missing item-4 tests (NUL padding → one log, correct count, per end and both ends;
+  whitespace-only → no log).
+- Re-run `cd packages/fret && yarn test` and `npx tsc --noEmit`; both must pass.
+- Write the `complete/` ticket with the `## Review findings` section, folding in the *Established
+  findings* above (items 1 and 2 clean; item 3 disposition; item 4 disposition; docs updated).
