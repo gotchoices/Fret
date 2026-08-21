@@ -1,4 +1,4 @@
-import type { Startable, PeerId } from '@libp2p/interface';
+import type { Startable, PeerId, Libp2pEvents, IdentifyResult, PeerUpdate } from '@libp2p/interface';
 import type {
 	FretService as IFretService,
 	FretMode,
@@ -200,7 +200,13 @@ export class FretService implements IFretService, Startable {
 	private preconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	/** runGen the active-preconnect loop is armed for; -1 when no loop is armed. */
 	private preconnectGen = -1;
-	private readonly nodeListeners: Array<{ type: string; handler: (evt: any) => void }> = [];
+	/**
+	 * Detach thunks for the node event listeners this service registered. Storing the removal
+	 * closure rather than a `{type, handler}` pair keeps the array homogeneous: the four
+	 * listeners carry four different payload types, and a pair array would have to widen the
+	 * handler to a common supertype (and cast on the way in) to hold them all.
+	 */
+	private readonly nodeListeners: Array<() => void> = [];
 	private inflightAct = 0;
 	private readonly bucketNeighbors: TokenBucket;
 	private readonly bucketMaybeAct: TokenBucket;
@@ -919,12 +925,11 @@ export class FretService implements IFretService, Startable {
 		}
 		// Merged: the one-time post-bootstrap announce and the per-connect store upsert both fire
 		// on the same event, so one listener does both rather than paying two dispatches per connect.
-		this.addNodeListener('peer:connect', async (evt: any) => {
+		this.addNodeListener('peer:connect', async (evt: CustomEvent<PeerId>) => {
 			try {
 				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
-				const id = evt?.detail?.toString?.();
-				if (!id) return;
+				const id = evt.detail.toString();
 				const coord = await this.coordOf(id);
 				this.store.upsert(id, coord);
 				this.store.setState(id, 'connected');
@@ -939,12 +944,11 @@ export class FretService implements IFretService, Startable {
 				try { await this.announceNeighborsBounded(8); } catch (err) { log.error('postBootstrap announce failed - %e', err) }
 			}
 		});
-		this.addNodeListener('peer:disconnect', async (evt: any) => {
+		this.addNodeListener('peer:disconnect', async (evt: CustomEvent<PeerId>) => {
 			try {
 				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
-				const id = evt?.detail?.toString?.();
-				if (!id) return;
+				const id = evt.detail.toString();
 				const coord = await this.coordOf(id);
 				const wasNear = this.isNearNeighbor(id, coord);
 				this.noteDisconnected(id);
@@ -960,32 +964,30 @@ export class FretService implements IFretService, Startable {
 		// re-admission — a peer that later starts serving this network re-identifies
 		// and is re-evaluated foreign → member. (No-op on transports without identify,
 		// e.g. the in-memory test nodes; those rely on the probe pass.)
-		this.addNodeListener('peer:identify', async (evt: any) => {
+		this.addNodeListener('peer:identify', async (evt: CustomEvent<IdentifyResult>) => {
 			try {
 				if (this.stopped) return;
-				const pid: PeerId | undefined = evt?.detail?.peerId;
-				const id = pid?.toString?.();
-				if (!id) return;
+				const pid = evt.detail.peerId;
+				const id = pid.toString();
 				// Ensure an entry exists to label, but don't reset an existing one.
-				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
-				this.classifyByProtocols(id, evt?.detail?.protocols);
+				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid));
+				this.classifyByProtocols(id, evt.detail.protocols);
 				// identify is where a peer's addresses usually arrive; pick them up now rather
 				// than at the next stabilization tick, so the peer is dialable immediately.
 				await this.refreshAddressKnown(id);
 			} catch (err) { log.error('peer:identify handler failed - %e', err) }
 		});
-		this.addNodeListener('peer:update', async (evt: any) => {
+		this.addNodeListener('peer:update', async (evt: CustomEvent<PeerUpdate>) => {
 			try {
 				if (this.stopped) return;
-				const peer = evt?.detail?.peer;
-				const pid: PeerId | undefined = peer?.id;
-				const id = pid?.toString?.();
-				if (!id) return;
-				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid!));
-				this.classifyByProtocols(id, peer?.protocols);
+				const peer = evt.detail.peer;
+				const pid = peer.id;
+				const id = pid.toString();
+				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid));
+				this.classifyByProtocols(id, peer.protocols);
 				// The event carries the updated Peer record, so its addresses are authoritative
 				// here — no peerStore round-trip needed.
-				this.setAddressKnown(id, (peer?.addresses?.length ?? 0) > 0);
+				this.setAddressKnown(id, peer.addresses.length > 0);
 			} catch (err) { log.error('peer:update handler failed - %e', err) }
 		});
 	}
@@ -1039,16 +1041,16 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/** Register a node event listener and track it so stop() can detach it. */
-	private addNodeListener(type: string, handler: (evt: any) => void): void {
-		this.nodeListeners.push({ type, handler });
-		this.node.addEventListener(type as any, handler);
+	private addNodeListener<K extends keyof Libp2pEvents>(type: K, handler: (evt: Libp2pEvents[K]) => void): void {
+		this.node.addEventListener(type, handler);
+		// The removal closure captures `type` and `handler` still bound to the same K, so the
+		// detach side needs no cast either.
+		this.nodeListeners.push(() => this.node.removeEventListener(type, handler));
 	}
 
 	/** Detach all node event listeners registered via addNodeListener. */
 	private removeNodeListeners(): void {
-		for (const { type, handler } of this.nodeListeners) {
-			this.node.removeEventListener(type as any, handler);
-		}
+		for (const detach of this.nodeListeners) detach();
 		this.nodeListeners.length = 0;
 	}
 
