@@ -1,4 +1,3 @@
-import { expect } from 'chai'
 import type { Connection, Stream } from '@libp2p/interface'
 import type { Uint8ArrayList } from 'uint8arraylist'
 import * as lp from 'it-length-prefixed'
@@ -50,13 +49,6 @@ export function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
 }
 
-/** Poll `predicate` until true, or fail after `limitMs`. */
-export async function waitUntil(predicate: () => boolean, limitMs: number, what: string): Promise<void> {
-	const until = Date.now() + limitMs
-	while (!predicate() && Date.now() < until) await sleep(10)
-	expect(predicate(), `${what} within ${limitMs}ms`).to.equal(true)
-}
-
 // Module-private on purpose: `baseMsg` is the only writer, and an importer that could read it
 // would invite a second file driving the counter directly.
 let seq = 0
@@ -83,7 +75,7 @@ export function withoutKey(): Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Unit tier: stub streams with libp2p's status lifecycle, so release-exactly-once is countable.
+// Stub streams modelling libp2p's status lifecycle, so release-exactly-once is countable.
 // ---------------------------------------------------------------------------------------------
 
 export interface InboundStub {

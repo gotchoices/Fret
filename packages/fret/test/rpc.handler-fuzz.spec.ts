@@ -17,10 +17,10 @@ import {
 	peerIdStr,
 	sampleCoord,
 	sleep,
-	waitUntil,
 	withoutKey,
 	wrongWidthCoord,
 } from './helpers/rpc-fuzz.js'
+import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { decodeJson, encodeJson, isFrameTruncationError, readFramed, registerRpcHandler, sendFramed } from '../src/rpc/protocols.js'
 import { registerMaybeAct } from '../src/rpc/maybe-act.js'
@@ -1357,9 +1357,10 @@ describe('RPC handler fault isolation', function () {
 			// The heart of the ticket: whatever the row did, the receiver's inbound stream for
 			// that protocol must be released — before the fix every abort-shaped row here left
 			// one more stream open forever.
-			await waitUntil(
+			await waitFor(
 				() => openStreams(receiver, sender, row.protocol) === 0,
 				2000,
+				10,
 				`${row.name}: inbound stream released`
 			)
 		}
@@ -1858,9 +1859,10 @@ describe('RPC handler fault isolation', function () {
 				sendRaw(rig.sender, rig.receiver.peerId, P.PROTOCOL_MAYBE_ACT, '{ not: json }')
 			))
 
-			await waitUntil(
+			await waitFor(
 				() => openStreams(rig.receiver, rig.sender, P.PROTOCOL_MAYBE_ACT) === 0,
 				2000,
+				10,
 				'all concurrent streams released'
 			)
 
@@ -1881,9 +1883,10 @@ describe('RPC handler fault isolation', function () {
 				await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, payload)
 			}
 
-			await waitUntil(
+			await waitFor(
 				() => openStreams(receiver, sender, P.PROTOCOL_MAYBE_ACT) === 0,
 				2000,
+				10,
 				'the batch left nothing open'
 			)
 			expect(receiver.getConnections(sender.peerId).length, 'still the one connection').to.equal(1)
@@ -1917,9 +1920,10 @@ describe('RPC handler fault isolation', function () {
 			const stream = await rig.sender.dialProtocol(rig.receiver.peerId, [P.PROTOCOL_PING])
 			stream.abort(new Error('sender bailed'))
 
-			await waitUntil(
+			await waitFor(
 				() => openStreams(rig.receiver, rig.sender, P.PROTOCOL_PING) === 0,
 				2000,
+				10,
 				'nothing left open'
 			)
 		})
@@ -1941,9 +1945,10 @@ describe('RPC handler fault isolation', function () {
 				await sendRaw(sender, receiver.peerId, P.PROTOCOL_MAYBE_ACT, payload)
 			}
 
-			await waitUntil(
+			await waitFor(
 				() => openStreams(receiver, sender, P.PROTOCOL_MAYBE_ACT) === 0,
 				2000,
+				10,
 				'the batch left nothing open'
 			)
 
