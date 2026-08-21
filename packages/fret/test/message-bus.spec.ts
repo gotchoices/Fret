@@ -4,6 +4,7 @@ import { DeterministicRNG } from './simulation/deterministic-rng.js'
 import { SimMessageBus, type MessageBusConfig } from './simulation/message-bus.js'
 import { MetricsCollector } from './simulation/sim-metrics.js'
 import { FretSimulation } from './simulation/fret-sim.js'
+import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS } from './simulation/placement-assertions.js'
 
 describe('DeterministicRNG extensions', () => {
 	it('nextGaussian produces values with mean ~0 and stddev ~1', () => {
@@ -293,80 +294,96 @@ describe('Placement distributions', function () {
 	this.timeout(60000)
 
 	it('clustered placement: peers cluster around centers', () => {
-		const sim = new FretSimulation({
-			seed: 42,
-			n: 30,
-			k: 15,
-			m: 8,
-			churnRatePerSec: 0,
-			stabilizationIntervalMs: 500,
-			durationMs: 5000,
-			placement: 'clustered',
-			clusterConfig: { numClusters: 3, spreadBits: 32 },
-		})
-		sim.initialize()
-
-		// Collect all peer coords
-		const coords: bigint[] = []
-		for (const peer of sim.getPeers().values()) {
-			let val = 0n
-			for (let i = 0; i < 32; i++) {
-				val = (val << 8n) | BigInt(peer.coord[i]!)
+		function reading(placement?: 'clustered', seed = 42): number {
+			const sim = new FretSimulation({
+				seed,
+				n: 30,
+				k: 15,
+				m: 8,
+				churnRatePerSec: 0,
+				stabilizationIntervalMs: 500,
+				durationMs: 5000,
+				...(placement
+					? { placement, clusterConfig: { numClusters: 3, spreadBits: 32 } }
+					: {}),
+			})
+			sim.initialize()
+			while (sim.scheduler.pending() > 0) {
+				const evt = sim.scheduler.nextEvent()
+				if (!evt || evt.time > 5000) break
+				sim.processEvent(evt)
 			}
-			coords.push(val)
+			const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+			return maxPeersInOneSpacingArc(alive.map((p) => coordToBigInt(p.coord)))
 		}
 
-		// With 3 clusters, peers should be grouped — measure by sorting and finding gaps
-		coords.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
-		const gaps: bigint[] = []
-		for (let i = 1; i < coords.length; i++) {
-			gaps.push(coords[i]! - coords[i - 1]!)
-		}
-		gaps.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0))
+		// UNVERIFIED PLACEHOLDER — not yet measured against a real run (budget cut off before the
+		// test could be executed). Run this case once with the threshold set very loose (e.g. 0),
+		// capture the printed clustered/uniform readings across PLACEMENT_SEEDS from the console.log
+		// below, then replace this with a real measured table (format: see this file's own prior
+		// resume-note, or placement-assertions.ts's MAX_PEERS_IN_ONE_SPACING_ARC doc comment).
+		const CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 10
 
-		// The largest gaps should be significantly larger than the smallest
-		// (clusters create large inter-cluster gaps and small intra-cluster gaps)
-		const largestGap = gaps[gaps.length - 1]!
-		const medianGap = gaps[Math.floor(gaps.length / 2)]!
-		expect(largestGap > medianGap).to.be.true
+		for (const seed of PLACEMENT_SEEDS) {
+			const clustered = reading('clustered', seed)
+			const uniform = reading(undefined, seed)
+			console.log(
+				`  clustered vs uniform seed ${seed}: clustered ${clustered}, uniform ${uniform}` +
+					` (threshold ${CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC})`
+			)
+			expect(uniform).to.be.at.most(CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC)
+			expect(clustered).to.be.greaterThan(CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC)
+		}
 	})
 
 	it('clustered placement: inter-cluster routing takes more hops', () => {
-		const clusterSim = new FretSimulation({
-			seed: 42,
-			n: 30,
-			k: 15,
-			m: 8,
-			churnRatePerSec: 0,
-			stabilizationIntervalMs: 500,
-			durationMs: 8000,
-		})
-		clusterSim.initialize()
+		function avgHopsFor(placement?: 'clustered'): number {
+			const sim = new FretSimulation({
+				seed: 42,
+				n: 30,
+				k: 15,
+				m: 8,
+				churnRatePerSec: 0,
+				stabilizationIntervalMs: 500,
+				durationMs: 8000,
+				...(placement
+					? { placement, clusterConfig: { numClusters: 3, spreadBits: 32 } }
+					: {}),
+			})
+			sim.initialize()
 
-		// Warm up
-		for (const evt of clusterSim.scheduler.advanceTo(5000)) {
-			clusterSim.processEvent(evt)
+			for (const evt of sim.scheduler.advanceTo(5000)) {
+				sim.processEvent(evt)
+			}
+
+			const alivePeers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+			for (let i = 0; i < 10; i++) {
+				const from = alivePeers[i % alivePeers.length]!
+				const target = new Uint8Array(32)
+				const seed = 42 + i * 13
+				for (let j = 0; j < 32; j++) target[j] = (seed * (j + 1) * 37) & 0xff
+				sim.scheduleRoute(from.id, target, 5001 + i)
+			}
+
+			while (sim.scheduler.pending() > 0) {
+				const evt = sim.scheduler.nextEvent()
+				if (!evt || evt.time > 8000) break
+				sim.processEvent(evt)
+			}
+
+			const metrics = sim.metrics.finalize()
+			expect(metrics.routingAttempts).to.equal(10)
+			console.log(
+				`  ${placement ?? 'uniform'}: avgRoutingHops ${metrics.avgRoutingHops}, ` +
+					`successfulRouteHops avg ` +
+					`${metrics.successfulRouteHops.length > 0 ? metrics.successfulRouteHops.reduce((a, b) => a + b, 0) / metrics.successfulRouteHops.length : 'n/a'}`
+			)
+			return metrics.avgRoutingHops
 		}
 
-		// Schedule routes
-		const alivePeers = Array.from(clusterSim.getPeers().values()).filter((p) => p.alive)
-		for (let i = 0; i < 10; i++) {
-			const from = alivePeers[i % alivePeers.length]!
-			const target = new Uint8Array(32)
-			const seed = 42 + i * 13
-			for (let j = 0; j < 32; j++) target[j] = (seed * (j + 1) * 37) & 0xff
-			clusterSim.scheduleRoute(from.id, target, 5001 + i)
-		}
-
-		while (clusterSim.scheduler.pending() > 0) {
-			const evt = clusterSim.scheduler.nextEvent()
-			if (!evt || evt.time > 8000) break
-			clusterSim.processEvent(evt)
-		}
-
-		const metrics = clusterSim.metrics.finalize()
-		// Routing should work at all
-		expect(metrics.routingAttempts).to.equal(10)
+		const clustered = avgHopsFor('clustered')
+		const uniform = avgHopsFor()
+		expect(clustered).to.be.greaterThan(uniform)
 	})
 
 	it('skewed placement: some regions are denser than others', () => {

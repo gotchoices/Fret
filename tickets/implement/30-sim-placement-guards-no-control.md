@@ -4,9 +4,33 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-TENTH run stopped here (BUDGET_WARNING fired immediately after the required Read of
-`message-bus.spec.ts`, before any edit — same checkpoint the ninth run stopped at). Sections 1
-and 2 remain DONE and confirmed (do not re-verify, do not re-read their files):
+ELEVENTH run: made the section-3 edits (import + both case bodies replaced in
+`message-bus.spec.ts`) — BUDGET_WARNING fired right after, on the Edit call itself. Per the
+budget-warning rule, stopped here WITHOUT running tests or `tsc`. Do that next.
+
+**What changed in `message-bus.spec.ts` this run** (verify by reading the file, not by re-deriving
+— it should now match "3." below almost exactly):
+- Added `import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS } from
+  './simulation/placement-assertions.js'` after the `FretSimulation` import.
+- Replaced `'clustered placement: peers cluster around centers'` with the both-directions
+  `reading()` version from "3." below.
+- Replaced `'clustered placement: inter-cluster routing takes more hops'` with the both-directions
+  `avgHopsFor()` version from "3." below.
+- **`CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` is set to `10` as an UNVERIFIED PLACEHOLDER** — this
+  run never executed the test, so that number is a guess, not a measurement. The comment above it
+  in the file says so explicitly (no fabricated "measured" table — an earlier draft of this edit
+  wrongly wrote one before being caught and corrected in the same run). **Next run: do not trust
+  `10`** — treat it exactly like the original `/* MEASURE AND FILL IN */ 0` the ticket spec'd,
+  run the case, read the real clustered/uniform readings from the `console.log` output, and set a
+  real threshold with margin (same method as `MAX_PEERS_IN_ONE_SPACING_ARC` in
+  `placement-assertions.ts` — copy that file's doc-comment table format).
+- A stale-looking TS diagnostic ("All imports in import declaration are unused") appeared on the
+  new import line immediately after the first of the two edits landed, before the second edit (which
+  adds the actual usages) had applied — almost certainly just diagnostics running between the two
+  sequential Edit calls, not a real problem. **Not confirmed** — next run should sanity-check with
+  a quick `tsc --noEmit` (already on the TODO list below) rather than assume it's stale.
+
+Sections 1 and 2 remain DONE and confirmed (do not re-verify, do not re-read their files):
 
 - `packages/fret/test/simulation/placement-assertions.ts` exists, verbatim per "1." below.
   Exports confirmed this run: `coordToBigInt(coord: Uint8Array): bigint`,
@@ -237,11 +261,13 @@ which is what the snippets above do, rather than relying on passing `clusterConf
 - [x] Edit `churn-scenarios.spec.ts` per "2." above (add import, delete the four lifted
       definitions, keep `PlacementCase`/`placementReading`/`assertPlacementSeparates`) — DONE,
       confirmed via re-read
-- [ ] Edit `message-bus.spec.ts` per "3." above — replace both vacuous cases with the snippets
-      given; run once with a loose/zero threshold in case 1 to capture real readings across
-      `PLACEMENT_SEEDS`, then fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` with a real
-      measured-and-commented threshold (same table format as `placement-assertions.ts`'s
-      `MAX_PEERS_IN_ONE_SPACING_ARC` doc comment)
+- [x] Edit `message-bus.spec.ts` per "3." above — both vacuous cases replaced with the
+      both-directions snippets — DONE (eleventh run)
+- [ ] `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` is currently `10`, an UNVERIFIED PLACEHOLDER (never
+      run). Run case 1 once, read the real clustered/uniform readings from its `console.log`
+      output across `PLACEMENT_SEEDS`, and replace `10` with a real measured-and-commented
+      threshold (same table format as `placement-assertions.ts`'s `MAX_PEERS_IN_ONE_SPACING_ARC`
+      doc comment)
 - [ ] For case 2 (`inter-cluster routing takes more hops`), run once, compare the two candidate
       statistics (`avgRoutingHops` vs `successfulRouteHops` average) per the guidance above, pick
       whichever separates cleanly, note which and why in a one-line comment
