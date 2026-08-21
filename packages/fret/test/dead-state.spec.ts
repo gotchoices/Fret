@@ -114,7 +114,7 @@ describe('dead state: liveness seam', () => {
 
 	/** One failed contact, as `noteRpcFailure` routes a dial/stream error. */
 	async function strike(id: string): Promise<void> {
-		await (svc as any).applyContactFailure(id, coordAt(1))
+		await (svc as any).applyContactFailure(id)
 	}
 
 	it('marks a peer dead after three spread-out contact failures', async () => {
@@ -216,7 +216,7 @@ describe('dead state: liveness seam', () => {
 	it('does not strike on a bare relevance decay (the peer:disconnect path)', async () => {
 		const id = seedPeer('peer-e')
 		for (let i = 0; i < 3; i++) {
-			await (svc as any).applyFailure(id, coordAt(1))
+			await (svc as any).applyFailure(id)
 			unspace(id)
 		}
 
@@ -245,7 +245,7 @@ describe('dead state: liveness seam', () => {
 		await strike(id)
 		expect(store.getById(id)?.state).to.equal('dead')
 
-		await (svc as any).applySuccess(id, coordAt(1), 12)
+		await (svc as any).applySuccess(id, 12)
 
 		expect(store.getById(id)?.contactFailures).to.equal(0)
 		// No live connection to a synthetic id, so it comes back as disconnected rather than
@@ -303,10 +303,10 @@ describe('dead state: liveness seam', () => {
 		const store2 = svc2.getStore()
 		store2.upsert('peer-i', coordAt(1))
 
-		await (svc2 as any).applyContactFailure('peer-i', coordAt(1))
+		await (svc2 as any).applyContactFailure('peer-i')
 		expect(store2.getById('peer-i')?.state).to.not.equal('dead')
 		store2.update('peer-i', { lastContactFailureAt: 0 })
-		await (svc2 as any).applyContactFailure('peer-i', coordAt(1))
+		await (svc2 as any).applyContactFailure('peer-i')
 
 		expect(store2.getById('peer-i')?.contactFailures).to.equal(2)
 		expect(store2.getById('peer-i')?.state).to.equal('dead')
@@ -335,7 +335,7 @@ describe('dead state: liveness seam', () => {
 		await strike(id); unspace(id)
 
 		await Promise.all([
-			(svc as any).applyContactFailure(id, coordAt(1)),
+			(svc as any).applyContactFailure(id),
 			(svc as any).noteInboundRpc(id),
 		])
 
