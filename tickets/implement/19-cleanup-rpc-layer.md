@@ -2,6 +2,38 @@ description: A set of small, low-risk tidy-ups in the network-message code: drop
 files: packages/fret/src/rpc/protocols.ts, packages/fret/src/rpc/leave.ts, packages/fret/src/rpc/neighbors.ts, packages/fret/src/rpc/request.ts, packages/fret/src/rpc/maybe-act.ts, packages/fret/src/rpc/ping.ts
 difficulty: easy
 ----
+<!-- resume-note -->
+Prior run (2026-08-21) hit its token budget right after re-reading all six files in `files:` above
+and confirming every line reference below still matches current code — byte for byte, nothing
+drifted since the ticket was written. **Zero edits made.** All four items below are ready to
+implement exactly as written; no further investigation needed on items 2-4.
+
+For item 1 (needless async), the prior run located every `await encodeJson(`/`await decodeJson(`
+call site so the next agent does not need to re-grep the five named files:
+- `protocols.ts:208` — `sendFramed(stream, await encodeJson(await opts.serve(connection)));` (reply-only branch of `registerJsonHandler`)
+- `protocols.ts:215` — `decoded = await decodeJson(bytes);` (request branch of `registerJsonHandler`)
+- `protocols.ts:230` — `sendFramed(stream, await encodeJson(res));` (request branch of `registerJsonHandler`)
+- `request.ts:148` — `writeBody`: `const hasRoom = sendFramed(stream, await encodeJson(body));`
+- `request.ts:177` — `decodeReply`: `parsed = await decodeJson(bytes);`
+- `neighbors.ts:115` — `fetchNeighbors`'s `decode`: `parseOrThrow(parse, await decodeJson(b))`
+- `maybe-act.ts:28` — `registerMaybeAct`: `const msg = await decodeJson<RouteAndMaybeActV1>(bytes);`
+- `maybe-act.ts:30` — `registerMaybeAct`: `sendFramed(stream, await encodeJson(res));`
+- `maybe-act.ts:55` — `sendMaybeAct`'s `decode`: `parseOrThrow(parseMaybeActReply, await decodeJson(b))`
+- `ping.ts:93` — `sendPing`'s `decode`: `parseOrThrow(parsePingResponse, await decodeJson(b))`
+- `leave.ts` — **no direct calls**; `registerLeave`/`sendLeave` only go through `registerJsonHandler`/`rpcRequest`, never call either function directly.
+
+**Still outstanding, not yet done by the prior run:** the ticket's own edge-case instruction to
+grep `packages/fret/src` and `test/` *beyond* the six files above for any other
+`await decodeJson(`/`await encodeJson(` call site (e.g. `fret-service.ts`, or spec files that call
+either function directly rather than through the RPC senders). Do this grep before removing
+`async`, since a hit outside the eleven sites above would need its own `await` stripped too.
+
+After the async change, the return types change from `Promise<Uint8Array>`/`Promise<T>` to
+`Uint8Array`/`T` — check the `Parser`/`decode` callback types in `validate.ts` and `request.ts`
+(`RpcRequestOptions.decode: (bytes: Uint8Array) => T | Promise<T>`) still accept a non-Promise
+return with no signature change needed (they already union in the non-Promise case, so this should
+be a no-op, but confirm with `tsc`).
+
 Mechanical cleanups in the rpc directory, fully re-verified against current code
 (post `rpc-shared-helper` consolidation) on 2026-08-21. Four items — the original ticket's item 3
 (stream non-null assertions) was investigated and dropped: `openRpcStream` already returns
