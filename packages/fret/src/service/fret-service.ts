@@ -811,6 +811,19 @@ export class FretService implements IFretService, Startable {
 	 * re-identify promotes back to member. We tag and retain rather than evict — an evicted
 	 * foreign peer is just re-added by the next peer:connect / peerStore seed and re-probed in
 	 * a loop.
+	 *
+	 * NOTE: accepted tradeoff — lifting this guard (plus `classifyByProtocols` and
+	 * `noteAnsweredOnProtocol`) into its own module was weighed and declined; the classification
+	 * policy stays here. It is already the single choke point the evidence-strength ordering
+	 * needs, and the measured benefit was one test: of the 20 `as any` casts in
+	 * `test/ring-membership.spec.ts` exactly one reaches this method, and the rest belong to the
+	 * probe-backoff seam. The tests that need real libp2p nodes need them for the *wiring* — a
+	 * genuine `UnsupportedProtocolError` off a stopped service, a genuine inbound dial on a
+	 * namespaced protocol — which a policy module cannot retire. Against that, extracting would
+	 * separate this arm from `applyContactStrike`, whose own NOTE is about the duplication
+	 * between the two and needs them readable side by side. Revisit if a *third* classification
+	 * call site appears that cannot route through this method, or if the policy grows state of
+	 * its own beyond the store entry and the clock.
 	 */
 	private applyMembershipSignal(id: string, signal: MembershipSignal): void {
 		const e = this.store.getById(id);
