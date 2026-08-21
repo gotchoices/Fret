@@ -4,7 +4,7 @@ import { createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { PROTOCOL_MAYBE_ACT } from '../src/rpc/protocols.js'
-import type { Libp2p } from 'libp2p'
+import { buildMesh } from './helpers/mesh.js'
 import type { RouteAndMaybeActV1 } from '../src/index.js'
 import type { RpcOutcome } from '../src/rpc/outcome.js'
 
@@ -195,17 +195,16 @@ describe('iterativeLookup does not re-probe a peer', function () {
 	this.timeout(25000)
 
 	it('yields no duplicate peer across the probing events of one lookup', async () => {
-		const nodes: Libp2p[] = []
-		for (let i = 0; i < 4; i++) { const n = await createMemoryNode(); await n.start(); nodes.push(n) }
-		const services: CoreFretService[] = []
-		for (let i = 0; i < nodes.length; i++) {
-			const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()]
-			const svc = new CoreFretService(nodes[i]!, { profile: 'edge', k: 7, bootstraps: boot })
-			await svc.start()
-			services.push(svc)
-		}
-		for (let i = 1; i < nodes.length; i++) await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
+		// Services start BEFORE the star is dialed, so each `peer:connect` handler fires.
+		const mesh = await buildMesh(4, { factory: createMemoryNode })
+		await mesh.addServices((i, m) => ({
+			profile: 'edge',
+			k: 7,
+			bootstraps: i === 0 ? [] : [m.ids[0]!]
+		}))
+		await mesh.connect('star')
 		await new Promise(r => setTimeout(r, 2000))
+		const services = mesh.services
 
 		const probed: string[] = []
 		for await (const evt of services[0]!.iterativeLookup(new TextEncoder().encode('visited-key'), {
@@ -220,7 +219,6 @@ describe('iterativeLookup does not re-probe a peer', function () {
 		expect(new Set(probed).size, `probed the same peer twice: ${probed.join(', ')}`)
 			.to.equal(probed.length)
 
-		await Promise.all(services.map(s => s.stop()))
-		await stopAll(nodes)
+		await mesh.stop()
 	})
 })

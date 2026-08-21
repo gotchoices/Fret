@@ -1,7 +1,6 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { createMemNode, stopAll } from './helpers/libp2p.js'
-import { FretService as CoreFretService } from '../src/service/fret-service.js'
+import { buildMesh, type Mesh } from './helpers/mesh.js'
 import type { RouteProgress } from '../src/index.js'
 import { hashKey, hashPeerId } from '../src/ring/hash.js'
 import { lexLess, minDistance } from '../src/ring/distance.js'
@@ -16,40 +15,24 @@ import { fromString as u8FromString } from 'uint8arrays/from-string'
 //   - correlation-id dedup → the whole of `maybeact-dedup-phases.spec.ts`, which sends over the
 //     wire because `routeAct` alone never touches the dedup cache.
 
-async function makeMesh(n: number) {
-	const nodes = [] as any[]
-	for (let i = 0; i < n; i++) {
-		const node = await createMemNode()
-		await node.start()
-		nodes.push(node)
-	}
-	// Start services BEFORE connections so peer:connect handlers fire
-	const services = [] as CoreFretService[]
-	for (let i = 0; i < n; i++) {
-		const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()]
-		const svc = new CoreFretService(nodes[i], { profile: 'edge', k: 7, bootstraps: boot })
-		await svc.start()
-		services.push(svc)
-	}
-	// Star topology: all nodes connect to bootstrap
-	for (let i = 1; i < n; i++) {
-		const ma = nodes[0]!.getMultiaddrs()[0]!
-		await nodes[i]!.dial(ma)
-	}
-	return { nodes, services }
-}
-
-type Mesh = Awaited<ReturnType<typeof makeMesh>>
-
 /**
- * Tear a mesh down from a `finally`, so a failed assertion reports *itself* rather than being
- * buried under the exit watchdog's open-handle dump for the nodes the throw skipped past. Service
- * stops are settled rather than `Promise.all`ed for the same reason: one rejecting stop must not
- * strand the other services or the nodes underneath them.
+ * `n` in-memory nodes, services started BEFORE the star is dialed so each `peer:connect` handler
+ * fires.
+ *
+ * Every case below tears the mesh down from a `finally`, so a failed assertion reports *itself*
+ * rather than being buried under the exit watchdog's open-handle dump for the nodes the throw
+ * skipped past. `mesh.stop()` settles each service stop rather than `Promise.all`ing them for the
+ * same reason: one rejecting stop must not strand the other services or the nodes underneath them.
  */
-async function teardown({ nodes, services }: Mesh): Promise<void> {
-	await Promise.allSettled(services.map(s => s.stop()))
-	await stopAll(nodes)
+async function makeMesh(n: number): Promise<Mesh> {
+	const mesh = await buildMesh(n)
+	await mesh.addServices((i, m) => ({
+		profile: 'edge',
+		k: 7,
+		bootstraps: i === 0 ? [] : [m.ids[0]!]
+	}))
+	await mesh.connect('star')
+	return mesh
 }
 
 describe('Iterative lookup', function () {
@@ -65,7 +48,7 @@ describe('Iterative lookup', function () {
 		await new Promise(r => setTimeout(r, 2000))
 
 		try {
-			const otherIds = nodes.slice(1).map((n: any) => n.peerId.toString())
+			const otherIds = nodes.slice(1).map(n => n.peerId.toString())
 			const key = u8FromString('test-key')
 			const events: RouteProgress[] = []
 			for await (const evt of services[0]!.iterativeLookup(key, {
@@ -97,7 +80,7 @@ describe('Iterative lookup', function () {
 			)
 			expect(substantive.length, 'an in-cluster responder returns real anchors and a cohort hint').to.be.greaterThan(0)
 		} finally {
-			await teardown(mesh)
+			await mesh.stop()
 		}
 	})
 
@@ -140,7 +123,7 @@ describe('Iterative lookup', function () {
 			// always sends.
 			expect(fired[0], 'the initiator never runs the activity itself').to.equal(0)
 		} finally {
-			await teardown(mesh)
+			await mesh.stop()
 		}
 	})
 
@@ -190,7 +173,7 @@ describe('Iterative lookup', function () {
 			expect(completed?.commitCertificate, `lookup did not complete; trail: ${trail}`).to.equal('cert-initiator-nearest')
 			expect(fired, `the activity ran exactly once; trail: ${trail}`).to.equal(1)
 		} finally {
-			await teardown(mesh)
+			await mesh.stop()
 		}
 	})
 })
