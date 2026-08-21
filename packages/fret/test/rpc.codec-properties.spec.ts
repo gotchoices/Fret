@@ -1935,6 +1935,35 @@ describe('RPC codec properties', function () {
 				expect(kept?.confidence).to.equal(0.25)
 			})
 
+			it('drops out-of-range confidence/size_estimate independently, keeps in-range boundaries', () => {
+				// confidence must land in [0, 1]; out of range drops the field, not the message
+				const tooHigh = parseSnapshot(snap({ confidence: 1_000_000_000 }))
+				expect(tooHigh, 'huge confidence never rejects the message').to.not.equal(undefined)
+				expect(tooHigh).to.not.have.property('confidence')
+				expect(parseSnapshot(snap({ confidence: -1 }))).to.not.have.property('confidence')
+
+				// inclusive boundaries kept - 0 is a legitimate "no information" value (see
+				// handlePingRequest's NearAnchor-empty reply), 1 is full confidence
+				expect(parseSnapshot(snap({ confidence: 0 }))?.confidence).to.equal(0)
+				expect(parseSnapshot(snap({ confidence: 1 }))?.confidence).to.equal(1)
+
+				// size_estimate has no upper bound (cluster size), only a floor of 0
+				expect(parseSnapshot(snap({ size_estimate: -1 }))).to.not.have.property('size_estimate')
+				expect(parseSnapshot(snap({ size_estimate: 0 }))?.size_estimate).to.equal(0)
+				expect(parseSnapshot(snap({ size_estimate: 1_000_000_000 }))?.size_estimate).to.equal(1_000_000_000)
+
+				// each field drops independently: an in-range field survives an out-of-range sibling
+				// without affecting it or rejecting the whole message
+				const mixed = parseSnapshot(snap({ confidence: 0.5, size_estimate: -5 }))
+				expect(mixed, 'mixed in/out-of-range never rejects').to.not.equal(undefined)
+				expect(mixed?.confidence).to.equal(0.5)
+				expect(mixed).to.not.have.property('size_estimate')
+
+				const mixed2 = parseSnapshot(snap({ confidence: -5, size_estimate: 500 }))
+				expect(mixed2).to.not.have.property('confidence')
+				expect(mixed2?.size_estimate).to.equal(500)
+			})
+
 			it('drops `metadata` unless it is a non-null non-array object', () => {
 				for (const bad of [null, [], 'str', 7, true]) {
 					expect(parseSnapshot(snap({ metadata: bad })), JSON.stringify(bad)).to.not.have.property('metadata')
@@ -1984,6 +2013,22 @@ describe('RPC codec properties', function () {
 			it('parsePingResponse drops advisory numerics individually', () => {
 				expect(parsePingResponse({ ok: true, ts: 1, size_estimate: 'x', confidence: 0.5 }))
 					.to.deep.equal({ ok: true, confidence: 0.5 })
+			})
+
+			it('parsePingResponse drops out-of-range confidence/size_estimate, keeps in-range boundaries', () => {
+				expect(parsePingResponse({ ok: true, confidence: 1_000_000_000 })).to.not.have.property('confidence')
+				expect(parsePingResponse({ ok: true, confidence: -1 })).to.not.have.property('confidence')
+				expect(parsePingResponse({ ok: true, confidence: 0 })?.confidence).to.equal(0)
+				expect(parsePingResponse({ ok: true, confidence: 1 })?.confidence).to.equal(1)
+
+				expect(parsePingResponse({ ok: true, size_estimate: -1 })).to.not.have.property('size_estimate')
+				expect(parsePingResponse({ ok: true, size_estimate: 0 })?.size_estimate).to.equal(0)
+				expect(parsePingResponse({ ok: true, size_estimate: 1_000_000_000 })?.size_estimate)
+					.to.equal(1_000_000_000)
+
+				const mixed = parsePingResponse({ ok: true, confidence: 0.5, size_estimate: -5 })
+				expect(mixed?.confidence).to.equal(0.5)
+				expect(mixed).to.not.have.property('size_estimate')
 			})
 
 			it('parseNearAnchor rejects a reply that cannot state its numerics', () => {
