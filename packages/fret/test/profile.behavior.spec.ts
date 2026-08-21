@@ -248,7 +248,7 @@ describe('Profile behavior tests', function () {
 			expect(result.retry_after_ms).to.be.greaterThan(0)
 
 			const diag = svc.getDiagnostics()
-			expect(diag.rejected.rateLimited).to.be.greaterThan(0)
+			expect(diag.rejected.rateLimited.maybeAct).to.be.greaterThan(0)
 		})
 
 		it('handleNeighborsRequest returns BusyResponseV1 when bucket exhausted', async () => {
@@ -330,14 +330,14 @@ describe('Profile behavior tests', function () {
 			const bucket: TokenBucket = (svc as any).bucketNeighbors
 			drainBucket(bucket, 20)
 
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.neighbors
 
 			// Three rejected requests
 			await (svc as any).handleNeighborsRequest()
 			await (svc as any).handleNeighborsRequest()
 			await (svc as any).handleNeighborsRequest()
 
-			const after = svc.getDiagnostics().rejected.rateLimited
+			const after = svc.getDiagnostics().rejected.rateLimited.neighbors
 			expect(after - before).to.equal(3)
 		})
 	})
