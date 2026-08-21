@@ -337,6 +337,16 @@ export class FretService implements IFretService, Startable {
 	/** Per-notice budget inside {@link SHUTDOWN_BUDGET_MS}, so one stalled peer cannot eat it whole. */
 	private static readonly LEAVE_NOTICE_TIMEOUT_MS = 1500;
 	private firstStabilizeDone = false;
+	/** Resolves once this run's first stabilization pass completes; see `ready()`. */
+	private readyDeferred: { promise: Promise<void>; resolve: () => void } = (() => {
+		let resolve!: () => void;
+		const promise = new Promise<void>((res) => { resolve = res; });
+		return { promise, resolve };
+	})();
+	/** Tracks whether `readyDeferred` has already settled, so `start()` knows whether to reuse it
+	 *  (a pre-start caller's promise must still be the one that later resolves) or replace it with
+	 *  a fresh pending one (a restart must gate on its own first stabilize pass, not a stale one). */
+	private readyResolved = false;
 	/**
 	 * Plain `++` counters on a single-threaded event loop, so the pooled stabilization tick cannot
 	 * corrupt them. A tick truncated by `STABILIZE_TICK_BUDGET_MS` counts fewer pings/snapshots
@@ -884,6 +894,15 @@ export class FretService implements IFretService, Startable {
 		// "already announced" state of the previous run.
 		this.postBootstrapAnnounced = false;
 		this.firstStabilizeDone = false;
+		if (this.readyResolved) {
+			// Prior run already settled this gate — a restart needs its own, fresh one.
+			this.readyDeferred = (() => {
+				let resolve!: () => void;
+				const promise = new Promise<void>((res) => { resolve = res; });
+				return { promise, resolve };
+			})();
+		}
+		this.readyResolved = false;
 		await this.seedFromPeerStore();
 		// The seed no longer enforces for itself (the caller owns the one enforcement per insert
 		// sequence), so do it here explicitly rather than leaving it to the first stabilization
@@ -898,12 +917,8 @@ export class FretService implements IFretService, Startable {
 			// otherwise setMode('active') would have to be called again to get warm-up back.
 			this.startActivePreconnectLoop();
 		}
-		// One-time post-bootstrap announce when first remote connects
-		this.addNodeListener('peer:connect', async () => {
-			if (this.stopped || this.postBootstrapAnnounced) return;
-			this.postBootstrapAnnounced = true;
-			try { await this.announceNeighborsBounded(8); } catch (err) { log.error('postBootstrap announce failed - %e', err) }
-		});
+		// Merged: the one-time post-bootstrap announce and the per-connect store upsert both fire
+		// on the same event, so one listener does both rather than paying two dispatches per connect.
 		this.addNodeListener('peer:connect', async (evt: any) => {
 			try {
 				if (this.stopped) return;
@@ -919,6 +934,10 @@ export class FretService implements IFretService, Startable {
 				this.noteProofOfLife(id);
 				await this.applyTouch(id, coord);
 			} catch (err) { log.error('peer:connect handler failed - %e', err) }
+			if (!this.stopped && !this.postBootstrapAnnounced) {
+				this.postBootstrapAnnounced = true;
+				try { await this.announceNeighborsBounded(8); } catch (err) { log.error('postBootstrap announce failed - %e', err) }
+			}
 		});
 		this.addNodeListener('peer:disconnect', async (evt: any) => {
 			try {
@@ -992,6 +1011,8 @@ export class FretService implements IFretService, Startable {
 		// Left in place (not nulled) so a late `runSignal` read still reports "cancelled"; the next
 		// start() mints a fresh controller. See `runAbort`.
 		this.runAbort?.abort();
+		this.readyDeferred.resolve();
+		this.readyResolved = true;
 		this.removeNodeListeners();
 		// Unhandle before the leave notices: unhandle only removes *inbound* handlers,
 		// while the leave notices go out over our own outbound streams.
@@ -1036,7 +1057,9 @@ export class FretService implements IFretService, Startable {
 		if (mode === 'active') this.startActivePreconnectLoop();
 	}
 
-	async ready(): Promise<void> {}
+	ready(): Promise<void> {
+		return this.readyDeferred.promise;
+	}
 
 	// One number for both profiles: this bounds what a *peer* may send us, and Edge and Core peers
 	// talk to each other, so it must cover the largest snapshot any profile can legally emit. Kept
@@ -1485,16 +1508,23 @@ export class FretService implements IFretService, Startable {
 		logRejected(results, targets, label);
 	}
 
+	/**
+	 * Shared target gather for both warm-up passes: live-scoped neighbors within `radius` on each
+	 * side, self excluded. Unfiltered store walk: preconnect/warm-up must reach not-yet-classified
+	 * peers (a ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
+	 */
+	private async warmupTargetIds(radius: number): Promise<string[]> {
+		const selfCoord = await this.selfCoord();
+		const selfStr = this.node.peerId.toString();
+		return Array.from(new Set([
+			...this.store.neighborsRight(selfCoord, Math.min(radius, this.cfg.m)),
+			...this.store.neighborsLeft(selfCoord, Math.min(radius, this.cfg.m))
+		])).filter((id) => id !== selfStr);
+	}
+
 	private async preconnectNeighbors(): Promise<void> {
 		try {
-			const selfCoord = await this.selfCoord();
-			const selfStr = this.node.peerId.toString();
-			// Unfiltered store walk: preconnect/warm-up must reach not-yet-classified peers (a
-			// ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
-			const ids = Array.from(new Set([
-				...this.store.neighborsRight(selfCoord, Math.min(6, this.cfg.m)),
-				...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
-			])).filter((id) => id !== selfStr);
+			const ids = await this.warmupTargetIds(6);
 			await this.pingWarmupTargets(ids, 'preconnectNeighbors');
 		} catch (err) { log.error('preconnectNeighbors outer failed - %e', err) }
 	}
@@ -1526,14 +1556,8 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async activePreconnectTick(): Promise<void> {
 		try {
-			const selfCoord = await this.selfCoord();
-			const selfStr = this.node.peerId.toString();
 			const budget = this.cfg.profile === 'core' ? 6 : 3;
-			// Unfiltered store walk (warm-up must reach unclassified peers; ring reads use getNeighbors).
-			const ids = Array.from(new Set([
-				...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
-				...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
-			])).filter((id) => id !== selfStr);
+			const ids = await this.warmupTargetIds(12);
 			await this.pingWarmupTargets(ids, 'active preconnect', budget);
 		} catch (err) { log.error('active preconnect tick failed - %e', err) }
 	}
@@ -1945,6 +1969,7 @@ export class FretService implements IFretService, Startable {
 	private startStabilizationLoop(): void {
 		// One loop per run; start() guards re-entry, so no "already running" check is needed.
 		const gen = this.runGen;
+		const readyDeferred = this.readyDeferred;
 		const tick = async () => {
 			if (this.stopped || gen !== this.runGen) return;
 			try {
@@ -1955,6 +1980,8 @@ export class FretService implements IFretService, Startable {
 				if (!this.firstStabilizeDone) {
 					this.firstStabilizeDone = true;
 					this.detach(this.proactiveAnnounceOnStart(), 'proactiveAnnounceOnStart');
+					readyDeferred.resolve();
+					this.readyResolved = true;
 				}
 			} catch (err) {
 				log.error('stabilize tick failed - %e', err);

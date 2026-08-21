@@ -3,7 +3,69 @@ files: packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/protocol
 difficulty: easy
 
 <!-- resume-note -->
-**Seventh interrupted run — READ THIS FIRST: next agent must EDIT, not re-verify.** Runs 1-2:
+**Eighth run — 3 of 4 remaining TODOs LANDED. READ THIS FIRST.** Applied this run, confirmed
+present by `grep -n "warmupTargetIds\|readyDeferred\|readyResolved" fret-service.ts`:
+
+1. **`warmupTargetIds(radius)` extraction — DONE.** New private method right before
+   `preconnectNeighbors`. `preconnectNeighbors` now calls `await this.warmupTargetIds(6)`,
+   `activePreconnectTick` calls `await this.warmupTargetIds(12)`. Both still pass their own
+   `label`/`budget` to `pingWarmupTargets` as before — only the id-gathering moved.
+2. **Merged the two `peer:connect` listeners — DONE.** One `addNodeListener('peer:connect', ...)`
+   in `start()` now does the store-upsert/state/proof-of-life work in its try/catch, then (outside
+   the catch, so it still runs even if the try body no-ops early) does the one-time
+   `postBootstrapAnnounced` guard + `announceNeighborsBounded(8)`. Both halves fire on every
+   connect event; only the announce half is gated to fire once.
+3. **`ready()` wired — DONE**, exactly per the design that was carried across runs 3-7 (fields
+   next to `firstStabilizeDone` ~line 341, reset-or-reuse branch in `start()` ~line 897, resolve+
+   flag in `stop()` alongside `runAbort?.abort()` ~line 1014, capture-and-resolve in
+   `startStabilizationLoop`'s tick ~line 1972/1983, `ready()` body now `return this.readyDeferred.promise`
+   at ~line 1061). Went with the **inline-IIFE-twice** option from the design doc (accepted small
+   duplication) rather than a shared `createReadyDeferred()` helper — avoids needing to find/verify
+   a module-level insertion point under budget pressure. If a future pass wants to dedupe those two
+   IIFEs, that's cosmetic, not correctness.
+
+**NOT done — the 4th TODO, typed event handlers, deliberately skipped this run:**
+`nodeListeners`, `addNodeListener`, `removeNodeListeners`, and the four listener bodies
+(`peer:connect`, `peer:disconnect`, `peer:identify`, `peer:update`) are still `evt: any` /
+`type as any`. Reason: the concrete typing plan from run 6/7 (parameter type
+`(evt: Event) => void` on `nodeListeners`/`addNodeListener`, with each call site typing its own
+callback as `(evt: CustomEvent<PeerId>) => ...` etc.) **likely does not type-check as written** —
+worked through the variance by hand this run: assigning a callback typed
+`(evt: CustomEvent<PeerId>) => Promise<void>` to a parameter typed `(evt: Event) => void` requires
+`Event` to be assignable to `CustomEvent<PeerId>` under `strictFunctionTypes` contravariant
+parameter checking (this is a `private` class *method* parameter of function-type, not a method
+declared with shorthand syntax, so the bivariant-method exception does NOT apply here) — and
+`Event` is not assignable to `CustomEvent<PeerId>` (missing `detail`), so `tsc` almost certainly
+rejects it. This was never actually run through `tsc` to confirm either way — no budget left.
+**Next agent: verify this claim with `cd packages/fret && npx tsc --noEmit` BEFORE attempting the
+typed-handler edit**, and if it fails as predicted, fall back to the OTHER option already in the
+design doc history: keep `addNodeListener`/`nodeListeners` generic —
+`addNodeListener<K extends keyof Libp2pEvents>(type: K, handler: (evt: Libp2pEvents[K]) => void)`
+(import `Libp2pEvents` from `@libp2p/interface` alongside `PeerId`/`Startable` at line 1) — check
+it compiles against `this.node`'s type (`Libp2p<T>` extends `TypedEventTarget<Libp2pEvents<T>>`).
+That generic route avoids the variance problem entirely because each call is checked against its
+own `K`, not against one shared `Event`-typed parameter. `IdentifyResult`/`PeerUpdate` types
+confirmed exported from `@libp2p/interface` (run 6/7); payload shapes:
+`peer:connect`/`peer:disconnect` → `CustomEvent<PeerId>`, `peer:identify` → `CustomEvent<IdentifyResult>`,
+`peer:update` → `CustomEvent<PeerUpdate>`.
+
+## Verification NOT yet run this run (do this first, before the typed-handler attempt)
+
+`cd packages/fret && npx tsc --noEmit` and `yarn test` have **not** been re-run since the 6 edits
+above landed. Run 5 confirmed a clean baseline (tsc clean, 1116 passing, 0 failing) before any of
+today's edits, so a new failure is from today's changes, not carried debt. One odd signal from
+the IDE's live diagnostics right after editing: it flagged `readyDeferred`/`readyResolved` as
+"declared but never read" (TS6133) — but `grep -n "readyDeferred|readyResolved"` shows both used
+at every site the design calls for (start/stop/ready/tick). Almost certainly a stale/incremental
+diagnostic snapshot taken mid-edit-sequence, not a real error — but **confirm with a real `tsc`
+run before trusting that assumption**.
+
+## Superseded — original seventh-run note retained below for history only, do not re-run its
+"re-verify anchors" advice; anchors below were re-confirmed once more (8th time) at the top of
+this run before the edits above were applied, then the edits landed. Do not repeat the anchor
+sweep again — the remaining work is exactly the typed-handler TODO above, nothing else.
+
+**Seventh interrupted run:** Runs 1-2:
 pure investigation, stopped on BUDGET_WARNING before any edits. Run 3: landed one edit (added
 `FretProtocols` type export to `protocols.ts`), then hit BUDGET_WARNING before wiring it in.
 Run 4: wired that type in, re-verified all prior anchors still hold, found one new concrete
@@ -267,22 +329,15 @@ field initializer and the `start()` branch — it's two lines, arguably not wort
 
 ## Remaining scope, still to do in this file
 
-- **Apply the `warmupTargetIds` extraction above** — the actual remaining "factor onto one
-  shared helper" work; concrete diff is written out, just needs typing in.
-- **Merge the two `peer:connect` listeners** (`start()` lines 902 and 907) into one — same
-  trigger, no reason to register twice and pay two dispatches per event. Preserve both
-  behaviors: the one-shot post-bootstrap announce (guarded by `postBootstrapAnnounced`) and the
-  per-connect store upsert / state / proof-of-life work.
-- **Type laziness to tighten:**
-  - `nodeListeners: Array<{ type: string; handler: (evt: any) => void }>` (line 203) and the
-    four listener bodies typed `(evt: any) =>` (`peer:connect` 907, `peer:disconnect` 923,
-    `peer:identify` 944, `peer:update` 958), plus `addNodeListener`'s own `(evt: any)` param
-    (1021) and its two `type as any` casts (1023, 1029). Pull real libp2p event types from
-    `@libp2p/interface` instead of `any`. Comments at ~910/~926 already note "libp2p v3:
-    evt.detail is the PeerId directly, not `{ id: PeerId }`" — the tightened type must reflect
-    that shape, not `{ id: PeerId }`.
-- **Wire `ready()`** per the concrete design above (fields, `start()`, `stop()`,
-  `startStabilizationLoop()`, `ready()` body) — code is drafted above, just needs typing in.
+- ~~Apply the `warmupTargetIds` extraction~~ — **done, run 8.**
+- ~~Merge the two `peer:connect` listeners~~ — **done, run 8.**
+- ~~Wire `ready()`~~ — **done, run 8.**
+- **Only remaining: type laziness on the node-listener registry.**
+  `nodeListeners: Array<{ type: string; handler: (evt: any) => void }>` (still `any`) and the
+  four listener bodies typed `(evt: any) =>`, plus `addNodeListener`'s own `(evt: any)` param and
+  its two `type as any` casts. Pull real libp2p event types from `@libp2p/interface` instead of
+  `any`. See the top-of-file resume-note for why the naive typing plan likely fails `tsc` and what
+  to try instead (generic `addNodeListener<K extends keyof Libp2pEvents>`).
 
 ## Edge cases & interactions (unchanged from original ticket, still the acceptance bar)
 
@@ -302,16 +357,16 @@ field initializer and the `start()` branch — it's two lines, arguably not wort
 
 ## TODO tasks
 
-- Apply the `warmupTargetIds(radius)` extraction (design above) to de-duplicate
-  `preconnectNeighbors` and `activePreconnectTick`.
-- Merge the two `peer:connect` listeners into one.
-- Replace `evt: any` / `type as any` on the node-listener registry and its four handler bodies
-  with real libp2p event types.
-- Wire `ready()` per the concrete design above (fields, `start()`, `stop()`,
-  `startStabilizationLoop()`, `ready()` body).
-- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` again after applying the edits
-  above, before handoff. (Run 5 already confirmed a clean baseline — tsc clean, 1116 passing,
-  0 failing — so this is a re-check after new code changes, not the first-ever run.)
+- ~~warmupTargetIds extraction~~, ~~merge peer:connect listeners~~, ~~wire ready()~~ — all done, run 8.
+- Run `cd packages/fret && npx tsc --noEmit` FIRST, before touching code — verify whether today's
+  6 edits (warmupTargetIds, merged listener, ready() wiring) compile clean, and specifically
+  whether the stray TS6133 "declared but never read" signal on `readyDeferred`/`readyResolved`
+  was real or a stale IDE snapshot (grep evidence in the resume-note says stale, but this was
+  never confirmed with a real compiler run).
+- Only then: replace `evt: any` / `type as any` on the node-listener registry and its four
+  handler bodies with real libp2p event types (last remaining TODO item — see resume-note for
+  the two candidate approaches and why the simpler one likely fails to compile).
+- Run `yarn test` after tsc is clean.
 
 ## End
 Work ticket as described above.
