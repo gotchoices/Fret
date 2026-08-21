@@ -168,3 +168,49 @@ At a pinned clock and a fixed `x`, with a fresh model per call so the sparsity b
   counts proven contact only, that a mention scores once at creation, and that health is
   deliberately a rate.
 - `cd packages/fret && npx tsc --noEmit && yarn test`
+
+<!-- resume-note -->
+## Resume note (run 1 — budget-capped before any edit)
+
+A prior run stopped on `BUDGET_WARNING` **before making any change**. No source, test, or doc
+file was touched; the working tree is clean of this ticket's work. Nothing to reconcile — start
+from the TODO list above. What that run established, so the next one need not re-read:
+
+**Confirmed call sites in `packages/fret/src/service/fret-service.ts`** (exact, at the SHA that
+run read — still grep the symbol, but these were verified rather than approximated):
+
+| Line | Site | Action |
+|---|---|---|
+| 549 | `applyTouch` definition | unchanged |
+| 575 | `applySuccess` definition | add `accessCount` to the `baseRelevance` input *and* to the `store.update` patch |
+| 568–574 | NOTE above `applySuccess` (lost-increment race) | names `successCount` only; must name `accessCount` too |
+| 596 | `applyFailure` definition | unchanged |
+| 968 | `peer:connect` handler → `applyTouch` | **keep** — a transport connection formed |
+| 1802–1803 | leave-replacement bare `upsert` NOTE | reword to point at `noteDiscovered` as the general rule |
+| 1915 | announce-snapshot **sender** → `applyTouch` | **keep** — inbound RPC on our protocol |
+| 1939 | announce-snapshot id lists → `applyTouch` | switch to `noteDiscovered` |
+| 1963 | announce-snapshot sample entries → `applyTouch` | switch to `noteDiscovered` |
+| 2089 | `seedFromBootstraps` → `applyTouch` | switch to `noteDiscovered` |
+| 2529 | fetched-snapshot id lists → `applyTouch` | switch to `noteDiscovered` |
+| 2540 | fetched-snapshot sample entries → `applyTouch` | switch to `noteDiscovered` |
+| 2219, 2431, 2826 | the three `applySuccess` callers | no change needed at the call sites; the patch fix is inside `applySuccess` itself |
+
+`seedFromPeerStore` (2036) scores nothing already — leave it.
+
+**`packages/fret/src/store/relevance.ts`** — the long NOTE to replace sits directly above
+`recordSuccess` and runs ~20 lines; it cites `tickets/backlog/bug-frequency-credit-only-from-gossip`
+(closed). `healthScore` and `frequencyScore` are both small exported/module-level functions near
+the top, so the accepted-tradeoff and tripwire `NOTE:`s have obvious homes.
+
+**Test-fixture facts** (saves re-reading two long specs):
+
+- `test/relevance.properties.spec.ts` already has `makeEntry(overrides?)` and
+  `FIXED_NOW = 1_700_000_000_000`; the "success above a failure" test at the end of the
+  `recordSuccess` block carries the comment block that explicitly declines to pin a direction and
+  cites the closed backlog slug — that comment is what the TODO means by "must now pin the
+  direction".
+- `test/relevance.eviction.spec.ts` already has everything the service-level eviction test needs:
+  `seededService({m, capacity})` (starts then immediately stops, so no tick scores underneath the
+  assertions), `place(svc, peers)` for direct store writes, `enforce(svc)` (an empty `importTable`
+  purely to trigger the private `enforceCapacity`), `survivors(svc)`, and the `ringOffset` /
+  `serializedPeer` / `tableOf` helpers. Build the new case on those rather than a fresh rig.
