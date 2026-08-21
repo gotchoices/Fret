@@ -174,6 +174,17 @@ export class LivenessModel {
 	 * the same head — the production ordering rule. The sim has no backoff model and does not
 	 * need one: production backs dead re-probes off exponentially; here the tick cadence bounds
 	 * the rate.
+	 *
+	 * NOTE: accepted tradeoff — a successful re-probe here restores the entry but applies no
+	 * success scoring, where production's dead arm treats the answered ping as proven contact and
+	 * scores it. Deliberate: `contactSweep` runs *before* this pass on every tick (fret-sim.ts),
+	 * and a restored entry is no longer `dead`, so the very next tick's sweep contacts it and
+	 * scores it through `recordContactSuccess`. The whole divergence is therefore one tick of
+	 * deferred success credit, weighed against a change that would rewrite stored relevance and
+	 * `lastAccess` — the key the re-probe rotation and any capacity-bounded eviction order by.
+	 * Revisit if the sweep ever stops running every tick (e.g. it is given its own cadence, as
+	 * the magnitude NOTE at `recordContactSuccess` contemplates), or if a spec ever needs a
+	 * recovered entry scored within the tick that recovered it.
 	 */
 	reprobeDeadEntries(selfId: string, store: DigitreeStore, time: number): void {
 		const dead = store.list().filter((e) => e.state === 'dead')
