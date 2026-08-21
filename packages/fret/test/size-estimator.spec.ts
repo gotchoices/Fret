@@ -56,6 +56,23 @@ function relativeError(estimate: number, actual: number): number {
 // --- Tests ---
 
 describe('Size estimator', () => {
+	// Parity check for the `windowGaps` migration onto `ringNeighborsBothSides`: the window must
+	// still be self + m successors + m predecessors, i.e. G = 2m gaps at the default m. G is not
+	// exposed, so it is pinned through the confidence formula, which is a closed form in G on an
+	// evenly-spaced ring: cv = 0, so cvEff = 1, dispersion = 1 - 1/sqrt(G), and with the store
+	// well past 2m entries sizeFactor = 1, giving confidence = 0.5 + 0.5*(1 - 1/sqrt(G)). At
+	// G = 16 that is exactly 0.875 (the figure docs/fret.md quotes); losing the anchor slot on
+	// each side would give G = 14 and 0.8664, and asking each side for m + 1 twice over would
+	// give G = 18 and 0.8821.
+	it('the S/P window is 2m gaps at the default m, unchanged by the ring-walk migration', () => {
+		const m = 8
+		const coords = uniformCoords(64)
+		const store = populateStore(coords)
+		const est = estimateSizeAndConfidence(store, m, { selfCoord: coords[0]!, selfId: 'p0' })
+		expect(est.confidence, 'G = 2m = 16 on an evenly spaced ring').to.be.closeTo(0.5 + 0.5 * (1 - 1 / Math.sqrt(2 * m)), 1e-12)
+		expect(est.n, 'the window mean gap still recovers the true population').to.equal(64)
+	})
+
 	// Preserve the original test
 	it('increases confidence with more peers and balanced gaps', () => {
 		const coordByte = (b: number): Uint8Array => { const u = new Uint8Array(32); u[31] = b; return u }

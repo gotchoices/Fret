@@ -1,4 +1,5 @@
 import type { DigitreeStore, PeerEntry } from '../store/digitree-store.js'
+import { ringNeighborsBothSides } from '../service/ring-walk.js'
 
 export type SizeEstimate = { n: number; confidence: number };
 
@@ -11,6 +12,13 @@ export interface SizeEstimateOptions {
 	 * selects the degraded whole-store fallback (see {@link estimateSizeAndConfidence}).
 	 */
 	selfCoord?: Uint8Array;
+	/**
+	 * Peer id of the local node, paired with {@link selfCoord}. The window walk drops the entry
+	 * sitting at the anchor by *id* (self contributes offset 0 explicitly), so without it a store
+	 * that holds self spends one slot per side on self and the window loses two of its 2m gaps.
+	 * Omitting it is harmless on the whole-store fallback, which never walks the window.
+	 */
+	selfId?: string;
 }
 
 const RING_SIZE = 1n << 256n;
@@ -61,14 +69,19 @@ function consecutiveGaps(ascendingValues: bigint[]): bigint[] {
  * would split such a window in two and manufacture an interior gap the size of the rest of the
  * ring — precisely the outlier this method exists to avoid.
  *
- * Self is normally present in the store, and a walk anchored exactly at `selfCoord` returns it
- * as its own first result on *both* sides — so each side is asked for `m + 1` to still yield the
- * m successors and m predecessors the S/P window is defined as, and offsets are collected in a
- * `Set` so self (and any coincident coordinate) contributes once. Asking for plain `m` instead
- * costs two of the 2m gaps. When self is absent from the store the extra slot simply widens the
- * window by one peer per side, which is harmless.
+ * The walk is {@link ringNeighborsBothSides}, whose `count` already means *peers besides self* —
+ * it over-fetches and drops the anchor entry itself, which is exactly the compensation this
+ * function used to hand-roll as a local `m + 1`. Self is seeded here as offset 0 instead, and
+ * offsets are collected in a `Set` so a coordinate coincident with self contributes once. The
+ * window is therefore self + m successors + m predecessors, i.e. G = 2m gaps at the default m.
  */
-function windowGaps(store: DigitreeStore, m: number, selfCoord: Uint8Array, filter?: (e: PeerEntry) => boolean): bigint[] {
+function windowGaps(
+	store: DigitreeStore,
+	m: number,
+	selfCoord: Uint8Array,
+	selfId: string,
+	filter?: (e: PeerEntry) => boolean
+): bigint[] {
 	const selfBig = bytesToBigInt(selfCoord);
 	const offsets = new Set<bigint>([0n]);
 	const addById = (id: string): void => {
@@ -78,9 +91,7 @@ function windowGaps(store: DigitreeStore, m: number, selfCoord: Uint8Array, filt
 		if (d < 0n) d += RING_SIZE;
 		offsets.add(d > HALF_RING ? d - RING_SIZE : d);
 	};
-	const reach = m + 1;
-	for (const id of store.neighborsRight(selfCoord, reach, filter)) addById(id);
-	for (const id of store.neighborsLeft(selfCoord, reach, filter)) addById(id);
+	for (const id of ringNeighborsBothSides(store, selfCoord, m, selfId, { filter })) addById(id);
 	return consecutiveGaps([...offsets].sort(ascending));
 }
 
@@ -133,10 +144,11 @@ function collectGaps(
 	m: number,
 	peers: PeerEntry[],
 	filter?: (e: PeerEntry) => boolean,
-	selfCoord?: Uint8Array
+	selfCoord?: Uint8Array,
+	selfId?: string
 ): { gaps: bigint[]; representativeGap: bigint } {
 	if (selfCoord) {
-		const gaps = windowGaps(store, m, selfCoord, filter);
+		const gaps = windowGaps(store, m, selfCoord, selfId ?? '', filter);
 		if (gaps.length > 0) return { gaps, representativeGap: meanBigInt(gaps) };
 	}
 	const gaps = consecutiveGaps(peers.map((p) => bytesToBigInt(p.coord)).sort(ascending));
@@ -166,7 +178,7 @@ export function estimateSizeAndConfidence(store: DigitreeStore, m: number, optio
 	if (count === 0) return { n: 0, confidence: 0 };
 	if (count === 1) return { n: 1, confidence: 0.2 };
 
-	const { gaps, representativeGap } = collectGaps(store, m, peers, options?.filter, options?.selfCoord);
+	const { gaps, representativeGap } = collectGaps(store, m, peers, options?.filter, options?.selfCoord, options?.selfId);
 	const safeGap = representativeGap > 0n ? representativeGap : RING_SIZE / BigInt(count);
 	const nEst = Math.max(1, Math.min(Number(RING_SIZE / safeGap), 1_000_000_000));
 

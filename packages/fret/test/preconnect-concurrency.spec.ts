@@ -2,6 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { buildMaintenanceRig, type MaintenanceRig, type PeerRig } from './helpers/maintenance-rig.js'
 import type { FretService as CoreFretService } from '../src/service/fret-service.js'
+import { ringNeighborsBothSides } from '../src/service/ring-walk.js'
 
 // The two connection warm-up passes — the one-shot `preconnectNeighbors` at `start()` and the
 // per-second active-mode tick (`activePreconnectTick`) — share one pooled fan-out
@@ -177,11 +178,10 @@ describe('connection warm-up: pooled pings at the maintenance concurrency cap', 
 		await harness.seedPeers(16, 'member')
 		const selfCoord: Uint8Array = await (svc as any).selfCoord()
 		const m = (svc as any).cfg.m as number
-		// The tick's own target walk, re-derived so the test can choose ring positions, not seed order.
-		const walk = Array.from(new Set([
-			...harness.store.neighborsRight(selfCoord, Math.min(12, m)),
-			...harness.store.neighborsLeft(selfCoord, Math.min(12, m))
-		]))
+		// The tick's own target walk, taken from the shared helper rather than restated here, so
+		// the test cannot drift from `warmupTargetIds` the way a hand-rolled copy did: the copy was
+		// side-major where the helper interleaves, and it did not drop self where the pass does.
+		const walk = ringNeighborsBothSides(harness.store, selfCoord, Math.min(12, m), harness.node.peerId.toString())
 		expect(walk.length, 'the walk is wider than the budget, so the budget actually binds').to.be.greaterThan(ACTIVE_BUDGET)
 
 		const blocked = new Set(walk.slice(0, ACTIVE_BUDGET))

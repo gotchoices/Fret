@@ -1454,12 +1454,15 @@ export class FretService implements IFretService, Startable {
 	 * - Non-connected-but-addressable peers come **first**, because a connected peer learns the
 	 *   same content through normal exchange. That preference is why the choke point dials, and
 	 *   therefore why {@link isDoomedDial} is applied there rather than here.
+	 *
+	 * The `fanout` slice runs over {@link ringNeighborsBothSides}' **interleaved** union, so it
+	 * bounds *who we contact* while leaving the window itself two-sided: a Core fanout of 8
+	 * against `m = 8` used to eat the second walk whole and announce to successors only. `exclude`
+	 * is passed into the helper rather than filtered off its result, so the helper's over-fetch
+	 * pays for the excluded ids instead of the walk coming up short (self is dropped regardless).
 	 */
 	private announceTargetsAround(coord: Uint8Array, exclude: Set<string>, fanout: number): string[] {
-		const all = Array.from(new Set([
-			...this.store.neighborsRight(coord, this.cfg.m),
-			...this.store.neighborsLeft(coord, this.cfg.m)
-		])).filter((id) => !exclude.has(id));
+		const all = ringNeighborsBothSides(this.store, coord, this.cfg.m, this.node.peerId.toString(), { exclude });
 		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
 		const connected = all.filter((id) => this.isConnected(id));
 		return [...nonConnected, ...connected].slice(0, fanout);
@@ -1525,17 +1528,18 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Shared target gather for both warm-up passes: live-scoped neighbors within `radius` on each
-	 * side, self excluded. Unfiltered store walk: preconnect/warm-up must reach not-yet-classified
-	 * peers (a ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
+	 * Shared target gather for both warm-up passes: neighbors within `radius` on each side, self
+	 * excluded. Unfiltered store walk: preconnect/warm-up must reach not-yet-classified peers (a
+	 * ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
+	 *
+	 * `ringNeighborsBothSides`' `count` means *peers besides self*, so the walk yields
+	 * `min(radius, m)` peers on each side rather than spending one side's slot on self, and the
+	 * result is side-interleaved — which matters because the active tick slices this list down to
+	 * its per-second budget.
 	 */
 	private async warmupTargetIds(radius: number): Promise<string[]> {
 		const selfCoord = await this.selfCoord();
-		const selfStr = this.node.peerId.toString();
-		return Array.from(new Set([
-			...this.store.neighborsRight(selfCoord, Math.min(radius, this.cfg.m)),
-			...this.store.neighborsLeft(selfCoord, Math.min(radius, this.cfg.m))
-		])).filter((id) => id !== selfStr);
+		return ringNeighborsBothSides(this.store, selfCoord, Math.min(radius, this.cfg.m), this.node.peerId.toString());
 	}
 
 	private async preconnectNeighbors(): Promise<void> {
@@ -1813,15 +1817,15 @@ export class FretService implements IFretService, Startable {
 		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
 	}
 
+	/**
+	 * Is `id` inside our own successor/predecessor window? Synchronous by contract — it runs from
+	 * the connection-event path — so it reads the *cached* self coordinate and answers `false`
+	 * when it has not been hashed yet, rather than awaiting the hash.
+	 */
 	private isNearNeighbor(id: string, _coord: Uint8Array): boolean {
-		const selfStr = this.node.peerId.toString();
 		const selfCoord = this.cachedSelfCoord;
 		if (!selfCoord) return false;
-		const near = Array.from(new Set([
-			...this.store.neighborsRight(selfCoord, this.cfg.m),
-			...this.store.neighborsLeft(selfCoord, this.cfg.m),
-		])).filter((nid) => nid !== selfStr);
-		return near.includes(id);
+		return ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, this.node.peerId.toString()).includes(id);
 	}
 
 	private async announceToNewPeers(ids: string[]): Promise<void> {
@@ -2529,7 +2533,7 @@ export class FretService implements IFretService, Startable {
 		// advertise describes only this network's reachable peers — and never re-introduces a
 		// foreign peer to same-network neighbors via the sample (the transitive-propagation
 		// guard), nor advertises a peer we have already given up on as a neighbor.
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord });
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord, selfId: this.node.peerId.toString() });
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -2586,6 +2590,20 @@ export class FretService implements IFretService, Startable {
 		return idx >= 0 ? idx : Number.POSITIVE_INFINITY;
 	}
 
+	/**
+	 * NOTE: deliberately **not** migrated to `ringNeighborsBothSides`, and the helper deliberately
+	 * does not cover it. This is the public `FretService` interface's key-anchored walk: `wants` is
+	 * both the per-side count *and* the total cap, self is a legitimate neighbor of a key (so it is
+	 * not excluded), and no entry normally sits on a key's coordinate, so the helper's
+	 * `count`-means-peers-besides-self over-fetch would answer a question this method is not
+	 * asking. The consequence is stated rather than fixed: the `both` direction concatenates the
+	 * two walks and slices, so a `wants` at or below one side's yield is **successor-biased** —
+	 * with `wants = m` a caller gets the m successors and no predecessors. That is the `wants`
+	 * contract behaving as designed, not the copy-paste defect the helper exists to retire; folding
+	 * this in would change public behavior to fix a bug it does not have. Callers wanting a
+	 * two-sided window of `wants` *per side* should ask for both directions separately (as
+	 * `snapshot()` does) or use the helper.
+	 */
 	getNeighbors(
 		hashedCoord: Uint8Array,
 		direction: 'left' | 'right' | 'both',
@@ -2713,7 +2731,8 @@ export class FretService implements IFretService, Startable {
 		const selfId = this.node.peerId.toString();
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
-			selfCoord: await this.selfCoord()
+			selfCoord: await this.selfCoord(),
+			selfId: this.node.peerId.toString()
 		});
 
 		// In-cluster test: `neighborDistance` returns Infinity when self is absent from a cohort of
@@ -2952,7 +2971,8 @@ export class FretService implements IFretService, Startable {
 		// when it is not yet populated the estimator falls through to its whole-store path.
 		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
-			selfCoord: this.cachedSelfCoord ?? undefined
+			selfCoord: this.cachedSelfCoord ?? undefined,
+			selfId: this.node.peerId.toString()
 		});
 
 		// Add FRET estimate as an observation
@@ -3122,7 +3142,7 @@ export class FretService implements IFretService, Startable {
 		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord });
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord, selfId: this.node.peerId.toString() });
 
 			// Decide whether to include payload
 			const distToKey = minDistance(selfCoord, coord);
