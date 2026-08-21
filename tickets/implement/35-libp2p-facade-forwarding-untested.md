@@ -4,10 +4,22 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Prior run stopped on BUDGET_WARNING before writing any code — read-only research phase only, no
-edits made, nothing to revert. Confirmed facts below save the next run a re-discovery pass; the
-Design/Edge-cases/TODO sections from the original ticket are otherwise unchanged and still the
-spec to implement.
+Second run in a row stopped on BUDGET_WARNING before writing any code — again read-only, no edits
+made, nothing to revert. This run re-read `libp2p-fret-service.ts` (full file) and
+`libp2p-service-node-source.spec.ts` (full file) fresh, independent of the prior run's notes below,
+and confirms **zero drift**: every line number, method name, throw message, and pattern the prior
+run recorded still matches the current source exactly (`ensure()` still line 86 with the same
+throw text, `getDiagnostics` still line 142, both `get` accessors still lines 62/114,
+`discoverySource` still line 102, all skip-list candidates still present, construction pattern in
+the existing spec unchanged). Nothing here needed correction — the design below is still exactly
+right and requires no re-derivation. The only work left is the mechanical act of writing the file;
+two runs in a row have now spent their whole budget confirming that fact rather than doing it, so
+the next run should skip straight to writing `test/libp2p-facade-forwarding.spec.ts` without
+re-reading the source files first.
+
+Confirmed facts below (unchanged from the original ticket, now double-checked) save the next run a
+re-discovery pass; the Design/Edge-cases/TODO sections are otherwise unchanged and still the spec
+to implement.
 
 **Confirmed by reading `packages/fret/src/service/libp2p-fret-service.ts` (full file, 223 lines):**
 - Every method matches the design doc's description. `ensure()` (private, line 86) throws
