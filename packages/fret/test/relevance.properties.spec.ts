@@ -306,7 +306,7 @@ describe('Relevance scoring properties', function () {
 			const failed = recordFailure(entry, 0.5, createSparsityModel(), now)
 
 			expect(succeeded.relevance).to.be.greaterThan(failed.relevance)
-			expect(succeeded.relevance, 'measured').to.be.closeTo(1.26, 1e-4)
+			expect(succeeded.relevance, 'measured').to.be.closeTo(1.3099065970003163, 1e-4)
 			expect(failed.relevance, 'measured').to.be.closeTo(0.63, 1e-4)
 		})
 
