@@ -206,25 +206,31 @@ describe('RPC handler fault isolation', function () {
 			expect(s.status()).to.equal('reset')
 		})
 
-		it('aborts once when the maybeAct body is not JSON', async () => {
+		// An undecodable maybeAct body is a *body-level* failure — the peer framed correctly, so
+		// the handler drops it: the seam's budgeted close runs and no reply frame is written.
+		// Answering would be unmetered (`decodeJson` runs ahead of the maybeAct token bucket), so
+		// a static reply would be one free reply frame per undecodable message. See the catch arm
+		// in `src/rpc/maybe-act.ts`.
+		it('closes once, with no reply, when the maybeAct body is not JSON', async () => {
 			const { node, invoke } = fakeNode()
 			await registerMaybeAct(node, async () => { throw new Error('handle must not run') }, P.PROTOCOL_MAYBE_ACT)
 			const s = inboundStub([framed('{ not: json }')])
 
 			await invoke(P.PROTOCOL_MAYBE_ACT, s.stream, 'peer-a')
 
-			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 0, aborts: 1 })
+			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
 			expect(s.sends, 'no reply attempted').to.equal(0)
 		})
 
-		it('aborts once when the maybeAct body decodes to a non-object', async () => {
+		it('closes once, with no reply, when the maybeAct body decodes to a non-object', async () => {
 			const { node, invoke } = fakeNode()
 			await registerMaybeAct(node, async () => { throw new Error('handle must not run') }, P.PROTOCOL_MAYBE_ACT)
 			const s = inboundStub([framed('null')])
 
 			await invoke(P.PROTOCOL_MAYBE_ACT, s.stream, 'peer-a')
 
-			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 0, aborts: 1 })
+			expect({ closes: s.closes, aborts: s.aborts }).to.deep.equal({ closes: 1, aborts: 0 })
+			expect(s.sends, 'no reply attempted').to.equal(0)
 		})
 
 		it('aborts once when the service callback itself throws', async () => {

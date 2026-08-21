@@ -33,9 +33,20 @@ export async function registerMaybeAct(
 		try {
 			msg = decodeJson<RouteAndMaybeActV1>(bytes);
 		} catch (err) {
+			// Body-level failure: the peer framed correctly and is alive, it just sent junk. Drop
+			// it — close the stream (the seam's own budgeted close, hence the bare return and no
+			// `close()` here) and write nothing back. Same rule the other four handlers get from
+			// `registerJsonHandler`'s body-level tier; maybeAct only parses in its own body
+			// because its token bucket must be taken first.
+			//
+			// Answering with a static reject would be *unmetered*, which is what separates this
+			// from the cheap-guard rejections that do answer: `decodeJson` runs here, upstream of
+			// the maybeAct token bucket taken inside `handleMaybeAct`, so a static reply would
+			// hand a peer one reply frame per undecodable message without ever spending a token.
+			// The cheap guards run after the bucket, so they are metered. Metered -> answer;
+			// unmetered -> drop.
 			log.error('%s: undecodable body - dropping - %e', protocol, err);
 			onMalformed?.();
-			sendFramed(stream, encodeJson({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 } satisfies NearAnchorV1));
 			return;
 		}
 		const res = await handle(msg, connection.remotePeer.toString());

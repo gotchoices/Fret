@@ -107,8 +107,15 @@ describe('RPC handler fault isolation over the wire', function () {
 		payload: (senderId: string) => string
 		/**
 		 * reject — answered with the static reject (validator);
-		 * abort — stream aborted (decode/handler threw): the sender's read fails non-truncation;
-		 * drop — silently closed with no reply frame (identity mismatch): the sender sees EOF;
+		 * abort — stream aborted (a frame-level failure, or the handler threw): the sender's read
+		 *   fails non-truncation. **No row in this matrix uses it today**, and the variant is
+		 *   kept deliberately rather than deleted as dead: `runMatrix`'s `abort` arm is the
+		 *   assertion that a frame-level failure is still distinguishable from a body-level drop,
+		 *   which is the whole two-tier split. A payload string cannot produce one — framing
+		 *   failures come out of `readFramed`, above anything `sendRaw` can express — so a row
+		 *   needing it must drive the frame itself.
+		 * drop — silently closed with no reply frame (undecodable body, parser rejection, or
+		 *   identity mismatch): the sender sees EOF;
 		 * ok — answered normally.
 		 */
 		expect: RowExpect
@@ -125,18 +132,27 @@ describe('RPC handler fault isolation over the wire', function () {
 	/** The measured defect matrix from the ticket, plus the decoder's non-object shapes. */
 	function malformedMatrix(): MatrixRow[] {
 		return [
-			{ name: 'maybeAct: invalid JSON', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '{ not: json }', expect: 'abort' },
-			{ name: 'maybeAct: truncated JSON', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '{"v":1,"key":"', expect: 'abort' },
-			{ name: 'maybeAct: null top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => 'null', expect: 'abort' },
-			{ name: 'maybeAct: array top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '[1,2,3]', expect: 'abort' },
+			// Body-level failures, all four: a *complete* frame carrying a body that will not
+			// decode. maybeAct parses in its own handler body rather than on the
+			// `registerJsonHandler` seam (its token bucket must be taken first), but it follows
+			// the same rule — close, no reply. Note 'truncated JSON' is named for its payload,
+			// not for where it fails: the frame is whole, so it fails in `decodeJson` like the
+			// other three rather than in `readFramed`.
+			{ name: 'maybeAct: invalid JSON', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '{ not: json }', expect: 'drop', counts: 'malformed' },
+			{ name: 'maybeAct: truncated JSON', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '{"v":1,"key":"', expect: 'drop', counts: 'malformed' },
+			{ name: 'maybeAct: null top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => 'null', expect: 'drop', counts: 'malformed' },
+			{ name: 'maybeAct: array top level', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => '[1,2,3]', expect: 'drop', counts: 'malformed' },
 			{ name: 'maybeAct: bad base64url key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ key: '!!!bad!!!' })), expect: 'reject', counts: 'malformed' },
 			{ name: 'maybeAct: absent key', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(withoutKey()), expect: 'reject', counts: 'malformed' },
 			{ name: 'maybeAct: numeric breadcrumbs', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ breadcrumbs: 5 })), expect: 'reject', counts: 'malformed' },
 			{ name: 'maybeAct: string want_k', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ want_k: 'abc' })), expect: 'reject', counts: 'malformed' },
 			{ name: 'maybeAct: numeric activity', protocol: P.PROTOCOL_MAYBE_ACT, payload: () => JSON.stringify(baseMsg({ activity: 5 })), expect: 'reject', counts: 'malformed' },
 			// A well-formed frame whose *body* will not decode is a body-level failure under
-			// `registerJsonHandler`, so it drops (close, no reply) rather than aborting. Framing
-			// failures still abort — see the maybeAct rows above, which are not on that seam.
+			// `registerJsonHandler`, so it drops (close, no reply) rather than aborting. That is
+			// the rule on every protocol — the maybeAct rows above drop for the same reason off
+			// their own seam. Only *frame*-level failures (truncation, over-cap, reset) abort,
+			// and no row here produces one: they come out of `readFramed`, which `sendRaw` cannot
+			// drive from a payload string.
 			{ name: 'leave: non-JSON', protocol: P.PROTOCOL_LEAVE, payload: () => 'total garbage', expect: 'drop', counts: 'malformed' },
 			{ name: 'leave: numeric replacements', protocol: P.PROTOCOL_LEAVE, payload: (senderId) => JSON.stringify({ v: 1, from: senderId, replacements: 5, timestamp: Date.now() }), expect: 'ok' },
 			// A *parseable* peer id that is not the sender: the wire-shape parser refuses an
