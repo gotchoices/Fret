@@ -4,21 +4,57 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Prior run stopped on a BUDGET_WARNING before touching any code or running anything. Nothing
-changed this run — resume from the same TODO list as before. The one new fact: confirmed the two
-flip sites exist exactly where the previous handoff said —
+Prior run stopped on a BUDGET_WARNING again, this time **after** confirming case 1 and cleanly
+restoring the tree. Resume from case 2 — do not re-run case 1, it is done.
 
-- Case 1's line: `packages/fret/src/service/fret-service.ts:2634`, inside
-  `fetchAndMergeSnapshot` — `timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,` (part of the
-  options object passed to `fetchNeighbors` at line 2632).
-- Case 2's line: `packages/fret/src/service/fret-service.ts:2323`, inside `probeAndFetch` —
-  `if (!answered) return [];`.
+**Confirmed this run: `fetchNeighbors`'s `timeoutMs` fallback.** `rpcRequest`
+(`packages/fret/src/rpc/request.ts:245`) does `const timeoutMs = opts.timeoutMs ?? RPC_TIMEOUT_MS`
+— confirms the route-sized 5000ms default from `src/rpc/protocols.ts:27`, as the prior handoff
+predicted.
 
-Not yet confirmed: what `fetchNeighbors` (`packages/fret/src/rpc/neighbors.ts:102`) actually
-falls back to when `timeoutMs` is omitted from its options — the handoff below asserts it is the
-route-sized `RPC_TIMEOUT_MS` (5000ms) default from `src/rpc/protocols.ts`, inherited via
-`rpcRequest`. Worth a quick read of `fetchNeighbors`'s options handling before doing the flip, so
-the predicted ~5000ms-vs-1000ms timing difference is not a surprise mid-run.
+**Confirmed this run: case 1 bites.** One chained shell invocation (sed delete line 2634 → run
+both Core/Edge case-1 specs via `--grep "does not cost phase 2 its turn"` → `git checkout --
+src/service/fret-service.ts` → `git status --short` to prove clean) —
+
+- Before flip: `git status --short src/service/fret-service.ts` empty (confirmed clean, safe to
+  use `git checkout --` as the restore).
+- Flipped: deleted line 2634 (`timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,`) from the
+  options object passed to `fetchNeighbors` inside `fetchAndMergeSnapshot`.
+- Result: **both Core and Edge case-1 tests failed**, i.e. the case bites. Actual failure shape
+  was more informative than the ~5000ms-vs-1000ms guess: with the per-call override gone,
+  `fetchNeighbors` falls back to the route-sized 5000ms, which *exceeds* phase 1's own
+  `STABILIZE_PHASE_ONE_BUDGET_MS` (3000ms) sub-budget — so phase 1 now truncates on **its own**
+  budget (assertion measured phase-1 wall time ≈3000–3013ms) rather than running the stalled fetch
+  out to its full timeout. Either way the mechanism the test exists to catch is present: phase 1
+  no longer ends on the intended 1000ms snapshot-timeout floor, so its budget accounting and
+  phase-2 reserve arithmetic are off from what the shipped constants promise. This is *stronger*
+  evidence for the fix than the originally-guessed failure mode, not weaker — say so plainly in
+  the review handoff rather than restating the original (slightly wrong) prediction.
+- After restore: `git status --short src/service/fret-service.ts` empty again — confirmed clean,
+  tree is exactly as it was before the flip. The fix (line 2634) is back in place.
+
+**Not yet done: case 2's flip.** Same one-shot pattern, not yet attempted this run:
+1. `git status --short packages/fret/src/service/fret-service.ts` — confirm clean before flipping
+   (expected: clean, nothing else has touched this file).
+2. `sed -i '2323d' packages/fret/src/service/fret-service.ts` — deletes
+   `if (!answered) return [];` inside `probeAndFetch`, so an unanswered ping no longer skips the
+   snapshot fetch.
+3. Run: `node --import ./register.mjs node_modules/mocha/bin/mocha.js
+   "test/stabilize-concurrency.spec.ts" --timeout 30000 --grep "never answers is not
+   snapshot-fetched at all"` (from `packages/fret/`).
+4. `git checkout -- src/service/fret-service.ts` then `git status --short
+   src/service/fret-service.ts` to confirm clean restore, chained in the **same** shell invocation
+   as steps 2–3 with `;` so an interrupt cannot separate flip from restore (same rule case 1
+   followed, and it worked cleanly).
+
+Expect the test to fail while flipped (the point is proving it currently passes only because of
+the `!answered` gate) and pass again once restored — don't stop to puzzle over the exact failure
+shape, just record what it was, the way case 1's writeup above does.
+
+**Then, in order:** `yarn test` from `packages/fret/` (foreground, no redirection — not run this
+run either); write the review handoff into `tickets/review/` (fold in both case findings above,
+plus the phase-1/phase-2 division-of-labour point from the original ticket body below — it is
+still accurate and unchanged); delete this ticket.
 <!-- /resume-note -->
 
 ## What landed earlier (do not redo)
