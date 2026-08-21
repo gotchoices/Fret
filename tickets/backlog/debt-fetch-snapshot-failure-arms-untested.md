@@ -48,3 +48,13 @@ connection), so the incremental cost is small.
 Each of the ways a neighbour-list request can fail has a test showing which bookkeeping it does and,
 just as importantly, which it does not — in particular that our own cancellation and a missing
 connection score nothing at all, and that a peer answering badly is still treated as alive.
+
+## Blocked on the same harness limitation as a sibling ticket
+
+(Appended by the review pass on `phase-two-reserve-regression-tests`.) Several of the seven arms
+above cannot be driven from a maintenance-path test today, because the shared harness
+`packages/fret/test/helpers/maintenance-rig.ts` can only make a stub peer reply "yes" or go silent
+— its behavior type is exactly `'answers' | 'hangs'` and its reply builder hard-codes `{ok: true}`.
+`tickets/backlog/debt-maintenance-rig-non-ok-replies` describes that root cause and the same gap one
+RPC earlier (the busy arm of the maintenance *ping*). Different site, different arms, so the two stay
+separate — but the harness change is shared, so do it once and satisfy both.

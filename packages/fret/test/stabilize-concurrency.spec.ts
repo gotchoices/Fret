@@ -126,7 +126,11 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 
 		const elapsed = await tick()
 
-		expect(elapsed, 'phase 1 ended on the snapshot timeout, inside its own sub-budget').to.be.at.most(3000)
+		// Bounds the *snapshot* timeout (1000ms), not phase 1's own sub-budget (3000ms): a tick here
+		// costs ~1.05s, and losing the timeoutMs override lets phase 1 run to 3000ms instead. A bound
+		// at the sub-budget's own value would separate those two by ~13ms, which is no separation at
+		// all on shared CI. 2000 is ~2x the real cost and ~1000ms clear of the mutation.
+		expect(elapsed, 'phase 1 ended on the 1000ms snapshot timeout, not on its 3000ms sub-budget').to.be.at.most(2000)
 		expect(rig.protocolsSeenBy(stalled!), 'ping answered, then the fetch opened and stalled').to.deep.equal([ping(), neighbors()])
 		expect(rig.protocolsSeenBy(unknown!), 'the classification arm still got its turn').to.deep.equal([ping()])
 		expect(rig.protocolsSeenBy(dead!), 'the dead re-probe arm still got its turn').to.deep.equal([ping()])
