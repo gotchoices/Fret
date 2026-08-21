@@ -46,13 +46,13 @@ import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
 import {
-    createSparsityModel,
-    normalizedLogDistance,
-    sparsityBonus,
-    touch as scoreTouch,
-    recordSuccess as scoreSuccess,
-    recordFailure as scoreFailure,
-    type SparsityModel,
+	createSparsityModel,
+	normalizedLogDistance,
+	sparsityBonus,
+	touch as scoreTouch,
+	recordSuccess as scoreSuccess,
+	recordFailure as scoreFailure,
+	type SparsityModel,
 } from '../store/relevance.js';
 import { createLogger } from '../logger.js';
 
@@ -996,7 +996,7 @@ export class FretService implements IFretService, Startable {
 		// Unhandle before the leave notices: unhandle only removes *inbound* handlers,
 		// while the leave notices go out over our own outbound streams.
 		await this.unregisterRpcHandlers();
-		try { await this.sendLeaveToNeighbors(); } catch (err) { console.warn('sendLeaveToNeighbors failed', err); }
+		try { await this.sendLeaveToNeighbors(); } catch (err) { log.error('sendLeaveToNeighbors failed - %e', err); }
 		// A start→stop→start cycle is a fresh run, so neither map may carry into it: a peer's
 		// backoff escalation is per-run handshake history, exactly like `negotiateFailures`, which
 		// the store already refuses to carry across a restart. Cleared after the leave fan-out so
@@ -1642,7 +1642,7 @@ export class FretService implements IFretService, Startable {
 				try {
 					coord = await hashPeerId(peerIdFromString(peerId));
 				} catch (e) {
-					console.warn('handleLeave: could not hash departing peer id', peerId, e);
+					log.error('handleLeave: could not hash departing peer id %s - %e', peerId, e);
 				}
 			}
 			// remove leaving peer from the store
@@ -1916,7 +1916,7 @@ export class FretService implements IFretService, Startable {
 					// only from `unknown`, wherever the list came from).
 					this.classifyByProtocols(pidStr, p.protocols);
 				} catch (err) {
-					console.warn('failed to add peer from peerStore', p?.id?.toString?.(), err);
+					log.error('failed to add peer from peerStore %s - %e', p?.id?.toString?.(), err);
 				}
 			}
 			// NOTE: wholesale replacement clobbers any `setAddressKnown` an identify handler ran
@@ -1932,13 +1932,13 @@ export class FretService implements IFretService, Startable {
 				// Self always serves its own network.
 				this.store.setMembership(selfStr, 'member');
 			} catch (err) {
-				console.error('failed to add self to store', err);
+				log.error('failed to add self to store - %e', err);
 			}
 			// No `enforceCapacity` here: the caller does the one enforcement for the whole insert
 			// sequence (see `stabilizeOnce` phase 1, and `start()` for the direct call before the
 			// loop is armed) — the same rule `fetchAndMergeSnapshot` follows.
 		} catch (err) {
-			console.error('seedFromPeerStore failed:', err);
+			log.error('seedFromPeerStore failed - %e', err);
 		}
 	}
 
@@ -1957,7 +1957,7 @@ export class FretService implements IFretService, Startable {
 					this.detach(this.proactiveAnnounceOnStart(), 'proactiveAnnounceOnStart');
 				}
 			} catch (err) {
-				console.error('stabilize tick failed:', err);
+				log.error('stabilize tick failed - %e', err);
 			} finally {
 				// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
 				if (!this.stopped && gen === this.runGen) {
@@ -1989,7 +1989,7 @@ export class FretService implements IFretService, Startable {
 				this.store.upsert(id, coord);
 				await this.applyTouch(id, coord);
 			} catch (err) {
-				console.warn('seedFromBootstraps failed for', bootstrapEntry, err);
+				log.error('seedFromBootstraps failed for %s - %e', bootstrapEntry, err);
 			}
 		}
 		// No `enforceCapacity` here either — same rule as `seedFromPeerStore` above: the caller
@@ -2429,7 +2429,7 @@ export class FretService implements IFretService, Startable {
 				this.store.upsert(pid, coord);
 				await this.applyTouch(pid, coord);
 			} catch (err) {
-				console.warn('failed to merge neighbor', pid, err);
+				log.error('failed to merge neighbor %s - %e', pid, err);
 			}
 		}
 		for (const s of snap.sample ?? []) {
