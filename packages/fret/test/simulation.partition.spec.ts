@@ -473,6 +473,55 @@ describe('Partition and merge simulation', function () {
 		sim.heal()
 	})
 
+	it('contact scoring writes real relevance, reproducibly', () => {
+		/**
+		 * The per-tick contact sweep scores every reachable entry through production's own
+		 * `recordSuccess` / `recordFailure`. Nothing else in this suite proves that scoring ran:
+		 * every other assertion here holds just as well with every entry parked at relevance 0.
+		 * So assert both halves — the scores are non-zero, and the same seed reproduces them
+		 * exactly (they are simulation state like any other, and a clock or ordering leak shows
+		 * up here before it shows up in the aggregate metrics).
+		 */
+		function relevanceByPeer(): Array<[string, string]> {
+			const config: SimConfig = {
+				seed: 424242,
+				n: 20,
+				k: 15,
+				m: 8,
+				churnRatePerSec: 0,
+				stabilizationIntervalMs: 500,
+				durationMs: 6000,
+			}
+			const sim = new FretSimulation(config)
+			sim.initialize()
+			pump(sim, 5000)
+			return Array.from(sim.getStores().entries())
+				.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+				.map(([id, store]) => [
+					id,
+					store
+						.list()
+						.map((e) => `${e.id}:${e.relevance}`)
+						.sort()
+						.join(','),
+				])
+		}
+
+		const run1 = relevanceByPeer()
+		const scores = run1.flatMap(([, line]) =>
+			line.split(',').map((pair) => Number(pair.slice(pair.lastIndexOf(':') + 1)))
+		)
+		expect(scores.length, 'the sweep left entries to score').to.be.greaterThan(0)
+		expect(scores.every((r) => Number.isFinite(r)), 'every relevance is a real number').to.equal(true)
+		expect(
+			Math.max(...scores),
+			'some entry holds a non-zero relevance after the sweep'
+		).to.be.greaterThan(0)
+
+		const run2 = relevanceByPeer()
+		expect(JSON.stringify(run2)).to.equal(JSON.stringify(run1))
+	})
+
 	it('deterministic replay: same seed and same partition/heal schedule → identical metrics', () => {
 		function scriptedRun(): { metrics: SimMetrics; blocked: number } {
 			const config: SimConfig = {
