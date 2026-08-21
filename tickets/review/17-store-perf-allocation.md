@@ -122,3 +122,73 @@ that retires the bug class rather than the one instance.
 - **The `cleanup-store-ring` interaction is a comment, not an enforcement.** Nothing stops that
   later ticket from copying the set/exit logic per call site instead of absorbing it into the
   shared walker.
+
+---
+
+## Review progress (run interrupted by budget — resume here)
+
+A first review pass ran and was cut short by the token budget before lint/tests were run. **No
+code was changed** in that pass; the working tree is exactly the implement commit's. Nothing
+below has been fixed — it is all still open.
+
+### Done so far
+
+Read the implement diff (`94cd6e7`) first, then the store source in full
+(`packages/fret/src/store/digitree-store.ts`, 615 lines) and the `digitree.invariants.spec.ts`
+diff.
+
+**Arm A (tree-key cache) — checked, no finding.**
+
+- Re-ran the staleness grep the handoff asked for: no in-place write to a live entry's `coord`
+  or `id` anywhere in `src/` or `test/`. Every write path (`upsert`, `update`, `importEntries`)
+  constructs a fresh object, so a re-keyed entry misses the cache by identity, as designed.
+- `put` calls `assertCoordWidth` **before** `makeKey`, so a wrong-width coordinate throws and
+  never reaches the cache. Good ordering; worth keeping if that method is ever reordered.
+- `walkFrom` calls `makeKey(e)` per emitted entry to mint its cursor — that now hits the cache
+  too, an unremarked extra win.
+- The module-level `WeakMap` is shared across `DigitreeStore` instances. Harmless: the key an
+  entry object produces does not depend on which store holds it, and no code path hands one
+  store's entry objects to another (`importEntries` builds new objects from `SerializedPeerEntry`).
+
+**Arm B (lap exit) — equivalence argued, one comment-accuracy finding.**
+
+- Equivalence with the old trailing `Array.from(new Set(out))` holds in both regimes.
+  `count <= size()`: the walk collects `count` distinct ids before it can lap, same as before.
+  `count > size()`: old code circled, re-pushing duplicates until `count` pushes, then deduped
+  to the same `size()` ids in the same ring order; new code stops at the first repeat with the
+  same set, and `Set` insertion order preserves the sequence. Byte-for-byte identical.
+- Degenerate `count` values behave as before: `0`, negative and `NaN` all fail `out.size < count`
+  on the first test and return `[]`.
+
+**Finding (minor, comment accuracy — not yet fixed).** The early exit is **unreachable whenever a
+`filter` is supplied**, so soundness condition (2) at the walk site — the filter-purity argument —
+is vacuous as the code stands. With a filter, `maxScan = this.size()` and `scanned` increments on
+*every* entry visited, match or miss; the tree holds exactly `size()` entries with distinct ids
+(the store invariant), so the loop can visit at most one full lap and can never reach the entry
+that would repeat. `out.has(e.id)` is therefore never true on the filtered path. The comment is
+defensive rather than wrong, but it presents a live condition where there is none, and a future
+reader weakening `maxScan` would be relying on an exit that has never actually run. Suggested
+disposition: keep the purity note (it becomes live the moment `maxScan` changes) but say plainly
+that the exit is today reachable only on the unfiltered path, and that `maxScan` is what makes it
+so. Small edit at the `NOTE:` block above `neighborsRight`.
+
+### Not yet done — the whole rest of the review
+
+- **`test/digitree.neighbors.spec.ts` (+202 lines) not read.** Both new describe blocks — the lap
+  exit and the tree-key cache — are unexamined. The handoff's own "known gaps" list flags the
+  wall-clock 500 ms bound in the lap test as the thing a reviewer may want replaced; that call
+  has not been made.
+- **`docs/fret.md` (+35 lines) not verified against the code.** Treat as out of date until read.
+- **`npx tsc --noEmit`, `yarn build`, `yarn test` not run in this pass.** The gate is unmet. Note
+  the repo has no lint step (`AGENTS.md`: `yarn check` is the gate, and `yarn format` must not be
+  run).
+- The handoff's other attack surfaces are unexamined: whether anything can reintroduce a duplicate
+  tree id; the `successorOfCoord` / `predecessorOfCoord` claim that Arm B does not apply to them
+  (reading the code, it holds — they return the first match and never lap — but it was not
+  probed); and the interaction note with `plan/cleanup-store-ring`.
+
+### Resuming
+
+Start from the two unread files above, run the full gate, then decide the wall-clock-test
+question. Fold the filter-purity comment finding into that pass rather than filing it — it is a
+one-line comment edit at a single site, well inside "minor, fix in this pass".
