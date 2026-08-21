@@ -226,7 +226,10 @@ describe('Ring routing through the shipped selector', function () {
 		report('capped n=1000, capacity 32', r)
 
 		expect(r.attempts, 'every scheduled route must have fired').to.equal(ROUTE_COUNT)
-		// Every store saturates at the cap, so knowledge is capacity/n = 3.2% by construction.
+		// The cap is the ceiling, so knowledge cannot exceed capacity/n = 3.2%; in practice every
+		// store reaches it and the reported figure is 3.2% exactly (observed on the shipped metric
+		// and on both substituted ones). The bound is asserted against the ceiling, not against
+		// that observation, so a run that merely fails to saturate still passes here.
 		expect(r.knowledgeFraction, 'the cap is what makes this case sparse').to.be.below(0.05)
 		// Catches XOR (60–77% success), and clockwise-only (83–90%) a second time.
 		expect(r.successRate, 'capacity-bounded sparse routing success')
