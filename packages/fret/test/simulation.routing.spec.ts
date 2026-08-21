@@ -3,6 +3,7 @@ import { expect } from 'chai'
 import { FretSimulation, type SimConfig } from './simulation/fret-sim.js'
 import { percentileSummary } from './simulation/sim-metrics.js'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
+import { chooseNextHop } from '../src/selector/next-hop.js'
 
 /**
  * Does ring routing actually work?
