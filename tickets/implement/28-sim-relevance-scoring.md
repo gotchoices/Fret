@@ -1,12 +1,12 @@
 ---
 description: With the simulated peers now scoring relevance for real, measure the score spread and sweep store capacity to pick the constant the follow-up metric-guard ticket needs.
-prereq: sim-relevance-scoring-wiring
+prereq: sim-relevance-scoring-wiring-scores
 files: packages/fret/test/simulation/fret-sim.ts, packages/fret/src/store/relevance.ts, packages/fret/test/simulation.routing.spec.ts, tickets/implement/28.5-sim-metric-guard-case.md
 difficulty: medium
 ---
 
 Narrowed from the original `sim-relevance-scoring` (2026-08-21, run 3 hit token budget): the
-code changes moved to `sim-relevance-scoring-wiring` (prereq). This ticket is **measurement and
+code changes moved to `sim-relevance-scoring-wiring-scores` (prereq). This ticket is **measurement and
 the capacity decision only** — assume the wiring has landed: per-peer `SparsityModel`s, all five
 upsert sites scoring with sim time, the `LivenessModel` seam scoring route/sweep contacts, and
 production's `2·max(2, m) + 1` protection set in `enforceCapacity`.

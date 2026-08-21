@@ -8,6 +8,7 @@ import { LivenessModel, notDead } from './liveness.js'
 import { SimMeasurement } from './measurement.js'
 import { DigitreeStore } from '../../src/store/digitree-store.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
+import { ringNeighborsBothSides } from '../../src/ring/ring-walk.js'
 import { toCoord } from '../helpers/ring.js'
 
 // Re-exported so spec imports keep coming from this module (a re-export does not bring the
@@ -586,17 +587,38 @@ export class FretSimulation {
 		}
 	}
 
-	/** Enforce store capacity by evicting lowest-relevance entries (never self). */
+	/**
+	 * Enforce store capacity by evicting lowest-relevance entries, skipping a protection set.
+	 *
+	 * The protection set is production's (docs/fret.md — Relevance scoring and table
+	 * management): self plus `max(2, m)` live entries per side of self, gathered by the shipped
+	 * `ringNeighborsBothSides` helper rather than a hand-rolled two-sided walk, so the helper's
+	 * self-slot over-fetch keeps a walk anchored on self from protecting only `m - 1` per side.
+	 * The sim models no `membership`, so `notDead` stands in for production's `isLiveMember`.
+	 * That is `2 * max(2, m) + 1` ids.
+	 *
+	 * **Protection outranks the cap**: with `capacity < 2m + 1` the evictable set runs out and
+	 * the store simply stays over capacity — the slice-based eviction below cannot loop, and it
+	 * must never evict a protected id to get under the cap.
+	 *
+	 * NOTE: eviction is only *ranked* by relevance once something scores entries. The sim still
+	 * populates stores exclusively via `DigitreeStore.upsert`, which fixes relevance at 0, so
+	 * every unprotected entry ties and the ranking degenerates to ring order (`list()` is
+	 * key-ordered). Protection is real regardless of that; relevance ranking becomes real when
+	 * the scoring wiring lands (`sim-relevance-scoring-wiring-scores`), with no change here.
+	 */
 	private enforceCapacity(peerId: string, store: DigitreeStore): void {
 		const cap = this.config.capacity!
 		const overBy = store.size() - cap
 		if (overBy <= 0) return
+		const protectedIds = new Set(
+			ringNeighborsBothSides(store, this.peers.get(peerId)!.coord, Math.max(2, this.config.m), peerId, {
+				filter: notDead,
+			}),
+		)
+		protectedIds.add(peerId)
 		// Sort by relevance ascending and drop the lowest `overBy` in one pass.
-		// NOTE: the sim populates stores exclusively via DigitreeStore.upsert, which
-		// fixes relevance at 0, so today every entry ties and eviction degenerates to
-		// ring order (list() is key-ordered). If the harness ever starts scoring peers,
-		// this becomes true relevance-based eviction with no code change.
-		const evictable = store.list().filter((e) => e.id !== peerId)
+		const evictable = store.list().filter((e) => !protectedIds.has(e.id))
 		evictable.sort((a, b) => a.relevance - b.relevance)
 		for (const e of evictable.slice(0, overBy)) {
 			store.remove(e.id)
