@@ -405,5 +405,35 @@ describe('Relevance scoring properties', function () {
 
 			expect(recordFailure(stale, 0.5, model, now).lastAccess).to.equal(now)
 		})
+
+		it('does not score 500 failures above 1 failure', () => {
+			const now = FIXED_NOW
+			let one = makeEntry({ lastAccess: now })
+			one = recordFailure(one, 0.5, createSparsityModel(), now)
+
+			let five_hundred = makeEntry({ lastAccess: now })
+			for (let i = 0; i < 500; i++) {
+				five_hundred = recordFailure(five_hundred, 0.5, createSparsityModel(), now)
+			}
+
+			expect(five_hundred.relevance).to.not.be.greaterThan(one.relevance)
+		})
+	})
+
+	describe('initialRelevance', () => {
+		it('does not move model.occupancy (a mention is not an observed distance)', () => {
+			const model = createSparsityModel()
+			const before = Float64Array.from(model.occupancy)
+			initialRelevance(makeEntry(), 0.5, model, FIXED_NOW)
+			expect(Array.from(model.occupancy)).to.deep.equal(Array.from(before))
+		})
+
+		it('scores strictly below a single recordSuccess on the same fresh entry, same clock/model', () => {
+			const now = FIXED_NOW
+			const entry = makeEntry({ lastAccess: now })
+			const initial = initialRelevance(entry, 0.5, createSparsityModel(), now)
+			const succeeded = recordSuccess(entry, undefined, 0.5, createSparsityModel(), now)
+			expect(initial).to.be.lessThan(succeeded.relevance)
+		})
 	})
 })
