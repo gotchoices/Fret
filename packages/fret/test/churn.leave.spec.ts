@@ -1,6 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { buildMesh } from './helpers/mesh.js'
 import { waitFor } from './helpers/wait-for.js'
 import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
@@ -59,30 +60,20 @@ describe('Churn leave handling', function () {
 		services.some((svc, i) => i !== departed && svc.getDiagnostics().pingsSent > before[i]!.pingsSent)
 
 	it('a graceful stop sends leave notices to its neighbors without throwing', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 4; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as any[]
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], { profile: 'edge', k: 7, bootstraps: [nodes[0]!.peerId.toString()] })
-			await svc.start()
-			services.push(svc)
-		}
-		// Star topology
-		for (let i = 1; i < nodes.length; i++) {
-			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-		}
-		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
+		const mesh = await buildMesh(4)
+		await mesh.addServices(() => ({ profile: 'edge', k: 7, bootstraps: [mesh.ids[0]!] }))
+		await mesh.connect('star')
+		await waitFor(allConverged(mesh.services, mesh.ids),
 			CONVERGE_MS, 25, 'star of 4 converges before the leave')
-		const diagsBefore = services.map((s: any) => ({ ...s.getDiagnostics() }))
+		const diagsBefore = mesh.services.map((s: any) => ({ ...s.getDiagnostics() }))
 		// stop one node, which should send leave to its neighbors without throwing
-		await services[2].stop()
-		await nodes[2].stop()
-		await waitFor(anyProgressed(services, diagsBefore, 2),
+		await mesh.services[2]!.stop()
+		await mesh.nodes[2]!.stop()
+		await waitFor(anyProgressed(mesh.services, diagsBefore, 2),
 			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 		// ensure remaining services still running
-		for (const s of [services[0], services[1], services[3]]) if (!(s as any).getDiagnostics) throw new Error('service down')
-		await Promise.all(services.map((s: any, i: number) => i === 2 ? Promise.resolve() : s.stop()))
-		await stopAll([nodes[0], nodes[1], nodes[3]].filter(Boolean) as any)
+		for (const s of [mesh.services[0], mesh.services[1], mesh.services[3]]) if (!(s as any).getDiagnostics) throw new Error('service down')
+		await mesh.stop({ skip: [2] })
 	})
 
 	// NOTE: a `leave notice includes replacement suggestions` mesh test used to sit here. It spent
@@ -94,27 +85,13 @@ describe('Churn leave handling', function () {
 	// `Leave notice replacements (sender side)` at the bottom of this file.
 
 	it('fan-out notifies peers beyond immediate S/P', async () => {
-		const nodes = [] as any[]
-		// Use more nodes so fan-out has something to reach beyond S/P
-		for (let i = 0; i < 8; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		const services = [] as CoreFretService[]
-		for (let i = 0; i < nodes.length; i++) {
-			const svc = new CoreFretService(nodes[i], {
-				profile: 'core',
-				k: 7,
-				bootstraps: [nodes[0]!.peerId.toString()],
-			})
-			await svc.start()
-			services.push(svc)
-		}
-		// Star topology
-		for (let i = 1; i < nodes.length; i++) {
-			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-		}
-		await waitFor(allConverged(services, nodes.map((n: any) => n.peerId.toString())),
+		const mesh = await buildMesh(8)
+		await mesh.addServices(() => ({ profile: 'core', k: 7, bootstraps: [mesh.ids[0]!] }))
+		await mesh.connect('star')
+		await waitFor(allConverged(mesh.services, mesh.ids),
 			CONVERGE_MS, 25, 'star of 8 converges before the leave')
 
-		const diagsBefore = services.map(s => ({ ...s.getDiagnostics() }))
+		const diagsBefore = mesh.services.map(s => ({ ...s.getDiagnostics() }))
 
 		// Stop node 3 (middle-ish) — with core profile, fan-out = 4.
 		// NOTE: what this rig can observe is the departure being survived, not the fan-out itself.
@@ -124,37 +101,32 @@ describe('Churn leave handling', function () {
 		// *Dialability*). In a star, node 3 is connected to node 0 alone, so the notice reaches
 		// node 0 and nobody else. Observing a real beyond-S/P fan-out needs `createIdentifyNode`
 		// plus a topology where the departing node holds several connections.
-		await services[3].stop()
-		await nodes[3].stop()
-		await waitFor(anyProgressed(services, diagsBefore, 3),
+		await mesh.services[3]!.stop()
+		await mesh.nodes[3]!.stop()
+		await waitFor(anyProgressed(mesh.services, diagsBefore, 3),
 			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 
 		// All remaining services should still be running
-		for (let i = 0; i < services.length; i++) {
+		for (let i = 0; i < mesh.services.length; i++) {
 			if (i === 3) continue
-			expect(services[i].getDiagnostics()).to.have.property('pingsSent')
+			expect(mesh.services[i]!.getDiagnostics()).to.have.property('pingsSent')
 		}
 
-		await Promise.all(services.map((s, i) => i === 3 ? Promise.resolve() : s.stop()))
-		await stopAll(nodes.filter((_: any, i: number) => i !== 3))
+		await mesh.stop({ skip: [3] })
 	})
 
 	it('oversized replacements array is truncated', async () => {
-		const nodes = [] as any[]
-		for (let i = 0; i < 3; i++) { const n = await createMemNode(); await n.start(); nodes.push(n) }
-		// Star topology
-		for (let i = 1; i < nodes.length; i++) {
-			await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-		}
+		const mesh = await buildMesh(3)
+		await mesh.connect('star')
 
 		let capturedReplacements: string[] | undefined
 
 		// Register a custom leave handler on node 0 to capture the sanitized notice
 		// First, unhandle any existing leave handler, then register our spy
-		try { await nodes[0].unhandle(protocols.PROTOCOL_LEAVE) } catch {}
+		try { await mesh.nodes[0]!.unhandle(protocols.PROTOCOL_LEAVE) } catch {}
 
 		const { registerLeave: regLeave } = await import('../src/rpc/leave.js')
-		await regLeave(nodes[0], async (notice: LeaveNoticeV1) => {
+		await regLeave(mesh.nodes[0]!, async (notice: LeaveNoticeV1) => {
 			capturedReplacements = notice.replacements
 		}, protocols.PROTOCOL_LEAVE)
 
@@ -162,25 +134,25 @@ describe('Churn leave handling', function () {
 
 		// Send a crafted leave notice with 20 replacements (exceeds MAX_REPLACEMENTS=12)
 		const fakeReplacements = Array.from({ length: 20 }, () =>
-			nodes[1].peerId.toString()
+			mesh.nodes[1]!.peerId.toString()
 		)
-		// `from` must match the transport-authenticated sender (nodes[1]); the handler
+		// `from` must match the transport-authenticated sender (mesh.nodes[1]); the handler
 		// now drops leaves whose `from` is spoofed, so this exercises replacement
 		// truncation rather than the identity gate.
 		const notice: LeaveNoticeV1 = {
 			v: 1,
-			from: nodes[1].peerId.toString(),
+			from: mesh.nodes[1]!.peerId.toString(),
 			replacements: fakeReplacements,
 			timestamp: Date.now(),
 		}
-		await sendLeave(nodes[1], nodes[0].peerId.toString(), notice, protocols.PROTOCOL_LEAVE)
+		await sendLeave(mesh.nodes[1]!, mesh.ids[0]!, notice, protocols.PROTOCOL_LEAVE)
 		await new Promise(r => setTimeout(r, 500))
 
 		// Verify truncation: sanitizeReplacements caps at 12
 		expect(capturedReplacements).to.be.an('array')
 		expect(capturedReplacements!.length).to.be.at.most(12)
 
-		await stopAll(nodes)
+		await mesh.stop()
 	})
 })
 
