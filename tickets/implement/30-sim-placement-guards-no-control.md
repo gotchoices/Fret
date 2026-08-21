@@ -1,6 +1,37 @@
 description: Three simulation tests claim to prove that different peer-layout strategies produce different ring shapes, but two of them would pass just as happily against the default layout, so they prove nothing; give them the same both-directions check a sibling test already uses.
-files: packages/fret/test/message-bus.spec.ts, packages/fret/test/churn-scenarios.spec.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/simulation/sim-metrics.ts
+files: packages/fret/test/message-bus.spec.ts, packages/fret/test/churn-scenarios.spec.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/simulation/sim-metrics.ts, packages/fret/test/simulation/placement.ts
 difficulty: easy
+---
+
+<!-- resume-note -->
+Prior agent run stopped on a BUDGET_WARNING before any file edit was made — this is a fresh
+restart of the original ticket, not a partial implementation to unwind. No source or test file
+was touched in the interrupted run. Confirmed during that run (safe to trust, no need to re-derive):
+
+- `packages/fret/test/simulation/fret-sim.ts` line 24: `export type { PlacementStrategy,
+  ClusterConfig } from './placement.js'` — the literal union and `ClusterConfig` shape live in
+  `packages/fret/test/simulation/placement.ts` (not yet read — check it first for the exact
+  strategy name strings and `clusterConfig` field names before writing new sim configs).
+- `packages/fret/test/simulation/sim-metrics.ts`: `SimMetrics` has both `avgRoutingHops` (mean
+  over `routingHops`, all attempts) and `successfulRouteHops: number[]` (hops for successes
+  only, no averaged field precomputed — average it yourself if you pick this one). Matches the
+  ticket's description below exactly.
+- `packages/fret/test/churn-scenarios.spec.ts` lines ~337–453 already has the full pattern to
+  copy: `coordToBigInt`, `maxPeersInOneSpacingArc`, `PlacementCase`, `PLACEMENT_SEEDS = [8008,
+  8009, 8010, 4242, 99]`, `MAX_PEERS_IN_ONE_SPACING_ARC = 7`, `placementReading`,
+  `assertPlacementSeparates`. Read this section directly — it is reproduced in full below too.
+- `packages/fret/test/message-bus.spec.ts` lines ~292–406: the `describe('Placement
+  distributions', ...)` block with the two vacuous cases at ~295–332 (`clustered placement: peers
+  cluster around centers`, using a bare `largestGap > medianGap` check) and ~334–370 (`clustered
+  placement: inter-cluster routing takes more hops`, which never sets `placement: 'clustered'` on
+  its sim config despite the variable name `clusterSim`, and only asserts `routingAttempts === 10`
+  — never reads a hop count). The `skewed placement` case at ~372–405 is already correct, per its
+  own comment — do not touch its assertion, only optionally its inline coord-conversion loop.
+
+Nothing else was explored or decided beyond what's already in the original ticket body below,
+which is unchanged. Start by reading `placement.ts` for the strategy names, then follow the TODO
+list at the bottom in order.
+
 ---
 
 ## Context (already researched — do not re-derive)
@@ -25,7 +56,7 @@ test, landed by the now-complete `sim-placement-test-vacuous` ticket:
 `test/message-bus.spec.ts`'s `describe('Placement distributions', ...)` block (lines ~292–406)
 has three cases; two have no separating power (full analysis already in the ticket history —
 `git log`/prior ticket `30-sim-placement-guards-no-control` in `tickets/complete/` or
-`tickets/plan/` history has it, but the short version is below). Read `clustered placement: peers
+`tickets/plan/` history has it, but the short version is above). Read `clustered placement: peers
 cluster around centers` and `clustered placement: inter-cluster routing takes more hops` at their
 current line numbers before editing — line numbers will drift once you touch the file.
 
@@ -110,6 +141,8 @@ if it's a trivial swap, skip if it adds noise.
 
 ## TODO
 
+- Read `packages/fret/test/simulation/placement.ts` for the exact `PlacementStrategy` literal
+  values and `ClusterConfig` field names before writing any new sim config
 - Create `packages/fret/test/simulation/placement-assertions.ts` with the lifted
   `coordToBigInt`, `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS`, `MAX_PEERS_IN_ONE_SPACING_ARC`
 - Update `churn-scenarios.spec.ts` to import those from the new module instead of defining them
@@ -123,3 +156,8 @@ if it's a trivial swap, skip if it adds noise.
   swap its inline coord-conversion loop for the shared `coordToBigInt` if trivial
 - Run `cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 60000` and confirm all cases pass and finish in reasonable wall time
 - Run `cd packages/fret && npx tsc --noEmit` to confirm no type errors from the new shared module
+
+
+## End
+Work ticket as described above.
+Do NOT commit — runner handles commits after you complete.
