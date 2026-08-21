@@ -26,6 +26,11 @@ import { createMemNode, connectLine, stopAll } from './libp2p.js'
  * await mesh.addServices(() => ({ profile: 'edge', k: 7, bootstraps: [mesh.ids[0]!] }))
  * await mesh.connect('star')   // services first, then dial
  * ```
+ *
+ * NOTE: three specs now repeat the same `addServices({profile:'edge', k:7, bootstraps: i===0 ? []
+ * : [ids[0]]})` + `connect('star')` pair verbatim. Left as-is while it is a 6-line literal that reads
+ * at each site; if more specs adopt it, or the config drifts apart between them by accident, add a
+ * `starMesh(count, opts)` convenience here rather than letting the copies diverge.
  */
 export type Topology = 'star' | 'line' | 'full'
 

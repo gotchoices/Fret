@@ -204,21 +204,24 @@ describe('iterativeLookup does not re-probe a peer', function () {
 		}))
 		await mesh.connect('star')
 		await new Promise(r => setTimeout(r, 2000))
-		const services = mesh.services
 
-		const probed: string[] = []
-		for await (const evt of services[0]!.iterativeLookup(new TextEncoder().encode('visited-key'), {
-			wantK: 7,
-			minSigs: 1,
-			digest: 'Zg',
-			ttl: 4,
-		})) {
-			if (evt.type === 'probing') probed.push(evt.peerId!)
+		// Teardown from a `finally`: a failed assertion must report *itself* rather than be buried
+		// under the exit watchdog's open-handle dump for the nodes the throw skipped past.
+		try {
+			const probed: string[] = []
+			for await (const evt of mesh.services[0]!.iterativeLookup(new TextEncoder().encode('visited-key'), {
+				wantK: 7,
+				minSigs: 1,
+				digest: 'Zg',
+				ttl: 4,
+			})) {
+				if (evt.type === 'probing') probed.push(evt.peerId!)
+			}
+
+			expect(new Set(probed).size, `probed the same peer twice: ${probed.join(', ')}`)
+				.to.equal(probed.length)
+		} finally {
+			await mesh.stop()
 		}
-
-		expect(new Set(probed).size, `probed the same peer twice: ${probed.join(', ')}`)
-			.to.equal(probed.length)
-
-		await mesh.stop()
 	})
 })
