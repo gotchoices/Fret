@@ -7,7 +7,13 @@ import { PartitionModel } from './reachability.js'
 import { LivenessModel, notDead } from './liveness.js'
 import { SimMeasurement } from './measurement.js'
 import { DigitreeStore } from '../../src/store/digitree-store.js'
-import { createSparsityModel } from '../../src/store/relevance.js'
+import {
+	createSparsityModel,
+	initialRelevance,
+	normalizedLogDistance,
+	observeDistance,
+	touch,
+} from '../../src/store/relevance.js'
 import type { SparsityModel } from '../../src/store/relevance.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
 import { ringNeighborsBothSides } from '../../src/ring/ring-walk.js'
@@ -194,9 +200,21 @@ export class FretSimulation {
 		this.peers.set(peer.id, peer)
 		// `addPeer` is the single construction seam (initialize() and handleJoin() both go
 		// through it), so creating the model here covers every peer exactly once.
-		this.models.set(peer.id, createSparsityModel())
+		const model = createSparsityModel()
+		this.models.set(peer.id, model)
 		const store = new DigitreeStore()
 		store.upsert(peer.id, peer.coord)
+		// Score the self entry so it does not sit at the 0 sentinel `upsert` leaves. Self is
+		// eviction-protected anyway, so this only affects what the relevance index reads. The
+		// distance is 0 (self to itself) and the KDE is deliberately *not* observed with it:
+		// self is not a peer at some distance, and feeding 0 would bias every peer's occupancy
+		// toward the near end of the axis.
+		const now = this.scheduler.getCurrentTime()
+		const selfEntry = store.getById(peer.id)!
+		store.update(peer.id, {
+			relevance: initialRelevance(selfEntry, normalizedLogDistance(peer.coord, peer.coord), model, now),
+			lastAccess: now,
+		})
 		this.stores.set(peer.id, store)
 		this.metrics.recordJoin()
 		return peer
@@ -361,6 +379,9 @@ export class FretSimulation {
 						// for the dead re-probe ordering (upsert stamps wall-clock time).
 						if (store.getById(entry.id)?.state === 'dead') continue
 						store.upsert(p.id, p.coord)
+						// NOTE: gossip-fed KDE — a deliberate deviation from production's
+						// hearsay rule; the reasoning lives on `scoreMerge`.
+						this.scoreMerge(msg.to, store, p.id)
 					}
 				}
 				if (this.config.capacity) {
@@ -393,8 +414,22 @@ export class FretSimulation {
 		const alivePeers = Array.from(this.peers.values())
 			.filter((p) => p.id !== peerId && p.alive && this.partitionModel.reachable(peerId, p.id))
 		const sample = this.rng.shuffle(alivePeers).slice(0, Math.min(maxConn, alivePeers.length))
+		// A bootstrap dial is *proven contact*, not hearsay, so these take production's `touch`
+		// (accessCount incremented, KDE observed) rather than the merge sites' hearsay rule.
+		// `handleConnect` takes no time parameter, so the clock is read here.
+		const model = this.models.get(peerId)!
+		const simNow = this.scheduler.getCurrentTime()
 		for (const other of sample) {
 			store.upsert(other.id, other.coord)
+			const entry = store.getById(other.id)
+			if (entry) {
+				const scored = touch(entry, normalizedLogDistance(peer.coord, other.coord), model, simNow)
+				store.update(other.id, {
+					relevance: scored.relevance,
+					lastAccess: scored.lastAccess,
+					accessCount: scored.accessCount,
+				})
+			}
 			peer.connected.add(other.id)
 			this.metrics.recordConnection()
 		}
@@ -589,21 +624,65 @@ export class FretSimulation {
 			// Merge neighbor's view into peer's store. A merge never resurrects (or touches)
 			// a locally-dead entry — production upsert preserves state and a re-seed does not
 			// resurrect; skipping also keeps lastAccess sim-deterministic for re-probe ordering.
+			// NOTE: gossip-fed KDE — a deliberate deviation from production's hearsay rule; the
+			// reasoning lives on `scoreMerge`. Scoring runs only where the upsert ran, so the
+			// dead skip in each condition skips the scoring with it.
 			for (const id of [...nRight, ...nLeft]) {
 				const p = this.peers.get(id)
-				if (p && p.alive && store.getById(id)?.state !== 'dead') store.upsert(p.id, p.coord)
+				if (p && p.alive && store.getById(id)?.state !== 'dead') {
+					store.upsert(p.id, p.coord)
+					this.scoreMerge(peer.id, store, p.id)
+				}
 			}
 
-			// Merge peer's view into neighbor's store
+			// Merge peer's view into neighbor's store. Each side scores with *its own* model and
+			// its own coord as the "self" of the distance — the peer's store is the peer's view.
 			for (const id of [...peerRight, ...peerLeft]) {
 				const p = this.peers.get(id)
-				if (p && p.alive && nstore.getById(id)?.state !== 'dead') nstore.upsert(p.id, p.coord)
+				if (p && p.alive && nstore.getById(id)?.state !== 'dead') {
+					nstore.upsert(p.id, p.coord)
+					this.scoreMerge(nid, nstore, p.id)
+				}
 			}
 
 			if (this.config.capacity) {
 				this.enforceCapacity(nid, nstore)
 			}
 		}
+	}
+
+	/**
+	 * Score one merged (hearsay) entry in `storeOwnerId`'s store — the shared rule for every
+	 * merge site: the bus `neighbor-response` path and both directions of
+	 * `exchangeNeighborsDirect`. Call it only where the upsert actually ran, so a skipped
+	 * locally-dead entry is skipped here too.
+	 *
+	 * It reads the scheduler clock itself rather than taking a `time` parameter, which is a
+	 * deliberate difference from `LivenessModel`'s scoring calls (they take `time` because an
+	 * event's own time and the scheduler's are not the same number on the `processEvent` /
+	 * `advanceTo` paths). None of the three merge sites has a `time` in scope, and routing the
+	 * read through one helper is what stops the bus and instant paths from stamping different
+	 * timestamps or applying different scoring rules. Do not "fix" it into a parameter.
+	 *
+	 * NOTE: deviation from production, and the sim needs it. Production scores a gossiped peer
+	 * once at creation and never feeds its distance to the KDE (`initialRelevance` alone — see
+	 * docs/fret.md, Relevance scoring and table management). Here gossip *does* feed the KDE and
+	 * an already-held entry is re-scored on every merge, because a sim peer sees orders of
+	 * magnitude fewer contact events than a real node: proven contact alone supplies at most
+	 * about `maxConnections` observations per peer, so at `alpha = 0.03` occupancy stays near 0,
+	 * the ideal/density ratio stays above `sMax^(1/beta) ~= 2.63`, and every entry clamps at
+	 * `sMax = 1.8` and ties — the same degeneracy relevance ranking exists to escape, one layer
+	 * down. Re-scoring lets the bonus track growing occupancy.
+	 */
+	private scoreMerge(storeOwnerId: string, store: DigitreeStore, id: string): void {
+		// Churn: the entry can be gone by the time we score it.
+		const entry = store.getById(id)
+		if (!entry) return
+		const model = this.models.get(storeOwnerId)!
+		const x = normalizedLogDistance(this.peers.get(storeOwnerId)!.coord, entry.coord)
+		observeDistance(model, x)
+		const now = this.scheduler.getCurrentTime()
+		store.update(id, { relevance: initialRelevance(entry, x, model, now), lastAccess: now })
 	}
 
 	/**
@@ -620,11 +699,11 @@ export class FretSimulation {
 	 * the store simply stays over capacity — the slice-based eviction below cannot loop, and it
 	 * must never evict a protected id to get under the cap.
 	 *
-	 * NOTE: eviction is only *ranked* by relevance once something scores entries. The sim still
-	 * populates stores exclusively via `DigitreeStore.upsert`, which fixes relevance at 0, so
-	 * every unprotected entry ties and the ranking degenerates to ring order (`list()` is
-	 * key-ordered). Protection is real regardless of that; relevance ranking becomes real when
-	 * the scoring wiring lands (`sim-relevance-scoring-wiring-scores`), with no change here.
+	 * Eviction here is genuinely relevance-ranked: every entry a store holds is scored at the
+	 * site that put it there — the self-seed in `addPeer`, the bootstrap dials in
+	 * `handleConnect`, the three merge sites through `scoreMerge`, and the per-tick contact
+	 * sweep through `LivenessModel` — so unprotected entries no longer all tie at the 0 that
+	 * bare `upsert` leaves. Protection outranks that ranking, as above.
 	 */
 	private enforceCapacity(peerId: string, store: DigitreeStore): void {
 		const cap = this.config.capacity!
