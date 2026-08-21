@@ -29,9 +29,9 @@ describe('RPC handler fault isolation over the wire', function () {
 	this.timeout(30000)
 
 	// No case in this file may leak a rejection. Registered on this describe, not at file top
-	// level (a top-level hook is a *root* hook and would run against the whole suite). Its twin
-	// in `rpc.handler-fuzz.spec.ts` is deliberately a copy, not a shared import — a shared one
-	// would have to be installed by a root hook to cover both files.
+	// level (a top-level hook is a *root* hook and would run against the whole suite). Its twins
+	// in each sibling file are deliberately copies, not a shared import — a shared one would
+	// have to be installed by a root hook to cover them all.
 	const unhandled: unknown[] = []
 	const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
 
