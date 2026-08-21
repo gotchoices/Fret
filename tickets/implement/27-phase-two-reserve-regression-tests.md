@@ -5,6 +5,52 @@ difficulty: medium
 ---
 
 <!-- resume-note -->
+## Resume note (run 4 — BUDGET_WARNING on third tool call; no code written)
+
+Working tree untouched (`git status` still only untracked `tickets/.in-progress`; HEAD `911ae0f`).
+Run 4 re-read the rig, the whole spec, and grepped the service for the flip sites. It **confirms**
+run 3's note below in full — nothing in it is corrected — and adds the exact coordinates the next
+run would otherwise re-derive. Read run 3's note, then this list, then write the two cases.
+
+### Confirmed, do not re-verify
+
+- **Rig API is exactly as run 2's note describes.** `test/helpers/maintenance-rig.ts`:
+  `PeerRig.setProtocolBehavior(id, protocol, b)` (checked *before* the per-peer `behavior` map, in
+  `PeerRig.open`), `behavior`, `protocolsSeenBy`, `holdMs`, `inFlight`, `highWater`; and on the
+  `MaintenanceRig`: `ping()`, `neighbors()`, `concurrency()`, `setTickBudget()`, `seedPeers()`,
+  `teardown()`. There is **no** `setPhaseOneBudget` and neither new case needs one.
+- `seedPeers(count, membership, patch?)` mints real Ed25519 ids at true ring coords, marks each
+  dialable, and `buildMaintenanceRig` stubs `getConnections` so **every** peer has one open
+  connection. So the connection-only `fetchNeighbors` really does open a stream — which is what
+  makes case 2's `!answered`-gate flip a genuine bite rather than a no-op.
+- The spec's local aliases (`ping`, `neighbors`, `seedPeers`, `setTickBudget`, `concurrency`,
+  `tick()` returning elapsed ms) and the `evidence(id)` snapshot helper all exist near the top of
+  `test/stabilize-concurrency.spec.ts`; `this.timeout(10000)` is the describe-level default.
+
+### Exact sites (line numbers from HEAD `911ae0f`; grep the symbol, don't trust the number)
+
+`packages/fret/src/service/fret-service.ts`:
+- `MAINTENANCE_SNAPSHOT_TIMEOUT_MS = 1000` declared :334; `STABILIZE_PHASE_ONE_BUDGET_MS = 3000` :370.
+- `stabilizeOnce` :2234 — phase-1 `deadline(...)` :2245, pooled `probeAndFetch` call :2249,
+  phase-2 target selection :2281.
+- `nearProbeTargets` :2296, `probeAndFetch` :2313 (its `!answered` gate is the `return []` just
+  above the `fetchAndMergeSnapshot` call at :2324 — **case 2's bite flip**), `phaseTwoTargets` :2409.
+- `fetchAndMergeSnapshot` :2626 — its `fetchNeighbors` options carry
+  `timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS` at **:2634. That single line is case 1's
+  bite flip** (delete it -> falls back to the route-sized `RPC_TIMEOUT_MS` 5000 -> the stalled fetch
+  outruns the 5000 ms tick budget -> phase 2 early-returns and the phase-2 peers are never opened).
+  Put it back after running the one case.
+
+### Where to put the two cases
+
+`test/stabilize-concurrency.spec.ts` is organized by `// ----- section -----` banners in this
+order: headline regression, pool cap, ping-before-fetch per peer, disjoint candidate lists,
+truncation is not evidence, rotation, phase-2 target selection. Add a new
+`// ----- phase-2 reserve -----` section **immediately after the headline-regression case** (it is
+the same family: one stalled peer must not cost the tick its other work) and put both new cases
+there. Also add the two new concerns to the bullet list in the file-header comment, which
+enumerates the properties the spec pins.
+
 ## Resume note (run 3 — stopped on BUDGET_WARNING on the second tool call; no code written)
 
 Run 3 changed nothing in the working tree (`git status` still shows only the untracked
