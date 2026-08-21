@@ -3,20 +3,52 @@ files: packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/protocol
 difficulty: easy
 
 <!-- resume-note -->
-Fifth interrupted run. Runs 1-2: pure investigation, stopped on BUDGET_WARNING before any
+Sixth interrupted run. Runs 1-2: pure investigation, stopped on BUDGET_WARNING before any
 edits. Run 3: landed one edit (added `FretProtocols` type export to `protocols.ts`), then hit
 BUDGET_WARNING before wiring it in. Run 4: wired that type in, re-verified all prior anchors
 still hold, found one new concrete duplication, hit BUDGET_WARNING again before applying
-anything else. Run 5 (this run): made **zero code edits** — spent the run verifying the build,
-per run 4's own instruction to do this before adding more changes on top. Result:
-`cd packages/fret && npx tsc --noEmit` is clean (no errors), and `yarn test` is fully green —
-**1116 passing, 0 failing**. So every type-only edit from runs 3-4 (the `FretProtocols` import
-and field type at lines 19/210) is confirmed safe. Hit BUDGET_WARNING immediately after the test
-run completed, before starting on any of the remaining TODO items below. This note supersedes
-all previous ones; everything below is carried forward and still accurate. **The tsc/test
-verification is now done — do not re-run it reflexively at the very start of the next run just
-because past notes said to; it was clean as of this run's commit. Do re-run it after applying
-the remaining edits below, since those are real code changes (not just type-only ones).**
+anything else. Run 5: made **zero code edits** — verified the build instead. Result:
+`cd packages/fret && npx tsc --noEmit` clean, `yarn test` **1116 passing, 0 failing** — so the
+runs 3-4 type-only edits (the `FretProtocols` import and field type at lines 19/210, still there
+unchanged) are confirmed safe. Hit BUDGET_WARNING right after. Run 6 (this run): made **zero
+code edits** — re-read `start()` (874-972), `addNodeListener`/`removeNodeListeners` (1020-1032),
+`ready()` (1039), `stop()` (974-1006): every file:line anchor below is re-confirmed byte-for-byte
+unchanged from run 4/5. Then looked up the one open unknown for the "type laziness" TODO — the
+real libp2p event-payload types — and hit BUDGET_WARNING immediately after, before writing any
+code. That lookup's answer is recorded below; it removes the only remaining unknown blocking that
+TODO item. This note supersedes all previous ones; everything below is carried forward and still
+accurate. **tsc/test verification was clean as of run 5's commit — do not re-run reflexively at
+the very start of the next run; re-run it only after applying real code edits.**
+
+**New this run — libp2p event payload types** (from
+`node_modules/@libp2p/interface/dist/src/index.d.ts`, `Libp2pEvents` interface, ~line 219):
+```
+'peer:connect': CustomEvent<PeerId>;
+'peer:disconnect': CustomEvent<PeerId>;
+'peer:identify': CustomEvent<IdentifyResult>;
+'peer:update': CustomEvent<PeerUpdate>;
+```
+Confirms the existing code comments ("libp2p v3: evt.detail is the PeerId directly") are correct
+for connect/disconnect. `IdentifyResult` and `PeerUpdate` are exported from `@libp2p/interface`
+too (import alongside `PeerId`/`Startable` at the top of `fret-service.ts`, line 1). So the
+concrete typing for `nodeListeners`/`addNodeListener`/the four handlers is:
+- `peer:connect`, `peer:disconnect` handlers: `(evt: CustomEvent<PeerId>) => void`
+- `peer:identify` handler: `(evt: CustomEvent<IdentifyResult>) => void`
+- `peer:update` handler: `(evt: CustomEvent<PeerUpdate>) => void`
+Four different payload types is why `nodeListeners`/`addNodeListener` (which store all four
+under one array) can't trivially drop to one non-`any` handler shape — either keep `addNodeListener`
+generic (`addNodeListener<K extends keyof Libp2pEvents>(type: K, handler: (evt: Libp2pEvents[K]) => void)`,
+importing `Libp2pEvents` from `@libp2p/interface`, which is the type the real `node.addEventListener`
+already expects — check this compiles against `this.node`'s type, since `Libp2p<T>` extends
+`TypedEventTarget<Libp2pEvents<T>>`) or leave the array typed loosely but type each individual
+`addNodeListener('peer:connect', (evt: CustomEvent<PeerId>) => ...)` call site by hand and keep
+`nodeListeners`'s own storage as `Array<{ type: string; handler: (evt: Event) => void }>` (narrower
+than `any` — `Event` is the real base type `CustomEvent` extends, not an escape hatch) with a cast
+only at the two `addEventListener`/`removeEventListener` call sites inside
+`addNodeListener`/`removeNodeListeners` themselves (those casts are structurally necessary — a
+heterogeneous array of specifically-typed handlers cannot line up with libp2p's own overloaded
+`addEventListener<K>` signature without one). The generic-method route is cleaner if it type-checks;
+try that first.
 
 ## Done this run (already landed in the working tree — do not redo)
 
