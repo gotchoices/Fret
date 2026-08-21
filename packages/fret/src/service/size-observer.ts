@@ -29,7 +29,13 @@ export interface LocalSizeEstimate {
 }
 
 export interface SizeObserverOptions {
-	/** Sliding window; observations older than this are dropped. Default 300_000. */
+	/**
+	 * Sliding window; observations older than this are dropped. Default 300_000.
+	 * NOTE: both bounds degenerate at 0 — `windowMs: 0` makes the age filter (`timestamp > now`)
+	 * drop the observation just pushed, and `maxObservations: 0` is a no-op because `slice(-0)`
+	 * returns the whole array. Neither is validated: the service always takes the defaults and only
+	 * the spec passes these. If a production path ever configures them, validate at construction.
+	 */
 	windowMs?: number;
 	/** Hard count bound; the newest are kept. Default 100. */
 	maxObservations?: number;
