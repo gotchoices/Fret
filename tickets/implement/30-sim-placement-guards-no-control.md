@@ -4,33 +4,36 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-SIXTH interrupted run — BUDGET_WARNING hit before any edit, only ran `ls`/`wc -l` (no file
-content read/write). Confirmed by byte/line count, nothing has changed: `placement-assertions.ts`
-still exists (2103 bytes); `churn-scenarios.spec.ts` still 453 lines; `message-bus.spec.ts` still
-465 lines — matching the line numbers this note already cites below. **Section 1 is DONE and
-confirmed written**: `packages/fret/test/simulation/placement-assertions.ts` now exists with
-exactly the content under "1." below (coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS,
-MAX_PEERS_IN_ONE_SPACING_ARC, all exported, verbatim). Do NOT rewrite it, do NOT re-read it to
-confirm — it is correct. **Seventh run: do not run any exploratory command at all before editing
-— not `ls`, not `wc`, not `Read`.** Go straight to the first `Edit` call for section 2 (edit
-`churn-scenarios.spec.ts`), then section 3 (edit `message-bus.spec.ts`, including the measure-run
-to fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC`), then the two verification commands at the
-bottom of the TODO list. Do not open `placement.ts` / `fret-sim.ts` / `sim-metrics.ts` / either
-spec file to "confirm" anything first — the snippets below are verified current-state quotes, not
-paraphrases, and nothing has touched those files across six runs now. If BUDGET_WARNING fires
-again before section 2's Edit call completes, do not spend the remaining turn on any read-only
-command — either make the edit or stop immediately and leave this note as-is.
+EIGHTH run continues here. Sections 1 AND 2 are now DONE and confirmed:
 
-Confirmed exact state as of this run (nothing has touched these files):
+- `packages/fret/test/simulation/placement-assertions.ts` exists (section 1, done several runs
+  ago) exporting `coordToBigInt`, `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS`,
+  `MAX_PEERS_IN_ONE_SPACING_ARC` — verbatim per "1." below. Do not touch.
+- `packages/fret/test/churn-scenarios.spec.ts` (section 2, done THIS run): L3 now has
+  `import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS, MAX_PEERS_IN_ONE_SPACING_ARC } from './simulation/placement-assertions.js'`
+  right after the existing L1–2 imports; the four lifted local definitions (old `coordToBigInt`,
+  `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS`, the measured-table comment + `MAX_PEERS_IN_ONE_SPACING_ARC`)
+  are deleted. `PlacementCase` interface survives untouched, now starting at L338. Confirmed by
+  re-reading L325–354 after the edit: `interface PlacementCase { ... }` sits directly after the
+  `describe` block's closing `})`, followed by `placementReading`. A transient TS2440 "Import
+  declaration conflicts with local declaration" diagnostic appeared between the two edit calls
+  (expected — it's a snapshot taken between deleting the import-adding edit and the
+  local-decl-deleting edit landing) and is gone once both edits are applied; do not re-chase it,
+  it is not a real conflict in the current file.
 
-- `packages/fret/test/churn-scenarios.spec.ts`: imports at L1–2 (`import { describe, it } from
-  'mocha'` and `import { FretSimulation, type PlacementStrategy } from './simulation/fret-sim.js'`).
-  The placement-guard section runs L337–453: `coordToBigInt` (L337–344), `maxPeersInOneSpacingArc`
-  + its doc comment (L346–371), `PlacementCase` interface (L373–376), `PLACEMENT_SEEDS` (L378–379),
-  the measured-table comment + `MAX_PEERS_IN_ONE_SPACING_ARC = 7` (L381–394), `placementReading`
-  (L396–423), `assertPlacementSeparates` (L425–453). Two call sites earlier in the file (inside the
-  `describe` block, not touched by this ticket): L326 `assertPlacementSeparates('batch burst', ...)`
-  and L333 `assertPlacementSeparates('steady trickle', ...)`.
+**Ninth run: go straight to section 3 (edit `message-bus.spec.ts`).** Do not re-read
+`churn-scenarios.spec.ts` or `placement-assertions.ts` — both confirmed correct above. Section
+3 needs a Read of `message-bus.spec.ts` first (required by the Edit tool anyway), then the two
+`Edit` calls per "3." below, including the measure-run to fill in
+`CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` (this needs actually running the test file once with a
+loose threshold — a real `node --import ./register.mjs ...mocha.js "test/message-bus.spec.ts"`
+invocation, not a guess). Then the two verification commands at the bottom of the TODO list
+(mocha run + tsc). If BUDGET_WARNING fires again before section 3's edits land, stop immediately
+rather than starting the measure-run mid-budget — a half-applied edit plus an unrun measurement
+is worse than leaving section 3 untouched for the next run.
+
+Confirmed exact state as of this run (message-bus.spec.ts untouched across all runs so far):
+
 - `packages/fret/test/message-bus.spec.ts`: imports at L1–6, including L6
   `import { FretSimulation } from './simulation/fret-sim.js'`. The `describe('Placement
   distributions', ...)` block starts L292 (`this.timeout(60000)` at L293). Three cases, exact
@@ -296,8 +299,9 @@ which is what the snippets above do, rather than relying on passing `clusterConf
 
 - [x] Create `packages/fret/test/simulation/placement-assertions.ts` — DONE, confirmed written
       this run, verbatim match to "1." above
-- [ ] Edit `churn-scenarios.spec.ts` per "2." above (add import, delete the four lifted
-      definitions, keep `PlacementCase`/`placementReading`/`assertPlacementSeparates`)
+- [x] Edit `churn-scenarios.spec.ts` per "2." above (add import, delete the four lifted
+      definitions, keep `PlacementCase`/`placementReading`/`assertPlacementSeparates`) — DONE,
+      confirmed via re-read after edit
 - [ ] Edit `message-bus.spec.ts` per "3." above — replace both vacuous cases with the snippets
       given; run once with a loose/zero threshold in case 1 to capture real readings across
       `PLACEMENT_SEEDS`, then fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` with a real
