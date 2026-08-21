@@ -1633,10 +1633,13 @@ export class FretService implements IFretService, Startable {
 		try {
 			const selfCoord = await this.selfCoord();
 			const selfStr = this.node.peerId.toString();
-			// Unfiltered store walk: leave notices go to all ring neighbors (matches handleLeave /
-			// computeReplacements). Ring reads elsewhere use member-scoped getNeighbors.
+			// Unfiltered store walk, deliberately: unlike every other ring read (which uses the
+			// member-scoped views) this list is not one we advertise — it *defines* the S/P window
+			// the replacement list excludes, so a `foreign` or `dead` id costs one skipped dial
+			// (`isDoomedDial` below) and nothing else. `computeReplacements`' own walk is filtered,
+			// which is the opposite rule and the point.
 			//
-			// **One array, two readers.** `ids` is both who we notify and what our own S/P window
+			// **One array, three readers.** `ids` is both who we notify and what our own S/P window
 			// *is* — the set `computeReplacements` excludes and the beyond-S/P fan-out below
 			// filters on. Deriving one from a truncated copy of the other is what made the two
 			// diverge: the old walk was side-major and capped the concatenation at 8, so at the
