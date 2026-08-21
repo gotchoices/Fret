@@ -2,6 +2,7 @@ import type { Libp2p } from 'libp2p'
 import type { FretConfig } from '../../src/index.js'
 import { FretService } from '../../src/service/fret-service.js'
 import { createMemNode, connectLine, stopAll } from './libp2p.js'
+import type { Cleanup } from './cleanup.js'
 
 /**
  * Multi-node rig for the specs that stand up a real topology of in-memory libp2p nodes and
@@ -47,6 +48,17 @@ export interface MeshOptions {
 	 * TCP, or `createIdentifyNode` when the spec needs libp2p's `identify` to run.
 	 */
 	factory?: NodeFactory
+	/**
+	 * Teardown registry (see `helpers/cleanup.ts`). When supplied, `mesh.stop()` is registered on
+	 * it the moment the mesh exists, so a case that throws before its last statement still tears
+	 * the mesh down. This is the path that makes the leak structurally unwritable — a spec author
+	 * cannot forget a teardown the helper owns.
+	 *
+	 * `mesh.stop()` is idempotent enough to be the registered step even for a case that stops a
+	 * node or service mid-test: every stop in it is best-effort, so re-stopping something already
+	 * stopped is logged at worst, never thrown.
+	 */
+	cleanup?: Cleanup
 }
 
 export interface StopOptions {
@@ -105,11 +117,12 @@ export async function buildMesh(count: number, opts: MeshOptions = {}): Promise<
 			// service cannot strand the listeners behind it for the exit watchdog to report.
 			for (let i = services.length - 1; i >= 0; i--) {
 				if (skip.has(i)) continue
-				try { await services[i]!.stop() } catch { /* teardown is best-effort */ }
+				try { await services[i]!.stop() } catch (err) { console.error('[test cleanup] service stop failed:', err) }
 			}
 			await stopAll(nodes.filter((_, i) => !skip.has(i)))
 		}
 	}
+	opts.cleanup?.add(() => mesh.stop())
 	return mesh
 }
 

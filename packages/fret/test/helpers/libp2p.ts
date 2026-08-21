@@ -61,8 +61,11 @@ export async function connectLine(nodes: any[]): Promise<void> {
 }
 
 export async function stopAll(nodes: any[]): Promise<void> {
+	// Newest first, best-effort per node: one throwing `stop()` must not strand the nodes behind
+	// it for the exit watchdog to dump on. Logged rather than swallowed — "don't strand siblings"
+	// is not "hide failures".
 	for (const n of [...nodes].reverse()) {
-		try { await n.stop() } catch {}
+		try { await n.stop() } catch (err) { console.error('[test cleanup] node stop failed:', err) }
 	}
 }
 

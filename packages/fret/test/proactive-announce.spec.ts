@@ -1,9 +1,13 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { buildMesh } from './helpers/mesh.js'
+import { useCleanup } from './helpers/cleanup.js'
 
 describe('Proactive announcements', function () {
 	this.timeout(30000)
+	// Every mesh below is registered for teardown at construction, so a failed assertion tears
+	// its nodes down instead of leaving them for the exit watchdog to dump on top of the failure.
+	const cleanup = useCleanup()
 
 	// NOTE: every test here still gates on a fixed 2-4 s sleep rather than on a condition, so each
 	// one's premise ("announcements happened at all") is a wall-clock bet, not an observation. That
@@ -14,7 +18,7 @@ describe('Proactive announcements', function () {
 	// gates in `churn.leave.spec.ts`), not a longer sleep.
 
 	it('on-start announce fires after first stabilization tick', async () => {
-		const mesh = await buildMesh(3)
+		const mesh = await buildMesh(3, { cleanup })
 		await mesh.addServices({ profile: 'core', k: 7, bootstraps: [mesh.ids[0]!] })
 		await mesh.connect('line')
 
@@ -26,12 +30,10 @@ describe('Proactive announcements', function () {
 			(sum, svc) => sum + svc.getDiagnostics().announcementsSent + svc.getDiagnostics().announcementsSkipped, 0
 		)
 		expect(totalAttempted).to.be.greaterThan(0)
-
-		await mesh.stop()
 	})
 
 	it('peer disconnect triggers proactive announcement to remaining neighbors', async () => {
-		const mesh = await buildMesh(5)
+		const mesh = await buildMesh(5, { cleanup })
 		await mesh.addServices({ profile: 'core', k: 7, bootstraps: [mesh.ids[0]!] })
 		await mesh.connect('full')
 
@@ -54,22 +56,17 @@ describe('Proactive announcements', function () {
 		}
 		expect(additionalAnnouncements).to.be.greaterThan(0)
 
-		// Node 2's libp2p node is already down, but its FretService is not — mesh.stop's `skip`
-		// leaves both alone, so the service must be stopped explicitly or its internal timers
-		// (stabilization interval, etc.) leak past the test. In a `finally` because teardown here
-		// is inline rather than in an `afterEach`: a throw from this one stop would otherwise
-		// strand the other four nodes and services for the exit watchdog to dump on top of it.
-		try {
-			await mesh.services[2]!.stop()
-		} finally {
-			await mesh.stop({ skip: [2] })
-		}
+		// Node 2's libp2p node was stopped mid-test above; its FretService was not, and its
+		// stabilization timer would leak past the case. The registered `mesh.stop()` covers both:
+		// it stops every service (including node 2's) and then every node, and each stop is
+		// best-effort, so re-stopping the already-stopped node 2 is a no-op rather than a throw.
+		// No `skip` list is needed, and nothing here has to run before the assertion.
 	})
 
 	it('edge profile sends fewer announcements than core (bounded fanout)', async () => {
 		/** Six nodes on `profile`, fully meshed, services started before the dials. */
 		const announceCluster = async (profile: 'edge' | 'core') => {
-			const mesh = await buildMesh(6)
+			const mesh = await buildMesh(6, { cleanup })
 			await mesh.addServices({ profile, k: 7, bootstraps: [mesh.ids[0]!] })
 			await mesh.connect('full')
 			return mesh
@@ -99,8 +96,6 @@ describe('Proactive announcements', function () {
 		// limits). Deliberately not strict `>`: fan-out is a *ceiling*, and on a six-node mesh
 		// both profiles can legitimately saturate below it and tie.
 		expect(coreTotal).to.be.greaterThanOrEqual(edgeTotal)
-
-		await Promise.all([edgeMesh.stop(), coreMesh.stop()])
 	})
 
 	// NOTE: `rate limiting prevents announcement storms` used to sit here. It computed a
@@ -112,7 +107,7 @@ describe('Proactive announcements', function () {
 
 	it('new peer discovery via gossip triggers announcement to non-connected peers', async () => {
 		// Topology: A-B-C where A learns about C via B's snapshot (without direct connection)
-		const mesh = await buildMesh(4)
+		const mesh = await buildMesh(4, { cleanup })
 		await mesh.addServices({ profile: 'core', k: 7, bootstraps: [mesh.ids[0]!] })
 		await mesh.connect('line')
 
@@ -130,8 +125,6 @@ describe('Proactive announcements', function () {
 		// Node 0 should know about more peers than just node 1 (learned via gossip)
 		const store0 = mesh.services[0]!.getStore()
 		expect(store0.size()).to.be.greaterThan(2)
-
-		await mesh.stop()
 	})
 
 	// NOTE: `diagnostics track announcementsSkipped counter` used to sit here. It stood up three

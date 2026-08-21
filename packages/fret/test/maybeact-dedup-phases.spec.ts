@@ -5,6 +5,7 @@ import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { PROTOCOL_MAYBE_ACT } from '../src/rpc/protocols.js'
 import { starMesh } from './helpers/mesh.js'
+import { useCleanup, type Cleanup } from './helpers/cleanup.js'
 import type { RouteAndMaybeActV1 } from '../src/index.js'
 import type { RpcOutcome } from '../src/rpc/outcome.js'
 
@@ -13,15 +14,20 @@ import type { RpcOutcome } from '../src/rpc/outcome.js'
  * The requester sends over the wire so the whole inbound path (dedup cache included) runs,
  * which is where the phase collision lived — `routeAct` alone never touches the cache.
  */
-async function makePair() {
+async function makePair(cleanup: Cleanup) {
 	const requester = await createMemoryNode(); await requester.start()
 	const responder = await createMemoryNode(); await responder.start()
+	// Registered before the dial below rather than after the pair is fully built: a throw from
+	// the dial or from either `start()` must still tear down what already exists.
+	cleanup.add(() => stopAll([requester, responder]))
 	await requester.dial(responder.getMultiaddrs()[0]!)
 
 	const svcResponder = new CoreFretService(responder, { profile: 'edge', k: 7 })
 	const svcRequester = new CoreFretService(requester, {
 		profile: 'edge', k: 7, bootstraps: [responder.peerId.toString()]
 	})
+	// Registered after the nodes, so the newest-first unwind stops the services first.
+	cleanup.add(async () => { await svcRequester.stop(); await svcResponder.stop() })
 	await svcResponder.start()
 	await svcRequester.start()
 	await new Promise(r => setTimeout(r, 800))
@@ -56,9 +62,10 @@ function replyOf<T>(out: RpcOutcome<T>): T {
 
 describe('maybeAct dedup is keyed on phase, not just correlation id', function () {
 	this.timeout(25000)
+	const cleanup = useCleanup()
 
 	it('runs the activity on a resend that shares the probe\'s correlation id', async () => {
-		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const { requester, responder, svcResponder } = await makePair(cleanup)
 		let fired = 0
 		const seenCorrelationIds: string[] = []
 		svcResponder.setActivityHandler(async (_activity, _cohort, _minSigs, corrId) => {
@@ -88,12 +95,10 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		expect(fired, 'activity handler should fire exactly once').to.equal(1)
 		expect(seenCorrelationIds[0]).to.equal(corrId)
 
-		await svcRequester.stop(); await svcResponder.stop()
-		await stopAll([requester, responder])
 	})
 
 	it('still dedups within the activity phase: a repeated activity send performs the work once', async () => {
-		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const { requester, responder, svcResponder } = await makePair(cleanup)
 		let fired = 0
 		svcResponder.setActivityHandler(async () => {
 			fired++
@@ -112,12 +117,10 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 			.to.deep.equal(first)
 		expect(fired, 'work must be performed exactly once').to.equal(1)
 
-		await svcRequester.stop(); await svcResponder.stop()
-		await stopAll([requester, responder])
 	})
 
 	it('still dedups within the digest phase: a repeated probe is answered from cache', async () => {
-		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const { requester, responder } = await makePair(cleanup)
 		const corrId = 'digest-replay-1'
 		const responderId = responder.peerId.toString()
 
@@ -129,12 +132,10 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		expect(first).to.have.property('anchors')
 		expect(replay).to.deep.equal(first)
 
-		await svcRequester.stop(); await svcResponder.stop()
-		await stopAll([requester, responder])
 	})
 
 	it('does not cache a NearAnchor as the answer to an activity-bearing message', async () => {
-		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const { requester, responder, svcResponder } = await makePair(cleanup)
 		const corrId = 'refusal-not-cached-1'
 		const responderId = responder.peerId.toString()
 		const msg = { ...baseMsg(corrId), activity: 'payload-data' }
@@ -157,12 +158,10 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 			.to.have.property('commitCertificate')
 		expect(fired).to.equal(1)
 
-		await svcRequester.stop(); await svcResponder.stop()
-		await stopAll([requester, responder])
 	})
 
 	it('completes a find-then-act lookup end to end through iterativeLookup', async () => {
-		const { requester, responder, svcRequester, svcResponder } = await makePair()
+		const { svcRequester, svcResponder } = await makePair(cleanup)
 		let fired = 0
 		svcResponder.setActivityHandler(async () => {
 			fired++
@@ -186,36 +185,31 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 			.to.deep.equal({ commitCertificate: 'cert-e2e' })
 		expect(fired, 'activity performed exactly once').to.equal(1)
 
-		await svcRequester.stop(); await svcResponder.stop()
-		await stopAll([requester, responder])
 	})
 })
 
 describe('iterativeLookup does not re-probe a peer', function () {
 	this.timeout(25000)
+	const cleanup = useCleanup()
 
 	it('yields no duplicate peer across the probing events of one lookup', async () => {
 		// Services start BEFORE the star is dialed, so each `peer:connect` handler fires.
-		const mesh = await starMesh(4, { factory: createMemoryNode })
+		// `cleanup` owns the teardown, so a failed assertion reports *itself* rather than being
+		// buried under the exit watchdog's open-handle dump for the nodes a throw skipped past.
+		const mesh = await starMesh(4, { factory: createMemoryNode, cleanup })
 		await new Promise(r => setTimeout(r, 2000))
 
-		// Teardown from a `finally`: a failed assertion must report *itself* rather than be buried
-		// under the exit watchdog's open-handle dump for the nodes the throw skipped past.
-		try {
-			const probed: string[] = []
-			for await (const evt of mesh.services[0]!.iterativeLookup(new TextEncoder().encode('visited-key'), {
-				wantK: 7,
-				minSigs: 1,
-				digest: 'Zg',
-				ttl: 4,
-			})) {
-				if (evt.type === 'probing') probed.push(evt.peerId!)
-			}
-
-			expect(new Set(probed).size, `probed the same peer twice: ${probed.join(', ')}`)
-				.to.equal(probed.length)
-		} finally {
-			await mesh.stop()
+		const probed: string[] = []
+		for await (const evt of mesh.services[0]!.iterativeLookup(new TextEncoder().encode('visited-key'), {
+			wantK: 7,
+			minSigs: 1,
+			digest: 'Zg',
+			ttl: 4,
+		})) {
+			if (evt.type === 'probing') probed.push(evt.peerId!)
 		}
+
+		expect(new Set(probed).size, `probed the same peer twice: ${probed.join(', ')}`)
+			.to.equal(probed.length)
 	})
 })
