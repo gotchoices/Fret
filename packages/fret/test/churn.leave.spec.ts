@@ -134,14 +134,14 @@ describe('Churn leave handling', function () {
 
 		// Send a crafted leave notice with 20 replacements (exceeds MAX_REPLACEMENTS=12)
 		const fakeReplacements = Array.from({ length: 20 }, () =>
-			mesh.nodes[1]!.peerId.toString()
+			mesh.ids[1]!
 		)
 		// `from` must match the transport-authenticated sender (mesh.nodes[1]); the handler
 		// now drops leaves whose `from` is spoofed, so this exercises replacement
 		// truncation rather than the identity gate.
 		const notice: LeaveNoticeV1 = {
 			v: 1,
-			from: mesh.nodes[1]!.peerId.toString(),
+			from: mesh.ids[1]!,
 			replacements: fakeReplacements,
 			timestamp: Date.now(),
 		}
