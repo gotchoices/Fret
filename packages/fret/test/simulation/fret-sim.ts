@@ -4,7 +4,7 @@ import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
 import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
 import { DigitreeStore, type PeerEntry } from '../../src/store/digitree-store.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
-import { toCoord as bigintToCoord } from '../helpers/ring.js'
+import { toCoord } from '../helpers/ring.js'
 
 export interface SimPeerConfig {
 	profile: 'edge' | 'core'
@@ -267,7 +267,7 @@ export class FretSimulation {
 
 	/** Seeded-random ring position for a mid-run joiner — models placement by hash of peer id. */
 	private randomCoord(): Uint8Array {
-		return bigintToCoord(this.rng.nextBigInt(256))
+		return toCoord(this.rng.nextBigInt(256))
 	}
 
 	/** Gaussian spread around cluster centers. */
@@ -283,7 +283,7 @@ export class FretSimulation {
 		// Wrap around ring
 		let val = (center + offset) % ringSize
 		if (val < 0n) val += ringSize
-		return bigintToCoord(val)
+		return toCoord(val)
 	}
 
 	/** Power-law distribution — some ring regions are dense, most are sparse. */
@@ -299,7 +299,7 @@ export class FretSimulation {
 		// 256-bit range); the low 128 bits stay zero, which is fine for placement.
 		const ringSize = 1n << 256n
 		const val = BigInt(Math.floor(normalized * Number(ringSize >> 128n))) << 128n
-		return bigintToCoord(val % ringSize)
+		return toCoord(val % ringSize)
 	}
 
 	private scheduleStabilization(): void {
@@ -939,7 +939,7 @@ export class FretSimulation {
 		const span = (1n << 256n) / BigInt(Math.max(1, store.size()))
 		const raw = span * BigInt(this.config.k) * 2n
 		const halfRing = 1n << 255n
-		return bigintToCoord(raw > halfRing ? halfRing : raw)
+		return toCoord(raw > halfRing ? halfRing : raw)
 	}
 
 	/**

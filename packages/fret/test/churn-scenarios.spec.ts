@@ -334,7 +334,7 @@ describe('Churn scenario simulations', function () {
 	})
 })
 
-/** Inverse of bigintToCoord in fret-sim.ts: 32-byte big-endian Uint8Array -> BigInt. */
+/** Inverse of toCoord in test/helpers/ring.ts: 32-byte big-endian Uint8Array -> BigInt. */
 function coordToBigInt(coord: Uint8Array): bigint {
 	let v = 0n
 	for (let i = 0; i < 32; i++) {

@@ -3,7 +3,7 @@ import { expect } from 'chai'
 import { DigitreeStore } from '../src/store/digitree-store.js'
 import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
-import { toCoord as bigIntToCoord } from './helpers/ring.js'
+import { toCoord } from './helpers/ring.js'
 
 const RING_SIZE = 1n << 256n
 
@@ -12,14 +12,14 @@ const RING_SIZE = 1n << 256n
 /** Evenly spaced coords: i * (2^256 / n) */
 function uniformCoords(n: number): Uint8Array[] {
 	const step = RING_SIZE / BigInt(n)
-	return Array.from({ length: n }, (_, i) => bigIntToCoord(BigInt(i) * step))
+	return Array.from({ length: n }, (_, i) => toCoord(BigInt(i) * step))
 }
 
 /** Peers placed only in a fraction of the ring (e.g., 60%), leaving a large empty gap */
 function gappedCoords(n: number, fraction: number = 0.6): Uint8Array[] {
 	const arc = (RING_SIZE * BigInt(Math.floor(fraction * 1000))) / 1000n
 	const step = arc / BigInt(n)
-	return Array.from({ length: n }, (_, i) => bigIntToCoord(BigInt(i) * step))
+	return Array.from({ length: n }, (_, i) => toCoord(BigInt(i) * step))
 }
 
 /** Exponential distribution — most peers near origin, thinning out */
@@ -31,14 +31,14 @@ function skewedCoords(n: number, rng: DeterministicRNG): Uint8Array[] {
 		const x = -Math.log(u) / 5 // lambda=5 concentrates near 0
 		const frac = Math.min(x, 1) // clamp to [0,1]
 		const pos = (RING_SIZE * BigInt(Math.floor(frac * 1e15))) / BigInt(1e15)
-		coords.push(bigIntToCoord(pos))
+		coords.push(toCoord(pos))
 	}
 	return coords
 }
 
 /** Random uniform 32-byte coordinates */
 function randomUniformCoords(n: number, rng: DeterministicRNG): Uint8Array[] {
-	return Array.from({ length: n }, () => bigIntToCoord(rng.nextBigInt(256)))
+	return Array.from({ length: n }, () => toCoord(rng.nextBigInt(256)))
 }
 
 function populateStore(coords: Uint8Array[]): DigitreeStore {
@@ -232,8 +232,8 @@ describe('Size estimator', () => {
 
 			it('two peers: confidence > 0 and < 1', () => {
 				const store = new DigitreeStore()
-				store.upsert('a', bigIntToCoord(0n))
-				store.upsert('b', bigIntToCoord(RING_SIZE / 2n))
+				store.upsert('a', toCoord(0n))
+				store.upsert('b', toCoord(RING_SIZE / 2n))
 				const est = estimateSizeAndConfidence(store, M)
 				expect(est.confidence).to.be.greaterThan(0)
 				expect(est.confidence).to.be.lessThan(1)
@@ -241,7 +241,7 @@ describe('Size estimator', () => {
 
 			it('all peers at same coordinate: n_est capped, confidence low', () => {
 				const store = new DigitreeStore()
-				const coord = bigIntToCoord(42n)
+				const coord = toCoord(42n)
 				// Upsert with different IDs but same coordinate
 				for (let i = 0; i < 10; i++) {
 					store.upsert(`dup${i}`, coord)
@@ -302,7 +302,7 @@ describe('Size estimator', () => {
 			}
 			while (known.size < 2 * M + 1 + far) known.add(rng.nextInt(0, n))
 			const store = new DigitreeStore()
-			for (const idx of known) store.upsert(`p${idx}`, bigIntToCoord(values[idx]!))
+			for (const idx of known) store.upsert(`p${idx}`, toCoord(values[idx]!))
 			return store
 		}
 
@@ -319,7 +319,7 @@ describe('Size estimator', () => {
 					const selfIdx = rng.nextInt(0, N)
 					const store = partialKnowledgeStore(values, selfIdx, far, rng)
 
-					const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(values[selfIdx]!) })
+					const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[selfIdx]!) })
 					expect(est.n).to.be.greaterThan(N / 2, `undercount: n_est=${est.n} for N=${N}`)
 					expect(est.n).to.be.lessThan(N * 2, `overcount: n_est=${est.n} for N=${N}`)
 				})
@@ -338,7 +338,7 @@ describe('Size estimator', () => {
 				const selfIdx = rng.nextInt(0, N)
 				const store = partialKnowledgeStore(values, selfIdx, 32, rng)
 
-				const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(values[selfIdx]!) })
+				const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[selfIdx]!) })
 				worst = Math.max(worst, relativeError(est.n, N))
 				expect(est.n).to.be.greaterThan(N / 2, `undercount at seed ${seed}: n_est=${est.n}`)
 				expect(est.n).to.be.lessThan(N * 2, `overcount at seed ${seed}: n_est=${est.n}`)
@@ -363,10 +363,10 @@ describe('Size estimator', () => {
 			const points = 2 * M + 1
 			const step = band / BigInt(points)
 			const store = new DigitreeStore()
-			for (let i = 0; i < points; i++) store.upsert(`e${i}`, bigIntToCoord(BigInt(i) * step))
+			for (let i = 0; i < points; i++) store.upsert(`e${i}`, toCoord(BigInt(i) * step))
 
 			const selfIdx = Math.floor(points / 2)
-			const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(BigInt(selfIdx) * step) })
+			const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(BigInt(selfIdx) * step) })
 
 			// n is inflated by ~1000x: local spacing is 1000x tighter than the true spacing of
 			// any plausible ring this node could belong to.
@@ -386,7 +386,7 @@ describe('Size estimator', () => {
 			const rng = new DeterministicRNG(99)
 			const store = partialKnowledgeStore(values, 0, 64, rng)
 
-			const est = estimateSizeAndConfidence(store, M, { selfCoord: bigIntToCoord(values[0]!) })
+			const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[0]!) })
 			expect(est.n).to.be.greaterThan(N / 2)
 			expect(est.n).to.be.lessThan(N * 2)
 		})
@@ -399,13 +399,13 @@ describe('Size estimator', () => {
 			const values = sortedRing(2000, rng)
 			const selfIdx = rng.nextInt(0, 2000)
 			const healthy = partialKnowledgeStore(values, selfIdx, 64, rng)
-			const est = estimateSizeAndConfidence(healthy, M, { selfCoord: bigIntToCoord(values[selfIdx]!) })
+			const est = estimateSizeAndConfidence(healthy, M, { selfCoord: toCoord(values[selfIdx]!) })
 			expect(est.confidence).to.be.greaterThan(0.6)
 
 			// A store whose peers all sit at one coordinate carries no spacing information.
 			const degenerate = new DigitreeStore()
-			for (let i = 0; i < 32; i++) degenerate.upsert(`dup${i}`, bigIntToCoord(1234n))
-			const degenerateEst = estimateSizeAndConfidence(degenerate, M, { selfCoord: bigIntToCoord(1234n) })
+			for (let i = 0; i < 32; i++) degenerate.upsert(`dup${i}`, toCoord(1234n))
+			const degenerateEst = estimateSizeAndConfidence(degenerate, M, { selfCoord: toCoord(1234n) })
 			expect(degenerateEst.confidence).to.be.lessThan(est.confidence)
 			expect(degenerateEst.confidence).to.be.lessThan(0.6)
 		})

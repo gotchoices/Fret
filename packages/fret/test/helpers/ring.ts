@@ -4,20 +4,16 @@ import { COORD_BYTES } from '../../src/ring/hash.js'
 const RING = 1n << BigInt(COORD_BYTES * 8)
 
 /**
- * `base` shifted by `delta` ring units, exact modulo 2^256. The delta is added at the
- * *least-significant* byte (index `length - 1`) with carry/borrow propagated leftward across
- * every byte — dropping the carry anywhere along the chain would change the coordinate by more
- * than `delta`. This is the load-bearing half of the helper: a naive single-byte add is
- * silently wrong at the wrap (`(0 - 1) & 0xff` is 255, a change of +255, not -1), which is
- * exactly the class of bug this replaces. Any overflow out of byte 0 is the modulo-2^256
- * wraparound and is discarded, same as it would be for a 256-bit register.
+ * `base` shifted by `delta` ring units — the exact 256-bit sum, reduced mod 2^256. Any
+ * magnitude works, not only nearby offsets, and a negative `delta` borrows across the wrap
+ * (`ringOffset(ZERO, -1)` is all-`0xff`). The input is never mutated, and the result is always
+ * `COORD_BYTES` wide regardless of `base.length` — every caller passes a 32-byte coordinate,
+ * so that is inert today.
  *
- * Offsets here are meant to be *near* a target on the ring — a handful of units — which is
- * only true at this least-significant-byte scale. The legacy helper this replaced added its
- * delta into the most-significant byte, so one "step" was 2^248 ring units: 1/128th of the
- * ring's full span, not a nearby point. That made seeded "near" candidates actually scattered
- * across a wide arc, which is what let a uniformly random self coordinate land among them by
- * chance and made the calling specs flaky.
+ * Do not hand-roll this again as byte arithmetic. The legacy helper added its delta into the
+ * *most*-significant byte, so one "step" was 2^248 ring units — 1/128th of the ring rather
+ * than a nearby point — which scattered seeded "near" candidates across a wide arc and made
+ * the calling specs flaky.
  */
 export function ringOffset(base: Uint8Array, delta: number | bigint): Uint8Array {
 	return toCoord(toBigInt(base) + BigInt(delta))
