@@ -84,10 +84,18 @@ export class PeerRig {
 	highWater = 0
 	holdMs = 0
 
+	/** `id + '|' + protocol` to behavior; consulted before the per-peer map. */
+	readonly protocolBehavior = new Map<string, Behavior>()
+
 	constructor(
 		private readonly pingProtocol: string,
 		private readonly neighborsProtocol: string,
 	) {}
+
+	/** Per-(peer, protocol) behavior — e.g. a peer that answers ping and hangs the neighbors fetch. */
+	setProtocolBehavior(id: string, protocol: string, b: Behavior): void {
+		this.protocolBehavior.set(`${id}|${protocol}`, b)
+	}
 
 	connectionFor(id: string): Connection {
 		return {
@@ -105,7 +113,8 @@ export class PeerRig {
 		this.inFlight++
 		this.highWater = Math.max(this.highWater, this.inFlight)
 		const settle = (): void => { this.inFlight-- }
-		if ((this.behavior.get(id) ?? 'answers') === 'hangs') return hangsUntilAbort(opts, settle)
+		const behavior = this.protocolBehavior.get(`${id}|${protocol}`) ?? this.behavior.get(id) ?? 'answers'
+		if (behavior === 'hangs') return hangsUntilAbort(opts, settle)
 		return this.reply(id, protocol).then(
 			(bytes) => stubStream(bytes, this.holdMs, settle),
 			(err: unknown) => { settle(); throw err },

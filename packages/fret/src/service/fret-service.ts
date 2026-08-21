@@ -320,6 +320,19 @@ export class FretService implements IFretService, Startable {
 	 */
 	private static readonly MAINTENANCE_RPC_TIMEOUT_MS = 2000;
 	/**
+	 * Whole-RPC budget for the neighbor-snapshot fetch (`fetchNeighbors` in
+	 * `fetchAndMergeSnapshot`) — deliberately smaller than the route-sized default.
+	 *
+	 * `fetchNeighbors` is `dial: 'never'`, so no dial cost sits inside this budget: it is a stream
+	 * open on an already-multiplexed connection, one write, and a read the wire cap bounds at
+	 * `MAX_NEIGHBORS_BYTES` (16 KiB). 1 s is orders of magnitude above what that costs on any link
+	 * that is not already broken, so exceeding it means "this peer is stalled" — the verdict we
+	 * want promptly, because phase 1 of a tick is bounded by {@link STABILIZE_PHASE_ONE_BUDGET_MS}
+	 * and a stalled snapshot must not eat it. Still well above {@link MAINTENANCE_RPC_TIMEOUT_MS}
+	 * in kind: a snapshot is a real payload, not a ~50-byte ping.
+	 */
+	private static readonly MAINTENANCE_SNAPSHOT_TIMEOUT_MS = 1000;
+	/**
 	 * Wall-clock cap on one whole stabilization tick (`stabilizeOnce`).
 	 *
 	 * The tick's RPCs run pooled (`maintenanceConcurrency` in flight), each already bounded by its
@@ -337,6 +350,24 @@ export class FretService implements IFretService, Startable {
 	 * as well). Tighten per mode only if warm-up latency ever measurably suffers.
 	 */
 	private static readonly STABILIZE_TICK_BUDGET_MS = 5000;
+	/**
+	 * Wall-clock cap on **phase 1** of a stabilization tick (the pooled near-peer ping then
+	 * snapshot-fetch pass), opened as a *child* of the tick deadline.
+	 *
+	 * Its complement inside {@link STABILIZE_TICK_BUDGET_MS} is phase 2's reserved slice:
+	 * 5000 - 3000 = 2000 ms, exactly one {@link MAINTENANCE_RPC_TIMEOUT_MS} ping, so even a phase 1
+	 * that runs to its own deadline leaves phase 2 able to complete a probe against a peer that is
+	 * genuinely alive — which is the whole purpose of the classification and re-probe arms. Phase 2
+	 * is the *only* path by which a `dead` peer is contacted again or an `unknown` one is
+	 * classified, so a phase-1 straggler must not be able to starve it.
+	 *
+	 * 3000 is >= one worst-case phase-1 unit ({@link MAINTENANCE_RPC_TIMEOUT_MS} +
+	 * {@link MAINTENANCE_SNAPSHOT_TIMEOUT_MS}), so a merely-slow peer still completes rather than
+	 * being cut off by the phase budget. Both inequalities are pinned over the declared defaults by
+	 * `test/stabilize-budget-invariants.spec.ts` rather than asserted at runtime — the test rigs
+	 * mutate these statics down to tens of milliseconds, so a runtime assert would throw in them.
+	 */
+	private static readonly STABILIZE_PHASE_ONE_BUDGET_MS = 3000;
 	/**
 	 * Wall-clock cap on the whole leave fan-out inside `stop()`.
 	 *
@@ -2176,17 +2207,22 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * One stabilization tick: two pooled phases under one tick-wide budget.
+	 * One stabilization tick: two pooled phases under one tick-wide budget, with phase 1 further
+	 * bounded by its own sub-budget so it cannot starve phase 2.
 	 *
 	 * 1. For each near peer, ping **then** snapshot-fetch (`probeAndFetch`) — chained per peer,
 	 *    pooled across peers. Then one `enforceCapacity` and one announce for everything the
 	 *    merges saw for the first time; neither may run inside the pool (`enforceCapacity` sorts a
 	 *    snapshot of the store and would over-evict if two ran concurrently; a per-task announce
-	 *    would announce a peer once per task).
+	 *    would announce a peer once per task). The whole phase runs under
+	 *    {@link STABILIZE_PHASE_ONE_BUDGET_MS}, a *child* of the tick deadline, so a stalled near
+	 *    peer costs phase 1 its slice and leaves the tick signal un-aborted.
 	 * 2. The classification and re-probe *targets* — each still selected under its own per-tick
 	 *    budget and ordering (see `classifyTargets` / `reprobeExcludedTargets`; merging the
 	 *    candidate lists would repeal the separate-budgets rule) — pooled together through
-	 *    `probeMembership`.
+	 *    `probeMembership`, against the **tick** signal. What is left of the tick budget after
+	 *    phase 1's slice is phase 2's reserve (5000 - 3000 = one {@link MAINTENANCE_RPC_TIMEOUT_MS}
+	 *    ping), so phase 2 always gets a turn.
 	 *
 	 * The four candidate sets are disjoint by construction (near = live member; classify =
 	 * `unknown` non-dead; foreign arm = `foreign` non-dead; dead arm = `dead`), which is what makes
@@ -2202,10 +2238,20 @@ export class FretService implements IFretService, Startable {
 		// the finally is mandatory — see `deadline`.
 		const budget = deadline(FretService.STABILIZE_TICK_BUDGET_MS, this.runSignal);
 		try {
-			const pool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
-			const merged = await runPooled(near.map((id) => () => this.probeAndFetch(id, budget.signal)), pool);
-			logRejected(merged, near, 'probeAndFetch');
-			const announced = fulfilledValues(merged).flat();
+			// Phase 1 runs under its own sub-deadline, a *child* of the tick's, so phase 1
+			// exhausting its slice leaves the tick signal un-aborted and phase 2 still runs.
+			// `cancel()` is mandatory on every exit path including a throw — same rule as the tick
+			// deadline — or the tick leaks a timer and the mocha exit watchdog fails the run.
+			const phaseOne = deadline(FretService.STABILIZE_PHASE_ONE_BUDGET_MS, budget.signal);
+			let announced: string[];
+			try {
+				const phaseOnePool = { concurrency: this.maintenanceConcurrency, signal: phaseOne.signal };
+				const merged = await runPooled(near.map((id) => () => this.probeAndFetch(id, phaseOne.signal)), phaseOnePool);
+				logRejected(merged, near, 'probeAndFetch');
+				announced = fulfilledValues(merged).flat();
+			} finally {
+				phaseOne.cancel();
+			}
 			// The tick's one capacity enforcement. It sits after phase 1's seeds and snapshot
 			// merges, so it sees every insert the tick made — which is why `seedFromPeerStore` and
 			// `seedFromBootstraps` no longer trim for themselves.
@@ -2226,14 +2272,15 @@ export class FretService implements IFretService, Startable {
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
-			// Selecting phase-2 targets costs at most one store walk, and the pool would only `skip`
-			// every target once the budget has gone. This early return does not *cause* the skip —
-			// phase 2 is behind a barrier on phase 1, and one phase-1 task's worst case (2 s ping +
-			// 5 s fetch) already exceeds the 5 s tick budget, so a single stalled near peer starves
-			// phase 2 for the whole tick. Tracked as `bug-tick-budget-starves-phase-two`.
+			// Phase 2 tests the **tick** signal, never phase 1's: phase 1 exhausting its own
+			// sub-budget must not skip phase 2 — the reserve between the two budgets
+			// (STABILIZE_TICK_BUDGET_MS - STABILIZE_PHASE_ONE_BUDGET_MS = one ping) is exactly what
+			// buys phase 2 its turn. This return still fires for a `stop()` or a tick that really
+			// is out of time.
 			if (budget.signal.aborted) return;
 			const targets = this.phaseTwoTargets();
-			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), pool);
+			const phaseTwoPool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
+			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), phaseTwoPool);
 			logRejected(probed, targets, 'probeMembership');
 		} finally {
 			budget.cancel();
@@ -2264,10 +2311,16 @@ export class FretService implements IFretService, Startable {
 	 * Returns the ids the merge saw for the first time, for the tick's single announce.
 	 */
 	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
-		await this.probeNeighborLatency(id, signal);
+		const answered = await this.probeNeighborLatency(id, signal);
 		// A tick that ran out of budget mid-ping has nothing to fetch — and `fetchNeighbors` would
-		// swallow the abort into an empty snapshot and count it as fetched.
+		// swallow the abort into an empty snapshot and count it as fetched. Stays *ahead* of the
+		// answered gate below so the two can never disagree about a cancelled ping.
 		if (this.wasCancelled(signal)) return [];
+		// A ping that did not answer (`unreachable` / `timeout` / `foreign-protocol`) means the
+		// fetch can only fail too, so it would spend up to MAINTENANCE_SNAPSHOT_TIMEOUT_MS of
+		// phase-1 wall time for nothing. This removes an RPC that could not have succeeded; it
+		// scores nothing and changes no verdict.
+		if (!answered) return [];
 		return this.fetchAndMergeSnapshot(id, signal);
 	}
 
@@ -2276,8 +2329,16 @@ export class FretService implements IFretService, Startable {
 	 * signal) and is an explicit parameter rather than defaulted from `runSignal`, so no call site
 	 * can silently fall back to the run signal and escape the tick budget — see `wasCancelled` for
 	 * why the *caller's* signal is the discriminator.
+	 *
+	 * Returns whether the peer **answered** — the round-trip rule from *Evidence strength* in
+	 * `docs/fret.md`, not "answered well": `ok` (either pong polarity), `busy` and `decode-error`
+	 * all arrived over our namespaced protocol and so count as an answer; `unreachable`, `timeout`
+	 * and `foreign-protocol` did not. `cancelled` / `skipped` report `false` too, but that is
+	 * unreachable in practice — `probeAndFetch`'s `wasCancelled` check sits ahead of the gate that
+	 * reads this, so our own cancellation never reaches it. Scoring is unchanged by the return:
+	 * the only caller uses it to skip a fetch that could not have succeeded.
 	 */
-	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<void> {
+	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<boolean> {
 		try {
 			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
 			switch (out.kind) {
@@ -2293,7 +2354,7 @@ export class FretService implements IFretService, Startable {
 						await this.applyFailure(id);
 						this.diag.pingsFail++;
 					}
-					return;
+					return true;
 				case 'busy':
 					// Deliberate NEW behavior: the near pass records backoff for busy alone; timeout
 					// and unreachable still record none here (failure-recovery.spec pins that). Busy
@@ -2302,26 +2363,27 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsFail++;
 					this.noteAnsweredOnProtocol(id);
 					this.recordBackoff(id);
-					return;
+					return true;
 				case 'decode-error':
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out); // decay only
-					return;
+					return true;
 				case 'foreign-protocol':
 				case 'unreachable':
 				case 'timeout':
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out);
-					return;
+					return false;
 				case 'cancelled':
 				case 'skipped':
-					return; // our own cancellation / never attempted: record nothing
+					return false; // our own cancellation / never attempted: record nothing
 			}
 		} catch (err) {
 			// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
 			log.error('probeNeighborLatency failed for %s - %e', id, err);
 		}
+		return false;
 	}
 
 	/**
@@ -2563,9 +2625,13 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async fetchAndMergeSnapshot(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		const announced: string[] = [];
-		// Default (route-sized) budget: a snapshot is a real payload, not a ~50-byte ping.
+		// Maintenance-sized, not the route-sized default: this fetch runs inside a tick's phase-1
+		// sub-budget, and there is no dial in it (`fetchNeighbors` is connection-only), so the
+		// route budget would let one stalled peer consume the phase. See
+		// MAINTENANCE_SNAPSHOT_TIMEOUT_MS.
 		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, {
 			signal,
+			timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,
 			// The fetch path's single cap enforcement point — the merge loop below does not slice.
 			// Truncating here puts the bound ahead of the parse-and-hash loop instead of inside it.
 			parse: makeSnapshotParser(this.mergeSnapshotCaps()),
