@@ -446,4 +446,48 @@ describe('Relevance scoring properties', function () {
 			expect(initial).to.be.lessThan(succeeded.relevance)
 		})
 	})
+
+	// -------------------------------------------------------------------------------------
+	// The inversion this whole line of work exists to close: a peer we have actually contacted
+	// must outrank one we have only ever been told about, however often we were told.
+	//
+	// The gossip side is `initialRelevance` called *once* and nothing thereafter, because that
+	// is literally what the service does — `FretService.noteDiscovered` scores a brand-new entry
+	// once and leaves an id it already holds completely untouched, so the 500 further mentions
+	// write nothing at all. `noteDiscovered` is private to the service, so the flatness of those
+	// 500 mentions is pinned on the wired announce-merge path rather than restated here; this
+	// test is about the *ordering* of the two arms.
+	//
+	// A fresh `createSparsityModel()` per call (the file's convention) keeps the sparsity bonus
+	// identical on both sides, so the comparison is between the two base scores and not between
+	// two KDE states: `recordSuccess` observes the distance and `initialRelevance` deliberately
+	// does not, and sharing one model would let that difference — rather than frequency credit —
+	// decide the outcome.
+	// -------------------------------------------------------------------------------------
+	describe('gossip vs proven contact', () => {
+		it('scores 500 successes strictly above an entry the gossip rule created and never re-scored', () => {
+			const now = FIXED_NOW
+			const fresh = makeEntry({ lastAccess: now })
+
+			// Named once, then named 500 more times: still one score, from empty counters.
+			const gossiped = initialRelevance(fresh, 0.5, createSparsityModel(), now)
+
+			let contacted = fresh
+			for (let i = 0; i < 500; i++) {
+				contacted = recordSuccess(contacted, undefined, 0.5, createSparsityModel(), now)
+			}
+
+			expect(contacted.accessCount, 'proven contact accrues frequency credit').to.equal(500)
+			expect(contacted.relevance).to.be.greaterThan(gossiped)
+		})
+
+		it('scores even a single success above 500 mentions, since mentions are flat', () => {
+			const now = FIXED_NOW
+			const fresh = makeEntry({ lastAccess: now })
+			const gossiped = initialRelevance(fresh, 0.5, createSparsityModel(), now)
+			const once = recordSuccess(fresh, undefined, 0.5, createSparsityModel(), now)
+
+			expect(once.relevance).to.be.greaterThan(gossiped)
+		})
+	})
 })
