@@ -5,11 +5,12 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Rewritten 2026-08-21 by a second interrupted run (BUDGET_WARNING).** This run only re-read
-files — it ran no script and no test — and hit budget before doing new work. Do not re-read this
-file's own history further than what's below; it is complete. Step 1 is done (measured, not
-guessed) — do not re-verify it, no further action there. Step 2 is exactly where the prior run
-left it: reachable, understood, but the seed-robustness check has still never been run.
+**Rewritten 2026-08-21 by a third interrupted run (BUDGET_WARNING).** Same as before: only
+re-read files, ran no script and no test, hit budget before doing new work. Do not re-read this
+file's own history further than what's below — it is complete and now includes the throwaway
+script verbatim so the next run does not need to re-derive it. Step 1 is done (measured, not
+guessed) — no further action there. Step 2 is exactly where every prior run left it: reachable,
+understood, script content now fully specified below — just run it.
 
 ## Verified state (this run re-confirmed by reading files directly; ran nothing)
 
@@ -33,16 +34,66 @@ left it: reachable, understood, but the seed-robustness check has still never be
 
 ## Step 2 — hop statistic for case 2, still not seed-verified
 
-**Next agent, do this — no further investigation needed, just execute:**
+**Next agent, do this — no further investigation needed, just execute. Three runs in a row died
+of BUDGET_WARNING before running anything, only re-reading files, so the script is now spelled
+out verbatim below — paste it and run it, first action of the run.**
 
-1. Write a throwaway script (scratchpad, not committed — do NOT put it under `packages/fret/`)
-   that imports `FretSimulation` from `test/simulation/fret-sim.ts` and reproduces `avgHopsFor`
-   exactly as written at `test/message-bus.spec.ts` L348-390, but looping over
-   `PLACEMENT_SEEDS` (imported from `test/simulation/placement-assertions.ts`) instead of the
-   hardcoded `seed: 42`. Print `clustered` vs `uniform` `avgRoutingHops` (and the
-   `successfulRouteHops` average) per seed — mirroring exactly what step 1's diagnostic run
-   already proved out for the other test. Run it with the project's TS loader:
-   `node --import ./register.mjs <script>.ts` from `packages/fret/`.
+1. Write this exact file to the scratchpad (NOT under `packages/fret/` — do not commit it) as
+   `seed-check.ts`, then run `node --import ./register.mjs <path-to>/seed-check.ts` from
+   `packages/fret/`:
+
+   ```ts
+   import { FretSimulation } from '../../packages/fret/test/simulation/fret-sim.js' // adjust relative path to wherever the scratchpad file lands
+   import { PLACEMENT_SEEDS } from '../../packages/fret/test/simulation/placement-assertions.js'
+
+   function avgHopsFor(seed: number, placement?: 'clustered') {
+   	const sim = new FretSimulation({
+   		seed,
+   		n: 30,
+   		k: 15,
+   		m: 8,
+   		churnRatePerSec: 0,
+   		stabilizationIntervalMs: 500,
+   		durationMs: 8000,
+   		...(placement ? { placement, clusterConfig: { numClusters: 3, spreadBits: 32 } } : {}),
+   	})
+   	sim.initialize()
+   	for (const evt of sim.scheduler.advanceTo(5000)) sim.processEvent(evt)
+   	const alivePeers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+   	for (let i = 0; i < 10; i++) {
+   		const from = alivePeers[i % alivePeers.length]!
+   		const target = new Uint8Array(32)
+   		const s = seed + i * 13
+   		for (let j = 0; j < 32; j++) target[j] = (s * (j + 1) * 37) & 0xff
+   		sim.scheduleRoute(from.id, target, 5001 + i)
+   	}
+   	while (sim.scheduler.pending() > 0) {
+   		const evt = sim.scheduler.nextEvent()
+   		if (!evt || evt.time > 8000) break
+   		sim.processEvent(evt)
+   	}
+   	const metrics = sim.metrics.finalize()
+   	const successAvg =
+   		metrics.successfulRouteHops.length > 0
+   			? metrics.successfulRouteHops.reduce((a, b) => a + b, 0) / metrics.successfulRouteHops.length
+   			: NaN
+   	return { avgRoutingHops: metrics.avgRoutingHops, successAvg, attempts: metrics.routingAttempts }
+   }
+
+   for (const seed of PLACEMENT_SEEDS) {
+   	const c = avgHopsFor(seed, 'clustered')
+   	const u = avgHopsFor(seed)
+   	console.log(
+   		`seed ${seed}: clustered avgRoutingHops=${c.avgRoutingHops} successAvg=${c.successAvg} | ` +
+   			`uniform avgRoutingHops=${u.avgRoutingHops} successAvg=${u.successAvg}`
+   	)
+   }
+   ```
+
+   (Fix the two relative import paths to match wherever the scratchpad file actually lands
+   relative to `packages/fret/test/simulation/` — the paths above assume a sibling-of-repo-root
+   layout and must be adjusted to the real scratchpad path before running.)
+
 2. **If separation holds cleanly across all 5 seeds** (clustered consistently > uniform,
    comfortable margin, not 1-vs-0 flukes): the test is fine as shipped — leave the code
    untouched. Just record in the review ticket (see Handoff below) that the margin was checked
