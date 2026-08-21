@@ -3,6 +3,61 @@ files: packages/fret/src/rpc/protocols.ts, packages/fret/src/rpc/leave.ts, packa
 difficulty: easy
 ----
 <!-- resume-note -->
+Third run (2026-08-21) hit BUDGET_WARNING immediately after re-reading `protocols.ts` (full file)
+and `leave.ts` (full file) to confirm exact current line numbers before editing — **zero edits
+made, third run in a row**. Do NOT re-read those two files again; below is everything needed to
+edit them directly, confirmed against the file content just read this run.
+
+**protocols.ts, confirmed current line numbers (re-verify only by grep if diff after another
+agent's edit, not by full-file read):**
+- L29-38: `makeProtocols(networkName = 'default')` — the function item 2 must derive from.
+- L44-48: the five `PROTOCOL_*` literal-string consts item 2 replaces (`PROTOCOL_NEIGHBORS`
+  L44, `PROTOCOL_NEIGHBORS_ANNOUNCE` L45, `PROTOCOL_MAYBE_ACT` L46, `PROTOCOL_LEAVE` L47,
+  `PROTOCOL_PING` L48). Comment above them at L43 ("Backward compatibility...") can stay or be
+  trimmed to match — not load-bearing either way.
+- L208: `sendFramed(stream, await encodeJson(await opts.serve(connection)));` — drop both
+  `await`s on `encodeJson`/`opts.serve` per item 1 (only the `encodeJson` one; `opts.serve` itself
+  still may be async — check its declared type before touching that half, it's `Promise<Res> |
+  Res` at L169, so `await opts.serve(...)` must stay, only `await encodeJson(...)` goes).
+- L215: `decoded = await decodeJson(bytes);` → drop `await`.
+- L230: `sendFramed(stream, await encodeJson(res));` → drop `await`.
+- L249: `export async function encodeJson(obj: unknown): Promise<Uint8Array> {` → drop `async`,
+  return type becomes `Uint8Array` (body at L250-252 is already fully sync).
+- L254: `export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {` → drop
+  `async`, return type becomes `T` (body L255-275 fully sync).
+- L262-263: the NUL/whitespace trim loop — item 4's edit site. Track whether a stripped byte at
+  either end was specifically `0` (not 9/10/13/32); after the loop, if so, call
+  `log.warn('decodeJson: stripped %d NUL byte(s)', <count>)` (module logger `log` already at
+  L15) once per call, before the `JSON.parse` at L266. Keep trim behavior unchanged.
+
+**leave.ts, confirmed:**
+- L51: `return { ok: true };` inside `registerLeave`'s `serve` callback (L36-52) → change to
+  `return undefined;`. This is a **behavior-preserving wire change**: `registerJsonHandler`
+  (protocols.ts L227-230) already treats a `Res === undefined` return as "drop without replying,
+  seam still closes" — same as the existing identity-mismatch branch at L48 in this file. Confirmed
+  via protocols.ts re-read this run: no other consequence, seam's `stream.close()` at L131-137
+  runs unconditionally after `serve` returns either way.
+
+**neighbors.ts:78** (not re-read this run, but described identically in the ticket body below —
+trust that line number, it was verified in the prior run): same edit as leave.ts:51, same
+justification.
+
+**Still outstanding, unchanged from before, ready to implement exactly as written in the ticket
+body below (TODO list at the bottom):**
+- Item 1: every other `await encodeJson(`/`await decodeJson(` call site listed in the *second*
+  resume-note paragraph below (now third-from-top) — `request.ts:148,177`, `neighbors.ts:115`,
+  `maybe-act.ts:28,30,55`, `ping.ts:93`. That enumeration is unchanged and still accurate; do not
+  re-grep, just apply it.
+- Item 4's log-once-per-call requirement and the "don't spam on ordinary whitespace" requirement
+  are both satisfied by counting NUL bytes only (not 9/10/13/32) across both trim directions and
+  emitting a single `log.warn` after the loop only if that count is nonzero.
+
+**After all edits:** run `cd packages/fret && npx tsc --noEmit` then `yarn test` (from
+`packages/fret`), per the ticket's TODO list. Nothing has been run yet this run or last —
+typecheck and tests are both still pending from a clean slate.
+
+---
+
 Second run (2026-08-21) again hit its token budget right after finishing discovery — **still zero
 edits made** — but this run completed the one item the first run left outstanding, so the next
 agent can go straight to editing with no further grepping needed.
