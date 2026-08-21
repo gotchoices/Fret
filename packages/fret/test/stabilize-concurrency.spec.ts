@@ -10,6 +10,10 @@ import { hashPeerId } from '../src/ring/hash.js'
 // walking every target serially. These tests pin the properties that design rests on:
 //
 // - a peer that never answers costs the tick its budget, not the other peers their turn;
+// - phase 1 cannot starve phase 2: a near peer that answers its ping and then stalls the
+//   snapshot fetch still leaves the classification and dead-re-probe arms their turn, tick
+//   after tick;
+// - a near peer whose ping did not answer is not snapshot-fetched at all;
 // - the pool cap binds, and is actually reached (parallel, not merely bounded);
 // - the ping → snapshot-fetch dependency survives per peer even though peers overlap;
 // - the four candidate lists a tick pools are pairwise disjoint (what makes pooling safe against
@@ -94,6 +98,82 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		expect(rig.protocolsSeenBy(hung), 'hung peer: ping opened, fetch skipped after the cut').to.deep.equal([ping()])
 		expect(svc.getDiagnostics().pingsOk, 'three pings answered').to.equal(3)
 		expect(svc.getDiagnostics().snapshotsFetched, 'three snapshots fetched').to.equal(3)
+	})
+
+	// ----- phase-2 reserve -----
+
+	// Same family as the headline case above: one stalled peer must not cost the tick its other
+	// work. Here the stall is *inside* phase 1 rather than at the tick budget — the peer answers
+	// the cheap ping and then hangs the snapshot fetch, which is the shape that made this an
+	// outage rather than a hiccup: such a peer accrues no contact failures, so it is never marked
+	// dead, so it stays in the near list and stalls again on every tick. Phase 2 is the only path
+	// by which a `dead` peer is contacted again or an `unknown` one is classified, so a phase 1
+	// that eats the whole tick means neither ever happens.
+	//
+	// Both cases run at the *real, unmutated* budgets on purpose (no `setTickBudget`): what is
+	// being pinned is the arithmetic between the shipped constants, so a rig-shrunk budget would
+	// pin nothing. A tick costs ~1.1s here — phase 1 ends on `MAINTENANCE_SNAPSHOT_TIMEOUT_MS`
+	// (1000ms), well inside its own 3000ms sub-budget — and the raised per-case timeout is
+	// insurance against a slow CI box, not the expected cost.
+	async function expectPhaseTwoKeepsItsTurn(): Promise<void> {
+		const [stalled] = await seedPeers(1, 'member')
+		rig.setProtocolBehavior(stalled!, neighbors(), 'hangs')
+		const [unknown] = await seedPeers(1, 'unknown')
+		const [dead] = await seedPeers(1, 'member', { state: 'dead' })
+
+		const near: string[] = await (svc as any).nearProbeTargets()
+		expect(near, 'the stalling peer is the only near target this tick has').to.deep.equal([stalled!])
+
+		const elapsed = await tick()
+
+		expect(elapsed, 'phase 1 ended on the snapshot timeout, inside its own sub-budget').to.be.at.most(3000)
+		expect(rig.protocolsSeenBy(stalled!), 'ping answered, then the fetch opened and stalled').to.deep.equal([ping(), neighbors()])
+		expect(rig.protocolsSeenBy(unknown!), 'the classification arm still got its turn').to.deep.equal([ping()])
+		expect(rig.protocolsSeenBy(dead!), 'the dead re-probe arm still got its turn').to.deep.equal([ping()])
+
+		// Tick 1's probes answered, so both phase-2 peers were promoted to live members and would
+		// be drawn into the *near* list on tick 2 — where they are pinged *and* fetched, which is
+		// a different question. Re-pose the two labels so the second tick asks the same one.
+		store.setMembership(unknown!, 'unknown')
+		store.update(dead!, { state: 'dead' })
+
+		await tick()
+
+		// "...and it never gets a turn again" is the half that made this an outage; one tick is
+		// not enough to pin it.
+		expect(rig.protocolsSeenBy(unknown!), 'and again on the next tick').to.deep.equal([ping(), ping()])
+		expect(rig.protocolsSeenBy(dead!), 'and again on the next tick').to.deep.equal([ping(), ping()])
+	}
+
+	it('Core: a near peer that stalls its snapshot fetch does not cost phase 2 its turn, tick after tick', async function () {
+		this.timeout(20000)
+		await expectPhaseTwoKeepsItsTurn()
+	})
+
+	// Edge caps the pool at 2, so phase 1 takes more rounds to drain and is likelier to reach its
+	// sub-budget — the profile where a missing reserve would bite first.
+	it('Edge: a near peer that stalls its snapshot fetch does not cost phase 2 its turn, tick after tick', async function () {
+		this.timeout(20000)
+		await teardown()
+		await build('edge')
+		await expectPhaseTwoKeepsItsTurn()
+	})
+
+	// The companion half of the fix: `probeAndFetch` gates the fetch on whether the ping actually
+	// answered. Distinct from the headline case's hung peer, which is cut by the *tick budget*
+	// (`wasCancelled`) — here the budget is untouched and the ping simply times out, so it is the
+	// `!answered` gate alone that stops the fetch. Without it the fetch was still issued: the rig
+	// gives every peer an open stub connection, so connection-only `fetchNeighbors` really would
+	// open a neighbors stream that could only fail.
+	it('a near peer whose ping never answers is not snapshot-fetched at all', async function () {
+		this.timeout(20000)
+		const [silent] = await seedPeers(1, 'member')
+		rig.behavior.set(silent!, 'hangs')
+
+		await tick()
+
+		expect(rig.protocolsSeenBy(silent!), 'ping opened and timed out; no neighbors stream').to.deep.equal([ping()])
+		expect(svc.getDiagnostics().snapshotsFetched, 'nothing fetched').to.equal(0)
 	})
 
 	// ----- pool cap -----
