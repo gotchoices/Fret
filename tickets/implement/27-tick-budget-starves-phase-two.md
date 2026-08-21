@@ -211,3 +211,81 @@ yarn test
 
 Run `yarn test` in the foreground with no redirection so the runner's idle timer stays alive. Note
 in the handoff whether the stalled-snapshot test was confirmed failing against HEAD before the fix.
+
+<!-- resume-note -->
+## Discovered state (interrupted run, no code changed)
+
+A prior implement run stopped on a token-budget warning during investigation, before any edit.
+The working tree carries **no** changes from it. Everything below is discovery output — exact
+anchors so the next run does not repeat the reads. Line numbers are from that run; grep the named
+symbol rather than trusting them.
+
+### Anchors in `packages/fret/src/service/fret-service.ts`
+
+- `MAINTENANCE_RPC_TIMEOUT_MS = 2000` — declared ~line 321, doc comment above it already contrasts
+  itself with the route-sized `RPC_TIMEOUT_MS` and explains why `sendMaybeAct` keeps the default.
+  The new `MAINTENANCE_SNAPSHOT_TIMEOUT_MS` goes immediately after it.
+- `STABILIZE_TICK_BUDGET_MS = 5000` — declared ~line 339, with the `NOTE:` about active mode
+  ticking every 300 ms (the reason the plan rejected raising it). `STABILIZE_PHASE_ONE_BUDGET_MS`
+  goes beside it.
+- `maintenanceConcurrency` getter — ~line 2174, Core 6 / Edge 2.
+- `stabilizeOnce` — ~line 2198. Current body order: `sweepBoundedMaps()` → `nearProbeTargets()` →
+  `const budget = deadline(FretService.STABILIZE_TICK_BUDGET_MS, this.runSignal)` → `try {` →
+  `const pool = { concurrency: this.maintenanceConcurrency, signal: budget.signal }` → phase-1
+  `runPooled(near.map((id) => () => this.probeAndFetch(id, budget.signal)), pool)` → `logRejected`
+  → `fulfilledValues(merged).flat()` → **`await this.enforceCapacity()`** → announce via
+  `this.detach(this.announceToNewPeers(announced), ...)` → the stale `NOTE:` block naming
+  `bug-tick-budget-starves-phase-two` → `if (budget.signal.aborted) return` → `phaseTwoTargets()`
+  → phase-2 `runPooled(..., pool)` → `finally { budget.cancel() }`.
+  - Note `pool` is **one shared object literal** used by both phases. The ticket's "build two pool
+    option objects rather than mutating one" applies directly here: phase 1 needs
+    `{concurrency, signal: phase.signal}`, phase 2 keeps `{concurrency, signal: budget.signal}`.
+  - `enforceCapacity` and the announce already sit above the early return, as the ticket requires;
+    they must stay there when the phase-1 deadline is introduced.
+- `probeAndFetch` — ~line 2266. Body is exactly three statements: `await
+  this.probeNeighborLatency(id, signal)`, then `if (this.wasCancelled(signal)) return []`, then
+  `return this.fetchAndMergeSnapshot(id, signal)`. The new answered-gate goes **after** the
+  `wasCancelled` line, per the ticket.
+- `probeNeighborLatency` — ~line 2280, returns `Promise<void>` today. It is a single `try` around a
+  `switch (out.kind)` with arms `ok` (nested on `out.value.ok`), `busy`, `decode-error`,
+  `foreign-protocol`/`unreachable`/`timeout` (shared), `cancelled`/`skipped` (shared), plus a
+  `catch` logging a malformed id. Every arm already `return`s, so changing the signature to report
+  "answered" is a per-arm edit with no fallthrough to reason about. Answered arms per the ticket:
+  the two `ok` sub-arms, `busy`, `decode-error`. Not answered: `foreign-protocol`, `unreachable`,
+  `timeout`, `cancelled`, `skipped`, and the `catch`.
+- `fetchAndMergeSnapshot` — ~line 2564. The `fetchNeighbors` call passes `{ signal, parse:
+  makeSnapshotParser(this.mergeSnapshotCaps()) }` and **no** `timeoutMs`. The comment to replace is
+  the line directly above it: `// Default (route-sized) budget: a snapshot is a real payload, not a
+  ~50-byte ping.`
+- `phaseTwoTargets` — ~line 2347, already returns `[]` from the three O(1) label counts before any
+  `store.list()`. Nothing in this ticket should touch it.
+
+### Test rig facts (`packages/fret/test/helpers/maintenance-rig.ts`)
+
+- `buildMaintenanceRig(profile, cfg?)` returns `{node, svc, store, rig, ping(), neighbors(),
+  concurrency(), setTickBudget(ms), seedPeers(count, membership, patch?), teardown()}`.
+- `setTickBudget` writes `(FretService as any).STABILIZE_TICK_BUDGET_MS`; `teardown` restores the
+  value captured at build time. A `setPhaseOneBudget` would mirror this exactly (capture
+  `originalPhaseOneBudget` beside `originalTickBudget`, restore in the same `teardown`) — add it
+  only if a test needs it.
+- `PeerRig.behavior` is a `Map<string, 'answers' | 'hangs'>` keyed by peer id, and it is **per
+  peer, not per protocol**. The ticket's headline case needs a peer that answers `PROTOCOL_PING`
+  and hangs `PROTOCOL_NEIGHBORS`, which the rig cannot express today. Extending `PeerRig` is
+  therefore part of this ticket: the natural shape is a per-(peer, protocol) behavior override
+  consulted in `PeerRig.open` before the existing per-peer map, leaving every current caller
+  unchanged. `open()` already receives `protocols[0]` and records it into `this.opened`, so the
+  hook point is one line.
+- `hangsUntilAbort(opts, onSettle)` is exported and is what a hanging stream must use — it settles
+  only on the caller's signal, so a hang under the new phase-1 sub-deadline ends when that child
+  aborts.
+- The service is never started by the rig, so `runSignal` is `undefined` and `deadline` accepts it.
+  A `deadline(PHASE_ONE, budget.signal)` child is still a real child of the tick deadline.
+- `seedPeers` marks every peer dialable (`setAddressKnown`) and `node.getConnections` is stubbed to
+  return one open connection per peer, so every seeded peer is connected — which is what makes
+  `fetchNeighbors` (connection-only) reachable at all.
+
+### Not yet done
+
+The whole TODO list above is untouched. In particular the ticket's instruction to confirm the
+stalled-snapshot test **fails against HEAD before writing the fix** has not been carried out, and
+the handoff must still say so.
