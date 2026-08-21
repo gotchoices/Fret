@@ -63,7 +63,7 @@ export function sparsityBonus(model: SparsityModel, x: number): number {
 function recencyScore(entry: PeerEntry, now: number): number {
 	const dt = Math.max(0, now - entry.lastAccess);
 	const halfLifeMs = 60_000; // 1 minute half-life
-	const lambda = Math.log(2) / Math.max(1, halfLifeMs);
+	const lambda = Math.log(2) / halfLifeMs;
 	return Math.exp(-lambda * dt);
 }
 
@@ -98,20 +98,17 @@ function baseRelevance(entry: PeerEntry, now: number): number {
 	);
 }
 
-function withCounters(entry: PeerEntry, patch: Partial<PeerEntry>): PeerEntry {
-	return { ...entry, ...patch };
-}
-
 export function touch(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
 	observeDistance(model, x);
-	const base = baseRelevance(entry, now);
+	const base = baseRelevance({ ...entry, accessCount: entry.accessCount + 1 }, now);
 	const bonus = sparsityBonus(model, x);
 	const relevance = base * bonus;
-	return withCounters(entry, {
+	return {
+		...entry,
 		lastAccess: now,
 		relevance,
 		accessCount: entry.accessCount + 1
-	});
+	};
 }
 
 /**
@@ -160,12 +157,13 @@ export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x
 	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1 }, now);
 	const bonus = sparsityBonus(model, x);
 	const relevance = base * bonus;
-	return withCounters(entry, {
+	return {
+		...entry,
 		lastAccess: now,
 		relevance,
 		successCount: entry.successCount + 1,
 		avgLatencyMs
-	});
+	};
 }
 
 export function recordFailure(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
@@ -174,9 +172,10 @@ export function recordFailure(entry: PeerEntry, x: number, model: SparsityModel,
 	const base = baseRelevance({ ...entry, failureCount: entry.failureCount + 1 }, now) * 0.7;
 	const bonus = sparsityBonus(model, x);
 	const relevance = base * bonus;
-	return withCounters(entry, {
+	return {
+		...entry,
 		lastAccess: now,
 		relevance,
 		failureCount: entry.failureCount + 1
-	});
+	};
 }
