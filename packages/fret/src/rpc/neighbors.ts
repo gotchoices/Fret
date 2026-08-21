@@ -75,7 +75,10 @@ export async function registerNeighbors(
 					return undefined;
 				}
 				onAnnounce(snap.from, snap);
-				return undefined;
+				// NOTE: accepted tradeoff — unread by `announceNeighbors` (write-only), kept for the
+				// same reasons as `registerLeave`'s: the seam's `undefined` means *drop*, and the
+				// reply is part of the exported seam's observable wire behavior. See leave.ts.
+				return { ok: true };
 			},
 		});
 	}

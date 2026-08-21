@@ -48,7 +48,14 @@ export async function registerLeave(
 				return undefined;
 			}
 			await onLeave(msg);
-			return undefined;
+			// NOTE: accepted tradeoff — this `{ok: true}` is never read by any FRET sender
+			// (`sendLeave` is write-only through `rpcRequest`), but it stays: the seam's
+			// `undefined` return means *drop* (identity mismatch above), and collapsing success
+			// into it makes the two indistinguishable here; the reply is also observable by a
+			// non-FRET consumer of the exported `registerJsonHandler` seam, so removing it is a
+			// wire-format change. Revisit with the leave-authentication / busy-reply work, where
+			// `sendLeave` starts reading a reply (see docs/fret.md *Leave*).
+			return { ok: true };
 		},
 	});
 }
