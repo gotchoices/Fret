@@ -417,6 +417,11 @@ export class FretSimulation {
 		// A bootstrap dial is *proven contact*, not hearsay, so these take production's `touch`
 		// (accessCount incremented, KDE observed) rather than the merge sites' hearsay rule.
 		// `handleConnect` takes no time parameter, so the clock is read here.
+		// NOTE: this block is the proven-contact arm of the same rule `scoreMerge` states for the
+		// hearsay arm — score one entry in one store, patching exactly what the helper computed.
+		// It is inline rather than a `scoreContact` sibling because it is the only proven-contact
+		// site; if a second one appears, extract the pair rather than copying this. Read
+		// `scoreMerge`'s doc block before editing either — the clock rule below is stated there.
 		const model = this.models.get(peerId)!
 		const simNow = this.scheduler.getCurrentTime()
 		for (const other of sample) {
@@ -663,6 +668,13 @@ export class FretSimulation {
 	 * `advanceTo` paths). None of the three merge sites has a `time` in scope, and routing the
 	 * read through one helper is what stops the bus and instant paths from stamping different
 	 * timestamps or applying different scoring rules. Do not "fix" it into a parameter.
+	 *
+	 * NOTE: wall clock meets sim clock here, and on every other scoring site. `DigitreeStore.upsert`
+	 * stamps `lastAccess` with `Date.now()`; each scoring site then patches it to sim time. So the
+	 * *first* scoring of an entry computes `recencyScore` over `max(0, simNow - wallClock)` — always
+	 * 0, i.e. recency exactly 1.0 — while every later re-score decays against a `lastAccess` that is
+	 * already sim time. Benign (the sim never compares the two clocks, and same-seed replay is
+	 * unaffected), but not derivable from the code, so it is written down rather than re-derived.
 	 *
 	 * NOTE: deviation from production, and the sim needs it. Production scores a gossiped peer
 	 * once at creation and never feeds its distance to the KDE (`initialRelevance` alone — see

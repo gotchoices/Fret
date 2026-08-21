@@ -925,10 +925,18 @@ After import, the normal stabilization loop probes restored peers to update conn
     routing arrives in one or two hops under any roughly-monotone metric. Making metric quality
     measurable needs sparse, finger-shaped stores, which needs the sim's eviction to stop being
     degenerate — until then `capacity` is left unset in that spec, since setting it would
-    measure eviction instead. Note the *reason* eviction is degenerate has moved: the sim's
-    per-tick contact sweep now scores every reachable entry through production's own
-    `recordSuccess` / `recordFailure` (`test/simulation/liveness.ts`), so entries no longer all
-    tie at relevance 0. What is still degenerate is the store shape — unbounded stores plus a
+    measure eviction instead. Note the *reason* eviction is degenerate has moved: entries no longer
+    all tie at relevance 0, because **every entry is scored at the site that put it there** —
+    the self-seed in `addPeer`, the bootstrap dials in `handleConnect` (production's `touch`,
+    since a dial is proven contact), the three merge sites through `scoreMerge`, and the
+    per-tick contact sweep through production's own `recordSuccess` / `recordFailure`
+    (`test/simulation/liveness.ts`). The one deliberate exception is documented at
+    `reprobeDeadEntries`, which restores an entry without scoring it. The merge sites carry one
+    knowing deviation from production: gossip there *does* feed the sparsity KDE and re-scores
+    an already-held entry, where production scores a gossiped peer once at creation and never
+    observes its distance (see *Relevance scoring and table management*). The sim wants that
+    acceleration — a sim peer sees orders of magnitude more merges than wall-clock time — and
+    the reasoning lives on `scoreMerge`. What is still degenerate is the store shape — unbounded stores plus a
     per-tick gossip merge of every neighbour's window leave each peer a large near-uniform slice
     of the ring, so eviction has nothing sparse to choose between.
 - Benchmarks: Routing latency, memory usage, message overhead
