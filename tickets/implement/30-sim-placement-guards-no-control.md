@@ -4,16 +4,19 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-THIRD interrupted run, again on a BUDGET_WARNING before any file edit — three runs in a row have
+FOURTH interrupted run, again on a BUDGET_WARNING before any file edit — four runs in a row have
 now spent their entire budget re-reading context and produced zero code changes. This run
-re-confirmed (by direct read, not grep) both previously-unread ranges:
-`packages/fret/test/churn-scenarios.spec.ts` L330–454 and `packages/fret/test/message-bus.spec.ts`
-L285–410. Both match every prior summary exactly, byte for byte. **All research is done. Nothing
-in this repo needs to be re-read before editing.** Everything a fourth run needs — every line of
-code to write, exact current line ranges to replace — is inlined below. If you are the fourth run:
-skip straight to "Exact edits to make," do not open `placement.ts` / `fret-sim.ts` /
-`sim-metrics.ts` / either spec file to "confirm" anything first — the snippets below are verified
-current-state quotes, not paraphrases.
+re-confirmed (by direct read, not grep) `packages/fret/test/churn-scenarios.spec.ts` L330–454 and
+`packages/fret/test/message-bus.spec.ts` L1–410 in full. Both match every prior summary exactly,
+byte for byte — imports, the `Placement distributions` describe block (L292–405), all three
+cases' bodies. **All research is done, for the fourth time. Nothing in this repo needs to be
+re-read before editing.** Everything a fifth run needs — every line of code to write, exact
+current line ranges to replace — is inlined below. If you are the fifth run: skip straight to
+"Exact edits to make," do not open `placement.ts` / `fret-sim.ts` / `sim-metrics.ts` / either spec
+file to "confirm" anything first — the snippets below are verified current-state quotes, not
+paraphrases. If you hit BUDGET_WARNING again before writing a single file, do not spend any of it
+re-reading — go straight to Write on the new file (section 1) first, since that alone is a
+non-destructive, self-contained win even if the two spec-file edits don't fit in what's left.
 
 Confirmed exact state as of this run (nothing has touched these files):
 
