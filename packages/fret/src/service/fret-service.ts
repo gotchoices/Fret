@@ -1052,13 +1052,15 @@ export class FretService implements IFretService, Startable {
 				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt.detail.toString();
-				const coord = await this.coordOf(id);
-				const wasNear = this.isNearNeighbor(id, coord);
+				const wasNear = this.isNearNeighbor(id);
 				this.noteDisconnected(id);
 				await this.applyFailure(id);
-				// Proactive: announce to neighbors around departed peer if it was a near neighbor
+				// Proactive: announce to neighbors around departed peer if it was a near neighbor.
+				// The coordinate is read only inside this branch: `wasNear` implies the peer is in
+				// the store, so `coordOf` returns its stored coord and never pays `hashPeerId`.
+				// Neither call above mutates `entry.coord`, so reading it here is the same value.
 				if (wasNear && !this.stopped) {
-					this.detach(this.announceOnDeparture(id, coord), 'announceOnDeparture');
+					this.detach(this.announceOnDeparture(id, await this.coordOf(id)), 'announceOnDeparture');
 				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
 		});
@@ -1909,7 +1911,7 @@ export class FretService implements IFretService, Startable {
 	 * the connection-event path — so it reads the *cached* self coordinate and answers `false`
 	 * when it has not been hashed yet, rather than awaiting the hash.
 	 */
-	private isNearNeighbor(id: string, _coord: Uint8Array): boolean {
+	private isNearNeighbor(id: string): boolean {
 		const selfCoord = this.cachedSelfCoord;
 		if (!selfCoord) return false;
 		return ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, this.selfIdStr).includes(id);
