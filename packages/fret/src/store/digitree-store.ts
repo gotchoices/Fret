@@ -1,4 +1,4 @@
-import { BTree } from 'digitree';
+import { BTree, type Path } from 'digitree';
 import { COORD_BYTES, coordToBase64url, coordToHex, base64urlToCoord } from '../ring/hash.js';
 
 export type PeerState = 'connected' | 'disconnected' | 'dead';
@@ -148,6 +148,9 @@ function assertCoordWidth(coord: Uint8Array): void {
 		throw new Error(`DigitreeStore: ring coordinate must be ${COORD_BYTES} bytes, got ${coord.length}`);
 	}
 }
+
+/** A cursor into the ordered tree. Aliased so the walk signatures below stay readable. */
+type EntryPath = Path<string, PeerEntry>;
 
 /**
  * Tree keys, cached against the *entry object* that produced them.
@@ -382,127 +385,118 @@ export class DigitreeStore {
 	// up as slow here, maintain a member-only secondary index and walk that instead of
 	// skip-scanning the full ordered index.
 
-	successorOfCoord(coord: Uint8Array, filter?: (e: PeerEntry) => boolean): PeerEntry | undefined {
-		const hex = coordToHex(coord);
-		let p = this.ceilPath(hex);
-		p = p.on ? p : this.byKey.first();
-		if (!filter) return p.on ? this.byKey.at(p) : undefined;
-		const maxScan = this.size();
+	/**
+	 * The one directional ring walk: yields matching entries in ring order from `start`,
+	 * wrapping past the end of the ring, and visiting at most `maxScan` entries.
+	 *
+	 * Every ordered read in this class is a thin consumer of this generator — the five public
+	 * walks differ only in where they start, which way they step, what they collect, and when
+	 * they stop, so those are the four things left to the caller.
+	 *
+	 * `start` is taken raw: an off-end path (a coord past the last entry, an empty tree, a
+	 * cursor sitting on the final entry) is wrapped here rather than by each caller, and a wrap
+	 * that lands off as well means the tree is empty and the walk ends.
+	 *
+	 * `maxScan` counts every entry *visited*, match or miss, so it bounds a filtered walk that
+	 * matches nothing — the guard that makes a zero-match walk terminate instead of circling the
+	 * wrap-around forever. Callers that must terminate on ring size pass `size()`; the two
+	 * neighbor walks pass `Infinity` when unfiltered, where the ring-lapped exit in
+	 * {@link collectRing} is what stops them and today's behavior is byte-for-byte preserved.
+	 */
+	private *walkRing(
+		start: EntryPath,
+		direction: 'next' | 'prior',
+		maxScan: number,
+		filter?: (e: PeerEntry) => boolean
+	): Generator<PeerEntry, void, undefined> {
+		const step = direction === 'next'
+			? (p: EntryPath) => this.byKey.next(p)
+			: (p: EntryPath) => this.byKey.prior(p);
+		const wrapTo = direction === 'next'
+			? () => this.byKey.first()
+			: () => this.byKey.last();
+		let p = start;
 		let scanned = 0;
 		while (scanned < maxScan) {
 			if (!p.on) {
-				p = this.byKey.first();
-				if (!p.on) return undefined;
+				p = wrapTo();
+				if (!p.on) return;
 			}
 			const e = this.byKey.at(p)!;
 			scanned++;
-			if (filter(e)) return e;
-			p = this.byKey.next(p);
+			if (!filter || filter(e)) yield e;
+			p = step(p);
 		}
+	}
+
+	/**
+	 * Collects up to `count` distinct ids from a directional walk, stopping early on the first
+	 * id already collected — a repeat proves the walk has lapped the ring, because the store
+	 * guarantees exactly one tree entry per peer id (see the class doc, and the property test
+	 * in test/digitree.invariants.spec.ts). Without it an unfiltered walk keeps circling a ring
+	 * smaller than `count`, re-collecting the same ids until it has `count` of them — cost
+	 * O(count) rather than O(ring size). Measured on a 4-entry ring, 2000 walks: `count` 4 →
+	 * 3.5 ms, 20 → 3.9 ms, 200 → 19.9 ms, 2000 → 98.9 ms, all returning the same 4 ids.
+	 * Production `count` reaches ~30 (`assembleCohort` asks for `wants * 2 + excludeSet.size`),
+	 * so it was a bounded ~7× lap factor on a young ring — waste, not catastrophe, and bounded
+	 * only by an accident of today's callers.
+	 *
+	 * Sets are insertion-ordered, so `Array.from(set)` yields byte-for-byte the ordering an
+	 * `Array.from(new Set(out))` over the raw walk would: this changes cost, not results.
+	 *
+	 * NOTE: two soundness conditions, neither obvious.
+	 * (1) One-entry-per-id is what makes a repeat mean "lapped". Before that invariant landed
+	 *     (`store-index-tree-invariant`) a duplicated id could appear mid-walk with no wrap, and
+	 *     this exit would silently truncate the walk. If that invariant is ever weakened, this
+	 *     exit must go with it.
+	 * (2) A supplied `filter` must be **pure** (same entry, same answer), because the exit fires
+	 *     only on a *matching* entry and so relies on the first match re-matching after a lap.
+	 *     Every caller today passes `isLiveMember` or a plain field comparison. Note this
+	 *     condition is dormant as the code stands: with a filter `maxScan` is `size()` and
+	 *     {@link walkRing} counts every entry visited, match or miss, so a walk is cut off at
+	 *     exactly one lap and can never reach a repeat. The exit is therefore reachable **only**
+	 *     on the unfiltered path today, and `maxScan` is what makes that so — the purity
+	 *     condition goes live the moment `maxScan` is weakened or removed, which is why it is
+	 *     recorded here.
+	 * The `maxScan` guard stays: it is the guard for the *filtered zero-match* case, where
+	 * nothing is ever collected and the early exit therefore never fires. Neither subsumes the
+	 * other — deleting either one reopens a spin.
+	 */
+	private collectRing(
+		start: EntryPath,
+		direction: 'next' | 'prior',
+		count: number,
+		filter?: (e: PeerEntry) => boolean
+	): string[] {
+		const out = new Set<string>();
+		if (count <= 0) return [];
+		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
+		for (const e of this.walkRing(start, direction, maxScan, filter)) {
+			if (out.has(e.id)) break; // lapped the ring — every reachable id is already collected
+			out.add(e.id);
+			if (out.size >= count) break;
+		}
+		return Array.from(out);
+	}
+
+	successorOfCoord(coord: Uint8Array, filter?: (e: PeerEntry) => boolean): PeerEntry | undefined {
+		const start = this.ceilPath(coordToHex(coord));
+		for (const e of this.walkRing(start, 'next', this.size(), filter)) return e;
 		return undefined;
 	}
 
 	predecessorOfCoord(coord: Uint8Array, filter?: (e: PeerEntry) => boolean): PeerEntry | undefined {
-		const hex = coordToHex(coord);
-		let p = this.floorPath(hex);
-		p = p.on ? p : this.byKey.last();
-		if (!filter) return p.on ? this.byKey.at(p) : undefined;
-		const maxScan = this.size();
-		let scanned = 0;
-		while (scanned < maxScan) {
-			if (!p.on) {
-				p = this.byKey.last();
-				if (!p.on) return undefined;
-			}
-			const e = this.byKey.at(p)!;
-			scanned++;
-			if (filter(e)) return e;
-			p = this.byKey.prior(p);
-		}
+		const start = this.floorPath(coordToHex(coord));
+		for (const e of this.walkRing(start, 'prior', this.size(), filter)) return e;
 		return undefined;
 	}
 
-	// Both directional walks below collect straight into a `Set` and **return on the first id
-	// already in it**. A repeat proves the walk has lapped the ring, because the store
-	// guarantees exactly one tree entry per peer id (see the class doc, and the property test
-	// in test/digitree.invariants.spec.ts). Without it an unfiltered walk keeps circling a ring
-	// smaller than `count`, re-pushing the same ids until it has pushed `count` of them — cost
-	// O(count) rather than O(ring size). Measured on a 4-entry ring, 2000 walks: `count` 4 →
-	// 3.5 ms, 20 → 3.9 ms, 200 → 19.9 ms, 2000 → 98.9 ms, all returning the same 4 ids.
-	// Production `count` reaches ~30 (`assembleCohort` asks for `wants * 2 + excludeSet.size`),
-	// so it was a bounded ~7× lap factor on a young ring — waste, not catastrophe, and bounded
-	// only by an accident of today's callers.
-	//
-	// Sets are insertion-ordered, so `Array.from(set)` yields byte-for-byte the ordering the
-	// previous `Array.from(new Set(out))` produced: this changes cost, not results.
-	//
-	// NOTE: two soundness conditions, neither obvious.
-	// (1) One-entry-per-id is what makes a repeat mean "lapped". Before that invariant landed
-	//     (`store-index-tree-invariant`) a duplicated id could appear mid-walk with no wrap, and
-	//     this exit would silently truncate the walk. If that invariant is ever weakened, this
-	//     exit must go with it.
-	// (2) A supplied `filter` must be **pure** (same entry, same answer), because the exit fires
-	//     only on a *matching* entry and so relies on the first match re-matching after a lap.
-	//     Every caller today passes `isLiveMember` or a plain field comparison. Note this
-	//     condition is dormant as the code stands: with a filter `maxScan` is `size()` and
-	//     `scanned` counts every entry visited, match or miss, so a walk is cut off at exactly
-	//     one lap and can never reach a repeat. The exit is therefore reachable **only** on the
-	//     unfiltered path today, and `maxScan` is what makes that so — the purity condition goes
-	//     live the moment `maxScan` is weakened or removed, which is why it is recorded here.
-	// The `maxScan` guard stays: it is the guard for the *filtered zero-match* case, where
-	// nothing is ever added and the early exit therefore never fires. Neither subsumes the
-	// other — deleting either one reopens a spin.
-	//
-	// NOTE: `plan/cleanup-store-ring` extracts these two (and the near-identical walks above)
-	// into one shared directional walker. The collect-into-a-set and early-exit logic belongs in
-	// that walker when it lands, not copied per call site — the loop is deliberately left in one
-	// body with its guard conditions adjacent so the extraction absorbs this rather than
-	// reinventing it.
-
 	neighborsRight(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
-		const out = new Set<string>();
-		const hex = coordToHex(coord);
-		let p = this.ceilPath(hex);
-		p = p.on ? p : this.byKey.first();
-		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
-		let scanned = 0;
-		while (out.size < count && scanned < maxScan) {
-			if (!p.on) {
-				p = this.byKey.first();
-				if (!p.on) break;
-			}
-			const e = this.byKey.at(p)!;
-			scanned++;
-			if (!filter || filter(e)) {
-				if (out.has(e.id)) break; // lapped the ring — every reachable id is already collected
-				out.add(e.id);
-			}
-			p = this.byKey.next(p);
-		}
-		return Array.from(out);
+		return this.collectRing(this.ceilPath(coordToHex(coord)), 'next', count, filter);
 	}
 
 	neighborsLeft(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
-		const out = new Set<string>();
-		const hex = coordToHex(coord);
-		let p = this.floorPath(hex);
-		p = p.on ? p : this.byKey.last();
-		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
-		let scanned = 0;
-		while (out.size < count && scanned < maxScan) {
-			if (!p.on) {
-				p = this.byKey.last();
-				if (!p.on) break;
-			}
-			const e = this.byKey.at(p)!;
-			scanned++;
-			if (!filter || filter(e)) {
-				if (out.has(e.id)) break; // lapped the ring — every reachable id is already collected
-				out.add(e.id);
-			}
-			p = this.byKey.prior(p);
-		}
-		return Array.from(out);
+		return this.collectRing(this.floorPath(coordToHex(coord)), 'prior', count, filter);
 	}
 
 	/**
@@ -523,26 +517,18 @@ export class DigitreeStore {
 	 */
 	walkFrom(cursor: RingCursor | null, count: number, filter?: (e: PeerEntry) => boolean): RingWalkPage {
 		const entries: PeerEntry[] = [];
-		const maxScan = this.size();
-		if (count <= 0 || maxScan === 0) return { entries, next: cursor };
-		// `next` of the cursor's path is the first entry strictly after it whether the path landed
-		// *on* that key or in the crack where it used to be — so a cursor whose entry has since been
-		// evicted resumes at the right ring position instead of restarting the sweep.
-		let p = cursor ? this.byKey.next(this.byKey.find(cursor.key)) : this.byKey.first();
 		let next = cursor;
-		let scanned = 0;
-		while (entries.length < count && scanned < maxScan) {
-			if (!p.on) {
-				p = this.byKey.first();
-				if (!p.on) break;
-			}
-			const e = this.byKey.at(p)!;
-			scanned++;
-			if (!filter || filter(e)) {
-				entries.push(e);
-				next = { key: makeKey(e) };
-			}
-			p = this.byKey.next(p);
+		const maxScan = this.size();
+		if (count <= 0 || maxScan === 0) return { entries, next };
+		// Strictly-after is a property of the *start path*, not of the walker: `next` of the
+		// cursor's path is the first entry after it whether the path landed *on* that key or in
+		// the crack where it used to be — so a cursor whose entry has since been evicted resumes
+		// at the right ring position instead of restarting the sweep.
+		const start = cursor ? this.byKey.next(this.byKey.find(cursor.key)) : this.byKey.first();
+		for (const e of this.walkRing(start, 'next', maxScan, filter)) {
+			entries.push(e);
+			next = { key: makeKey(e) };
+			if (entries.length >= count) break;
 		}
 		return { entries, next };
 	}
