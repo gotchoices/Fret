@@ -3,6 +3,34 @@ description: Finish a batch of low-risk housekeeping cleanups in the core servic
 files: packages/fret/src/service/fret-service.ts
 difficulty: easy
 ----
+<!-- resume-note -->
+Prior agent run stopped on a BUDGET_WARNING before making any edits — pure investigation only,
+no code changed, no tests run. All four TODO items below are still fully open. No log file was
+written (nothing ran long enough to need one); the findings below are everything that prior run
+learned, inlined so the next run does not have to re-discover them.
+
+Confirmed file:line anchors (read directly, current file state):
+- `nodeListeners` field: line 203 — `private readonly nodeListeners: Array<{ type: string; handler: (evt: any) => void }> = [];`
+- `protocols` field (the inline `import()` type to replace): line 210 — `private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;`
+- `addNodeListener` method: lines 1020-1024 — `(evt: any) => void` param, `type as any` cast at 1023 (`node.addEventListener`) and again at 1029 in `removeNodeListeners` (`node.removeEventListener`).
+- `start()` body: lines 874-972. Registers listeners in this order:
+  - line 902: one-shot `peer:connect` (post-bootstrap announce, guarded by `postBootstrapAnnounced`) — no typed `evt` param used, handler ignores its arg entirely.
+  - line 907: second `peer:connect` (`evt: any`) — store upsert / state / proof-of-life. This is the one to merge the above into.
+  - line 923: `peer:disconnect` (`evt: any`).
+  - line 944: `peer:identify` (`evt: any`) — reads `evt?.detail?.peerId`.
+  - line 958: `peer:update` (`evt: any`) — reads `evt?.detail?.peer`.
+  - Both `peer:connect` handlers already carry the comment "libp2p v3: evt.detail is the PeerId directly, not `{ id: PeerId }`" at lines ~910/~926 (ticket's edge-cases section references this — confirm it's still accurate when typing).
+- `ready()` stub: line 1039 — `async ready(): Promise<void> {}`.
+- `firstStabilizeDone`: declared line 339 (`private firstStabilizeDone = false;`), reset in `start()` at line 886, set `true` inside the stabilization tick's success path at lines 1955-1956 (grepped, not yet read in full context — read a wider window around there before wiring `ready()`, to see exactly what scope that assignment sits in and what's available to resolve a promise from).
+- `stop()`: lines 974-1006. Order: `started=false` → `runGen++` → `stopped=true` → `clearLoopTimers()` → `runAbort?.abort()` → `removeNodeListeners()` → `unregisterRpcHandlers()` → `sendLeaveToNeighbors()` → clear `backoffMap`/`departureDebounce`. `ready()`'s stop-while-pending resolution should probably hook in around the `runAbort?.abort()` point, but this wasn't investigated — verify against the actual edge-case requirements below.
+
+Not yet located (next agent must still find these — ticket's approximate line numbers below are unverified this run):
+- `preconnectNeighbors` (~1488) and the active-tick warm-up body (~1538) — not read.
+- `pingWarmupTargets` — not read.
+- The exact code at stabilization-tick success (~1950-1960 area) — only the two `firstStabilizeDone` line numbers are confirmed via grep, not the surrounding logic.
+
+Everything else below (the actual TODO items) is unchanged from the original ticket — re-read it fresh, don't assume partial progress on any item.
+
 Continuation of `plan/18-cleanup-core-service` (deleted; this ticket carries the remaining scope after a budget-limited planning pass). That pass already **applied** two of the original items directly to `packages/fret/src/service/fret-service.ts` — no further action needed on them, listed here only so the remaining work isn't re-investigated:
 
 - **Done:** the ~8 `console.warn`/`console.error` call sites now go through the module's `log.error(...)` (the `@libp2p/logger` instance already used everywhere else in the file), matching the existing `'%s failed - %e'`-style format strings. `@libp2p/logger`'s `Logger` type has no `warn` level, so former `console.warn` sites became `log.error` too, same as every other error path in this file.
