@@ -1,82 +1,96 @@
-description: New tests prove a stalled or unresponsive near neighbor can no longer eat a whole background maintenance cycle, and both tests are confirmed to catch the bug they were written for.
-files: packages/fret/test/stabilize-concurrency.spec.ts, packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/neighbors.ts
+description: New tests prove a stalled or unresponsive near neighbor can no longer eat a whole background maintenance cycle; this review pass is partly done and needs finishing.
+files: packages/fret/test/stabilize-concurrency.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, packages/fret/src/service/fret-service.ts, docs/fret.md
+difficulty: medium
 ---
 
-## What shipped
+<!-- resume-note -->
+A prior review run stopped on a `BUDGET_WARNING` before finishing. No log file was written and
+**no files were changed** — the run was read-only. Nothing is half-applied; the working tree is
+as the implement stage left it. Resume from "What is still to do" below.
 
-Three new cases in `packages/fret/test/stabilize-concurrency.spec.ts`, under a
-`// ----- phase-2 reserve -----` section right after the headline-regression case (file-header
-bullet list updated to match):
+## What the implement stage actually shipped
 
-- `Core: a near peer that stalls its snapshot fetch does not cost phase 2 its turn, tick after
-  tick`
-- `Edge: ...` (same body via shared `expectPhaseTwoKeepsItsTurn()` helper)
+Seven commits carry the slug; **only `a16af9d7` touches code** — `+80` lines in
+`packages/fret/test/stabilize-concurrency.spec.ts` and nothing else. The other six are edits to
+the ticket file itself. So the whole review surface is those 80 test lines plus whatever
+production code and docs they should have dragged along. Confirm with:
+
+```
+git show a16af9d7 -- packages/fret/test/stabilize-concurrency.spec.ts
+```
+
+The three new cases sit under a `// ----- phase-2 reserve -----` heading after the headline
+regression case:
+
+- `Core: a near peer that stalls its snapshot fetch does not cost phase 2 its turn, tick after tick`
+- `Edge: …` — same body, via a shared `expectPhaseTwoKeepsItsTurn()` helper
 - `a near peer whose ping never answers is not snapshot-fetched at all`
 
-No production code changed — this ticket is tests only. Both new mechanisms were already live in
-`fret-service.ts` from prior work; this ticket's job was proving they hold and handing off.
+## What the first review pass covered
 
-## Both cases confirmed to bite (flip-the-fix, run, restore — done for each)
+Read with fresh eyes, before the handoff summary: the full diff, the shared harness
+(`test/helpers/maintenance-rig.ts`), and the spec's file-header comment block. No production
+file was re-read in depth; the relevant symbols were located but not audited
+(`stabilizeOnce` ~2234, `nearProbeTargets` ~2296, `probeAndFetch` ~2313, `phaseTwoTargets`
+~2409, `fetchAndMergeSnapshot` ~2626 in `src/service/fret-service.ts`).
 
-**Case 1 — phase-1 snapshot timeout.** Removed line 2634's
-`timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS` from the `fetchNeighbors` call inside
-`fetchAndMergeSnapshot`. Result: both Core and Edge case-1 tests failed. Failure shape was more
-informative than a simple "runs to full 5000ms timeout" guess: with the per-call override gone,
-`fetchNeighbors` falls back to the route-sized `RPC_TIMEOUT_MS` (5000ms) — which *exceeds* phase
-1's own `STABILIZE_PHASE_ONE_BUDGET_MS` sub-budget (3000ms) — so phase 1 now truncates on **its
-own** budget (measured wall time ≈3000–3013ms) rather than running the stalled fetch out to its
-full timeout. Either way, the mechanism the test exists to catch is present: phase 1 no longer
-ends on the intended 1000ms snapshot-timeout floor, so its budget accounting and the phase-2
-reserve arithmetic are off from what the shipped constants promise. Restored; tree confirmed
-clean before and after.
+Nothing was fixed and nothing was filed. Everything below is an **unverified observation** to
+re-check, not a finding.
 
-**Case 2 — the `!answered` gate.** Removed line 2323's `if (!answered) return [];` inside
-`probeAndFetch`. Result: test failed. Assertion expected the protocol list to be `["…/ping"]`
-only (no fetch attempted after an unanswered ping) but got `["…/ping", "…/neighbors"]` — i.e.
-with the gate gone, a near peer whose ping never answers still gets its snapshot fetched, wasting
-up to `MAINTENANCE_SNAPSHOT_TIMEOUT_MS` of phase-1 wall time on a fetch that could only fail too.
-Restored; tree confirmed clean before and after.
+## Observations to re-check (none confirmed)
 
-Neither flip was left in the tree at any point — each was done as a single chained shell
-invocation (flip → test → `git checkout --` restore → `git status --short` to confirm clean), so
-an interrupt between steps was never possible.
+- **The wall-clock assertion may not discriminate.** `expectPhaseTwoKeepsItsTurn()` asserts
+  `expect(elapsed).to.be.at.most(3000)` — but 3000 is also exactly the phase-1 sub-budget, so a
+  tick that truncates on the sub-budget instead of ending on the 1000 ms snapshot timeout lands
+  right on the boundary. The handoff itself reports that the deliberate mutation produced
+  measured wall times of ~3000–3013 ms, i.e. the test failed by ~13 ms. That is a thin margin
+  for a timing assertion running at real, unmutated constants on shared CI hardware. Consider
+  whether a tighter bound (the expected cost is ~1.1 s) would bite decisively without becoming
+  flaky, or whether the case should assert on something other than wall time.
+- **Both label re-poses between ticks are load-bearing and worth a second look.** The helper
+  calls `store.setMembership(unknown!, 'unknown')` and `store.update(dead!, { state: 'dead' })`
+  between tick 1 and tick 2, because tick 1's successful probes promote both peers to live
+  members and they would otherwise be drawn into the *near* list on tick 2 (a different
+  question). The comment says this; check the reasoning holds and that the second tick really
+  still exercises the phase-2 arms rather than something adjacent.
+- **Profile teardown ordering.** The Edge case calls `teardown()` then `build('edge')` inside
+  the test body while `afterEach(teardown)` is also registered. Looked correct on reading
+  (`harness` is reassigned, so `afterEach` tears down the Edge harness and the Core one was
+  already stopped) — confirm rather than assume, and check no rig state leaks between the two.
 
-## Division of labour — read this before touching either constant
+## What is still to do
 
-At today's constants, the phase-1 sub-budget (`STABILIZE_PHASE_ONE_BUDGET_MS` = 3000) is
-belt-and-braces, not the load-bearing fix: a phase-1 task is a ping (capped at
-`MAINTENANCE_RPC_TIMEOUT_MS` = 2000) chained to a fetch (capped at
-`MAINTENANCE_SNAPSHOT_TIMEOUT_MS` = 1000), so one task costs ~3000ms at worst regardless of how
-many near peers stall — phase 1's wall clock is already bounded without the sub-budget doing
-anything. **The snapshot timeout is the load-bearing change for this regression.** The sub-budget
-is what keeps the guarantee true *if* either RPC timeout is ever raised later, and that inequality
-is already pinned separately by `test/stabilize-budget-invariants.spec.ts`. Say this plainly
-because case 1's failure mode (phase 1 truncating on its own sub-budget once the snapshot timeout
-override was removed) could be misread as "case 1 pins the sub-budget" — it does not; it happens
-to trip the sub-budget as a side effect of losing the primary guard.
+- Audit the production code these tests claim to pin — `probeAndFetch`'s `!answered` gate, the
+  `MAINTENANCE_SNAPSHOT_TIMEOUT_MS` override in `fetchAndMergeSnapshot`, the phase-1 sub-budget
+  wiring in `stabilizeOnce` — with fresh eyes, not through the handoff's account of them.
+- Judge test coverage as a floor: the implementer verified exactly two mutated lines. Consider
+  error paths and interactions the three cases do not reach (a near peer answering `busy`; a
+  phase-1 that truncates on the *tick* budget rather than its own; phase 2 finding no targets).
+- Source hygiene on the diff: `stabilize-concurrency.spec.ts` is now 428 lines; comment density
+  in the new block is high relative to the surrounding file — judge whether it earns its place.
+- **Docs.** `docs/fret.md` already describes both mechanisms (the *Two phases* bullet under
+  *Stabilization and churn handling* names the phase-1 sub-budget, the reserve arithmetic and
+  the "ping did not answer → no fetch" rule). Verify it names the new cases where it lists what
+  `test/stabilize-concurrency.spec.ts` pins, and that nothing there is now stale.
+- Run the gate in the foreground with no redirection: `cd packages/fret && yarn test` (the
+  implementer reported `1217 passing (4m)`) and `npx tsc --noEmit`. There is no lint step in
+  this repo — `yarn check` (typecheck + build + test) is the gate, and `yarn format` /
+  `yarn format:check` must **not** be run (see AGENTS.md).
+- Produce the `complete/` ticket with a `## Review findings` section: what was checked, what was
+  found, what was done. Empty categories stated explicitly with a reason.
 
-## Full suite
+## Handoff claims worth keeping (from the implement stage)
 
-`yarn test` from `packages/fret/`, foreground, no redirection:
-
-```
-1217 passing (4m)
-```
-
-Zero failing, zero pending, no errors in output. `test/mocha-exit-watchdog.ts` did not report any
-handle held open at exit, so no timer leak from the two `deadline()` handles now live per tick.
-
-## What a reviewer should treat as a floor, not a finish line
-
-- Only the two flipped lines were verified to make their respective test fail. No other mutation
-  testing was done against the surrounding logic (e.g. the exact sub-budget/tick-budget numbers,
-  the disjointness of the four candidate sets) — those are covered by pre-existing specs
-  (`test/stabilize-budget-invariants.spec.ts`, the disjointness case in
-  `test/stabilize-concurrency.spec.ts`) that were not touched or re-audited this round beyond
-  confirming they still pass in the full suite run above.
-- The existing high-water-mark assertion (pool concurrency *equals* the cap) and the
-  four-candidate-set disjointness assertion were not individually re-verified in isolation this
-  round — only as part of the full 1217-passing run.
-- Type-check (`npx tsc --noEmit`) was run clean in an earlier session on this ticket (not
-  re-verified this run, but nothing has touched typed surface since — only test-file additions
-  land in this diff, and the full suite compiling and running is sufficient evidence).
+- Both new mechanisms were already live in `fret-service.ts` from the prior
+  `tick-budget-starves-phase-two` work; this ticket is tests only, no production change.
+- Each case was flip-the-fix verified: removing `timeoutMs:
+  FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS` from the `fetchNeighbors` call failed both case-1
+  tests; removing `if (!answered) return [];` from `probeAndFetch` failed case 2. Each flip was
+  a single chained shell invocation ending in a restore, so nothing was left in the tree.
+- The implementer's own stated division of labour: at today's constants the snapshot timeout is
+  the load-bearing guard and the phase-1 sub-budget is belt-and-braces (a phase-1 task is a
+  2000 ms ping chained to a 1000 ms fetch, so ~3000 ms at worst regardless of how many peers
+  stall). The sub-budget only starts earning its keep if either RPC timeout is raised later, and
+  that inequality is pinned separately by `test/stabilize-budget-invariants.spec.ts`. Case 1
+  tripping the sub-budget under mutation is a side effect of losing the primary guard, not
+  evidence that case 1 pins the sub-budget.
