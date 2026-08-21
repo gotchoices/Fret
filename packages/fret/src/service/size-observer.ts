@@ -96,6 +96,12 @@ export class SizeObserver {
 	/**
 	 * Blend `local` with the recorded observations. `local` is always the first observation, so
 	 * the population is never empty.
+	 *
+	 * NOTE: `local.confidence` is a blend weight exactly like a reported one, but is *not*
+	 * range-checked the way `report` checks its argument. Safe today because every caller feeds it
+	 * a clamped `estimateSizeAndConfidence` result and `blend` is not on the public `FretService`
+	 * surface (`getNetworkSizeEstimate` builds `local` itself). If `blend` ever becomes reachable
+	 * with a caller-supplied `local`, clamp `confidence` to `[0, 1]` here.
 	 */
 	blend(local: LocalSizeEstimate): BlendedSize {
 		const now = this.now();
