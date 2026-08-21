@@ -4,7 +4,24 @@ files: packages/fret/test/payload-bounds-ttl.spec.ts, packages/fret/test/rpc.cod
 difficulty: easy
 ---
 
-## Progress so far (this pass, 5th refiling)
+## Progress so far (this pass, 6th refiling)
+
+**Landed this pass:** `packages/fret/test/helpers/rate-limited.ts` created — exports
+`sumRateLimited(rateLimited)`, summing the five keyed sub-fields
+(`neighbors+ping+maybeAct+leave+announce`), excluding `concurrencyLimited`. Matches item 2 of the
+fix map below exactly, follows `wait-for.ts` style (plain function, no class, one JSDoc block).
+**Hit BUDGET_WARNING immediately after writing that file, before any other edit.** Zero progress
+on items 1, 3, 4, 5, 6 this pass — the mapping below (unchanged from passes 3/4/5, verified three
+times now, still not re-verified this pass since no file other than the new helper was touched).
+
+**Next pass: do NOT re-read rpc.codec-properties.spec.ts again — go straight to editing the 8
+sites in item 1 below, importing `sumRateLimited` from `./helpers/rate-limited` (relative path
+from `test/rpc.codec-properties.spec.ts` is `./helpers/rate-limited`), then item 3
+(`rpc.handler-fuzz.spec.ts:1184`, same import, relative path `./helpers/rate-limited`), then items
+4, 5, 6 in order.** The mapping has been independently confirmed on three prior passes with zero
+drift — treat it as ground truth.
+
+## Progress so far (prior pass, 5th refiling)
 
 **This pass (5th) hit BUDGET_WARNING immediately after re-reading and re-confirming lines
 1320-1670 of `rpc.codec-properties.spec.ts` against the prior pass's exact fix map — matches
