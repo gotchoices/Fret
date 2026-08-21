@@ -18,7 +18,15 @@ export interface SimMetrics {
 	coverageTimeSeries: CoverageSnapshot[]
 	routingAttempts: number
 	routingSuccesses: number
+	/** Hop counts for every attempt, successes and failures alike. */
 	routingHops: number[]
+	/**
+	 * Hop counts for successful routes only. Separate from `routingHops` because a failed
+	 * route contributes the partial path it managed before giving up, so a hop-count *bound* —
+	 * "a route takes O(log N) hops" — can only be read off this array. Mixing the two makes a
+	 * bound look better the more routes fail.
+	 */
+	successfulRouteHops: number[]
 	routingSuccessRate: number
 	avgRoutingHops: number
 	messageDrops: number
@@ -92,6 +100,7 @@ export class MetricsCollector {
 		routingAttempts: 0,
 		routingSuccesses: 0,
 		routingHops: [],
+		successfulRouteHops: [],
 		routingSuccessRate: 0,
 		avgRoutingHops: 0,
 		messageDrops: 0,
@@ -146,6 +155,7 @@ export class MetricsCollector {
 		this.metrics.routingAttempts++
 		if (success) this.metrics.routingSuccesses++
 		this.metrics.routingHops.push(hops)
+		if (success) this.metrics.successfulRouteHops.push(hops)
 	}
 
 	finalize(): SimMetrics {
@@ -168,7 +178,11 @@ export class MetricsCollector {
 			this.metrics.avgRoutingHops =
 				this.metrics.routingHops.reduce((a, b) => a + b, 0) / this.metrics.routingHops.length
 		}
-		return { ...this.metrics, coverageTimeSeries: [...this.metrics.coverageTimeSeries] }
+		return {
+			...this.metrics,
+			coverageTimeSeries: [...this.metrics.coverageTimeSeries],
+			successfulRouteHops: [...this.metrics.successfulRouteHops],
+		}
 	}
 
 	getMetrics(): Readonly<SimMetrics> {

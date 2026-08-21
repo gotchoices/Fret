@@ -823,7 +823,37 @@ After import, the normal stabilization loop probes restored peers to update conn
   - Pinned by `test/simulation.partition.spec.ts`: two-way, singleton and three-way splits;
     a leave during a cut reaching only the leaver's own side; in-flight messages dropped at the
     cut; a bus-mode run of the whole cut/escalate/heal lifecycle; mid-split joins; and
-    deterministic replay of a full partition/heal schedule.
+    deterministic replay of a full partition/heal schedule. A route across a *fresh* cut is a
+    separate case from a route across an escalated one: after escalation the cross entries are
+    already `dead` and the pool is empty, an outcome an oracle filter would also produce, so the
+    proof that routing is local is a route fired in the window between the cut and escalation —
+    it must fail *and* book refused contacts *and* leave a strike behind.
+  - **The sim routes the way a node does.** Each hop is chosen by the shipped `chooseNextHop`
+    (cost path) over the deciding peer's own store; the candidate pool reads neither the global
+    `alive` flag nor the partition map, so a peer learns a hop is unreachable only when its own
+    contact attempt fails — and that failure strikes the entry through the same escalation the
+    per-tick contact sweep uses (one shared `recordContactFailure`). A chosen hop is an attempt,
+    not a delivery: a refusal costs attempt budget and the selector runs again over what is
+    left, so only delivered hops count toward path length. `selfCoord` is supplied from the
+    second hop onward only, matching production's originator/forwarder split, and the near
+    radius derives from `store.size()` rather than the harness's alive count. Churn is
+    scheduled lazily and pairs a join with every leave, so a non-zero rate measures behavior
+    under churn rather than population collapse.
+  - **Routing itself is guarded, within a stated limit** (`test/simulation.routing.spec.ts`):
+    success rate and p90 hop count over successful routes only, on a dense 200-peer ring, a
+    sparser 1000-peer all-edge ring, and that ring under churn, plus the originator-nearest case
+    that pins the from-hop-2 floor. The thresholds are set from measured runs across four seeds
+    (95–100% success, p90 2 hops) and shown to bite: inverting the selector's preference moves
+    p90 from 2 to ~19. **The hop bound is the sensitive measure, not the success rate** — the
+    attempt budget absorbs a bad route until it stumbles onto the target. The spec deliberately
+    does not claim to discriminate one plausible ring metric from another: substituting
+    clockwise-only distance, or XOR, for `minDistance` moves neither number, because the sim's
+    stores are unbounded and its gossip merges every neighbor's window each tick, leaving each
+    peer a large near-uniform slice of the ring (63% at n=200, 19% at n=1000) over which greedy
+    routing arrives in one or two hops under any roughly-monotone metric. Making metric quality
+    measurable needs sparse, finger-shaped stores, which needs the sim's eviction to stop being
+    degenerate (every entry ties at relevance 0, so it collapses to ring order) — until then
+    `capacity` is left unset in that spec, since setting it would measure eviction instead.
 - Benchmarks: Routing latency, memory usage, message overhead
 
 ### Open questions / next steps

@@ -116,9 +116,17 @@ function farWeights(confidence: number): CostWeights {
  * `connectedToleranceBytes` default of 1, so both selector paths agree on what "slightly
  * farther" means.
  *
- * NOTE: 8 ± 4 is reasoned from that legacy correspondence, not measured — nothing under
- * `test/simulation/` drives the shipped selector today, so there is no routing-success or
- * hop-count number to tune against. Retune once such a harness exists.
+ * NOTE: 8 ± 4 is reasoned from that legacy correspondence, and is still not measured.
+ * `test/simulation.routing.spec.ts` now drives this selector for real — the sim routes hop by
+ * hop through `chooseNextHop` over each peer's own store — but it cannot tune these constants,
+ * and that is a measured finding rather than an untried idea. Its break-test table records the
+ * reason: substituting clockwise-only distance, or XOR, for `minDistance` moves neither the
+ * routing-success rate nor the p90 hop count, because the sim's stores are unbounded and
+ * near-uniform, so greedy routing reaches the target's anchor in one or two hops under any
+ * roughly-monotone metric. A slack constant is a tie-break between candidates that are close
+ * in distance; with routes this short there are no such ties to break. Tuning needs sparse,
+ * finger-shaped stores first (see the NOTE at `FretSimulation.enforceCapacity`). What the spec
+ * *does* guard is direction: inverting the preference moves p90 hops from 2 to ~19.
  */
 const CONNECTED_SLACK_ORDERS = 8;
 const CONNECTED_SLACK_CONFIDENCE_SWING = 4;
