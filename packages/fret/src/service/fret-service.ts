@@ -1600,8 +1600,11 @@ export class FretService implements IFretService, Startable {
 		// `spNeighborIds` goes in as the helper's `exclude`, not as a filter on its result: it
 		// holds up to 2m ids, which on this walk blankets one side's whole window. The helper
 		// over-fetches by `exclude.size` for exactly that reason, so the excluded side still
-		// yields `m * 2` candidates instead of starving. Interleaved, so the `maxReplacements`
-		// cap below takes from both sides rather than emptying the clockwise one first.
+		// yields `m * 2` candidates instead of starving. The helper's interleave is the
+		// *tie-break* the sort below falls back on, not a guarantee about the cap: the cap is
+		// applied after a connected-first, then-relevance sort, so it takes the best-connected
+		// and most-relevant six wherever they sit, and side-interleaving only decides order
+		// among candidates that tie on both keys.
 		const wider = ringNeighborsBothSides(
 			this.store,
 			selfCoord,
