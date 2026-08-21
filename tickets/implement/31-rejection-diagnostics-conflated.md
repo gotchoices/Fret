@@ -5,10 +5,194 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Third run also hit BUDGET_WARNING before any code edit landed** — three runs in, still ZERO
-files touched. This run confirmed exact line content (below) so the fourth run can edit
-immediately with no exploring: read nothing except the three narrow context-reads called out
-below, then start editing.
+**Fourth run also hit BUDGET_WARNING before any code edit landed** — four runs in, still ZERO
+files touched (each dies right after the first confirmatory Read). Fifth run: do NOT re-verify
+anything below by reading it again — the block below is copy-paste-ready `Edit` `old_string`/
+`new_string` pairs, confirmed twice now (run 3 and run 4) byte-for-byte identical. Fire the Edits
+in order below with **zero** exploration. Only 3 reads remain genuinely required (marked below);
+do those inline, immediately followed by their Edit, not batched as a separate "exploration phase".
+
+## Simplification vs earlier drafts of this note: skip the standalone type alias
+
+Earlier drafts said add `type RateLimitedProtocol = 'neighbors' | 'ping' | 'maybeAct' | 'leave' |
+'announce';` somewhere above the `rejected:` field. **Skip that** — its exact placement was never
+pinned (would need an extra read of the outer class-field context to find a safe insertion point),
+and it is not required for correctness: this is a plain object-literal initializer, so TypeScript
+structurally infers `rateLimited: { neighbors: number; ping: number; maybeAct: number; leave:
+number; announce: number }` from the literal below with no alias needed. `rejected.rateLimited.
+maybeAct++` etc. type-checks fine against the inferred shape. Do not spend a read hunting a
+placement for a cosmetic-only alias — get the six call sites + maybe-act.ts landed first.
+
+## Ready-to-fire Edit #1 — the `diag.rejected` block (no read needed, content re-confirmed twice)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+`old_string` (exact, unique in file):
+```
+		rejected: {
+			payloadTooLarge: 0,
+			timestampBounds: 0,
+			ttlExpired: 0,
+			rateLimited: 0,
+			identityMismatch: 0,
+			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+			malformed: 0,
+		},
+	};
+```
+
+`new_string`:
+```
+		rejected: {
+			payloadTooLarge: 0,
+			timestampBounds: 0,
+			ttlExpired: 0,
+			rateLimited: { neighbors: 0, ping: 0, maybeAct: 0, leave: 0, announce: 0 },
+			identityMismatch: 0,
+			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+			malformed: 0,
+			/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
+			concurrencyLimited: 0,
+		},
+	};
+```
+
+## Ready-to-fire Edits #2-4 — three unique-line call sites (no read needed)
+
+All in `packages/fret/src/service/fret-service.ts`.
+
+Edit #2 (line ~1381, `handleMaybeAct` token bucket):
+`old_string`: `if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }`
+`new_string`: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.rateLimited.maybeAct++`
+
+Edit #3 (line ~1421, `handleMaybeAct` concurrency cap — NOT the same counter, see Edge cases below):
+`old_string`: `if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }`
+`new_string`: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.concurrencyLimited++`
+
+Edit #4 (line ~1838, `handleLeave`):
+`old_string`: `if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }`
+`new_string`: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.rateLimited.leave++`
+
+If any of these three `old_string`s no longer matches exactly (file drifted), fall back to a
+targeted `Read` of just that line ± 2 and adapt — but try the exact string first, zero-read.
+
+## Remaining 3 reads that ARE genuinely required — do read immediately followed by its Edit
+
+1. Read `packages/fret/src/service/fret-service.ts` lines ~1285-1302 → find the two bare lines
+   `this.diag.rejected.rateLimited++;` in `handleNeighborsRequest` (~1290) and `handlePingRequest`
+   (~1298) (3 identical bare-line matches exist file-wide, so bare `old_string` is ambiguous —
+   grab 2-3 surrounding lines per site to disambiguate). Edit line ~1290 →
+   `this.diag.rejected.rateLimited.neighbors++`; edit line ~1298 →
+   `this.diag.rejected.rateLimited.ping++`.
+2. Read lines ~1995-2003 → find the third bare `this.diag.rejected.rateLimited++;` in
+   `handleAnnounce` (~1999). Edit → `this.diag.rejected.rateLimited.announce++`.
+3. Read lines ~1225-1245 → find the `registerMaybeAct(` call inside `registerRpcHandlers` (line
+   ~1234, with `return await this.handleMaybeAct(msg);` around line 1238). Add a 5th positional
+   arg `() => { this.diag.rejected.malformed++; }` (the new `onMalformed` param — see maybe-act.ts
+   edit below).
+
+## Ready-to-fire Edit #5 — `packages/fret/src/rpc/maybe-act.ts` (full file content pinned, verified
+twice — no read needed)
+
+Full current file (59 lines) — for `Edit` tool matching, use the specific old/new fragments below
+rather than re-pasting the whole file:
+
+Fragment A — imports, top of file:
+`old_string`:
+```
+import type { Libp2p } from 'libp2p';
+import {
+	PROTOCOL_MAYBE_ACT,
+	encodeJson,
+	decodeJson,
+	readFramed,
+	sendFramed,
+	registerRpcHandler,
+} from './protocols.js';
+```
+`new_string`:
+```
+import type { Libp2p } from 'libp2p';
+import {
+	PROTOCOL_MAYBE_ACT,
+	encodeJson,
+	decodeJson,
+	readFramed,
+	sendFramed,
+	registerRpcHandler,
+} from './protocols.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:maybe-act');
+```
+
+Fragment B — function signature + body:
+`old_string`:
+```
+export async function registerMaybeAct(
+	node: Libp2p,
+	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT,
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES
+): Promise<void> {
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
+		const bytes = await readFramed(stream, maxBytes);
+		const msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		const res = await handle(msg, connection.remotePeer.toString());
+		sendFramed(stream, encodeJson(res));
+	});
+}
+```
+`new_string`:
+```
+export async function registerMaybeAct(
+	node: Libp2p,
+	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT,
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
+	onMalformed?: () => void
+): Promise<void> {
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
+		const bytes = await readFramed(stream, maxBytes);
+		let msg: RouteAndMaybeActV1;
+		try {
+			msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		} catch (err) {
+			log.error('%s: undecodable body - dropping - %e', protocol, err);
+			onMalformed?.();
+			sendFramed(stream, encodeJson({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 } satisfies NearAnchorV1));
+			return;
+		}
+		const res = await handle(msg, connection.remotePeer.toString());
+		sendFramed(stream, encodeJson(res));
+	});
+}
+```
+
+(`NearAnchorV1` is already imported in this file per the pinned full-file listing further below —
+confirm the import line still lists it; it does in the pinned content.)
+
+## Steps 6-9 (test/doc updates + verify) — unchanged from original TODO, see full list at bottom
+
+After edits #1-5 land: update `test/inflight-concurrency.spec.ts` (assert on
+`concurrencyLimited`, drop stale comment), `test/profile.behavior.spec.ts` (keyed-shape reads),
+`docs/fret.md` (3 sites, listed in "Edge cases & interactions" below), then
+`cd packages/fret && npx tsc --noEmit && yarn test`.
+
+## If budget runs out again before step 9
+
+Commit whatever subset of edits #1-5 landed (do NOT leave the working tree half-edited across a
+ticket handoff with no note) — update this same resume-note to say exactly which of edits #1-5
+completed and which remain, using the same ready-to-fire format above for whatever's left, and
+re-pin any NEW exact line numbers/content the completed edits shifted. Do not restate content
+that's already correctly pinned above unchanged.
+
+--- ORIGINAL (run 3) NOTE BELOW, kept for the exact verified six-call-site mapping table and
+line-content pins that are still accurate ---
+
+This run confirmed exact line content (below) so the next run can edit immediately with no
+exploring: read nothing except the three narrow context-reads called out below, then start
+editing.
 
 ## Exact current content, pinned this run (safe to trust, no re-read needed)
 
