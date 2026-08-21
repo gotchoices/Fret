@@ -54,6 +54,10 @@ describe('Proactive announcements', function () {
 		}
 		expect(additionalAnnouncements).to.be.greaterThan(0)
 
+		// Node 2's libp2p node is already down, but its FretService is not — mesh.stop's `skip`
+		// leaves both alone, so the service must be stopped explicitly or its internal timers
+		// (stabilization interval, etc.) leak past the test.
+		await mesh.services[2]!.stop()
 		await mesh.stop({ skip: [2] })
 	})
 
