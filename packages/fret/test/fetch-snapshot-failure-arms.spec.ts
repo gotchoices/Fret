@@ -68,6 +68,24 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 	})
 
 	/**
+	 * Serve `newStream` as the node's only open connection for the duration of `fn`, restoring the
+	 * real `getConnections` afterwards. The three stubs below differ only in what that `newStream`
+	 * does — a readable reply, an open that rejects, a stream that never yields — and each must
+	 * stay incapable of producing the others' behavior, so the *behaviors* remain three separate
+	 * functions while this override/restore shape is stated once.
+	 */
+	async function withConnection<T>(newStream: () => Promise<Stream>, fn: () => Promise<T>): Promise<T> {
+		const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
+		const real = holder.getConnections.bind(node)
+		holder.getConnections = () => [{ status: 'open', newStream }] as unknown as Connection[]
+		try {
+			return await fn()
+		} finally {
+			holder.getConnections = real
+		}
+	}
+
+	/**
 	 * Hand back an open connection whose stream yields `body` as one framed JSON chunk then EOF,
 	 * for the duration of `fn`. `pulls` proves the stream was actually read, so a test using this
 	 * cannot pass by silently taking the `skipped` arm instead.
@@ -88,14 +106,7 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 			}),
 		} as unknown as Stream
 
-		const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
-		const real = holder.getConnections.bind(node)
-		holder.getConnections = () => [{ status: 'open', newStream: async () => stream }] as unknown as Connection[]
-		try {
-			return { result: await fn(), pulls }
-		} finally {
-			holder.getConnections = real
-		}
+		return { result: await withConnection(async () => stream, fn), pulls }
 	}
 
 	function snapshotBody(from: string): unknown {
@@ -200,17 +211,8 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 	 */
 	async function withFailingOpen<T>(fn: () => Promise<T>): Promise<{ result: T, opens: number }> {
 		let opens = 0
-		const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
-		const real = holder.getConnections.bind(node)
-		holder.getConnections = () => [{
-			status: 'open',
-			newStream: async (): Promise<Stream> => { opens++; throw new Error('boom') },
-		}] as unknown as Connection[]
-		try {
-			return { result: await fn(), opens }
-		} finally {
-			holder.getConnections = real
-		}
+		const newStream = async (): Promise<Stream> => { opens++; throw new Error('boom') }
+		return { result: await withConnection(newStream, fn), opens }
 	}
 
 	it('unreachable: a stream that will not open is a contact failure, not a membership one', async () => {
@@ -271,14 +273,7 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 				}),
 			} as unknown as Stream
 
-			const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
-			const real = holder.getConnections.bind(node)
-			holder.getConnections = () => [{ status: 'open', newStream: async () => stream }] as unknown as Connection[]
-			try {
-				return { result: await fn(), pulls }
-			} finally {
-				holder.getConnections = real
-			}
+			return { result: await withConnection(async () => stream, fn), pulls }
 		}
 
 		it('a peer that opens a stream and then stalls lands on the same counter as unreachable', async () => {
@@ -295,9 +290,11 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 			const after = readEntry(FROM)
 
 			expect(pulls, 'the stub stream was actually read, not skipped').to.be.greaterThan(0)
-			// Bounded by the *overridden* static, not the real 1000ms — so this cannot go green on
-			// a build where the override silently stopped taking effect.
-			expect(elapsed, 'bounded by the overridden timeout, not the real 1000ms').to.be.lessThan(REAL_TIMEOUT)
+			// Bounded well inside the real 1000ms, so an override that silently stopped taking
+			// effect fails here rather than squeaking under a bound set at the real value. Half
+			// the real timeout is 10x the override and still nowhere near scheduler noise, so it
+			// pins the override taking effect without pinning the deadline's exact value.
+			expect(elapsed, 'bounded by the overridden timeout, not the real 1000ms').to.be.lessThan(REAL_TIMEOUT / 2)
 			expect(announced, 'nothing announced').to.deep.equal([])
 			expect(svc.getDiagnostics().snapshotsFetched, 'not counted as fetched').to.equal(fetchedBefore)
 			// Same channel as `unreachable`: both are "could not get an answer at all".
