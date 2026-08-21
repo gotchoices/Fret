@@ -841,8 +841,14 @@ After import, the normal stabilization loop probes restored peers to update conn
     under churn rather than population collapse.
   - **Routing itself is guarded, within a stated limit** (`test/simulation.routing.spec.ts`):
     success rate and p90 hop count over successful routes only, on a dense 200-peer ring, a
-    sparser 1000-peer all-edge ring, and that ring under churn, plus the originator-nearest case
-    that pins the from-hop-2 floor. The thresholds are set from measured runs across four seeds
+    sparser 1000-peer all-edge ring, and that ring under churn, plus a direct assertion on the
+    selector — not on a route outcome — that a peer already nearest the key has no
+    strictly-improving first hop, which is *why* `selfCoord` is withheld when originating. That
+    case cannot be driven through a route: a peer nearest a coordinate is that coordinate's
+    anchor in its own store, so the route completes at hop 0 without the selector ever running.
+    The sim's own from-hop-2 split is therefore unpinned by any route in that spec; it can bite
+    only when every entry nearer the key in the originator's store is `dead`, which is a
+    partition-shaped case rather than a routing one. The thresholds are set from measured runs across four seeds
     (95–100% success, p90 2 hops) and shown to bite: inverting the selector's preference moves
     p90 from 2 to ~19. **The hop bound is the sensitive measure, not the success rate** — the
     attempt budget absorbs a bad route until it stumbles onto the target. The spec deliberately

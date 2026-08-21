@@ -1,3 +1,14 @@
+import { COORD_BYTES } from '../../src/ring/hash.js'
+
+/** 2^256 — the ring's full span. */
+const RING = 1n << BigInt(COORD_BYTES * 8)
+
+/**
+ * NOTE: this module is the landing place for coordinate arithmetic hand-rolled inside specs.
+ * Copies still living in `test/ring.properties.spec.ts` (`toCoord`, `refMinDistance`) and
+ * `test/size-estimator.spec.ts` (`bigIntToCoord`) should migrate here rather than multiply.
+ */
+
 /**
  * `base` shifted by `delta` ring units, exact modulo 2^256. The delta is added at the
  * *least-significant* byte (index `length - 1`) with carry/borrow propagated leftward across
@@ -44,4 +55,29 @@ export function toBigInt(u: Uint8Array): bigint {
 	let v = 0n
 	for (const b of u) v = (v << 8n) | BigInt(b)
 	return v
+}
+
+/**
+ * Big-endian bigint → ring coordinate, reduced mod 2^256 so a negative or over-wide value
+ * still yields a well-formed coordinate.
+ */
+export function toCoord(v: bigint): Uint8Array {
+	let x = ((v % RING) + RING) % RING
+	const out = new Uint8Array(COORD_BYTES)
+	for (let i = COORD_BYTES - 1; i >= 0; i--) {
+		out[i] = Number(x & 0xffn)
+		x >>= 8n
+	}
+	return out
+}
+
+/**
+ * Independent BigInt oracle for the ring metric — deliberately shares no code with
+ * `src/ring/distance.ts`, so a bug in `clockwiseDistance` or `lexLess` cannot hide behind a
+ * spec that re-derives the answer from the same helpers. Only `COORD_BYTES`, a width constant,
+ * is taken from `src/`.
+ */
+export function refMinDistance(a: Uint8Array, b: Uint8Array): bigint {
+	const cw = (toBigInt(b) - toBigInt(a) + RING) % RING
+	return cw <= RING - cw ? cw : RING - cw
 }

@@ -4,6 +4,7 @@ import { FretSimulation, type SimConfig } from './simulation/fret-sim.js'
 import { percentileSummary } from './simulation/sim-metrics.js'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
 import { chooseNextHop } from '../src/selector/next-hop.js'
+import { refMinDistance, toCoord } from './helpers/ring.js'
 
 /**
  * Does ring routing actually work?
@@ -46,17 +47,6 @@ import { chooseNextHop } from '../src/selector/next-hop.js'
  * here rather than used as a sparsity knob: today it would evict a contiguous arc from every
  * store and this spec would measure eviction rather than routing.
  */
-
-/** Big-endian bigint → 32-byte ring coordinate. Mirrors the module-private helper in fret-sim.ts. */
-function coordFromBigInt(val: bigint): Uint8Array {
-	const coord = new Uint8Array(32)
-	let v = val
-	for (let i = 31; i >= 0; i--) {
-		coord[i] = Number(v & 0xffn)
-		v >>= 8n
-	}
-	return coord
-}
 
 /** Drive every event scheduled up to `uptoMs`, one at a time, then park the clock there. */
 function pump(sim: FretSimulation, uptoMs: number): void {
@@ -119,7 +109,7 @@ function measureRouting(config: SimConfig): RouteResult {
 		.map((p) => p.id)
 	for (let i = 0; i < ROUTE_COUNT; i++) {
 		const from = liveIds[rng.nextInt(0, liveIds.length)]!
-		sim.scheduleRoute(from, coordFromBigInt(rng.nextBigInt(256)), CONVERGE_MS + 10 + i)
+		sim.scheduleRoute(from, toCoord(rng.nextBigInt(256)), CONVERGE_MS + 10 + i)
 	}
 	pump(sim, CONVERGE_MS + 10 + ROUTE_COUNT)
 
@@ -180,55 +170,83 @@ describe('Ring routing through the shipped selector', function () {
 		expect(r.p90Hops, 'p90 hop count under churn').to.be.at.most(MAX_P90_HOPS)
 	})
 
-	it('a route whose originator is already the peer nearest the target still succeeds', () => {
+	it('an originator already nearest the key has no strictly-improving first hop', () => {
 		// The strict-improvement floor makes a hop no closer to the key ineligible. Production
 		// applies it only when *forwarding* — an originator aiming at a key's cluster is
 		// legitimately farther from the key than every member of that cluster — so the sim
-		// supplies selfCoord from the second hop onward. Without that split, a route whose
-		// source is itself the nearest peer has no eligible first hop and fails, and the
-		// aggregate cases above would hide it as a couple of percent.
-		const sim = new FretSimulation(baseConfig())
+		// supplies `selfCoord` from the second hop onward (`fret-sim.ts`, `handleRoute`).
+		//
+		// This asserts on that hop-0 selector call directly rather than through a route
+		// outcome, because **a route cannot reach it**: a peer nearest a coordinate is that
+		// coordinate's anchor in its own store, so `handleRoute` records success at hop 0 and
+		// never calls the selector. Measured 2026-08-20 — the route-level version of this case
+		// completed all 20 of its routes at hop 0, and deleting the `hops > 0` split left every
+		// one of them passing, so it pinned nothing. What is reachable, and what this pins, is
+		// the rule's *price*: with `selfCoord` supplied such an originator has no eligible
+		// candidate at all, and only withholding it lets the message leave.
+		//
+		// Consequence worth stating: the sim's own `hops > 0` split is therefore unpinned by
+		// any route here. It can only bite when the entries nearer the key in the originator's
+		// store are all `dead` (the pool is `notDead`-filtered while the anchor check is not),
+		// which is a partition-shaped scenario rather than a routing one.
+		const cfg = baseConfig()
+		const sim = new FretSimulation(cfg)
 		sim.initialize()
 		pump(sim, CONVERGE_MS)
 
 		const rng = new DeterministicRNG(99)
 		const peers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+		// The floor is applied *before* the near/far partition, so the radius cannot change the
+		// outcome; a whole-ring radius keeps the assertion independent of which branch runs.
+		const wholeRing = toCoord(1n << 255n)
+
 		for (let i = 0; i < 20; i++) {
-			const target = coordFromBigInt(rng.nextBigInt(256))
+			const target = toCoord(rng.nextBigInt(256))
 			const nearest = nearestByCoord(peers, target)
-			const before = sim.metrics.getMetrics().routingSuccesses
-			sim.scheduleRoute(nearest.id, target, CONVERGE_MS + 100 + i)
-			pump(sim, CONVERGE_MS + 100 + i)
+			const store = sim.getStores().get(nearest.id)!
+			// The same pool `handleRoute` builds for its first hop, minus self.
+			const pool = [
+				...store.neighborsRight(target, cfg.m, (e) => e.state !== 'dead'),
+				...store.neighborsLeft(target, cfg.m, (e) => e.state !== 'dead'),
+			].filter((id) => id !== nearest.id)
+			const connected = (id: string) => nearest.connected.has(id)
+			const opts = { nearRadius: wholeRing, confidence: 0.5 }
+
+			expect(pool, `case ${i} must offer candidates for the floor to reject`).to.not.be.empty
 			expect(
-				sim.metrics.getMetrics().routingSuccesses,
-				`originator-nearest route ${i} from ${nearest.id}`,
-			).to.equal(before + 1)
+				chooseNextHop(store, target, pool, connected, () => 0, {
+					...opts,
+					selfCoord: nearest.coord,
+				}),
+				`forwarding rule at hop 0 strands originator-nearest case ${i} (${nearest.id})`,
+			).to.equal(undefined)
+			expect(
+				chooseNextHop(store, target, pool, connected, () => 0, opts),
+				`originator ${nearest.id} must still get a first hop without the floor`,
+			).to.be.a('string')
 		}
 	})
 })
 
-/** Ring-nearest peer to a coordinate, by the same shorter-arc metric the selector uses. */
-function nearestByCoord(peers: { id: string; coord: Uint8Array }[], target: Uint8Array) {
+/**
+ * Ring-nearest peer to a coordinate, by the shorter-arc metric.
+ *
+ * Deliberately measured with the reference bigint arithmetic in `test/helpers/ring.ts` rather
+ * than `src/ring/distance.ts`: this selects the *case* the selector is then asked about, so an
+ * independent
+ * implementation makes the assertion a cross-check — if the two disagreed about which peer is
+ * nearest, the strict-improvement assertion fails loudly. Selecting the case with the selector's
+ * own helper would make that agreement an assumption instead of a result.
+ */
+function nearestByCoord<T extends { id: string; coord: Uint8Array }>(peers: T[], target: Uint8Array): T {
 	let best = peers[0]!
-	let bestDist = ringDistance(best.coord, target)
+	let bestDist = refMinDistance(best.coord, target)
 	for (const p of peers.slice(1)) {
-		const d = ringDistance(p.coord, target)
+		const d = refMinDistance(p.coord, target)
 		if (d < bestDist) {
 			best = p
 			bestDist = d
 		}
 	}
 	return best
-}
-
-function toBigInt(u8: Uint8Array): bigint {
-	let v = 0n
-	for (const b of u8) v = (v << 8n) | BigInt(b)
-	return v
-}
-
-function ringDistance(a: Uint8Array, b: Uint8Array): bigint {
-	const RING = 1n << 256n
-	const cw = (toBigInt(b) - toBigInt(a) + RING) % RING
-	return cw < RING - cw ? cw : RING - cw
 }
