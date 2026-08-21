@@ -5,8 +5,9 @@ import { createMemNode } from './helpers/libp2p.js'
 import { ringOffset } from './helpers/ring.js'
 import { serializedPeer, tableOf } from './helpers/serialized-table.js'
 import { FretService } from '../src/service/fret-service.js'
-import { hashPeerId } from '../src/ring/hash.js'
-import type { MembershipState, PeerState, SerializedPeerEntry } from '../src/store/digitree-store.js'
+import { hashPeerId, COORD_BYTES } from '../src/ring/hash.js'
+import { createSparsityModel, initialRelevance, recordSuccess } from '../src/store/relevance.js'
+import type { MembershipState, PeerEntry, PeerState, SerializedPeerEntry } from '../src/store/digitree-store.js'
 
 /**
  * Capacity enforcement and victim selection — the service-level half of relevance scoring.
@@ -24,6 +25,18 @@ import type { MembershipState, PeerState, SerializedPeerEntry } from '../src/sto
  */
 
 const NETWORK = 'relevance-eviction-test'
+
+/**
+ * Fixed clock and ring position for the one fixture below that *derives* its relevances instead
+ * of stating them.
+ *
+ * Every scoring call blends in a recency term, so `lastAccess` and `now` must be the same
+ * instant or the derived numbers move by however long the test took. `X_SHARED` is the
+ * normalized log distance both arms are scored at — the same value for each, so the comparison
+ * is between frequency credit and hearsay rather than between two ring positions.
+ */
+const FIXED_NOW = 1_700_000_000_000
+const X_SHARED = 0.5
 
 /** A peer to place on the ring relative to self, with the state a fixture cares about. */
 interface Placed {
@@ -303,6 +316,80 @@ describe('FretService capacity enforcement and victim selection', function () {
 		await service.importTable(tableOf(records(standardLayout(self))))
 
 		expect(survivors(service)).to.include(selfId)
+	})
+
+	// ------------------------------------------------------------------------------------
+	// The user-visible point of scoring gossip flat: a peer we have actually contacted must
+	// survive a capacity squeeze against one we have only ever been told about. Without that,
+	// a peer named in hundreds of merged snapshots could outrank one we had pinged hundreds of
+	// times, and eviction would drop the peer we can actually reach.
+	//
+	// The two relevances are **computed, not copied**. `place()` takes a literal number, so
+	// hand-writing the values from the design work would assert on constants and would still
+	// pass with `recordSuccess` / `initialRelevance` deleted. Derived here, the fixture *is*
+	// the two scoring arms.
+	//
+	// One **shared** sparsity model, unlike the isolated ones `relevance.properties.spec.ts`
+	// uses for the same comparison: `enforceCapacity` ranks the scores as *stored*, and every
+	// stored score in a running service was written under one service-wide model. Sharing it is
+	// the property under test here, where isolating it is the property under test there.
+	//
+	// Scoring the gossiped entry first is the conservative order: `recordSuccess` observes the
+	// distance and `initialRelevance` does not, so the 500 successes raise the model occupancy
+	// at `X_SHARED` and each one is scored under a *lower* sparsity bonus than the gossiped
+	// entry got from the pristine model. Frequency credit wins anyway.
+	// ------------------------------------------------------------------------------------
+	it('evicts a peer we were only ever told about before one we actually contacted', async () => {
+		const model = createSparsityModel()
+		const fresh: PeerEntry = {
+			id: 'derivation-only', coord: new Uint8Array(COORD_BYTES), relevance: 0,
+			lastAccess: FIXED_NOW, state: 'disconnected', membership: 'member',
+			negotiateFailures: 0, lastNegotiateFailureAt: 0,
+			contactFailures: 0, lastContactFailureAt: 0,
+			accessCount: 0, successCount: 0, failureCount: 0, avgLatencyMs: null,
+		}
+
+		// Named once and then named 500 more times: `FretService.noteDiscovered` scores a new
+		// entry once from its own empty counters and leaves an id it already holds untouched,
+		// so the further mentions write nothing. One `initialRelevance` is the whole arm.
+		const gossipedRelevance = initialRelevance(fresh, X_SHARED, model, FIXED_NOW)
+
+		let contactedEntry = fresh
+		for (let i = 0; i < 500; i++) {
+			contactedEntry = recordSuccess(contactedEntry, undefined, X_SHARED, model, FIXED_NOW)
+		}
+		const contactedRelevance = contactedEntry.relevance
+
+		expect(contactedEntry.accessCount, 'only proven contact accrues frequency credit').to.equal(500)
+		expect(contactedRelevance, 'the fixture is the ordering under test').to.be.greaterThan(gossipedRelevance)
+
+		// m 3, so protection is self plus the 3 nearest live members on each side: the four
+		// near peers, `far-1` clockwise, and `far-6` counter-clockwise by wrap-around. Both
+		// fixture peers sit at +2000 / +3000 — the 4th and 5th live members clockwise — so
+		// they are the *only* unprotected entries and relevance alone decides between them.
+		const service = await seededService({ m: 3, capacity: 8 })
+		place(service, [
+			{ id: 'near-cw-1', coord: ringOffset(self, 1), relevance: 0.01 },
+			{ id: 'near-cw-2', coord: ringOffset(self, 2), relevance: 0.02 },
+			{ id: 'near-ccw-1', coord: ringOffset(self, -1), relevance: 0.03 },
+			{ id: 'near-ccw-2', coord: ringOffset(self, -2), relevance: 0.04 },
+			{ id: 'far-1', coord: ringOffset(self, 1000), relevance: 3 },
+			{ id: 'contacted', coord: ringOffset(self, 2000), relevance: contactedRelevance },
+			{ id: 'gossiped', coord: ringOffset(self, 3000), relevance: gossipedRelevance },
+			{ id: 'far-6', coord: ringOffset(self, 6000), relevance: 4 },
+		])
+
+		await enforce(service)
+
+		// 9 entries (8 placed + self) against a capacity of 8, so exactly one eviction.
+		const ids = survivors(service)
+		expect(ids, 'proven contact survives the squeeze').to.include('contacted')
+		expect(ids, 'hearsay does not').to.not.include('gossiped')
+		// `contacted` also sits *nearer* self in ring order than `gossiped`, so a ring-ordered
+		// eviction loop would have taken it instead — the survival is relevance, not position.
+		expect(ids).to.have.members([
+			selfId, ...NEAR_IDS, 'far-1', 'contacted', 'far-6',
+		])
 	})
 
 	// The tripwire recorded at `enforceCapacity`: protection wins over the cap, so a capacity
