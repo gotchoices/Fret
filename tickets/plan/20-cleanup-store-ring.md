@@ -26,10 +26,9 @@ The store and ring modules carry several small cleanups worth doing together:
 Out of scope: the dead ring-distance exports (clockwise-distance and min-distance) are handled by the separate consolidate-ring-distance ticket; do not touch them here.
 
 <!-- resume-note -->
-Prior run hit BUDGET_WARNING partway through research (no log file — cut short before any
-edits). Fully read `digitree-store.ts` and `relevance.ts` (both in full); did not yet read
-`ring/hash.ts` or `ring/distance.ts`, and did not grep the rest of the tree. No code changed yet.
-Findings, so the next run doesn't re-derive them:
+Second run also hit BUDGET_WARNING (still research phase, no code changed yet). Read
+`ring/hash.ts` and `ring/distance.ts` in full, and grepped the rest of `src/` for the remaining
+4 items. Findings, so the third run doesn't re-derive them:
 
 - **Item "bare-spread counters helper" — located and resolved.** `relevance.ts:101-103`:
   `function withCounters(entry, patch) { return { ...entry, ...patch }; }` — literally just a
@@ -65,31 +64,56 @@ Findings, so the next run doesn't re-derive them:
   logic (not the seek/wrap loop) can't reintroduce an unguarded spin. Keep the `neighborsRight`/
   `neighborsLeft` early-exit-on-repeat behavior and the `walkFrom` strictly-after/paging behavior
   as documented in their existing docblocks — those are behavior, not incidental to the loop shape.
-- **Items NOT yet located — need grep, not yet done:**
-  - "store re-implements a coordinate-to-hex helper that already lives in ring hash module" —
-    `digitree-store.ts` already imports and uses `coordToHex` from `../ring/hash.js` (used in
-    `ceilPath`, `floorPath`, `makeKey`), so the duplicate isn't in this file as read. Check
-    `ring/hash.ts` itself and any other store-adjacent file for a second hex-conversion
-    implementation.
-  - "lexicographic-less comparison pads left vs xor/clockwise pad right" — not in
-    `digitree-store.ts` or `relevance.ts`. Likely `ring/distance.ts` (padding shows up around a
-    hex/byte comparison for the peer-id tie-break). Read `ring/distance.ts` and `ring/hash.ts`.
-  - "metadata field typed Record<string, any> should be Record<string, unknown>" — NOT in
-    `digitree-store.ts`: `PeerEntry.metadata` and `SerializedPeerEntry.metadata` are already
-    `Record<string, unknown>`. Grep the tree (likely `service/fret-service.ts`) for
-    `Record<string, any>`.
-  - "dead guard clamping a constant to a minimum of one" — not found in either file read so far.
-    Grep for `Math.max(1,` across `src/`.
-  - "mirrored-index xor loop that's an obfuscated forward loop" — not found in either file read.
-    Not `ring/distance.ts`'s dead `clockwiseDistance`/`minDistance` exports (explicitly out of
-    scope per this ticket) — check `relevance.ts`'s sparsity/KDE code and
-    `selector/next-hop.ts`/`estimate/size-estimator.ts` for an xor-indexed loop that's really just
-    counting forward.
+- **"store re-implements a coordinate-to-hex helper" — appears ALREADY FIXED, no dupe found.**
+  `digitree-store.ts` uses the shared `coordToHex` from `../ring/hash.js` throughout (`ceilPath`,
+  `floorPath`, `makeKey`). Grepped all of `src/` for `coordToHex|hexToCoord|hex(coord)` — only
+  `digitree-store.ts` and `ring/hash.ts` itself match; no second implementation anywhere. Treat
+  as no-op unless the implementer spots one this grep missed.
+- **"lexicographic-less comparison pads left vs xor/clockwise pad right" — appears ALREADY FIXED.**
+  `ring/distance.ts:10-19` (`lexLess`) is right-aligned (`a[a.length - 1 - i]`), matching
+  `clockwiseDistance`'s own right-aligned loop (`ring/distance.ts:21-40`), and its docblock
+  explicitly says so ("matches the arithmetic in `clockwiseDistance`"). Grepped `src/` for any
+  other `lexLess`/padding/tie-break comparator — only this one exists (consumed by
+  `selector/next-hop.ts`). No mismatch present in the code as it stands today; this ticket item
+  is stale (probably written before an earlier pass already aligned the two). Treat as no-op.
+- **"metadata field typed Record<string, any>" — CONFIRMED already fixed.** Grepped all of
+  `src/` for `Record<string, any>` / `: any` — zero live matches. `digitree-store.ts`'s
+  `PeerEntry.metadata` / `SerializedPeerEntry.metadata` are `Record<string, unknown>`. The one
+  hit is a **comment** in `service/libp2p-fret-service.ts:15` narrating the *historical* bug
+  ("wrapper ended up handing callers `Record<string, any>` metadata after the interface had been
+  tightened") — that's the fix's own commit message, not remaining work. No-op.
+- **"dead guard clamping a constant to a minimum of one" — NOT YET NARROWED, multiple candidates.**
+  Grepped `Math.max(1,` across `src/`, 10 hits: `utils/pool.ts:78`, `utils/expiring-map.ts:158`,
+  `store/relevance.ts:66`, `estimate/size-estimator.ts:171,173`, `service/fret-service.ts:161,500,2536`,
+  `service/payload-heuristic.ts:43,69`. Ticket's own `files:` header names only
+  `digitree-store.ts`/`relevance.ts`, which narrows it to `store/relevance.ts:66`:
+  `const lambda = Math.log(2) / Math.max(1, halfLifeMs);` — need to check whether `halfLifeMs`
+  can ever legitimately be < 1 (a config constant vs. a computed value) to tell whether this
+  clamp is live defense or dead ballast. **Not yet checked** — next run: read the call site(s)
+  passing `halfLifeMs` and confirm it's always a positive config constant ≥ 1 before calling this
+  one dead and removable.
+- **"mirrored-index xor loop that's an obfuscated forward loop" — NOT FOUND anywhere in `src/`.**
+  Grepped `for (let i` across all of `src/`: the only descending/mirrored-index loops are
+  `ring/distance.ts:12` (`lexLess`, right-aligned magnitude compare — legitimate, not obfuscated,
+  and out of scope per this ticket's own "don't touch ring-distance" exclusion) and
+  `service/payload-heuristic.ts:81` (`computeNearRadius`, a plain big-endian byte-write loop
+  writing a BigInt into a 32-byte buffer MSB-first — also plain, not mirrored/xor, not
+  obfuscated). Neither matches "mirrored-index xor" at all — no `^`/`xor`/mirror-style indexing
+  found anywhere via grep. **This item may be stale** (already fixed in an earlier pass, same as
+  the coordToHex/lexLess items above) or may describe code outside `src/` (test helpers? sim
+  harness?) — not yet checked. Next run: grep `test/` and `docs/` for `xor` too, and if still
+  nothing turns up, drop this bullet from the ticket as resolved/stale rather than blocking on it.
 
-Next run: finish locating the 5 ungrepped items above (quick greps), confirm each against its
-cited file/line in this ticket's `References:` line, then this ticket is ready to resolve into an
-`implement/` ticket per the Plan-stage rules (design fully resolved — no open questions once the
-5 locations are confirmed and the walker's consumer-shape is settled per the sketch above).
+**Net picture after 2 research-only runs:** of the original 6 mechanical items, 2 are done-but-
+unapplied (bare-spread inline, relevance touch fix — both fully specified above, trivial patches),
+1 is a real, fully-designed refactor (directional walker extraction — sketch above is complete),
+and 3 (coord-to-hex dupe, lex-pad mismatch, metadata `any`) now appear to be **already fixed in
+the codebase** and are very likely stale ticket text — carry them into the implement ticket as
+"verify still true, else no-op" rather than as required work. Only the dead-`Math.max(1,...)`
+guard and the mirrored-xor-loop items remain genuinely unresolved-locations; both are small,
+bounded lookups (not new design work), so they belong in the implement ticket as a first checkpoint
+rather than blocking another plan-stage pass. This is now specified enough to hand to
+`implement/` — the walker design is the only substantial design decision, and it's settled.
 <!-- /resume-note -->
 
 
