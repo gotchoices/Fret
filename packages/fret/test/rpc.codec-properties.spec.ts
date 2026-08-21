@@ -8,6 +8,7 @@ import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { disable, enable } from '@libp2p/logger'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { sumRateLimited } from './helpers/rate-limited.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import * as lp from 'it-length-prefixed'
 import { decodeJson, encodeJson, makeProtocols, readFramed, sendFramed } from '../src/rpc/protocols.js'
@@ -1354,39 +1355,39 @@ describe('RPC codec properties', function () {
 			const svc = service()
 			const d = drivable(svc)
 			drain(d.bucketMaybeAct)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.maybeAct
 
 			const res = await d.handleMaybeAct(maybeActMsg())
 
 			expect(isBusy(res), 'busy reply').to.equal(true)
 			expect((res as BusyResponseV1).retry_after_ms).to.be.greaterThan(0)
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'counted exactly once').to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.maybeAct - before, 'counted exactly once').to.equal(1)
 		})
 
 		it('answers a neighbors request with busy + a positive retry_after_ms once its bucket is drained', async () => {
 			const svc = service()
 			const d = drivable(svc)
 			drain(d.bucketNeighbors)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.neighbors
 
 			const res = await d.handleNeighborsRequest()
 
 			expect(isBusy(res), 'busy reply').to.equal(true)
 			expect((res as BusyResponseV1).retry_after_ms).to.be.greaterThan(0)
-			expect(svc.getDiagnostics().rejected.rateLimited - before).to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.neighbors - before).to.equal(1)
 		})
 
 		it('answers ping with busy + a positive retry_after_ms once its bucket is drained', async () => {
 			const svc = service()
 			const d = drivable(svc)
 			drain(d.bucketPing)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.ping
 
 			const res = d.handlePingRequest()
 
 			expect(isBusy(res), 'busy reply').to.equal(true)
 			expect((res as BusyResponseV1).retry_after_ms).to.be.greaterThan(0)
-			expect(svc.getDiagnostics().rejected.rateLimited - before).to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.ping - before).to.equal(1)
 		})
 
 		it('silently ignores a rate-limited leave — visible only as a counter', async () => {
@@ -1395,14 +1396,14 @@ describe('RPC codec properties', function () {
 			const departing = 'peer-departing'
 			svc.getStore().upsert(departing, await hashKey(enc.encode(departing)))
 			drain(d.bucketLeave)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.leave
 
 			await d.handleLeave({ v: 1, from: departing, timestamp: Date.now() })
 
 			// `handleLeave` returns void either way, so the *only* local evidence is that the peer
 			// was not removed and the counter moved. See the wire-level asymmetry test below.
 			expect(svc.getStore().getById(departing), 'the notice was not acted on').to.not.equal(undefined)
-			expect(svc.getDiagnostics().rejected.rateLimited - before).to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.leave - before).to.equal(1)
 		})
 
 		it('drops a rate-limited inbound announce and counts it', async () => {
@@ -1417,13 +1418,13 @@ describe('RPC codec properties', function () {
 			svc.getStore().remove(announcer)
 
 			drain(d.bucketAnnounceInbound)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.announce
 
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
 
 			await sleep(50) // the merge is detached; give one that should not run every chance to
 			expect(svc.getStore().getById(announcer), 'never merged').to.equal(undefined)
-			expect(svc.getDiagnostics().rejected.rateLimited - before).to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.announce - before).to.equal(1)
 		})
 
 		// `rejected.rateLimited` has one more contributor than the five buckets: the maybeAct
@@ -1439,7 +1440,7 @@ describe('RPC codec properties', function () {
 			drain(d.bucketPing)
 			drain(d.bucketLeave)
 			drain(d.bucketAnnounceInbound)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = sumRateLimited(svc.getDiagnostics().rejected.rateLimited)
 
 			await d.handleMaybeAct(maybeActMsg())
 			await d.handleNeighborsRequest()
@@ -1448,7 +1449,7 @@ describe('RPC codec properties', function () {
 			const announcer = await newPeerIdString()
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
 
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'five paths, five increments').to.equal(5)
+			expect(sumRateLimited(svc.getDiagnostics().rejected.rateLimited) - before, 'five paths, five increments').to.equal(5)
 		})
 
 		it('keeps the buckets independent — draining maybeAct leaves the other four answering', async () => {
@@ -1457,7 +1458,7 @@ describe('RPC codec properties', function () {
 			const departing = 'peer-leaving'
 			svc.getStore().upsert(departing, await hashKey(enc.encode(departing)))
 			drain(d.bucketMaybeAct)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.maybeAct
 
 			expect(isBusy(await d.handleMaybeAct(maybeActMsg())), 'maybeAct is drained').to.equal(true)
 			expect(isBusy(await d.handleNeighborsRequest()), 'neighbors still answers').to.equal(false)
@@ -1470,7 +1471,7 @@ describe('RPC codec properties', function () {
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
 			await waitUntil(() => svc.getStore().getById(announcer) != null, 2000, 'announce still merged')
 
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'only the maybeAct rejection').to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.maybeAct - before, 'only the maybeAct rejection').to.equal(1)
 		})
 
 		it('refills every one of the five buckets after the wait it reports', async () => {
@@ -1540,7 +1541,10 @@ describe('RPC codec properties', function () {
 			const svc = service()
 			const d = drivable(svc)
 			drain(d.bucketMaybeAct)
+			// Shallow spread: `before.rateLimited` is the same object reference as the live
+			// counter, so the scalar sub-field must be captured by value separately.
 			const before = { ...svc.getDiagnostics().rejected }
+			const beforeMaybeActRateLimited = svc.getDiagnostics().rejected.rateLimited.maybeAct
 
 			const res = await d.handleMaybeAct(maybeActMsg({ breadcrumbs: 5 }))
 
@@ -1550,7 +1554,7 @@ describe('RPC codec properties', function () {
 			expect(isBusy(res), 'busy, not the static malformed reject').to.equal(true)
 			const after = svc.getDiagnostics().rejected
 			expect(after.malformed - before.malformed, 'the validator never ran').to.equal(0)
-			expect(after.rateLimited - before.rateLimited).to.equal(1)
+			expect(after.rateLimited.maybeAct - beforeMaybeActRateLimited).to.equal(1)
 		})
 
 		it('never caches a busy reply, so a retry after refill gets real work done', async () => {
@@ -1640,7 +1644,7 @@ describe('RPC codec properties', function () {
 			store.upsert(senderId, await hashKey(enc.encode(senderId)))
 
 			drain(drivable(svc).bucketLeave)
-			const before = svc.getDiagnostics().rejected.rateLimited
+			const before = svc.getDiagnostics().rejected.rateLimited.leave
 
 			const reply = await request(P.PROTOCOL_LEAVE, JSON.stringify({
 				v: 1, from: senderId, timestamp: Date.now(),
@@ -1654,7 +1658,7 @@ describe('RPC codec properties', function () {
 			expect(reply, 'still answered').to.not.equal(undefined)
 			expect((await decodeJson<{ ok: boolean }>(reply!)).ok, 'answered ok despite being dropped').to.equal(true)
 			expect(store.getById(senderId), 'but the notice was not acted on').to.not.equal(undefined)
-			expect(svc.getDiagnostics().rejected.rateLimited - before, 'visible only as a counter').to.equal(1)
+			expect(svc.getDiagnostics().rejected.rateLimited.leave - before, 'visible only as a counter').to.equal(1)
 
 			await waitUntil(() => openStreams(P.PROTOCOL_LEAVE) === 0, 2000, 'no inbound stream left open')
 		})

@@ -1174,14 +1174,18 @@ describe('RPC handler fault isolation', function () {
 			// Edge profile: maybeAct bucket burst 8, refill 4/s — so a short malformed flood must
 			// visibly drain it.
 			const edge = new CoreFretService(node, { profile: 'edge', networkName: `${NETWORK}-edge` })
+			// Shallow spread: `before.rateLimited` is the same object reference as the live
+			// counter, so the maybeAct sub-field must be captured by value separately. Only
+			// maybeAct is driven by this burst, so the single field is the right comparison.
 			const before = { ...edge.getDiagnostics().rejected }
+			const beforeMaybeActRateLimited = edge.getDiagnostics().rejected.rateLimited.maybeAct
 
 			const replies: Reply[] = []
 			for (let i = 0; i < 12; i++) replies.push(await drive(edge, baseMsg({ ttl: 'not-a-number' })))
 
 			const after = edge.getDiagnostics().rejected
 			const malformed = after.malformed - before.malformed
-			const rateLimited = after.rateLimited - before.rateLimited
+			const rateLimited = after.rateLimited.maybeAct - beforeMaybeActRateLimited
 			expect(malformed + rateLimited, 'every message hit exactly one of the two').to.equal(12)
 			expect(malformed, 'the burst got through the bucket and was rejected as malformed').to.be.at.least(8)
 			expect(rateLimited, 'the bucket then emptied — malformed messages are metered').to.be.at.least(1)

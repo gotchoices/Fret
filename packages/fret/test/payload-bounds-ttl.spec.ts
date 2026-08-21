@@ -362,7 +362,7 @@ describe('Payload bounds and TTL validation', function () {
 			expect(result.retry_after_ms).to.be.greaterThan(0)
 
 			const diag = svc.getDiagnostics()
-			expect((diag as any).rejected.rateLimited).to.be.greaterThan(0)
+			expect(diag.rejected.rateLimited.maybeAct).to.be.greaterThan(0)
 
 			await svc.stop(); await node.stop()
 		})
