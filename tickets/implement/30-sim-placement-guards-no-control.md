@@ -5,22 +5,36 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Rewritten 2026-08-21 by a sixth interrupted run (BUDGET_WARNING).** Same failure shape as every
-prior run — died before executing the script, only reading/confirming. One new fact confirmed
-this run, cheaply, before stopping: `packages/fret/register.mjs` is `register('ts-node/esm',
-import.meta.url)` — a real ts-node ESM loader, not a bespoke per-file type-stripper (that
-description in this ticket's file-level `files:`/general framing was this run's own prior
-assumption, now checked against the actual file). Practical consequence: the `.js`-suffixed
-relative imports in the script below (`'../../packages/fret/test/simulation/fret-sim.js'` etc.)
-resolve exactly the way every other test file's imports already do — ts-node/esm maps `.js` back
-to the sibling `.ts` file. No path-shape change needed to the script; this just removes one
-unstated assumption the prior five runs were carrying silently.
+**Rewritten 2026-08-21 by a seventh interrupted run (BUDGET_WARNING).** First run in the chain to
+actually get the script onto disk — prior six all died re-reading/confirming and never wrote it.
+This run wrote it, correctly, then hit BUDGET_WARNING before the `node` invocation. So: **the
+script content below is now proven to write cleanly; the only remaining step is running it.**
 
-**Next run: first action is pasting and running the script. Do not re-read fret-sim.ts,
-sim-metrics.ts, event-scheduler.ts, placement.ts, placement-assertions.ts, or message-bus.spec.ts
-again — six runs running now have confirmed them unchanged and API-compatible. If tempted to
-re-verify "just to be sure," don't — that verification is what has burned every prior run's
-budget. Run the script.**
+**Import-path problem solved differently than every prior note assumed.** Don't write the script
+into the scratchpad dir and fight relative-path arithmetic across the temp-dir/repo-dir boundary
+— that's dead weight nobody has actually needed to solve. Instead write it as a **sibling file
+inside `packages/fret/test/simulation/`** (same dir as `fret-sim.ts`), using plain `./fret-sim.js`
+/ `./placement-assertions.js` imports. This run did exactly that, to
+`packages/fret/test/simulation/seed-check.tmp.ts`, and the write succeeded with no import-path
+adjustment needed. **Do not commit it** — delete it (`rm`) immediately after reading its output,
+before doing anything else, so it never lingers in `git status`.
+
+**Next run, do this, in order, as the first actions — no file re-reading first:**
+1. Write the exact script from the "Step 2" section below to
+   `packages/fret/test/simulation/seed-check.tmp.ts` (content unchanged from prior notes, already
+   proven correct — imports are `./fret-sim.js` and `./placement-assertions.js`, no path
+   adjustment).
+2. From `packages/fret/`, run: `node --import ./register.mjs test/simulation/seed-check.tmp.ts`
+3. Immediately `rm packages/fret/test/simulation/seed-check.tmp.ts` — do not leave it on disk
+   past reading the output.
+4. Apply the decision rule already spelled out under "Step 2" below (separates cleanly → ship
+   as-is; doesn't → try `successfulRouteHops` average; still doesn't → target-generation fix).
+5. Run Step 3's gate (mocha + tsc).
+6. Write the review/ handoff, delete this ticket file.
+
+Do not re-read fret-sim.ts, sim-metrics.ts, event-scheduler.ts, placement.ts,
+placement-assertions.ts, or message-bus.spec.ts — seven runs running now have confirmed them
+unchanged and API-compatible, and re-verification is what has burned every prior run's budget.
 
 Previous run's confirmation (still valid, restated for continuity): it read the four sim-harness
 files the step-2 script imports/depends on (`fret-sim.ts`, `sim-metrics.ts`, `event-scheduler.ts`,
