@@ -57,7 +57,9 @@ export async function waitUntil(predicate: () => boolean, limitMs: number, what:
 	expect(predicate(), `${what} within ${limitMs}ms`).to.equal(true)
 }
 
-export let seq = 0
+// Module-private on purpose: `baseMsg` is the only writer, and an importer that could read it
+// would invite a second file driving the counter directly.
+let seq = 0
 
 /** A structurally valid `RouteAndMaybeAct` as a plain record, so rows can corrupt any field. */
 export function baseMsg(over: Record<string, unknown> = {}): Record<string, unknown> {
