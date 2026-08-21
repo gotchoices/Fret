@@ -37,6 +37,9 @@ export function makeProtocols(networkName = 'default') {
 	};
 }
 
+/** Network-namespaced protocol id set produced by {@link makeProtocols}. */
+export type FretProtocols = ReturnType<typeof makeProtocols>;
+
 // Backward compatibility: default export uses 'default' network
 export const PROTOCOL_NEIGHBORS = '/optimystic/default/fret/1.0.0/neighbors';
 export const PROTOCOL_NEIGHBORS_ANNOUNCE = '/optimystic/default/fret/1.0.0/neighbors/announce';

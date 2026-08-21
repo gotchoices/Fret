@@ -3,11 +3,41 @@ files: packages/fret/src/service/fret-service.ts
 difficulty: easy
 
 <!-- resume-note -->
-Second interrupted run. Both prior runs stopped on BUDGET_WARNING before making any edits —
-pure investigation only, no code changed, no tests run. All four TODO items below are still
-fully open. This note supersedes the previous one; it carries forward everything confirmed
-still-accurate and adds a full concrete design for the `ready()` item (the trickiest of the
-four), derived but not yet typed into the file.
+Third interrupted run. First two runs stopped on BUDGET_WARNING before any edits (pure
+investigation). This run made exactly ONE edit before hitting BUDGET_WARNING again — see
+"Done this run" below — then stopped per the workflow rule (no further tool calls once a
+ticket update starts). This note supersedes the previous one; everything below is carried
+forward and still accurate.
+
+## Done this run (already landed in the working tree — do not redo)
+
+- `packages/fret/src/rpc/protocols.ts`: added a named type export right after `makeProtocols`
+  (around line 38-39):
+  ```ts
+  /** Network-namespaced protocol id set produced by {@link makeProtocols}. */
+  export type FretProtocols = ReturnType<typeof makeProtocols>;
+  ```
+  Purely additive — new export, nothing consumes it yet, cannot have broken anything. This is
+  the named type the `import type()` replacement TODO (see below) needs; the wiring at the
+  `fret-service.ts` call site is NOT done yet.
+
+## Immediate next step (small, do this first)
+
+Wire the type just added into `fret-service.ts`:
+1. Add `FretProtocols` to the existing type-only import from `../rpc/protocols.js` at line 19:
+   currently `import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';` — add
+   `import type { FretProtocols } from '../rpc/protocols.js';` as a separate type-only import
+   line (or merge via `import { makeProtocols, validateTimestamp, type FretProtocols } from ...`
+   — check house style elsewhere in the file for which form is preferred, both compile).
+2. Replace line 210:
+   ```ts
+   private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
+   ```
+   with:
+   ```ts
+   private readonly protocols: FretProtocols;
+   ```
+That closes out the last piece of the "inline `import()` type" TODO item.
 
 ## Confirmed file:line anchors (re-verified this run, current file state)
 
