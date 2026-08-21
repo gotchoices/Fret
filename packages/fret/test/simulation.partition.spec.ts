@@ -218,8 +218,8 @@ describe('Partition and merge simulation', function () {
 		// also pass on a strike left behind by the pre-cut pump or the pre-cut route, and the
 		// argument that neither can strike (nothing is unreachable before the cut) is exactly the
 		// kind of reasoning a later edit invalidates silently.
-		const struckBefore = new Set(
-			groupB.filter((id) => (store.getById(id)?.contactFailures ?? 0) > 0),
+		const struckBefore = new Map(
+			groupB.map((id) => [id, store.getById(id)?.contactFailures ?? 0] as const),
 		)
 
 		expect(routeOnce(sim, fromA, coordOf(sim, interiorB), 3020), 'A→B route across a fresh cut')
@@ -232,7 +232,7 @@ describe('Partition and merge simulation', function () {
 		// Each refusal struck exactly one entry, so a cross entry the route actually tried now
 		// carries a strike it did not carry before.
 		const struck = groupB.filter(
-			(id) => !struckBefore.has(id) && (store.getById(id)?.contactFailures ?? 0) > 0,
+			(id) => (store.getById(id)?.contactFailures ?? 0) > (struckBefore.get(id) ?? 0),
 		)
 		expect(struck.length, 'a refused contact must strike that entry').to.be.greaterThan(0)
 	})

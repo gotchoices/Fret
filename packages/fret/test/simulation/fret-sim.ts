@@ -922,6 +922,17 @@ export class FretSimulation {
 	 * shorter arc, so it cannot exceed 2^255). Using `aliveCount()` would put the oracle back
 	 * in a new place — the point of this path is that every input is something the deciding
 	 * peer could actually know.
+	 *
+	 * NOTE: as a fraction of the maximum ring distance this radius is exactly `4k/store.size()`
+	 * (2·k·2^256/size ÷ 2^255). The sim's stores are unbounded and its gossip merges every
+	 * neighbour's window each tick, so `size()` stays within an order of the population and the
+	 * radius lands around a third of maximum distance at the routing spec's sizes — most
+	 * candidates therefore take the selector's *near* branch, where ordering is by distance
+	 * alone and both the connected allowance and the backoff arm of the cost path are inert.
+	 * That is production's own arithmetic, not a sim defect, but it bounds the claim: this
+	 * harness exercises chiefly the near branch. Exercising the far branch needs sparse,
+	 * finger-shaped stores, which needs sim eviction to stop being degenerate — see the
+	 * `enforceCapacity` NOTE and `backlog/debt-sim-eviction-degenerate-blocks-metric-guard`.
 	 */
 	private nearRadiusFor(store: DigitreeStore): Uint8Array {
 		const span = (1n << 256n) / BigInt(Math.max(1, store.size()))
