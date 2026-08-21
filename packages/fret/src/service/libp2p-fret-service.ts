@@ -23,7 +23,7 @@ type FretServiceFacade = Pick<FretService,
 	| 'exportTable' | 'importTable'>;
 
 export class Libp2pFretService implements Startable, FretServiceFacade {
-	private inner: FretService | null = null;
+	private inner: CoreFretService | null = null;
 	private nodeRef: Libp2p | null = null;
 	/**
 	 * Built here rather than on demand: libp2p reads `peerDiscoverySymbol` off each service while
@@ -83,7 +83,7 @@ export class Libp2pFretService implements Startable, FretServiceFacade {
 			}
 			this.inner = new CoreFretService(node, this.cfg);
 		}
-		return this.inner as CoreFretService;
+		return this.inner;
 	}
 
 	/**
@@ -143,8 +143,8 @@ export class Libp2pFretService implements Startable, FretServiceFacade {
 		return this.ensure().assembleCohort(key, wants);
 	}
 
-	getDiagnostics(): unknown {
-		return (this.ensure() as any).getDiagnostics?.();
+	getDiagnostics(): ReturnType<CoreFretService['getDiagnostics']> {
+		return this.ensure().getDiagnostics();
 	}
 
 	neighborDistance(selfId: string, key: Uint8Array, k: number): number {
