@@ -4,6 +4,33 @@ difficulty: easy
 tradeoffs: n/a (implement ticket)
 ---
 
+<!-- resume-note -->
+Prior run hit BUDGET_WARNING before any code edit landed. No files touched yet — safe to
+resume from scratch, nothing to undo.
+
+Confirmed during this run (no need to re-derive):
+- All six `rejected.rateLimited++` call sites match the ticket's line-number mapping exactly
+  (checked via `Grep rejected` over `fret-service.ts`): 1290 (`handleNeighborsRequest`), 1298
+  (`handlePingRequest`), 1381 (maybeAct token bucket), 1421 (maybeAct concurrency cap, must
+  become `concurrencyLimited++`, NOT `rateLimited.maybeAct`), 1838 (`handleLeave`), 1999
+  (`handleAnnounce`/`mergeAnnounceSnapshot` area).
+- `diag.rejected` type/initializer block read in full: lines 415-424 of `fret-service.ts`.
+- `handleMaybeAct` body read in full (lines 1370-1433): confirms it is the one handler off the
+  `registerJsonHandler` seam per the ticket's second arm — its own `parseRouteAndMaybeAct` call
+  at line 1391 already counts `malformed` correctly and is NOT the gap.
+- **Still unlocated**: the second-arm gap (undecodable maybeAct body silently aborting the
+  stream with no counter). It is NOT inside `handleMaybeAct` itself (msg already decoded by the
+  time that method runs) — it is in the raw `registerRpcHandler(this.protocols.maybeAct, ...)`
+  registration wiring, somewhere in the `registerRpcHandlers` method around lines 1195-1245
+  (grep `registerRpcHandler` + `this.protocols.maybeAct` in that range; the decode call feeding
+  `msg` into `handleMaybeAct(msg)` at line 1238 is the thing to find and wrap in try/catch per
+  the ticket's second-arm fix).
+
+Next agent: resume directly from the ticket body below — design and TODO list are already
+final, nothing to re-plan. Start by reading `fret-service.ts` lines 1195-1250 to pin the exact
+decode call for the second arm, then work the TODO list top to bottom.
+<!-- /resume-note -->
+
 ## Resolved design
 
 Replace the single `rejected.rateLimited: number` field with a keyed record, one slot per
