@@ -7,18 +7,16 @@ export interface SizeEstimateOptions {
 	/** Restrict the estimate to a subset of the store (e.g. same-network members only). */
 	filter?: (e: PeerEntry) => boolean;
 	/**
-	 * Ring coordinate of the local node. When supplied, gaps are drawn from the
+	 * Ring position *and* id of the local node. When supplied, gaps are drawn from the
 	 * successor/predecessor window around it — the intended arc-length method. Omitting it
 	 * selects the degraded whole-store fallback (see {@link estimateSizeAndConfidence}).
+	 *
+	 * The two travel as one field because the window walk drops the anchor entry by *id* (self
+	 * contributes offset 0 explicitly) — a coordinate without its id silently costs the window
+	 * one gap per side, so the half-specified anchor is made unrepresentable rather than
+	 * defaulted away.
 	 */
-	selfCoord?: Uint8Array;
-	/**
-	 * Peer id of the local node, paired with {@link selfCoord}. The window walk drops the entry
-	 * sitting at the anchor by *id* (self contributes offset 0 explicitly), so without it a store
-	 * that holds self spends one slot per side on self and the window loses two of its 2m gaps.
-	 * Omitting it is harmless on the whole-store fallback, which never walks the window.
-	 */
-	selfId?: string;
+	self?: { coord: Uint8Array; id: string };
 }
 
 const RING_SIZE = 1n << 256n;
@@ -129,7 +127,7 @@ function dispersionFactor(gaps: bigint[]): number {
 /**
  * The gap population the estimate rests on, plus the representative gap derived from it.
  *
- * With `selfCoord` this is the successor/predecessor window and its arithmetic **mean** — the
+ * With `self` this is the successor/predecessor window and its arithmetic **mean** — the
  * arc-length method from docs/fret.md. Without it, the degraded fallback: every known
  * coordinate, and the **median** to blunt the outliers a whole-store population carries.
  *
@@ -144,11 +142,10 @@ function collectGaps(
 	m: number,
 	peers: PeerEntry[],
 	filter?: (e: PeerEntry) => boolean,
-	selfCoord?: Uint8Array,
-	selfId?: string
+	self?: { coord: Uint8Array; id: string }
 ): { gaps: bigint[]; representativeGap: bigint } {
-	if (selfCoord) {
-		const gaps = windowGaps(store, m, selfCoord, selfId ?? '', filter);
+	if (self) {
+		const gaps = windowGaps(store, m, self.coord, self.id, filter);
 		if (gaps.length > 0) return { gaps, representativeGap: meanBigInt(gaps) };
 	}
 	const gaps = consecutiveGaps(peers.map((p) => bytesToBigInt(p.coord)).sort(ascending));
@@ -158,7 +155,7 @@ function collectGaps(
 /**
  * Online network-size estimate from inter-peer ring gaps: `n = 2^256 / gap`.
  *
- * `options.selfCoord` selects the successor/predecessor window as the gap population and is the
+ * `options.self` selects the successor/predecessor window as the gap population and is the
  * intended path; omitting it falls back to whole-store gaps (see {@link collectGaps}).
  * `options.filter` scopes the estimate to a subset of the store (e.g. same-network members only)
  * so foreign peers from a co-resident network can't inflate `n` and the derived cluster span /
@@ -168,7 +165,7 @@ function collectGaps(
  * Confidence blends sample count against 2m with the dispersion factor above.
  */
 export function estimateSizeAndConfidence(store: DigitreeStore, m: number, options?: SizeEstimateOptions): SizeEstimate {
-	// NOTE: `list()` walks and materializes every entry, but on the `selfCoord` path only its
+	// NOTE: `list()` walks and materializes every entry, but on the `self` path only its
 	// length is used (for `sizeFactor`) — the gap population comes from the S/P window instead.
 	// That is an O(store) allocation per call, and the estimator is called once per inbound
 	// maybeAct. Fine at today's capacity (2048) and message rates; if either grows, give the
@@ -178,7 +175,7 @@ export function estimateSizeAndConfidence(store: DigitreeStore, m: number, optio
 	if (count === 0) return { n: 0, confidence: 0 };
 	if (count === 1) return { n: 1, confidence: 0.2 };
 
-	const { gaps, representativeGap } = collectGaps(store, m, peers, options?.filter, options?.selfCoord, options?.selfId);
+	const { gaps, representativeGap } = collectGaps(store, m, peers, options?.filter, options?.self);
 	const safeGap = representativeGap > 0n ? representativeGap : RING_SIZE / BigInt(count);
 	const nEst = Math.max(1, Math.min(Number(RING_SIZE / safeGap), 1_000_000_000));
 

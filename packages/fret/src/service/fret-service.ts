@@ -2533,7 +2533,7 @@ export class FretService implements IFretService, Startable {
 		// advertise describes only this network's reachable peers — and never re-introduces a
 		// foreign peer to same-network neighbors via the sample (the transitive-propagation
 		// guard), nor advertises a peer we have already given up on as a neighbor.
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord, selfId: this.node.peerId.toString() });
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.node.peerId.toString() } });
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -2731,8 +2731,7 @@ export class FretService implements IFretService, Startable {
 		const selfId = this.node.peerId.toString();
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
-			selfCoord: await this.selfCoord(),
-			selfId: this.node.peerId.toString()
+			self: { coord: await this.selfCoord(), id: selfId }
 		});
 
 		// In-cluster test: `neighborDistance` returns Infinity when self is absent from a cohort of
@@ -2971,8 +2970,7 @@ export class FretService implements IFretService, Startable {
 		// when it is not yet populated the estimator falls through to its whole-store path.
 		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
-			selfCoord: this.cachedSelfCoord ?? undefined,
-			selfId: this.node.peerId.toString()
+			self: this.cachedSelfCoord ? { coord: this.cachedSelfCoord, id: this.node.peerId.toString() } : undefined
 		});
 
 		// Add FRET estimate as an observation
@@ -3142,7 +3140,7 @@ export class FretService implements IFretService, Startable {
 		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, selfCoord, selfId: this.node.peerId.toString() });
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.node.peerId.toString() } });
 
 			// Decide whether to include payload
 			const distToKey = minDistance(selfCoord, coord);

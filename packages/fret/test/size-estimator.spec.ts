@@ -68,7 +68,7 @@ describe('Size estimator', () => {
 		const m = 8
 		const coords = uniformCoords(64)
 		const store = populateStore(coords)
-		const est = estimateSizeAndConfidence(store, m, { selfCoord: coords[0]!, selfId: 'p0' })
+		const est = estimateSizeAndConfidence(store, m, { self: { coord: coords[0]!, id: 'p0' } })
 		expect(est.confidence, 'G = 2m = 16 on an evenly spaced ring').to.be.closeTo(0.5 + 0.5 * (1 - 1 / Math.sqrt(2 * m)), 1e-12)
 		expect(est.n, 'the window mean gap still recovers the true population').to.equal(64)
 	})
@@ -159,7 +159,7 @@ describe('Size estimator', () => {
 	// NOTE: these subsample a *uniform* ring, so a contiguous window's median gap
 	// exactly equals the global inter-peer step and the estimator returns ~N
 	// exactly (the "within 2x" bound is therefore slack). This is the easy case,
-	// and it exercises the no-selfCoord whole-store fallback. The realistic hard
+	// and it exercises the no-`self` whole-store fallback. The realistic hard
 	// case — local density != global density, because the node knows every near
 	// peer but only a scattering of far ones — is Phase 5 below.
 	describe('Phase 2: Partial-knowledge subsampling', () => {
@@ -336,7 +336,7 @@ describe('Size estimator', () => {
 					const selfIdx = rng.nextInt(0, N)
 					const store = partialKnowledgeStore(values, selfIdx, far, rng)
 
-					const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[selfIdx]!) })
+					const est = estimateSizeAndConfidence(store, M, { self: { coord: toCoord(values[selfIdx]!), id: `p${selfIdx}` } })
 					expect(est.n).to.be.greaterThan(N / 2, `undercount: n_est=${est.n} for N=${N}`)
 					expect(est.n).to.be.lessThan(N * 2, `overcount: n_est=${est.n} for N=${N}`)
 				})
@@ -355,7 +355,7 @@ describe('Size estimator', () => {
 				const selfIdx = rng.nextInt(0, N)
 				const store = partialKnowledgeStore(values, selfIdx, 32, rng)
 
-				const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[selfIdx]!) })
+				const est = estimateSizeAndConfidence(store, M, { self: { coord: toCoord(values[selfIdx]!), id: `p${selfIdx}` } })
 				worst = Math.max(worst, relativeError(est.n, N))
 				expect(est.n).to.be.greaterThan(N / 2, `undercount at seed ${seed}: n_est=${est.n}`)
 				expect(est.n).to.be.lessThan(N * 2, `overcount at seed ${seed}: n_est=${est.n}`)
@@ -383,7 +383,7 @@ describe('Size estimator', () => {
 			for (let i = 0; i < points; i++) store.upsert(`e${i}`, toCoord(BigInt(i) * step))
 
 			const selfIdx = Math.floor(points / 2)
-			const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(BigInt(selfIdx) * step) })
+			const est = estimateSizeAndConfidence(store, M, { self: { coord: toCoord(BigInt(selfIdx) * step), id: `e${selfIdx}` } })
 
 			// n is inflated by ~1000x: local spacing is 1000x tighter than the true spacing of
 			// any plausible ring this node could belong to.
@@ -403,7 +403,7 @@ describe('Size estimator', () => {
 			const rng = new DeterministicRNG(99)
 			const store = partialKnowledgeStore(values, 0, 64, rng)
 
-			const est = estimateSizeAndConfidence(store, M, { selfCoord: toCoord(values[0]!) })
+			const est = estimateSizeAndConfidence(store, M, { self: { coord: toCoord(values[0]!), id: 'p0' } })
 			expect(est.n).to.be.greaterThan(N / 2)
 			expect(est.n).to.be.lessThan(N * 2)
 		})
@@ -416,13 +416,13 @@ describe('Size estimator', () => {
 			const values = sortedRing(2000, rng)
 			const selfIdx = rng.nextInt(0, 2000)
 			const healthy = partialKnowledgeStore(values, selfIdx, 64, rng)
-			const est = estimateSizeAndConfidence(healthy, M, { selfCoord: toCoord(values[selfIdx]!) })
+			const est = estimateSizeAndConfidence(healthy, M, { self: { coord: toCoord(values[selfIdx]!), id: `p${selfIdx}` } })
 			expect(est.confidence).to.be.greaterThan(0.6)
 
 			// A store whose peers all sit at one coordinate carries no spacing information.
 			const degenerate = new DigitreeStore()
 			for (let i = 0; i < 32; i++) degenerate.upsert(`dup${i}`, toCoord(1234n))
-			const degenerateEst = estimateSizeAndConfidence(degenerate, M, { selfCoord: toCoord(1234n) })
+			const degenerateEst = estimateSizeAndConfidence(degenerate, M, { self: { coord: toCoord(1234n), id: 'dup0' } })
 			expect(degenerateEst.confidence).to.be.lessThan(est.confidence)
 			expect(degenerateEst.confidence).to.be.lessThan(0.6)
 		})
