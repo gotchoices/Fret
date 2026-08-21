@@ -1,7 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
-import { buildMesh } from './helpers/mesh.js'
+import { buildMesh, type Mesh } from './helpers/mesh.js'
 import { waitFor } from './helpers/wait-for.js'
 import { ringOffset } from './helpers/ring.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
@@ -45,6 +45,19 @@ describe('Churn leave handling', function () {
 	const CONVERGE_MS = 6000
 	const PROGRESS_MS = 5000
 
+	let mesh: Mesh | undefined
+	/** Indices a test stopped itself mid-case; afterEach must not double-stop them. */
+	let alreadyStopped: number[] = []
+
+	// Teardown lives here rather than at the end of each body so a rig whose assertion or
+	// `waitFor` gate throws still stops its nodes — otherwise the leaked libp2p handles surface
+	// as an exit-watchdog dump stacked on top of the real failure.
+	afterEach(async () => {
+		await mesh?.stop({ skip: alreadyStopped })
+		mesh = undefined
+		alreadyStopped = []
+	})
+
 	/**
 	 * Every service knows every other node and has completed at least one neighbour exchange.
 	 * Remote peers only: a store holds its own entry from `start()`, so a self-inclusive count is
@@ -60,8 +73,8 @@ describe('Churn leave handling', function () {
 		services.some((svc, i) => i !== departed && svc.getDiagnostics().pingsSent > before[i]!.pingsSent)
 
 	it('a graceful stop sends leave notices to its neighbors without throwing', async () => {
-		const mesh = await buildMesh(4)
-		await mesh.addServices(() => ({ profile: 'edge', k: 7, bootstraps: [mesh.ids[0]!] }))
+		mesh = await buildMesh(4)
+		await mesh.addServices((_i, m) => ({ profile: 'edge', k: 7, bootstraps: [m.ids[0]!] }))
 		await mesh.connect('star')
 		await waitFor(allConverged(mesh.services, mesh.ids),
 			CONVERGE_MS, 25, 'star of 4 converges before the leave')
@@ -69,11 +82,13 @@ describe('Churn leave handling', function () {
 		// stop one node, which should send leave to its neighbors without throwing
 		await mesh.services[2]!.stop()
 		await mesh.nodes[2]!.stop()
+		// Recorded before the assertions below, so a failure there still leaves afterEach
+		// skipping the index rather than double-stopping it.
+		alreadyStopped.push(2)
 		await waitFor(anyProgressed(mesh.services, diagsBefore, 2),
 			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 		// ensure remaining services still running
 		for (const s of [mesh.services[0], mesh.services[1], mesh.services[3]]) if (!(s as any).getDiagnostics) throw new Error('service down')
-		await mesh.stop({ skip: [2] })
 	})
 
 	// NOTE: a `leave notice includes replacement suggestions` mesh test used to sit here. It spent
@@ -85,8 +100,8 @@ describe('Churn leave handling', function () {
 	// `Leave notice replacements (sender side)` at the bottom of this file.
 
 	it('fan-out notifies peers beyond immediate S/P', async () => {
-		const mesh = await buildMesh(8)
-		await mesh.addServices(() => ({ profile: 'core', k: 7, bootstraps: [mesh.ids[0]!] }))
+		mesh = await buildMesh(8)
+		await mesh.addServices((_i, m) => ({ profile: 'core', k: 7, bootstraps: [m.ids[0]!] }))
 		await mesh.connect('star')
 		await waitFor(allConverged(mesh.services, mesh.ids),
 			CONVERGE_MS, 25, 'star of 8 converges before the leave')
@@ -103,6 +118,7 @@ describe('Churn leave handling', function () {
 		// plus a topology where the departing node holds several connections.
 		await mesh.services[3]!.stop()
 		await mesh.nodes[3]!.stop()
+		alreadyStopped.push(3)
 		await waitFor(anyProgressed(mesh.services, diagsBefore, 3),
 			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
 
@@ -111,12 +127,10 @@ describe('Churn leave handling', function () {
 			if (i === 3) continue
 			expect(mesh.services[i]!.getDiagnostics()).to.have.property('pingsSent')
 		}
-
-		await mesh.stop({ skip: [3] })
 	})
 
 	it('oversized replacements array is truncated', async () => {
-		const mesh = await buildMesh(3)
+		mesh = await buildMesh(3)
 		await mesh.connect('star')
 
 		let capturedReplacements: string[] | undefined
@@ -133,9 +147,8 @@ describe('Churn leave handling', function () {
 		await new Promise(r => setTimeout(r, 500))
 
 		// Send a crafted leave notice with 20 replacements (exceeds MAX_REPLACEMENTS=12)
-		const fakeReplacements = Array.from({ length: 20 }, () =>
-			mesh.ids[1]!
-		)
+		const replacementId = mesh.ids[1]!
+		const fakeReplacements = Array.from({ length: 20 }, () => replacementId)
 		// `from` must match the transport-authenticated sender (mesh.nodes[1]); the handler
 		// now drops leaves whose `from` is spoofed, so this exercises replacement
 		// truncation rather than the identity gate.
@@ -151,8 +164,6 @@ describe('Churn leave handling', function () {
 		// Verify truncation: sanitizeReplacements caps at 12
 		expect(capturedReplacements).to.be.an('array')
 		expect(capturedReplacements!.length).to.be.at.most(12)
-
-		await mesh.stop()
 	})
 })
 
