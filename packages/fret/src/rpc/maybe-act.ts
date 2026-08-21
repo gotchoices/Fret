@@ -8,12 +8,12 @@ import {
 	registerRpcHandler,
 } from './protocols.js';
 import { createLogger } from '../logger.js';
-
-const log = createLogger('rpc:maybe-act');
 import { rpcRequest } from './request.js';
 import { parseMaybeActReply, parseOrThrow, MAX_ACTIVITY_BYTES, MAYBE_ACT_OVERHEAD_BYTES } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';
+
+const log = createLogger('rpc:maybe-act');
 
 export async function registerMaybeAct(
 	node: Libp2p,

@@ -517,6 +517,12 @@ export class FretService implements IFretService, Startable {
 		});
 	}
 
+	// NOTE: `Readonly<>` is shallow, and `rejected` is now a nested record (`rateLimited` keyed
+	// per protocol), so a caller can still mutate through the returned handle -- and it is the
+	// live object, not a copy. Nothing does today, and every reader is a test taking a *reading*;
+	// the one hazard already met in practice is a test spreading `rejected` and aliasing the
+	// counters underneath (see `rpc.codec-properties.spec.ts`). If a consumer ever needs a
+	// stable snapshot, deep-freeze or deep-clone here rather than asking every caller to copy.
 	public getDiagnostics(): Readonly<typeof this.diag> {
 		return this.diag;
 	}
