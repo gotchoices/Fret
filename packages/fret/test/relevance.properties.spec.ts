@@ -10,6 +10,7 @@ import {
 	recordSuccess,
 	recordFailure,
 	healthScore,
+	initialRelevance,
 } from '../src/store/relevance.js'
 import type { PeerEntry } from '../src/store/digitree-store.js'
 import { COORD_BYTES } from '../src/ring/hash.js'
@@ -297,20 +298,6 @@ describe('Relevance scoring properties', function () {
 			expect(entry.avgLatencyMs).to.equal(200)
 		})
 
-		// The uncontroversial half of "success up-ranks a peer": from one starting entry, at one
-		// instant and one ring position, a success outranks a failure. Measured 1.2600 vs 0.6300.
-		//
-		// The *other* half — that repeated success keeps up-ranking — is NOT asserted, in either
-		// direction, because the code does not do it: `successCount` only feeds the
-		// success/failure ratio, which saturates after the first success, so ten successes score
-		// exactly what one does, and `recordSuccess` never touches `accessCount` (only `touch`
-		// does), so a peer merely named in inbound snapshots outscores one we have actually
-		// called. See the NOTE at `recordSuccess` and
-		// `tickets/backlog/bug-frequency-credit-only-from-gossip`, which owns that question.
-		//
-		// Separate models so the two calls are scored against identical occupancy — the sparsity
-		// bonus is service-wide state and every scoring call moves it, so reusing one model here
-		// would compare two different bonuses and confuse the comparison it is making.
 		it('scores a success above a failure from the same starting entry', () => {
 			const now = FIXED_NOW
 			const entry = makeEntry({ lastAccess: now })
@@ -321,6 +308,21 @@ describe('Relevance scoring properties', function () {
 			expect(succeeded.relevance).to.be.greaterThan(failed.relevance)
 			expect(succeeded.relevance, 'measured').to.be.closeTo(1.26, 1e-4)
 			expect(failed.relevance, 'measured').to.be.closeTo(0.63, 1e-4)
+		})
+
+		// Frequency credit: settled by tickets/implement/25-frequency-credit-relevance-core (formerly
+		// tickets/backlog/bug-frequency-credit-only-from-gossip). A completed RPC is an access.
+		it('scores 500 successes strictly above 1 success', () => {
+			const now = FIXED_NOW
+			let one = makeEntry({ lastAccess: now })
+			one = recordSuccess(one, undefined, 0.5, createSparsityModel(), now)
+
+			let five_hundred = makeEntry({ lastAccess: now })
+			for (let i = 0; i < 500; i++) {
+				five_hundred = recordSuccess(five_hundred, undefined, 0.5, createSparsityModel(), now)
+			}
+
+			expect(five_hundred.relevance).to.be.greaterThan(one.relevance)
 		})
 	})
 
