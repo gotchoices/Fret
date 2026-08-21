@@ -5,12 +5,16 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Rewritten 2026-08-21 by a third interrupted run (BUDGET_WARNING).** Same as before: only
-re-read files, ran no script and no test, hit budget before doing new work. Do not re-read this
-file's own history further than what's below — it is complete and now includes the throwaway
-script verbatim so the next run does not need to re-derive it. Step 1 is done (measured, not
+**Rewritten 2026-08-21 by a fourth interrupted run (BUDGET_WARNING).** Same as every prior run:
+re-read files only (`placement-assertions.ts`, `message-bus.spec.ts` L280-400), confirmed nothing
+has changed, ran no script and no test, hit budget before doing new work. This confirms the
+"Verified state" section below is still accurate byte-for-byte — no new information this run.
+Do not re-read this file's own history further than what's below. Step 1 is done (measured, not
 guessed) — no further action there. Step 2 is exactly where every prior run left it: reachable,
-understood, script content now fully specified below — just run it.
+understood, script content fully specified below — **the next run's first action must be running
+it**, not reading files again. If a fifth run starts by re-reading `placement-assertions.ts` or
+`message-bus.spec.ts` instead of pasting and running the script below, it has repeated this run's
+mistake — those files are confirmed unchanged four times now.
 
 ## Verified state (this run re-confirmed by reading files directly; ran nothing)
 
