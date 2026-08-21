@@ -31,6 +31,12 @@ This document proposes FRET, a Chord-style ring overlay with symmetric successor
 - The routing table has a hard capacity C. When over capacity, evict the lowest-relevance entries.
 - Components (bucketless, sparsity-weighted):
   - Access recency (EMA decay) and frequency (log-slowing). **Frequency counts proven contact, not hearsay.** `accessCount` is incremented only by a completed RPC or a direct interaction with the peer; being *named* by some other peer — in a merged neighbor snapshot, a leave notice's replacement list, or the configured bootstrap list — accrues none. Those paths go through one seam, `FretService.noteDiscovered`, which creates a missing entry and scores it **once** from its own empty counters (`initialRelevance`) and leaves an id we already hold completely untouched. So an id has the same score after a thousand mentions as after one, and mention count is not a lever an attacker (or a chatty honest peer) can pull. Without this a peer we had actually contacted hundreds of times could be evicted before one we had only ever been told about.
+
+    The scoring helpers themselves (`applyTouch`, `applySuccess`, `applyFailure`,
+    `applyContactFailure`) never create an entry — scoring a peer not already in the routing table
+    is a silent no-op. Creation belongs to `noteDiscovered` and the explicit insert sites
+    (`peer:connect`, bootstrap seeding, `importTable`); a peer only reaches scoring after one of
+    those has already placed it.
     - The baseline exists rather than "gossip scores nothing at all" because stored relevance is only ever written by a scoring call: a never-scored entry sits at 0, and eviction takes the lowest unprotected entry — so on a full table every newly discovered peer would be evicted before the classification pass could probe it, and the table could never learn a new peer again. A fixed baseline avoids that starvation while staying flat in mention count.
     - An id already held is left alone rather than given a bare `upsert`, because `upsert` refreshes `lastAccess` — which is both the recency input *and* the ordering key for the unknown-classification probe rotation (ascending `lastAccess`), so refreshing it on gossip would sink a heavily-gossiped unknown peer to the back of its own probe queue.
   - Health: success/failure ratio and average RTT.

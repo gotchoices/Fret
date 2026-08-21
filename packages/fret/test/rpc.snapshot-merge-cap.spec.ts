@@ -134,9 +134,12 @@ describe('RPC snapshot merge caps', function () {
 		/**
 		 * Record every id the merge loop upserts, in order.
 		 *
-		 * `applyTouch` opens with `getById(id) ?? upsert(id, coord)` and the loop has always just
-		 * upserted that id, so it does not double-count — a doubled count is the first assumption
-		 * to re-check if these numbers ever drift.
+		 * `applyTouch` no longer creates on a miss — it returns early when the id isn't already in
+		 * the store (see `docs/fret.md`, *Relevance scoring and table management*). Counted upserts
+		 * still don't double-count for a different reason: every id in a merged snapshot (`from`,
+		 * and each successor/predecessor/sample id) reaches the store through `noteDiscovered`, not
+		 * `applyTouch`, and `noteDiscovered` itself returns early on an id the store already holds —
+		 * so a repeated id upserts at most once, via that guard, not via `applyTouch`.
 		 *
 		 * NOTE: this **stacks** wrappers rather than replacing them, and nothing restores. A second
 		 * call wraps the first, so a counter installed earlier keeps recording while a later one is
