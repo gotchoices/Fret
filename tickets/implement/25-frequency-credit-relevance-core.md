@@ -3,6 +3,21 @@ files: packages/fret/src/store/relevance.ts, packages/fret/test/relevance.proper
 difficulty: easy
 
 <!-- resume-note -->
+Fourth run hit BUDGET_WARNING before making any edits — spent its budget re-reading both files to
+verify prior-run claims, made zero changes. Both reads confirm the third run's resume-note below is
+accurate and current; nothing has drifted. Specifically verified this run:
+- `packages/fret/src/store/relevance.ts` — all 5 source edits present exactly as described below,
+  including `initialRelevance(entry, x, model, now = Date.now())` signature (line 128) — matches
+  the call shape used in the "not started" test snippets below (`initialRelevance(entry, 0.5,
+  model, now)` positional order: entry, x, model, now). Do not second-guess this signature again.
+- `packages/fret/test/relevance.properties.spec.ts` — `initialRelevance` import present (line 13),
+  stale comment block gone, the `'scores 500 successes strictly above 1 success'` test present
+  and correct (lines 315-326). The two "not started" edits below are still, in fact, not started.
+
+Next run: skip re-verification, go straight to applying the two edits below, then run
+`cd packages/fret && npx tsc --noEmit && yarn test`, then write the review/ handoff. Do not re-read
+relevance.ts — it is done, confirmed twice now.
+
 Third run hit BUDGET_WARNING mid-edit. No half-applied state in either file — each edit that
 landed was a complete, verified Edit tool call. What's done vs left:
 
