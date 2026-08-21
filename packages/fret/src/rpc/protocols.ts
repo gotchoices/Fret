@@ -270,6 +270,14 @@ export function decodeJson<T = unknown>(bytes: Uint8Array): T {
 		end--;
 	}
 	if (nulsStripped > 0) {
+		// NOTE: a peer can drive one of these per NUL-padded message it sends, and this decode runs
+		// *before* the maybeAct token bucket (`registerMaybeAct` decodes in its own handler body,
+		// then takes the bucket), so nothing rate-limits the line. It is not log amplification
+		// today: `log.error` is `debug('optimystic:fret:rpc:handler:error')`, and a weald debug
+		// instance returns immediately when its namespace is not enabled, so with `DEBUG` unset
+		// this writes nothing at all. Revisit if FRET ever gains a sink that records
+		// unconditionally (a metrics counter, a structured logger, a file appender) — then the
+		// line needs the bucket in front of it, or its own.
 		log.error('decodeJson: stripped %d NUL byte(s) from message padding - possible framing bug', nulsStripped);
 	}
 	if (end <= start) throw new Error('whitespace response');
