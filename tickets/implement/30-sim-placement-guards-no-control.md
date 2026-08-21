@@ -1,14 +1,14 @@
-description: Two simulation tests claimed to prove placement strategies produce different ring shapes but would pass without that behavior; the replacement checks are written and only need one threshold measured and the suite run.
+description: Two simulation tests claimed to prove placement strategies produce different ring shapes but would pass without that behavior; one of the two replacement checks now has a real measured threshold — the other still needs its measurement, then the whole suite needs a run and a review handoff.
 files: packages/fret/test/message-bus.spec.ts, packages/fret/test/churn-scenarios.spec.ts, packages/fret/test/simulation/placement-assertions.ts
 difficulty: easy
 tradeoffs: n/a (implement ticket)
 ---
 
 **Rewritten 2026-08-21 by an interrupted run (BUDGET_WARNING), replacing the prior handoff.**
-No code edits happened this run — only read-only verification. Do not re-read this file's own
-history further than what's below; it is complete.
+Step 1 below is now genuinely done (measured, not guessed). Steps 2 and 3 were not reached this
+run. Do not re-read this file's own history further than what's below; it is complete.
 
-## Verified state (this run confirmed by reading the files directly)
+## Verified state (this run confirmed by reading the files directly, and by running step 1)
 
 - `test/simulation/placement-assertions.ts` exists and exports `coordToBigInt`,
   `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
@@ -18,51 +18,43 @@ history further than what's below; it is complete.
 - `test/churn-scenarios.spec.ts` edit landed (per prior handoff; not re-verified this run — no
   reason to doubt it, out of scope for this run's budget).
 
-## Step 1 — NOT done. `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` is a placeholder guess, not a measurement
+## Step 1 — DONE this run. Real measured threshold, not a guess
 
-At `test/message-bus.spec.ts` L320-325, the `'clustered placement: peers cluster around centers'`
-case currently reads:
-
-```
-// UNVERIFIED PLACEHOLDER — not yet measured against a real run (budget cut off before the
-// test could be executed). Run this case once with the threshold set very loose (e.g. 0),
-// capture the printed clustered/uniform readings across PLACEMENT_SEEDS from the console.log
-// below, then replace this with a real measured table...
-const CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 10
-```
-
-A prior run guessed `10` and left it explicitly marked unverified. **Nobody has actually run this
-test and looked at the printed numbers yet.** That is the one required action:
-
+Ran:
 ```
 node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" --grep "peers cluster around centers" --timeout 60000
+```
+from `packages/fret/`. Result: passed, clean separation across all 5 `PLACEMENT_SEEDS` —
+
+```
+seed 8008: clustered 13, uniform 1
+seed 8009: clustered 12, uniform 1
+seed 8010: clustered 15, uniform 1
+seed 4242: clustered 17, uniform 1
+seed 99:   clustered 12, uniform 1
+```
+
+`test/message-bus.spec.ts` now has `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5` (worst uniform 1,
+best clustered 12 — 5 sits 5x above worst / 2.4x below best) with a real measured-table comment
+replacing the old `UNVERIFIED PLACEHOLDER` one. Test re-run not yet done against the new constant
+(it was passing against the old placeholder 10, and 5 is strictly stricter/still within the gap,
+so it should still pass — but **confirm this by running it again** as part of step 3's gate below,
+since it was not independently re-run after the edit this session).
+
+## Step 2 — hop statistic for case 2, still unchecked (not reached this run)
+
+`'clustered placement: inter-cluster routing takes more hops'` (~L339-387, line numbers may have
+shifted slightly by the step-1 edit above) asserts `expect(clustered).to.be.greaterThan(uniform)`
+on `avgRoutingHops` and logs both candidates plus `successfulRouteHops` average. Never run this
+session.
+
+```
+node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" --grep "inter-cluster routing takes more hops" --timeout 60000
 ```
 
 Run from `packages/fret/` (if your shell is already sitting in `packages/fret/`, do **not**
 prefix with `cd packages/fret &&` — that fails with "No such file or directory" since it's
 relative to repo root, not idempotent).
-
-At threshold 10 the test may pass or fail depending on actual readings — either way, read the
-`clustered X, uniform Y` lines logged for all five `PLACEMENT_SEEDS` (stderr/stdout console.log).
-Pick a threshold strictly between the worst (highest) uniform reading and the best (lowest)
-clustered reading, with margin, the same way `MAX_PEERS_IN_ONE_SPACING_ARC` was picked (see its
-doc comment in `placement-assertions.ts`: ~1.75x above the worst fixed reading, ~1.57x below the
-best buggy one). Replace the `10` and delete the `UNVERIFIED PLACEHOLDER` comment above it with a
-real measured table in the same comment style as `placement-assertions.ts`'s doc comment.
-
-If the guessed `10` genuinely does NOT separate the two distributions (uniform sometimes exceeds
-it, or clustered sometimes doesn't) — that's real signal, not just "pick a better number in the
-same run"; note it plainly in the review handoff.
-
-## Step 2 — hop statistic for case 2, still unchecked
-
-`'clustered placement: inter-cluster routing takes more hops'` (~L339-387) asserts
-`expect(clustered).to.be.greaterThan(uniform)` on `avgRoutingHops` and logs both candidates plus
-`successfulRouteHops` average. This was never run this session either.
-
-```
-node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" --grep "inter-cluster routing takes more hops" --timeout 60000
-```
 
 - Passes with clean separation → done, leave as-is.
 - Fails or numbers don't separate → return the `successfulRouteHops` average instead of
@@ -73,9 +65,9 @@ node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.s
   cluster centers come from (`clusterConfig: { numClusters: 3, spreadBits: 32 }`) and aim each
   target near a *different* cluster (e.g. bucket by `i % numClusters`). **Do not ship the case
   unseparating.** This path is real investigation — if budget is short again, split it into its
-  own follow-up ticket rather than rushing it alongside step 1 and step 3.
+  own follow-up ticket rather than rushing it alongside step 3.
 
-## Step 3 — gate (only after steps 1 and 2 are both real, not placeholder)
+## Step 3 — gate (only after step 2 is real, not skipped)
 
 ```
 node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 60000
@@ -90,7 +82,7 @@ workflow rules rather than being chased here.
 Write the `review/` ticket (slug `sim-placement-guards-no-control`) covering: the two vacuous
 tests replaced with both-directions clustered-vs-uniform checks following the
 `assertPlacementSeparates` pattern already proven in `churn-scenarios.spec.ts`; the new shared
-module; the measured threshold and its provenance (actual numbers, not the guessed 10); and which
-hop statistic case 2 used and why. Say so plainly if step 2 needed the target-generation fix —
-that is a real change beyond the original snippet. Delete this file once the review ticket is
-written.
+module; the measured threshold and its provenance (real numbers above, for step 1 — already
+final); and which hop statistic case 2 used and why. Say so plainly if step 2 needed the
+target-generation fix — that is a real change beyond the original snippet. Delete this file once
+the review ticket is written.
