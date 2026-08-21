@@ -5,9 +5,10 @@ difficulty: medium
 ----
 
 <!-- resume-note -->
-A prior review run hit `BUDGET_WARNING` after reading the implement diff and the source helpers,
-before running any validation. This ticket carries the remainder. Nothing was edited in the working
-tree by that run — `git status` was clean apart from `tickets/.in-progress`.
+Two prior review runs hit `BUDGET_WARNING` before running any validation. This ticket carries the
+remainder. Neither run edited the working tree — `git status` is clean apart from
+`tickets/.in-progress`. **Validation has still never been run against this work; that is the first
+thing to do, not the last.**
 
 ## What the rule under review is
 
@@ -19,7 +20,7 @@ argument. Creation belongs to `noteDiscovered` and the explicit insert sites (`p
 bootstrap seeding, `importTable`). The source change landed in an earlier run; the implement work
 under review is **tests only**.
 
-## What the implement stage produced (already read, no findings raised against it yet)
+## What the implement stage produced
 
 Diff range `fe5c0c1..d8ac5d7`, `packages/fret/test/` only:
 
@@ -34,28 +35,60 @@ Read of `fret-service.ts:550-800` and the two node listeners at `~1031-1063` con
 are present and consistent, and that `applyContactStrike` / `noteProofOfLife` carry the same
 `if (!e) return` shape.
 
-## Work remaining in this ticket
+## Already settled — do not redo
 
-- **Run the full suite in the foreground with no redirection**: `cd packages/fret && yarn test`.
-  It has never been run against this work. Also `cd packages/fret && npx tsc --noEmit`.
-  `test/dead-state.spec.ts`'s edited call sites have been type-checked but never executed.
-  Report anything unrelated through the `.pre-existing-known.md` / `.pre-existing-error.md`
-  protocol — never skip or loosen a test.
+**The `peer:disconnect` open observation is resolved: it is NOT a correctness defect.**
+`isNearNeighbor` (`fret-service.ts:1912`) ignores its coordinate parameter entirely — the signature
+is `(id: string, _coord: Uint8Array)` — and answers from the store's own ring window
+(`ringNeighborsBothSides(...).includes(id)`). A peer the table never held is not in that walk, so
+`wasNear` is `false` and `announceOnDeparture` never fires for a peer that was never in the routing
+table. The earlier worry that a disconnect could announce around a stranger's coordinate is wrong.
+
+The **residual** is hygiene, not correctness, and is the one open finding: `const coord = await
+this.coordOf(id)` at `fret-service.ts:1055` is now vestigial on that path. Its only consumer is
+`announceOnDeparture` inside the `wasNear` branch, and `wasNear === true` implies the entry is in
+the store — where `coordOf` returns `entry.coord` without hashing. So the `hashPeerId` fallback
+inside `coordOf` is only ever paid on a disconnect whose result is provably discarded. `applyFailure`
+was that coordinate's last real consumer on this path, and this ticket's source change removed it.
+(The unused `_coord` parameter itself predates this ticket — introduced by commit `798c6bc`.)
+
+Suggested minimal inline fix (a *minor* finding — fix it in this pass, do not file a ticket):
+
+```ts
+const wasNear = this.isNearNeighbor(id);
+this.noteDisconnected(id);
+await this.applyFailure(id);
+if (wasNear && !this.stopped) {
+	this.detach(this.announceOnDeparture(id, await this.coordOf(id)), 'announceOnDeparture');
+}
+```
+
+plus dropping the dead `_coord` parameter from `isNearNeighbor` and its one call site. Neither
+`noteDisconnected` nor `applyFailure` mutates `entry.coord`, so moving the read after them is not a
+behaviour change. Note `handleLeave` (`fret-service.ts:1828`) is a *different* call site of
+`announceOnDeparture` and legitimately needs its own hashed coordinate — leave it alone.
+
+## Work remaining
+
+- **Run validation first, in the foreground with no redirection**: `cd packages/fret && yarn test`,
+  and `cd packages/fret && npx tsc --noEmit`. `test/dead-state.spec.ts`'s edited call sites have
+  been type-checked but never executed. Report anything unrelated through the
+  `.pre-existing-known.md` / `.pre-existing-error.md` protocol — never skip or loosen a test.
+- **One unfinished check, cheap**: confirm `DigitreeStore.update` is a no-op on an id the store does
+  not hold (`src/store/digitree-store.ts`). `noteDisconnected` calls `store.setState(id, ...)` →
+  `this.update(id, { state })` *before* `applyFailure`'s guard runs, so if `update` creates or
+  throws on a missing id, the never-create rule has a hole in the very listener the new spec drives.
+  The spec's first test asserts `store.size()` is unchanged after a disconnect for an unheld peer,
+  so a *creating* `update` would already fail that test — but confirm by reading, since the test has
+  never been executed.
 - **Finish the adversarial pass** over the three test files: happy path / edge / error / regression
   / interaction coverage, source hygiene, and whether `docs/fret.md` still matches (the
   *Relevance scoring and table management* section already describes the never-create rule; confirm
   no other section still implies create-on-miss).
+- **Apply the minor fix above**, then re-run the suite.
 - **Produce the `complete/` ticket** with a `## Review findings` section — what was checked, what
-  was found, what was done, empty categories stated explicitly with a reason.
-
-## Open observation to resolve (not yet a finding)
-
-`peer:disconnect` (`fret-service.ts:1053-1062`) computes `const coord = await this.coordOf(id)`
-before `applyFailure`, and `coordOf` falls back to `hashPeerId` when the table holds no entry. So a
-disconnect for a peer we never held still pays a SHA-256, then runs `isNearNeighbor(id, coord)` and
-may fire `announceOnDeparture` for a peer that was never in the routing table. Decide whether that
-is intended (the announce is *around a coordinate*, not about the entry) — if intended, it is at
-most a tripwire `NOTE:`; if not, it is a finding. Do not file it without settling which.
+  was found, what was done, empty categories stated explicitly with a reason. Carry the resolved
+  open observation and the vestigial-`coordOf` finding into it.
 
 ## Known gaps carried forward from the implement handoff
 
