@@ -1,21 +1,74 @@
-import { describe, it } from 'mocha'
+import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode } from './helpers/libp2p.js'
-import { buildMesh } from './helpers/mesh.js'
+import { buildMesh, type Mesh } from './helpers/mesh.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
 import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
 import { peerDiscoverySymbol } from '@libp2p/interface'
 import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
+import type { FretConfig } from '../src/index.js'
+import type { Libp2p } from 'libp2p'
 
-// Helper: create a started service with given profile, returning both node and service
+/**
+ * Teardown registry. A case registers what it built here instead of stopping it as its last
+ * statement, so a case whose assertion throws still tears down — otherwise its libp2p handles
+ * leak and surface as an exit-watchdog dump stacked on top of the real failure. Entries are
+ * unwound in reverse construction order, best-effort per entry so one throwing `stop()` cannot
+ * strand the ones behind it (the contract `mesh.stop()` already applies to its own services).
+ */
+const cleanups: Array<() => Promise<void>> = []
+
+function onCleanup(fn: () => Promise<void>): void {
+	cleanups.push(fn)
+}
+
+async function runCleanups(): Promise<void> {
+	for (let i = cleanups.length - 1; i >= 0; i--) {
+		try { await cleanups[i]!() } catch { /* teardown is best-effort */ }
+	}
+	cleanups.length = 0
+}
+
+/** A started node with a started service on it, both registered for teardown. */
 async function createService(profile: 'edge' | 'core') {
 	const node = await createMemNode()
 	await node.start()
 	const svc = new CoreFretService(node, { profile, k: 7, m: 4 })
 	await svc.start()
+	onCleanup(async () => { await svc.stop(); await node.stop() })
 	return { node, svc }
 }
+
+/** `buildMesh` + star dial, registered for teardown. */
+async function starRig(count: number): Promise<Mesh> {
+	const mesh = await buildMesh(count)
+	onCleanup(() => mesh.stop())
+	await mesh.connect('star')
+	return mesh
+}
+
+/**
+ * A started service constructed directly on `node`, registered for teardown. Distinct from
+ * `mesh.addServices` on purpose: these cases put a service on a mesh node with a config the rest
+ * of the mesh does not share, so `mesh.stop()` never sees it.
+ */
+async function startService(node: Libp2p, cfg: Partial<FretConfig>): Promise<CoreFretService> {
+	const svc = new CoreFretService(node, cfg)
+	await svc.start()
+	onCleanup(() => svc.stop())
+	return svc
+}
+
+/** A started bare node with no service on it, registered for teardown. */
+async function startNode(): Promise<Libp2p> {
+	const node = await createMemNode()
+	await node.start()
+	onCleanup(async () => { await node.stop() })
+	return node
+}
+
+const delay = (ms: number) => new Promise(r => setTimeout(r, ms))
 
 // Helper: drain a token bucket and count accepted takes
 function drainBucket(bucket: TokenBucket, attempts: number): number {
@@ -44,6 +97,8 @@ function makeMaybeActMsg(correlationId: string) {
 describe('Profile behavior tests', function () {
 	this.timeout(15000)
 
+	afterEach(runCleanups)
+
 	// ----- Phase 1: Token bucket capacity and refill per profile -----
 
 	describe('Token bucket capacities and refill rates', () => {
@@ -66,24 +121,20 @@ describe('Profile behavior tests', function () {
 
 		for (const spec of bucketSpecs) {
 			it(`Core bucket${spec.name} capacity=${spec.coreCap}, refill=${spec.coreRefill}/s`, async () => {
-				const { node, svc } = await createService('core')
+				const { svc } = await createService('core')
 				const bucket: TokenBucket = (svc as any)[spec.field]
 				const accepted = drainBucket(bucket, spec.coreCap + 10)
 				expect(accepted).to.be.within(spec.coreCap - 1, spec.coreCap)
 				// Verify refill rate via internal state
 				expect((bucket as any).refillPerSec).to.equal(spec.coreRefill)
-				await svc.stop()
-				await node.stop()
 			})
 
 			it(`Edge bucket${spec.name} capacity=${spec.edgeCap}, refill=${spec.edgeRefill}/s`, async () => {
-				const { node, svc } = await createService('edge')
+				const { svc } = await createService('edge')
 				const bucket: TokenBucket = (svc as any)[spec.field]
 				const accepted = drainBucket(bucket, spec.edgeCap + 10)
 				expect(accepted).to.be.within(spec.edgeCap - 1, spec.edgeCap)
 				expect((bucket as any).refillPerSec).to.equal(spec.edgeRefill)
-				await svc.stop()
-				await node.stop()
 			})
 		}
 	})
@@ -106,17 +157,13 @@ describe('Profile behavior tests', function () {
 
 	describe('Announce fanout', () => {
 		it('Core announceFanout is 8', async () => {
-			const { node, svc } = await createService('core')
+			const { svc } = await createService('core')
 			expect((svc as any).announceFanout).to.equal(8)
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Edge announceFanout is 4', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			expect((svc as any).announceFanout).to.equal(4)
-			await svc.stop()
-			await node.stop()
 		})
 	})
 
@@ -124,37 +171,25 @@ describe('Profile behavior tests', function () {
 
 	describe('Snapshot export caps', () => {
 		it('Edge snapshot caps successors/predecessors ≤ 6, sample ≤ 6', async () => {
-			const mesh = await buildMesh(15)
-			await mesh.connect('star')
-
-			const svc = new CoreFretService(mesh.nodes[0], { profile: 'edge', k: 15, m: 8 })
-			await svc.start()
-			await new Promise((r) => setTimeout(r, 2000))
+			const mesh = await starRig(15)
+			const svc = await startService(mesh.nodes[0]!, { profile: 'edge', k: 15, m: 8 })
+			await delay(2000)
 
 			const snap = await (svc as any).snapshot()
 			expect(snap.successors.length).to.be.at.most(6)
 			expect(snap.predecessors.length).to.be.at.most(6)
 			expect((snap.sample ?? []).length).to.be.at.most(6)
-
-			await svc.stop()
-			await mesh.stop()
 		})
 
 		it('Core snapshot caps successors/predecessors ≤ 12, sample ≤ 8', async () => {
-			const mesh = await buildMesh(15)
-			await mesh.connect('star')
-
-			const svc = new CoreFretService(mesh.nodes[0], { profile: 'core', k: 15, m: 8 })
-			await svc.start()
-			await new Promise((r) => setTimeout(r, 2000))
+			const mesh = await starRig(15)
+			const svc = await startService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
+			await delay(2000)
 
 			const snap = await (svc as any).snapshot()
 			expect(snap.successors.length).to.be.at.most(12)
 			expect(snap.predecessors.length).to.be.at.most(12)
 			expect((snap.sample ?? []).length).to.be.at.most(8)
-
-			await svc.stop()
-			await mesh.stop()
 		})
 	})
 
@@ -162,57 +197,39 @@ describe('Profile behavior tests', function () {
 
 	describe('Snapshot receive caps', () => {
 		it('Edge truncates received successors to 8, predecessors to 8, sample to 6', async () => {
-			const mesh = await buildMesh(22)
-			await mesh.connect('star')
-			const sender = new CoreFretService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
-			await sender.start()
-			await new Promise((r) => setTimeout(r, 2000))
+			const mesh = await starRig(22)
+			const sender = await startService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
+			await delay(2000)
 
-			const receiverNode = await createMemNode()
-			await receiverNode.start()
+			const receiverNode = await startNode()
 			await receiverNode.dial(mesh.nodes[0]!.getMultiaddrs()[0]!)
-			const receiver = new CoreFretService(receiverNode, { profile: 'edge', k: 15, m: 8 })
-			await receiver.start()
+			const receiver = await startService(receiverNode, { profile: 'edge', k: 15, m: 8 })
 
 			const storeBefore = receiver.getStore().size()
 			await (receiver as any).fetchAndMergeSnapshot(mesh.ids[0]!, (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Edge receive caps: 8 succ + 8 pred + 6 sample = 22 max unique peers merged
-			const added = storeAfter - storeBefore
-			expect(added).to.be.at.most(22)
-
-			await receiver.stop()
-			await receiverNode.stop()
-			await sender.stop()
-			await mesh.stop()
+			expect(storeAfter - storeBefore).to.be.at.most(22)
+			expect(sender.getStore().size()).to.be.greaterThan(0)
 		})
 
 		it('Core truncates received successors to 16, predecessors to 16, sample to 8', async () => {
-			const mesh = await buildMesh(22)
-			await mesh.connect('star')
-			const sender = new CoreFretService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
-			await sender.start()
-			await new Promise((r) => setTimeout(r, 2000))
+			const mesh = await starRig(22)
+			const sender = await startService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
+			await delay(2000)
 
-			const receiverNode = await createMemNode()
-			await receiverNode.start()
+			const receiverNode = await startNode()
 			await receiverNode.dial(mesh.nodes[0]!.getMultiaddrs()[0]!)
-			const receiver = new CoreFretService(receiverNode, { profile: 'core', k: 15, m: 8 })
-			await receiver.start()
+			const receiver = await startService(receiverNode, { profile: 'core', k: 15, m: 8 })
 
 			const storeBefore = receiver.getStore().size()
 			await (receiver as any).fetchAndMergeSnapshot(mesh.ids[0]!, (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Core receive caps: 16 succ + 16 pred + 8 sample = 40 max unique peers merged
-			const added = storeAfter - storeBefore
-			expect(added).to.be.at.most(40)
-
-			await receiver.stop()
-			await receiverNode.stop()
-			await sender.stop()
-			await mesh.stop()
+			expect(storeAfter - storeBefore).to.be.at.most(40)
+			expect(sender.getStore().size()).to.be.greaterThan(0)
 		})
 	})
 
@@ -230,7 +247,7 @@ describe('Profile behavior tests', function () {
 		// The three bucket-exhaustion cases below are unaffected — they test the token bucket.
 
 		it('handleMaybeAct returns BusyResponseV1 when bucketMaybeAct exhausted', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			const bucket: TokenBucket = (svc as any).bucketMaybeAct
 			drainBucket(bucket, 20)
 
@@ -242,12 +259,10 @@ describe('Profile behavior tests', function () {
 			const diag = svc.getDiagnostics()
 			expect(diag.rejected.rateLimited).to.be.greaterThan(0)
 
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('handleNeighborsRequest returns BusyResponseV1 when bucket exhausted', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			const bucket: TokenBucket = (svc as any).bucketNeighbors
 			drainBucket(bucket, 20)
 
@@ -255,12 +270,10 @@ describe('Profile behavior tests', function () {
 			expect(result).to.have.property('busy', true)
 			expect(result).to.have.property('retry_after_ms')
 
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('handlePingRequest returns BusyResponseV1 when bucket exhausted', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			const bucket: TokenBucket = (svc as any).bucketPing
 			drainBucket(bucket, 20)
 
@@ -268,8 +281,6 @@ describe('Profile behavior tests', function () {
 			expect(result).to.have.property('busy', true)
 			expect(result).to.have.property('retry_after_ms')
 
-			await svc.stop()
-			await node.stop()
 		})
 	})
 
@@ -282,13 +293,9 @@ describe('Profile behavior tests', function () {
 		it('maxBytesNeighbors = MAX_NEIGHBORS_BYTES (16384) on both profiles', async () => {
 			const core = await createService('core')
 			expect((core.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
-			await core.svc.stop()
-			await core.node.stop()
 
 			const edge = await createService('edge')
 			expect((edge.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
-			await edge.svc.stop()
-			await edge.node.stop()
 
 			expect(MAX_NEIGHBORS_BYTES).to.equal(16384)
 		})
@@ -296,13 +303,9 @@ describe('Profile behavior tests', function () {
 		it('maxBytesMaybeAct = 144 KB (147456) on both profiles', async () => {
 			const core = await createService('core')
 			expect((core.svc as any).maxBytesMaybeAct()).to.equal(147456)
-			await core.svc.stop()
-			await core.node.stop()
 
 			const edge = await createService('edge')
 			expect((edge.svc as any).maxBytesMaybeAct()).to.equal(147456)
-			await edge.svc.stop()
-			await edge.node.stop()
 		})
 	})
 
@@ -319,20 +322,13 @@ describe('Profile behavior tests', function () {
 
 	describe('Profile config defaults', () => {
 		it('defaults to core profile', async () => {
-			const node = await createMemNode()
-			await node.start()
-			const svc = new CoreFretService(node)
-			await svc.start()
+			const svc = await startService(await startNode(), {})
 			expect((svc as any).cfg.profile).to.equal('core')
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Edge profile is set when requested', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			expect((svc as any).cfg.profile).to.equal('edge')
-			await svc.stop()
-			await node.stop()
 		})
 	})
 
@@ -340,7 +336,7 @@ describe('Profile behavior tests', function () {
 
 	describe('Diagnostics rejection tracking', () => {
 		it('rateLimited counter increments on each rate-limited rejection', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 
 			// Drain neighbors bucket
 			const bucket: TokenBucket = (svc as any).bucketNeighbors
@@ -356,8 +352,6 @@ describe('Profile behavior tests', function () {
 			const after = svc.getDiagnostics().rejected.rateLimited
 			expect(after - before).to.equal(3)
 
-			await svc.stop()
-			await node.stop()
 		})
 	})
 
@@ -365,31 +359,23 @@ describe('Profile behavior tests', function () {
 
 	describe('Bounded internal map capacities', () => {
 		it('Core backoffMap capacity defaults to routing-table capacity (2048)', async () => {
-			const { node, svc } = await createService('core')
+			const { svc } = await createService('core')
 			expect((svc as any).backoffMap.capacity).to.equal(2048)
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Edge backoffMap capacity is capped at 512', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			expect((svc as any).backoffMap.capacity).to.equal(512)
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Core departureDebounce capacity defaults to 512', async () => {
-			const { node, svc } = await createService('core')
+			const { svc } = await createService('core')
 			expect((svc as any).departureDebounce.capacity).to.equal(512)
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Edge departureDebounce capacity defaults to 128', async () => {
-			const { node, svc } = await createService('edge')
+			const { svc } = await createService('edge')
 			expect((svc as any).departureDebounce.capacity).to.equal(128)
-			await svc.stop()
-			await node.stop()
 		})
 
 		it('Core discovery debounce map (maxTracked) defaults to 4096', () => {
