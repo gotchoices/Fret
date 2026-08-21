@@ -127,6 +127,24 @@ const arbJsonNumber = fc.oneof(
 
 const arbUnitInterval = fc.double({ min: 0, max: 1, noNaN: true })
 
+/**
+ * Same shape as {@link arbJsonNumber} but floored at 0 — for fields this node's own encoder
+ * never emits negative (e.g. `size_estimate`, whose valid range is `[0, Infinity]` per
+ * `validate.ts`). `-0` is filtered for the same reason as `arbJsonNumber`.
+ */
+const arbNonNegativeJsonNumber = fc.oneof(
+	fc.integer({ min: 0 }),
+	fc.double({ min: 0, noNaN: true, noDefaultInfinity: true }),
+	fc.constantFrom(
+		0,
+		1,
+		Number.MAX_SAFE_INTEGER,
+		Number.MAX_SAFE_INTEGER + 2,
+		1e308,
+		5e-324
+	)
+).filter((n) => !Object.is(n, -0))
+
 const arbCoordBytes = fc.uint8Array({ minLength: COORD_BYTES, maxLength: COORD_BYTES })
 const arbCoordB64 = arbCoordBytes.map(coordToBase64url)
 
@@ -1692,7 +1710,7 @@ describe('RPC codec properties', function () {
 				fc.record({ id: arbPeerId, coord: arbCoordB64, relevance: arbJsonNumber }),
 				{ maxLength: 6 }
 			),
-			size_estimate: arbJsonNumber,
+			size_estimate: arbNonNegativeJsonNumber,
 			confidence: arbUnitInterval,
 			sig: arbNastyString,
 			metadata: arbMetadata,
@@ -1733,7 +1751,7 @@ describe('RPC codec properties', function () {
 		const arbLegalPingResponse: fc.Arbitrary<PingResponseV1> = withOptionals(fc.record({
 			ok: fc.boolean(),
 			ts: arbJsonNumber,
-			size_estimate: arbJsonNumber,
+			size_estimate: arbNonNegativeJsonNumber,
 			confidence: arbUnitInterval,
 		}), ['size_estimate', 'confidence'])
 
