@@ -418,7 +418,19 @@ export class FretService implements IFretService, Startable {
 			ttlExpired: 0,
 			rateLimited: { neighbors: 0, ping: 0, maybeAct: 0, leave: 0, announce: 0 },
 			identityMismatch: 0,
-			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+			/**
+			 * Inbound messages dropped for wire shape, across two tiers and four handlers.
+			 * Body-level *decode* failures (undecodable JSON / non-object top level) from the
+			 * `registerJsonHandler` seam's `onMalformed('decode')` and from maybeAct's own
+			 * handler-body catch, plus *parse* rejections — `parseRouteAndMaybeAct` here in
+			 * `handleMaybeAct`, and the seam's `onMalformed('parse')` for the announce and
+			 * leave parsers.
+			 *
+			 * NOTE: deliberately still one counter, not a per-handler record like
+			 * `rateLimited` — every increment means "a peer sent something unusable", and no
+			 * caller has needed to tell decode from parse or one protocol from another. Split
+			 * it the same way `rateLimited` was split if that ever stops being true.
+			 */
 			malformed: 0,
 			/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
 			concurrencyLimited: 0,
