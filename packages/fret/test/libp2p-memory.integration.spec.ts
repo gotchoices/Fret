@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
-import { buildMesh, type Mesh } from './helpers/mesh.js'
+import { starMesh, type Mesh } from './helpers/mesh.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { hashPeerId } from '../src/ring/hash.js'
@@ -16,21 +16,7 @@ import type { NearAnchorV1, RouteAndMaybeActV1 } from '../src/index.js'
 // --- helpers ---
 
 /** `n` memory-transport nodes: every service started first, then dialed into a star. */
-async function makeMesh(n: number): Promise<Mesh> {
-	const mesh = await buildMesh(n)
-	// Start ALL services first so RPC handlers and peer:connect listeners
-	// are registered before connections are established.
-	await mesh.addServices((i, m) => ({
-		profile: 'edge',
-		k: 7,
-		bootstraps: i === 0 ? [] : [m.ids[0]!]
-	}))
-	// Connect in a star AFTER services start — peer:connect events fire
-	// and populate each node's store.  Star ensures bootstrap knows all
-	// peers immediately and leave notices can reach it via direct connection.
-	await mesh.connect('star')
-	return mesh
-}
+const makeMesh = (n: number): Promise<Mesh> => starMesh(n)
 
 function makeRouteMsg(keyB64: string, ttl = 5): RouteAndMaybeActV1 {
 	return {

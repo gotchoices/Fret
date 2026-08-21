@@ -27,10 +27,9 @@ import { createMemNode, connectLine, stopAll } from './libp2p.js'
  * await mesh.connect('star')   // services first, then dial
  * ```
  *
- * NOTE: three specs now repeat the same `addServices({profile:'edge', k:7, bootstraps: i===0 ? []
- * : [ids[0]]})` + `connect('star')` pair verbatim. Left as-is while it is a 6-line literal that reads
- * at each site; if more specs adopt it, or the config drifts apart between them by accident, add a
- * `starMesh(count, opts)` convenience here rather than letting the copies diverge.
+ * The four specs that wanted *only* that ordering with one shared config now call
+ * {@link starMesh} instead; `buildMesh` + the two calls stays the path for every spec whose order
+ * or config differs (dial-then-construct, `line` / `full`, per-node config).
  */
 export type Topology = 'star' | 'line' | 'full'
 
@@ -69,7 +68,15 @@ export interface Mesh {
 	stop(opts?: StopOptions): Promise<void>
 }
 
-/** `count` started in-memory libp2p nodes. No services and no connections yet. */
+/**
+ * `count` started in-memory libp2p nodes. No services and no connections yet.
+ *
+ * NOTE: a throw from the factory or from `node.start()` on iteration *j* rejects without stopping
+ * nodes `0..j-1`, and the caller's `mesh` is never assigned, so its `afterEach` cannot stop them
+ * either — they would surface as an exit-watchdog open-handle dump. Only reachable if in-memory
+ * node construction itself fails, which is why the loop is left plain; if a spec ever reports a
+ * watchdog dump from a failed mesh construction, wrap the loop and `stopAll` what was built.
+ */
 export async function buildMesh(count: number, opts: MeshOptions = {}): Promise<Mesh> {
 	const factory = opts.factory ?? createMemNode
 	const nodes: Libp2p[] = []
@@ -103,6 +110,36 @@ export async function buildMesh(count: number, opts: MeshOptions = {}): Promise<
 			await stopAll(nodes.filter((_, i) => !skip.has(i)))
 		}
 	}
+	return mesh
+}
+
+export interface StarMeshOptions extends MeshOptions {
+	/**
+	 * Merged over the default per-node config, so a caller can override `k` or `profile` without
+	 * restating the index-dependent `bootstraps`. Pass `bootstraps` explicitly to override that too.
+	 */
+	config?: Partial<FretConfig>
+}
+
+/**
+ * The common case, in one call: `count` in-memory nodes, an edge-profile service on each
+ * bootstrapped off node 0, **then** a star dialed at node 0.
+ *
+ * Services first, dial second — so every node's RPC handlers and `peer:connect` listener are
+ * registered before any connection exists. A spec needing the other order (dial first, so
+ * `start()`'s `seedFromPeerStore` sees the connections) must use `buildMesh` and the two calls;
+ * that is why they are still separate.
+ */
+export async function starMesh(count: number, opts: StarMeshOptions = {}): Promise<Mesh> {
+	const { config, ...meshOpts } = opts
+	const mesh = await buildMesh(count, meshOpts)
+	await mesh.addServices((i, m) => ({
+		profile: 'edge',
+		k: 7,
+		bootstraps: i === 0 ? [] : [m.ids[0]!],
+		...config
+	}))
+	await mesh.connect('star')
 	return mesh
 }
 

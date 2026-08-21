@@ -8,7 +8,7 @@ import { DigitreeStore } from '../src/store/digitree-store.js';
 import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
 import { hashPeerId, coordToBase64url } from '../src/ring/hash.js';
 import { createMemNode, stopAll } from './helpers/libp2p.js';
-import { buildMesh, type Mesh } from './helpers/mesh.js';
+import { starMesh, type Mesh } from './helpers/mesh.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
 import { Libp2pFretService, fretService } from '../src/service/libp2p-fret-service.js';
 import type { SerializedPeerEntry, SerializedTable } from '../src/index.js';
@@ -486,9 +486,7 @@ describe('FretPeerDiscovery integration with CoreFretService', function () {
 	});
 
 	it('emits peers discovered by FretService stabilization', async () => {
-		mesh = await buildMesh(3);
-		await mesh.addServices((i, m) => ({ profile: 'edge', k: 7, bootstraps: i === 0 ? [] : [m.ids[0]!] }));
-		await mesh.connect('star');
+		mesh = await starMesh(3);
 		const { nodes, services } = mesh;
 
 		await new Promise(r => setTimeout(r, 4000));

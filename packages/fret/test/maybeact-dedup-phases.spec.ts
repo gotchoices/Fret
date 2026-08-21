@@ -4,7 +4,7 @@ import { createMemoryNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { sendMaybeAct } from '../src/rpc/maybe-act.js'
 import { PROTOCOL_MAYBE_ACT } from '../src/rpc/protocols.js'
-import { buildMesh } from './helpers/mesh.js'
+import { starMesh } from './helpers/mesh.js'
 import type { RouteAndMaybeActV1 } from '../src/index.js'
 import type { RpcOutcome } from '../src/rpc/outcome.js'
 
@@ -196,13 +196,7 @@ describe('iterativeLookup does not re-probe a peer', function () {
 
 	it('yields no duplicate peer across the probing events of one lookup', async () => {
 		// Services start BEFORE the star is dialed, so each `peer:connect` handler fires.
-		const mesh = await buildMesh(4, { factory: createMemoryNode })
-		await mesh.addServices((i, m) => ({
-			profile: 'edge',
-			k: 7,
-			bootstraps: i === 0 ? [] : [m.ids[0]!]
-		}))
-		await mesh.connect('star')
+		const mesh = await starMesh(4, { factory: createMemoryNode })
 		await new Promise(r => setTimeout(r, 2000))
 
 		// Teardown from a `finally`: a failed assertion must report *itself* rather than be buried

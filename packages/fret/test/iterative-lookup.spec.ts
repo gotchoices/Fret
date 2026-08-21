@@ -1,6 +1,6 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { buildMesh, type Mesh } from './helpers/mesh.js'
+import { starMesh, type Mesh } from './helpers/mesh.js'
 import type { RouteProgress } from '../src/index.js'
 import { hashKey, hashPeerId } from '../src/ring/hash.js'
 import { lexLess, minDistance } from '../src/ring/distance.js'
@@ -24,16 +24,7 @@ import { fromString as u8FromString } from 'uint8arrays/from-string'
  * skipped past. `mesh.stop()` settles each service stop rather than `Promise.all`ing them for the
  * same reason: one rejecting stop must not strand the other services or the nodes underneath them.
  */
-async function makeMesh(n: number): Promise<Mesh> {
-	const mesh = await buildMesh(n)
-	await mesh.addServices((i, m) => ({
-		profile: 'edge',
-		k: 7,
-		bootstraps: i === 0 ? [] : [m.ids[0]!]
-	}))
-	await mesh.connect('star')
-	return mesh
-}
+const makeMesh = (n: number): Promise<Mesh> => starMesh(n)
 
 describe('Iterative lookup', function () {
 	this.timeout(25000)
