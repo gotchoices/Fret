@@ -461,6 +461,19 @@ export class FretService implements IFretService, Startable {
 		return this.store;
 	}
 
+	/**
+	 * This node's ring coordinate, hashed once and cached.
+	 *
+	 * NOTE: the cache is load-bearing for two readers that consult `cachedSelfCoord` *nullably*
+	 * and degrade when it is unset — `isNearNeighbor` returns false outright, and
+	 * `getNetworkSizeEstimate` falls through to the estimator's whole-store gap population, which
+	 * `docs/fret.md` documents as a one-to-two-order-of-magnitude error. Routing a call site
+	 * through here rather than through `hashPeerId(this.node.peerId)` therefore populates the
+	 * cache earlier and shrinks both degraded windows; a future call site that hashes directly
+	 * silently widens them again. Nothing tests this, because the improvement is a timing
+	 * property rather than a behaviour; if either reader's degraded path is ever observed in the
+	 * wild, make the coordinate a construction-time invariant instead of a lazy cache.
+	 */
 	private async selfCoord(): Promise<Uint8Array> {
 		if (this.cachedSelfCoord) return this.cachedSelfCoord;
 		this.cachedSelfCoord = await hashPeerId(this.node.peerId);
@@ -2036,6 +2049,13 @@ export class FretService implements IFretService, Startable {
 			// deployment ever needs the table to be a hard memory bound.
 			// Must stay *above* the `budget.signal.aborted` early return below, so a truncated
 			// tick still enforces.
+			// NOTE: a throw *earlier* in the tick skips this, and the seeds no longer trim for
+			// themselves, so that tick's inserts stay untrimmed until the next one. The reachable
+			// candidates are the two calls above the try (`sweepBoundedMaps`, `nearProbeTargets`),
+			// both local and neither able to throw on any input a tick can present; the loop's own
+			// try/catch swallows anything that does, and the overshoot self-heals next tick. If a
+			// deterministic throw is ever found on that path, move the enforcement into this
+			// method's `finally` rather than adding a guard here.
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
@@ -3166,7 +3186,7 @@ export class FretService implements IFretService, Startable {
 				if (anchor.cohort_hint.length > 0) {
 					for (const hint of anchor.cohort_hint) {
 						try {
-							const hCoord = this.store.getById(hint)?.coord ?? (await hashPeerId(peerIdFromString(hint)));
+							const hCoord = await this.coordOf(hint);
 							this.store.upsert(hint, hCoord);
 						} catch {}
 					}
