@@ -608,10 +608,17 @@ export class FretSimulation {
 	 * ring-shaped read via the `notDead` filter.
 	 *
 	 * Production spaces strikes ≥ 500 ms apart so a burst of concurrent failures counts once
-	 * (docs/fret.md — Ring membership). Here one strike is one *tick*, so the independence the
-	 * spacing rule buys holds by construction and no spacing check is re-implemented — note
-	 * that this is a property of the tick, not of the clock: a driver that processes several
-	 * ticks at one simulated timestamp still strikes once per tick.
+	 * (docs/fret.md — Ring membership). *This sweep* strikes an entry at most once per tick,
+	 * so within the sweep the independence the spacing rule buys holds by construction and no
+	 * spacing check is re-implemented — a property of the tick, not of the clock: a driver
+	 * that processes several ticks at one simulated timestamp still sweeps once per tick.
+	 * NOTE: that is no longer the whole picture — `handleRoute` strikes through the same
+	 * `recordContactFailure`, so an entry can take a sweep strike and one route strike (and
+	 * one per further route) at the same simulated timestamp, escalating to `dead` faster
+	 * than the sweep alone would. Harmless while routes are scheduled sparsely by the specs;
+	 * if a suite ever fires many routes per tick through the same unreachable window, add the
+	 * production spacing check (≥ 500 ms since `lastContactFailureAt`) inside
+	 * `recordContactFailure` rather than re-deriving it per call site.
 	 * Production also spreads its contacts across budgeted passes (near / classify /
 	 * re-probe) rather than touching every entry each tick; the sim collapses those into one
 	 * per-tick sweep, so a fully unreachable population escalates in `deadAfterFailures`
