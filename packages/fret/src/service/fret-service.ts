@@ -872,6 +872,10 @@ export class FretService implements IFretService, Startable {
 		this.postBootstrapAnnounced = false;
 		this.firstStabilizeDone = false;
 		await this.seedFromPeerStore();
+		// The seed no longer enforces for itself (the caller owns the one enforcement per insert
+		// sequence), so do it here explicitly rather than leaving it to the first stabilization
+		// tick — that would couple a capacity bound to timer arming.
+		await this.enforceCapacity();
 		await this.registerRpcHandlers();
 		// Defer proactive announce to after first stabilization tick (table is richer)
 		this.startStabilizationLoop();
@@ -1410,7 +1414,7 @@ export class FretService implements IFretService, Startable {
 	}
 
 	private async announceNeighborsBounded(maxCount?: number): Promise<void> {
-		const selfCoord = await hashPeerId(this.node.peerId);
+		const selfCoord = await this.selfCoord();
 		const exclude = new Set([this.node.peerId.toString()]);
 		const ids = this.announceTargetsAround(selfCoord, exclude, maxCount ?? this.announceFanout);
 		if (ids.length === 0) return;
@@ -1470,7 +1474,7 @@ export class FretService implements IFretService, Startable {
 
 	private async preconnectNeighbors(): Promise<void> {
 		try {
-			const selfCoord = await hashPeerId(this.node.peerId);
+			const selfCoord = await this.selfCoord();
 			const selfStr = this.node.peerId.toString();
 			// Unfiltered store walk: preconnect/warm-up must reach not-yet-classified peers (a
 			// ping is itself a classification signal). Ring reads use member-scoped getNeighbors.
@@ -1563,7 +1567,7 @@ export class FretService implements IFretService, Startable {
 		const budget = deadline(FretService.SHUTDOWN_BUDGET_MS);
 		const sendOpts = { signal: budget.signal, timeoutMs: FretService.LEAVE_NOTICE_TIMEOUT_MS };
 		try {
-			const selfCoord = await hashPeerId(this.node.peerId);
+			const selfCoord = await this.selfCoord();
 			const selfStr = this.node.peerId.toString();
 			// Unfiltered store walk: leave notices go to all ring neighbors (matches handleLeave /
 			// computeReplacements). Ring reads elsewhere use member-scoped getNeighbors.
@@ -1791,12 +1795,15 @@ export class FretService implements IFretService, Startable {
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
 		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		try {
-			const self = peerIdFromString(from);
-			const selfCoord = await hashPeerId(self);
+			// The *sending* peer's id and ring coordinate, not ours — named so the next reader
+			// cannot mistake them for `selfCoord()`. Substituting our own coordinate here would
+			// upsert every announcing peer at our own ring position.
+			const sender = peerIdFromString(from);
+			const senderCoord = await hashPeerId(sender);
 			const discovered: string[] = [];
 			if (!this.store.getById(from)) discovered.push(from);
-			this.store.upsert(from, selfCoord);
-			await this.applyTouch(from, selfCoord);
+			this.store.upsert(from, senderCoord);
+			await this.applyTouch(from, senderCoord);
 			// `from` is transport-authenticated (the handler drops any mismatch) and it dialed
 			// our namespaced announce protocol — strongest possible membership proof.
 			this.applyMembershipSignal(from, 'rpc-inbound');
@@ -1859,11 +1866,11 @@ export class FretService implements IFretService, Startable {
 	// Seeding and stabilization
 	private async seedFromPeerStore(): Promise<void> {
 		try {
-			// NOTE: runs at start() and on every stabilization tick. This re-enumerates the whole
-			// peerStore and SHA-256-hashes each peer's id per tick (upsert preserves existing stats,
-			// so it is correct, just not free). Fine at current capacity (C=2048); if the peerStore
-			// grows large or the tick cadence tightens, gate re-seed on a peerStore change/epoch or
-			// skip hashing for ids already in the store (reuse the stored coord).
+			// NOTE: runs at start() and on every stabilization tick, re-enumerating the whole
+			// peerStore (upsert preserves existing stats, so it is correct, just not free). The
+			// per-peer SHA-256 is now paid only on a store miss — see the coord reuse below. Fine
+			// at current capacity (C=2048); if the peerStore grows large or the tick cadence
+			// tightens, gate the re-seed itself on a peerStore change/epoch.
 			// NOTE: FretPeerDiscovery now feeds this loop — every member it emits becomes an
 			// (address-less) peerStore entry, so the peerStore is no longer bounded by peers
 			// libp2p learned on its own. It is still bounded by C=2048 via the FRET store the
@@ -1876,7 +1883,18 @@ export class FretService implements IFretService, Startable {
 				try {
 					const pidStr = p.id.toString();
 					if (p.addresses.length > 0) addressKnown.add(pidStr);
-					const coord = await hashPeerId(p.id);
+					// NOTE: reuse the stored ring coordinate and hash only on a miss. Sound because
+					// the coordinate is `SHA-256(peer id)` and nothing rotates it, so a stored one
+					// cannot legitimately go stale — re-deriving it produces the same 32 bytes every
+					// tick. This removes an *incidental* repair path: the unconditional re-hash used
+					// to silently overwrite a wrong coordinate for any peer the libp2p peerStore also
+					// knew, which only `importTable` can introduce (it trusts the snapshot's coord).
+					// That defense belongs at the import boundary — see
+					// `tickets/backlog/plan/2-routing-table-export-integrity` item 3, now the only
+					// coordinate check for imported entries. Revisit if VRF/epoch ring-coordinate
+					// rotation is ever implemented (open question in `docs/fret.md`): a coordinate
+					// could then go stale and this reuse would be wrong.
+					const coord = this.store.getById(pidStr)?.coord ?? (await hashPeerId(p.id));
 					this.store.upsert(pidStr, coord);
 					// If identify has populated the peerStore, classify off its protocol
 					// list now rather than waiting for an outbound probe. No `unknown`-only
@@ -1895,7 +1913,7 @@ export class FretService implements IFretService, Startable {
 			// apply the walk's result as a diff instead of a swap.
 			this.addressKnown = addressKnown;
 			try {
-				const coord = await hashPeerId(this.node.peerId);
+				const coord = await this.selfCoord();
 				const selfStr = this.node.peerId.toString();
 				this.store.upsert(selfStr, coord);
 				// Self always serves its own network.
@@ -1903,7 +1921,9 @@ export class FretService implements IFretService, Startable {
 			} catch (err) {
 				console.error('failed to add self to store', err);
 			}
-			await this.enforceCapacity();
+			// No `enforceCapacity` here: the caller does the one enforcement for the whole insert
+			// sequence (see `stabilizeOnce` phase 1, and `start()` for the direct call before the
+			// loop is armed) — the same rule `fetchAndMergeSnapshot` follows.
 		} catch (err) {
 			console.error('seedFromPeerStore failed:', err);
 		}
@@ -1959,7 +1979,9 @@ export class FretService implements IFretService, Startable {
 				console.warn('seedFromBootstraps failed for', bootstrapEntry, err);
 			}
 		}
-		await this.enforceCapacity();
+		// No `enforceCapacity` here either — same rule as `seedFromPeerStore` above: the caller
+		// enforces once for the whole insert sequence. This is only ever called from the
+		// stabilization tick, which does so at the end of phase 1.
 	}
 
 	/**
@@ -2004,6 +2026,16 @@ export class FretService implements IFretService, Startable {
 			const merged = await runPooled(near.map((id) => () => this.probeAndFetch(id, budget.signal)), pool);
 			logRejected(merged, near, 'probeAndFetch');
 			const announced = fulfilledValues(merged).flat();
+			// The tick's one capacity enforcement. It sits after phase 1's seeds and snapshot
+			// merges, so it sees every insert the tick made — which is why `seedFromPeerStore` and
+			// `seedFromBootstraps` no longer trim for themselves.
+			// NOTE: accepted cost — the table may sit over capacity for the span of phase 1
+			// (bounded by STABILIZE_TICK_BUDGET_MS, 5 s) instead of being trimmed after each seed.
+			// Capacity is a soft eviction target, not an allocation bound, and the transient
+			// overshoot is whatever one tick's seeding added, not unbounded growth. Revisit if a
+			// deployment ever needs the table to be a hard memory bound.
+			// Must stay *above* the `budget.signal.aborted` early return below, so a truncated
+			// tick still enforces.
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
@@ -2358,7 +2390,7 @@ export class FretService implements IFretService, Startable {
 
 	// Snapshots
 	private async snapshot(): Promise<NeighborSnapshotV1> {
-		const selfCoord = await hashPeerId(this.node.peerId);
+		const selfCoord = await this.selfCoord();
 		// Size estimate, neighbors, and sample are all live-member-scoped so the snapshot we
 		// advertise describes only this network's reachable peers — and never re-introduces a
 		// foreign peer to same-network neighbors via the sample (the transitive-propagation

@@ -24,3 +24,24 @@ The design doc notes "The caller decides where and how to store the JSON" but pr
 ### Threat references
 
 - threat-analysis.md §5.5 (Medium): Serialized routing table tampering
+
+### Arm: item 3 is now the only coordinate check for imported entries
+
+Added by `implement/16-per-tick-hotpath-waste`.
+
+Until that change, the background maintenance loop rehashed every peer's ring coordinate from its
+peer id on every cycle and wrote the result back, which *incidentally* repaired a tampered
+coordinate for any peer that libp2p's own peer store also knew about. That repair is gone: the loop
+now reuses the coordinate already stored for a peer and only computes the hash for a peer it has
+never seen.
+
+Removing it was deliberate. The repair was partial (it only ever reached peers libp2p also knew),
+owned by nobody, and paid for by every node on every cycle. But it means item 3 above — re-deriving
+each imported entry's coordinate from its peer id and rejecting a mismatch — is now the only place
+a wrong coordinate from a restored snapshot would be caught. Whoever picks this ticket up should
+treat that half as the load-bearing one; it is also the half that stands on its own without the
+signing work.
+
+A test asserting the new behavior deliberately ("a tampered coordinate now survives a tick"), so
+that it is not later rediscovered as a regression, is queued in
+`implement/16.1-per-tick-hotpath-tests`.
