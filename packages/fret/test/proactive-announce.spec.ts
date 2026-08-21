@@ -56,19 +56,34 @@ describe('Proactive announcements', function () {
 
 		// Node 2's libp2p node is already down, but its FretService is not — mesh.stop's `skip`
 		// leaves both alone, so the service must be stopped explicitly or its internal timers
-		// (stabilization interval, etc.) leak past the test.
-		await mesh.services[2]!.stop()
-		await mesh.stop({ skip: [2] })
+		// (stabilization interval, etc.) leak past the test. In a `finally` because teardown here
+		// is inline rather than in an `afterEach`: a throw from this one stop would otherwise
+		// strand the other four nodes and services for the exit watchdog to dump on top of it.
+		try {
+			await mesh.services[2]!.stop()
+		} finally {
+			await mesh.stop({ skip: [2] })
+		}
 	})
 
 	it('edge profile sends fewer announcements than core (bounded fanout)', async () => {
-		const edgeMesh = await buildMesh(6)
-		await edgeMesh.addServices({ profile: 'edge', k: 7, bootstraps: [edgeMesh.ids[0]!] })
-		await edgeMesh.connect('full')
+		/** Six nodes on `profile`, fully meshed, services started before the dials. */
+		const announceCluster = async (profile: 'edge' | 'core') => {
+			const mesh = await buildMesh(6)
+			await mesh.addServices({ profile, k: 7, bootstraps: [mesh.ids[0]!] })
+			await mesh.connect('full')
+			return mesh
+		}
 
-		const coreMesh = await buildMesh(6)
-		await coreMesh.addServices({ profile: 'core', k: 7, bootstraps: [coreMesh.ids[0]!] })
-		await coreMesh.connect('full')
+		// Both clusters are built concurrently so they start their stabilization clocks together.
+		// Built one after the other, the edge cluster ran for the whole of the core cluster's
+		// setup before the shared sample window even opened — measured at 186 ms against a 1500 ms
+		// passive stabilization interval, so roughly one run in eight gave edge a whole extra
+		// announce round. That skew runs *against* the `coreTotal >= edgeTotal` assertion below.
+		const [edgeMesh, coreMesh] = await Promise.all([
+			announceCluster('edge'),
+			announceCluster('core')
+		])
 
 		await new Promise(r => setTimeout(r, 4000))
 
