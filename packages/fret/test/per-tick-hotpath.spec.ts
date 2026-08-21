@@ -234,5 +234,36 @@ describe('per-tick hot path', function () {
 				if (harness != null) await harness.teardown()
 			}
 		})
+
+		it('an untruncated tick does probe unknown peers', async () => {
+			// Non-vacuity for the assertion above. "No unknown peer was probed" is evidence that
+			// the tick was cut short only if a tick that is *not* cut short probes one — otherwise
+			// the same assertion would hold against a rig that never dials at all, and the
+			// truncation claim would rest on nothing. Same seeding, two differences: the near peers
+			// answer rather than hang, so phase 1 drains, and the budget is generous, so the
+			// `budget.signal.aborted` early return above phase 2 is not taken.
+			//
+			// Capacity is left at its default here on purpose. This test is about phase 2 running,
+			// and a binding capacity would evict most of the unknown population in phase 1's
+			// enforcement before `classifyTargets` ever walked the store — making the assertion
+			// depend on which peers survived eviction rather than on whether phase 2 ran.
+			let harness: MaintenanceRig | undefined
+			try {
+				harness = await buildMaintenanceRig('core', { k: K })
+				const { svc, rig } = harness
+				harness.setTickBudget(5_000)
+
+				await harness.seedPeers(4, 'member')
+				const unknowns = await harness.seedPeers(SEEDED, 'unknown')
+
+				await (svc as any).stabilizeOnce()
+
+				const probed = unknowns.filter((id) => rig.protocolsSeenBy(id).length > 0)
+				expect(probed, 'phase 2 ran, so the truncated-tick assertion is not vacuous')
+					.to.not.be.empty
+			} finally {
+				if (harness != null) await harness.teardown()
+			}
+		})
 	})
 })
