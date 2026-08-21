@@ -1,4 +1,6 @@
 import type { DigitreeStore, PeerEntry } from '../../src/store/digitree-store.js'
+import type { SparsityModel } from '../../src/store/relevance.js'
+import { normalizedLogDistance, recordFailure, recordSuccess } from '../../src/store/relevance.js'
 
 /**
  * Ring-shaped reads skip entries the probing peer has marked `dead` in its own store. This is
@@ -27,6 +29,20 @@ export interface LivenessDeps {
 	 * peer could not have.
 	 */
 	isAlive: (id: string) => boolean
+	/**
+	 * The sparsity (KDE) model belonging to `selfId`. One model **per peer**: a model shared
+	 * across peers would make every peer's sparsity bonus a function of every other peer's
+	 * observations, which no real node can see.
+	 */
+	modelFor: (selfId: string) => SparsityModel
+	/** Ring coordinate of a peer id — the self-to-peer distance every scoring call takes. */
+	coordOf: (id: string) => Uint8Array
+	/**
+	 * Sim clock. Every scoring call must be handed sim time explicitly: the scoring helpers
+	 * default `now` to `Date.now()`, and a wall-clock stamp makes two same-seed replays diverge
+	 * (recency's half-life is 60 s against sim runs of 4-60 s, so the term is live).
+	 */
+	now: () => number
 }
 
 /**
@@ -40,12 +56,18 @@ export class LivenessModel {
 	private readonly deadReprobePerTick: number
 	private readonly contactAllowed: (a: string, b: string) => boolean
 	private readonly isAlive: (id: string) => boolean
+	private readonly modelFor: (selfId: string) => SparsityModel
+	private readonly coordOf: (id: string) => Uint8Array
+	private readonly now: () => number
 
 	constructor(cfg: LivenessConfig, deps: LivenessDeps) {
 		this.deadAfterFailures = cfg.deadAfterFailures
 		this.deadReprobePerTick = cfg.deadReprobePerTick
 		this.contactAllowed = deps.contactAllowed
 		this.isAlive = deps.isAlive
+		this.modelFor = deps.modelFor
+		this.coordOf = deps.coordOf
+		this.now = deps.now
 	}
 
 	/**
@@ -84,9 +106,9 @@ export class LivenessModel {
 			}
 			if (entry.state === 'dead') continue // dead entries belong to the re-probe arm
 			if (!this.contactAllowed(selfId, entry.id)) {
-				this.recordContactFailure(store, entry, time)
+				this.recordContactFailure(selfId, store, entry, time)
 			} else {
-				this.recordContactSuccess(store, entry)
+				this.recordContactSuccess(selfId, store, entry)
 			}
 		}
 	}
@@ -98,21 +120,51 @@ export class LivenessModel {
 	 * point of sharing it — two copies of this arithmetic is how the sweep and the router
 	 * drift apart.
 	 */
-	recordContactFailure(store: DigitreeStore, entry: PeerEntry, time: number): void {
+	recordContactFailure(selfId: string, store: DigitreeStore, entry: PeerEntry, time: number): void {
 		const strikes = Math.min(entry.contactFailures + 1, this.deadAfterFailures)
+		const x = normalizedLogDistance(this.coordOf(selfId), entry.coord)
+		const scored = recordFailure(entry, x, this.modelFor(selfId), time)
+		// lastAccess ← sim time: the re-probe arm orders by ascending lastAccess, and only
+		// sim-clock stamps keep two same-seed runs picking identical candidates (Date.now()
+		// stamps differ between runs and would break deterministic replay). Scoring stamps it
+		// on *every* failure now, where the old code stamped it only on the dead transition,
+		// so the re-probe candidate rotation shifts - see simulation.partition.spec.ts.
+		const patch = {
+			relevance: scored.relevance,
+			failureCount: scored.failureCount,
+			lastAccess: time,
+			contactFailures: strikes,
+		}
 		if (strikes >= this.deadAfterFailures) {
-			// lastAccess ← sim time: the re-probe arm orders by ascending lastAccess, and
-			// only sim-clock stamps keep two same-seed runs picking identical candidates
-			// (Date.now() stamps differ between runs and would break deterministic replay).
-			store.update(entry.id, { contactFailures: strikes, state: 'dead', lastAccess: time })
+			store.update(entry.id, { ...patch, state: 'dead' })
 		} else {
-			store.update(entry.id, { contactFailures: strikes })
+			store.update(entry.id, patch)
 		}
 	}
 
-	/** A successful contact clears the strike run. Written only when there is one to clear. */
-	recordContactSuccess(store: DigitreeStore, entry: PeerEntry): void {
-		if (entry.contactFailures > 0) store.update(entry.id, { contactFailures: 0 })
+	/**
+	 * A successful contact clears the strike run *and* scores the entry, since proven contact is
+	 * what production's success path (`recordSuccess`) records. Latency is deliberately
+	 * `undefined`: the sim models no link latency, so there is no sample to blend and
+	 * `avgLatencyMs` must stay `null` rather than be fabricated as a 0 ms measurement.
+	 *
+	 * NOTE: `contactSweep` calls this for every reachable non-dead entry on every tick, so
+	 * `accessCount` and the KDE occupancy each grow by one per entry per tick - O(store size)
+	 * scoring writes per peer per tick, not one per real RPC. That is intended shared-seam
+	 * behavior (production's sweep is proven contact), but it means frequency saturates quickly
+	 * on long runs; if a suite ever needs frequency to discriminate, give the sweep its own
+	 * cadence rather than scoring per tick.
+	 */
+	recordContactSuccess(selfId: string, store: DigitreeStore, entry: PeerEntry): void {
+		const x = normalizedLogDistance(this.coordOf(selfId), entry.coord)
+		const scored = recordSuccess(entry, undefined, x, this.modelFor(selfId), this.now())
+		store.update(entry.id, {
+			relevance: scored.relevance,
+			lastAccess: scored.lastAccess,
+			accessCount: scored.accessCount,
+			successCount: scored.successCount,
+			contactFailures: 0,
+		})
 	}
 
 	/**

@@ -7,6 +7,8 @@ import { PartitionModel } from './reachability.js'
 import { LivenessModel, notDead } from './liveness.js'
 import { SimMeasurement } from './measurement.js'
 import { DigitreeStore } from '../../src/store/digitree-store.js'
+import { createSparsityModel } from '../../src/store/relevance.js'
+import type { SparsityModel } from '../../src/store/relevance.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
 import { ringNeighborsBothSides } from '../../src/ring/ring-walk.js'
 import { toCoord } from '../helpers/ring.js'
@@ -94,6 +96,11 @@ export class FretSimulation {
 	private readonly config: SimConfig
 	private readonly peers = new Map<string, SimPeer>()
 	private readonly stores = new Map<string, DigitreeStore>()
+	// One sparsity (KDE) model **per peer**: a shared model would make every peer's sparsity
+	// bonus a function of every other peer's observations. The model consumes no RNG, so it
+	// cannot perturb same-seed replay (pinned by simulation.partition.spec.ts). A departed peer
+	// keeps its model entry, same memory note `handleLeave` carries for `stores`.
+	private readonly models = new Map<string, SparsityModel>()
 	private readonly bus: SimMessageBus | undefined
 	private nextPeerIndex: number
 	private readonly lastStabilized = new Map<string, number>()
@@ -133,6 +140,9 @@ export class FretSimulation {
 					const p = this.peers.get(id)
 					return !!p && p.alive
 				},
+				modelFor: (selfId) => this.models.get(selfId)!,
+				coordOf: (id) => this.peers.get(id)!.coord,
+				now: () => this.scheduler.getCurrentTime(),
 			},
 		)
 		this.measurement = new SimMeasurement({
@@ -178,6 +188,9 @@ export class FretSimulation {
 	private addPeer(index: number, isJoin = false): SimPeer {
 		const peer = this.createPeer(index, isJoin)
 		this.peers.set(peer.id, peer)
+		// `addPeer` is the single construction seam (initialize() and handleJoin() both go
+		// through it), so creating the model here covers every peer exactly once.
+		this.models.set(peer.id, createSparsityModel())
 		const store = new DigitreeStore()
 		store.upsert(peer.id, peer.coord)
 		this.stores.set(peer.id, store)
@@ -730,12 +743,12 @@ export class FretSimulation {
 				const entry = store.getById(pick)
 				const target = this.peers.get(pick)
 				if (this.partitionModel.contactAllowed(current, pick) && target?.alive) {
-					if (entry) this.liveness.recordContactSuccess(store, entry)
+					if (entry) this.liveness.recordContactSuccess(current, store, entry)
 					next = pick
 					break
 				}
 				// Failed contact: strike it the way the sweep would, then try the next best.
-				if (entry) this.liveness.recordContactFailure(store, entry, time)
+				if (entry) this.liveness.recordContactFailure(current, store, entry, time)
 			}
 
 			if (!next) break
