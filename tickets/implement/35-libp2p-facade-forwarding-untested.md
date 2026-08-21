@@ -2,19 +2,64 @@ description: The libp2p wrapper around the core networking service forwards ever
 files: packages/fret/src/service/libp2p-fret-service.ts, packages/fret/test/libp2p-service-node-source.spec.ts, packages/fret/test/libp2p-facade-forwarding.spec.ts (new)
 difficulty: easy
 ---
-`Libp2pFretService` (`packages/fret/src/service/libp2p-fret-service.ts`) re-exposes all public
-`FretService` members as hand-written one-line pass-throughs to a private core instance
-(`this.inner`, built lazily by the private `ensure()`). `implements Startable, FretService` gives
-compiler proof the surface is complete and every signature matches. What no check covers is
-whether each body forwards **the arguments it was given, unchanged and in order**, and returns
-what the core returned.
 
-Not hypothetical for one shape: `reportNetworkSize(estimate: number, confidence: number,
-source?: string)` takes two adjacent numbers; a body that forwarded them swapped would
-type-check perfectly and silently feed the size estimator a confidence value as a population
-count. The existing wrapper spec (`test/libp2p-service-node-source.spec.ts`) only covers where
-the node reference comes from (component vs `setLibp2p` injection vs neither) — it never
-inspects call forwarding.
+<!-- resume-note -->
+Prior run stopped on BUDGET_WARNING before writing any code — read-only research phase only, no
+edits made, nothing to revert. Confirmed facts below save the next run a re-discovery pass; the
+Design/Edge-cases/TODO sections from the original ticket are otherwise unchanged and still the
+spec to implement.
+
+**Confirmed by reading `packages/fret/src/service/libp2p-fret-service.ts` (full file, 223 lines):**
+- Every method matches the design doc's description. `ensure()` (private, line 86) throws
+  `Error('Libp2pFretService: libp2p node not injected')` when neither `setLibp2p` nor the
+  `components.libp2p` fallback supplied a node — this is the exact string the not-injected-throws
+  property (design step 6) should match against (`/libp2p node not injected/`).
+- `getDiagnostics` (line 142) returns `ReturnType<CoreFretService['getDiagnostics']>` and forwards
+  to `this.ensure().getDiagnostics()` — confirmed not on the public `FretService` interface, confirmed
+  present as a real wrapper method. Must NOT be in the skip list; mock needs a `getDiagnostics` spy.
+- `[Symbol.toStringTag]` (line 62) and `[peerDiscoverySymbol]` (line 114) are both `get` accessors
+  (property descriptor has `get`, no plain `value`) — confirmed these are what the
+  `typeof proto[name] === 'function'` filter naturally excludes.
+- Skip-list candidates all confirmed present on the prototype: `constructor`, `start` (123),
+  `stop` (133), `setLibp2p` (71), `getPeerDiscovery` (119), plus the two private helpers `ensure`
+  (86) and `discoverySource` (102) — `discoverySource` has no same-named core counterpart at all,
+  confirmed (core has no `discoverySource` method).
+
+**Confirmed by reading `packages/src/index.ts` lines 100-130 (`FretService` interface):** 21
+members exactly: `start, stop, setMode, ready, neighborDistance, getNeighbors, assembleCohort,
+expandCohort, routeAct, report, setMetadata, getMetadata, listPeers, reportNetworkSize,
+getNetworkSizeEstimate, getNetworkChurn, detectPartition, setActivityHandler, iterativeLookup,
+exportTable, importTable`. This matches the ticket's "known 21-ish member count" — so
+(enumerated prototype methods − skip list) should equal 21 interface members + 1 (`getDiagnostics`)
+= 22 non-skipped forwarding methods to test.
+
+**Confirmed by reading `packages/fret/test/libp2p-service-node-source.spec.ts` (the existing
+wrapper spec, full file) — this is the pattern to follow for imports/setup:**
+```ts
+import { describe, it } from 'mocha'
+import { expect } from 'chai'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
+```
+Construction pattern confirmed: `new Libp2pFretService({ libp2p: node }, { profile: 'core', k: 7 })`,
+then `await svc.start()` / `await svc.stop()`, `await stopAll([node])` in a `finally`. The
+not-injected case in that existing spec (lines 44-50) is the direct precedent for design step 6:
+`new Libp2pFretService({}, { profile: 'core', k: 7 })`, call `svc.start()` (or whichever method),
+catch, assert `instanceOf Error` and message matches `/node not injected/`.
+
+**Confirmed by reading `packages/fret/test/helpers/libp2p.ts`:** `createMemNode(addr?)` returns a
+`Promise<Libp2p>` using the in-memory transport (no identify needed for this ticket — forwarding
+doesn't touch membership classification). `stopAll(nodes)` stops newest-first, best-effort,
+logging failures rather than throwing. Both already imported correctly in the existing spec above.
+
+**Not yet done — full scope remains:**
+- `test/libp2p-facade-forwarding.spec.ts` has not been created. Nothing written.
+- The `coreOf` cast helper, the mock core object, the runtime prototype enumeration, the two
+  properties (forwarding-with-mock, not-injected-throws) — all still to write, exactly per the
+  Design/Edge-cases sections below (unchanged from the original ticket).
+- Neither `mocha` nor `tsc --noEmit` has been run against the new file (it doesn't exist yet).
+
+Resume by writing the spec file directly — no further research needed before starting.
 
 ## Design (resolved)
 
@@ -109,3 +154,8 @@ Reaching into `svc.inner` uses the one named cast helper (`coreOf`) above — no
   `exclude` sets)
 - Add the not-injected-throws property against a second, un-injected instance
 - Run `cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000` and `npx tsc --noEmit`
+
+
+## End
+Work ticket as described above.
+Do NOT commit — runner handles commits after you complete.
