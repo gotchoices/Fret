@@ -5,16 +5,50 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**All 9 source edits landed** (confirmed again this run via direct read of
-`fret-service.ts:398-426`) — clean continuation, not resume-from-failure. Killed by
-`BUDGET_WARNING` a second time, before any edit this run. Do NOT re-verify source edits.
+**All 9 source edits landed** (confirmed a third time this run via `npx tsc --noEmit`, which
+compiles clean against `src/` — zero errors from `fret-service.ts` or `maybe-act.ts`). Killed by
+`BUDGET_WARNING` a third time. **Zero edits landed this run** — only ran `tsc --noEmit` for
+triage. Do NOT re-verify source edits, they are done and correct.
 
-**New this run: a full-repo grep for `rejected.rateLimited` / `concurrencyLimited` already ran**
-(`grep -n "rejected.rateLimited\|rejected\.rateLimited\|concurrencyLimited" -r src test`), so the
-next agent should NOT redo that discovery — the site list below is exhaustive as of this commit.
-It surfaced **two more affected test files beyond the ticket's original `files:` list**:
-`test/announce-rate-limit.spec.ts` and `test/payload-bounds-ttl.spec.ts`, plus confirms
-`test/rpc.codec-properties.spec.ts` has many sites too (not in original `files:` list either).
+**New this run: ran `cd packages/fret && npx tsc --noEmit` for the first time this ticket.**
+It is clean on `src/`, and fails only on test files reading `diag.rejected.rateLimited` as a
+number (arithmetic ops on what is now an object). This gives a **partial** checklist — read the
+warning below before using it as a to-do list.
+
+**IMPORTANT — tsc errors are a subset, not the full site list. Do not stop at green tsc.**
+Most test assertions use Chai (`expect(x).to.equal(y)`, `.include(...)`), which is untyped and
+will NOT throw a tsc error when comparing `diag.rejected.rateLimited` (now an object) against a
+number — it just silently fails at runtime (assertion mismatch) or, worse, is comparing the
+wrong shape and passing vacuously. So the full step-6-9 line-by-line pass described below is
+**still required in full** — do not treat "tsc passes" as "done". The tsc output below is a
+*confirmation aid* for the sites that happen to use arithmetic (`before - after`, `after - before`
+etc.), not a replacement for reading each file section named in steps 6-8.
+
+**Full `tsc --noEmit` error output this run** (26 errors, all `TS2362`/`TS2363` "arithmetic
+operation" pairs — i.e. sites doing `X - diag.rejected.rateLimited.foo` style delta math where
+the left/right operand is still the whole object, not a number):
+- `test/announce-rate-limit.spec.ts:94`, `:113`
+- `test/inflight-concurrency.spec.ts:198`
+- `test/profile.behavior.spec.ts:340`
+- `test/rpc.codec-properties.spec.ts:1363`, `:1376`, `:1389`, `:1405`, `:1426`, `:1451`, `:1473`,
+  `:1553`, `:1657`
+- `test/rpc.handler-fuzz.spec.ts:1184` — **brand new site, not in the original ticket `files:`
+  list, not in the previous resume-note's grep-derived exhaustive list either.** Needs its own
+  read-and-fix pass: read `test/rpc.handler-fuzz.spec.ts` around line 1184 (±20 lines for
+  context — what protocol/handler is under test there, whether it's a single-field delta or a
+  summed one like the `rpc.codec-properties.spec.ts:1429` five-path-sum case) and fix the same
+  way as the other sites (keyed field, or sum of keyed sub-fields if it's a multi-path assertion).
+  Add it to whatever grep/sweep step 9 runs so it doesn't get missed again.
+
+A prior run's grep (`grep -n "rejected.rateLimited\|rejected\.rateLimited\|concurrencyLimited" -r
+src test`) had already surfaced `test/announce-rate-limit.spec.ts` and
+`test/payload-bounds-ttl.spec.ts` as extra affected files beyond the original `files:` list, and
+flagged `test/rpc.codec-properties.spec.ts` as having many sites. That grep evidently missed
+`test/rpc.handler-fuzz.spec.ts:1184` (likely because the property access there doesn't match
+those exact literal strings — check for a variable/destructured reference instead of a literal
+`rejected.rateLimited` substring). **Re-run that grep AND cross-check against the tsc list above
+AND read `rpc.handler-fuzz.spec.ts` directly** — three independent methods, because each has
+proven to miss something the others catch.
 
 ## What already landed (do not redo)
 
