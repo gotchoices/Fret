@@ -3,164 +3,90 @@ files: packages/fret/src/store/relevance.ts, packages/fret/test/relevance.proper
 difficulty: easy
 
 <!-- resume-note -->
-Prior run hit BUDGET_WARNING before making any edit — pure investigation, no code touched, no
-partial state to clean up. Both target files were fully read this run; every edit below is exact
-and ready to apply with `Edit`, no further discovery needed. This replaces the identical prior
-ticket 1:1 (same decision, same shape, same tests) — just adding surgical line-level instructions
-so the next run does not re-read either file.
+Prior run hit BUDGET_WARNING right after finishing all 5 source edits — no partial/half-applied
+state in `relevance.ts`. Confirmed by reading the file section-by-section during that run before
+editing. What's done vs left:
 
-## Why this is split out (unchanged from prior ticket)
+**Done — `packages/fret/src/store/relevance.ts` (all 5 edits applied, verified via successful
+Edit tool calls, do NOT re-apply):**
+1. `initialRelevance` function added (right after `touch`, before the `blendLatency` doc comment).
+2. `recordSuccess` now increments `accessCount` in both the `baseRelevance` input object and the
+   returned patch (alongside `successCount`).
+3. The ~20-line JSDoc above `recordSuccess` (the one quoting 1.2600/1.5275/1.0449/0.8619 and
+   pointing at the closed backlog slug) replaced with the settled-rule version documenting the
+   frequency-credit decision.
+4. Accepted-tradeoff `NOTE:` appended to `healthScore`'s doc comment (pure-rate-by-design).
+5. Unbounded-frequency tripwire `NOTE:` added above `frequencyScore`.
+
+**Not started — `packages/fret/test/relevance.properties.spec.ts`:** none of the test edits from
+the ticket body below have been applied yet. Needed:
+- Add `initialRelevance` to the import list at the top (alongside `recordSuccess`,
+  `recordFailure`, etc.).
+- Delete the stale comment block at (was) lines 300–313 — starts "The uncontroversial half of...",
+  cites the now-superseded backlog slug `bug-frequency-credit-only-from-gossip`. **Leave the test
+  right after it — `'scores a success above a failure from the same starting entry'` — completely
+  unchanged**, it must keep passing byte-for-byte as-is.
+- Add new test `'scores 500 successes strictly above 1 success'` inside `describe('recordSuccess', ...)`.
+- Add new test `'does not score 500 failures above 1 failure'` inside `describe('recordFailure', ...)`.
+- Add new top-level `describe('initialRelevance', ...)` block with two tests: KDE-not-observed,
+  and initial < a single recordSuccess on the same fresh entry/clock/model.
+- Exact code for all of the above is spelled out verbatim in the "Exact edits —
+  `packages/fret/test/relevance.properties.spec.ts`" section further down this ticket file
+  (unchanged from the prior version — still accurate, just re-verify line numbers since the file
+  may have shifted slightly; search by the quoted comment/test text, not by line number).
+
+**Not started at all:**
+- `cd packages/fret && npx tsc --noEmit && yarn test` — never run this pass. Source compiles
+  conceptually (types match existing `PeerEntry` shape used elsewhere in the file) but not
+  verified by a real compiler run yet.
+- review/ handoff ticket — not written.
+
+## Why this is split out (unchanged from prior tickets)
 
 Carved off `25-frequency-credit-only-from-gossip` after two earlier agent runs were budget-capped
-before making any edit. Nothing in this ticket touches `fret-service.ts` or `docs/fret.md` — both
-belong to the companion ticket `frequency-credit-service-gossip`, which has this one as its
-`prereq:`. Keep the split: one file of source, one file of test, no service reading.
+before making any edit, and this run made the source edit but was budget-capped before the test
+edit. Nothing in this ticket touches `fret-service.ts` or `docs/fret.md` — both belong to the
+companion ticket `frequency-credit-service-gossip`, which has this one as its `prereq:`. Keep the
+split: one file of source (done), one file of test (pending), no service reading.
 
-## The decision (settled — do not re-open)
+## The decision (settled — do not re-open, and do not re-derive — it's already implemented)
 
-The relevance base is `w_r·recency + w_f·frequency + w_h·health` (0.4 / 0.2 / 0.4). Two facts
-about it produce the reported inversion (a peer contacted 500 times ranking *below* one merely
-named 500 times in other peers' snapshots):
-
-- `frequency = log1p(accessCount)/5`, and **only `touch` increments `accessCount`** — and `touch`
-  is what the snapshot-merge paths run for every id a *remote peer* names. So hearsay accrues
-  frequency without bound.
-- `health` is a *ratio*, so it saturates on the first success. `recordSuccess` touches neither
-  counter that grows, so the 2nd and the 500th successful round trip add nothing.
-
-Three rules, each checkable in isolation:
+The relevance base is `w_r·recency + w_f·frequency + w_h·health` (0.4 / 0.2 / 0.4). Three rules,
+now implemented in source:
 
 1. **A completed RPC is an access.** `recordSuccess` increments `accessCount`, exactly as `touch`
    does. Fixes "500 successes score what 1 success does".
-2. **A failed RPC is not.** `recordFailure` leaves `accessCount` alone.
-3. **A mention scores an entry once, at creation, and never again.** That is what
-   `initialRelevance` below is for; the companion ticket wires it up.
+2. **A failed RPC is not.** `recordFailure` leaves `accessCount` alone (already true, untouched).
+3. **A mention scores an entry once, at creation, and never again.** `initialRelevance` exists for
+   this; the companion ticket wires it up at the call site in `fret-service.ts`.
 
-**Health stays a pure rate — a deliberate decline, not an oversight.** Record it at `healthScore`
-as an accepted-tradeoff `NOTE:` so the next reviewer does not re-file it. Revisit condition: if
-the frequency term is ever removed or re-weighted to near zero.
+**Health stays a pure rate** — recorded as an accepted-tradeoff `NOTE:` at `healthScore`, done.
 
-## Exact edits — `packages/fret/src/store/relevance.ts`
+## Exact edits — `packages/fret/test/relevance.properties.spec.ts` (still to apply)
 
-**1. Add `initialRelevance`.** Insert immediately after the `touch` function (currently ends at
-line 112, right before the `blendLatency` doc comment at line 114):
-
+Add `initialRelevance` to the import list (currently reads, roughly):
 ```ts
-/**
- * Score a brand-new entry once, from its own empty counters.
- * No counter is incremented and the KDE is NOT observed: a name we were handed is not
- * a distance we accessed.
- */
-export function initialRelevance(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): number {
-	const base = baseRelevance(entry, now);
-	const bonus = sparsityBonus(model, x);
-	return base * bonus;
-}
+import {
+	createSparsityModel,
+	sparsityBonus,
+	observeDistance,
+	normalizedLogDistance,
+	touch,
+	recordSuccess,
+	recordFailure,
+	healthScore,
+} from '../src/store/relevance.js'
 ```
+→ add `initialRelevance,` to that list.
 
-Deliberately no `observeDistance(model, x)` call — that is the one thing that makes it different
-from a `touch` with the increment removed.
+Find the comment block that starts `// The uncontroversial half of "success up-ranks a peer"...`
+and ends immediately before `it('scores a success above a failure from the same starting entry'`.
+Delete that comment block entirely (it cites the closed backlog slug and stale measured numbers).
+**Do not touch the test itself** — `'scores a success above a failure from the same starting
+entry'` (asserts succeeded.relevance > failed.relevance, ~1.26 vs ~0.63) stays exactly as-is,
+including its own trailing comment about separate models for the sparsity bonus.
 
-**2. `recordSuccess` (currently lines 154–167): increment `accessCount` in both places.**
-
-Current body:
-```ts
-export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
-	observeDistance(model, x);
-	const avgLatencyMs = blendLatency(entry.avgLatencyMs, latencyMs);
-	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1 }, now);
-	const bonus = sparsityBonus(model, x);
-	const relevance = base * bonus;
-	return {
-		...entry,
-		lastAccess: now,
-		relevance,
-		successCount: entry.successCount + 1,
-		avgLatencyMs
-	};
-}
-```
-
-Change to (add `accessCount: entry.accessCount + 1` to the `baseRelevance` input object, and add
-`accessCount: entry.accessCount + 1` to the returned patch):
-```ts
-export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
-	observeDistance(model, x);
-	const avgLatencyMs = blendLatency(entry.avgLatencyMs, latencyMs);
-	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1, accessCount: entry.accessCount + 1 }, now);
-	const bonus = sparsityBonus(model, x);
-	const relevance = base * bonus;
-	return {
-		...entry,
-		lastAccess: now,
-		relevance,
-		successCount: entry.successCount + 1,
-		accessCount: entry.accessCount + 1,
-		avgLatencyMs
-	};
-}
-```
-
-`recordFailure` and `touch` are unchanged.
-
-**3. Replace the JSDoc directly above `recordSuccess`** (currently lines 129–153, the ~20-line
-`NOTE:` block quoting 1.2600 / 1.5275 / 1.0449 / 0.8619 and pointing at the closed backlog slug
-`tickets/backlog/bug-frequency-credit-only-from-gossip`). Replace the whole comment block with:
-
-```ts
-/**
- * Record a completed RPC against `entry`.
- *
- * `latencyMs` is **optional** because not every success carries a usable measurement — see
- * `blendLatency` above. Callers that supply no sample must likewise omit `avgLatencyMs` from
- * any patch they derive from the result.
- *
- * Frequency credit rule (settled): a completed RPC counts as an access, so `accessCount` is
- * incremented here exactly as `touch` increments it — repeated proven contact now raises
- * relevance instead of saturating after the first success. `recordFailure` does not accrue
- * frequency. A peer we were merely *told about* (never contacted) scores once at creation via
- * `initialRelevance`, and never again — it does not accumulate frequency from being renamed in
- * subsequent snapshots.
- */
-```
-
-**4. Accepted-tradeoff `NOTE:` at `healthScore`.** Add to its existing doc comment (currently
-lines 74–81, just above `export function healthScore`):
-
-```
- * NOTE: accepted tradeoff — health is deliberately a pure rate (saturates after the first
- * success) rather than a term that also grows with volume; volume lives in `frequencyScore`
- * instead. Putting volume in both would double-count it and force every weight to be re-tuned.
- * Revisit if the frequency term is ever removed or re-weighted to near zero.
-```
-
-**5. Unbounded-frequency tripwire `NOTE:` at `frequencyScore`.** Add a comment above the function
-(currently line 70):
-
-```ts
-// NOTE: log1p slows but does not cap — frequency is unbounded in principle. Bounded in practice
-// by real traffic now that hearsay (touch-only) accrual is gone: at accessCount 1e6 the term
-// contributes 0.55 against recency/health ceilings of 0.4 each. Not a defect today; if it ever
-// shows up as a problem, consider capping or re-scaling the term.
-function frequencyScore(entry: PeerEntry): number {
-```
-
-## Exact edits — `packages/fret/test/relevance.properties.spec.ts`
-
-Add `initialRelevance` to the import list at line 4–13 (alongside `recordSuccess`, `recordFailure`).
-
-**Replace lines 300–313** (the comment block that starts "The uncontroversial half of..." and
-ends just before `it('scores a success above a failure from the same starting entry'...)` at line
-314) — that comment cites the now-closed slug and must go. The test at 314–324 itself
-(`'scores a success above a failure from the same starting entry'`) stays **unchanged** — the
-ticket requires it keep passing as-is.
-
-Replace the deleted comment block, and add new tests, inside the `describe('recordSuccess', ...)`
-block (after the existing "success above failure" test, i.e. after line 324, before the closing
-`})` of that describe at line 325). Use `makeEntry` and `FIXED_NOW` already defined in the file.
-Fresh `createSparsityModel()` per call so the sparsity bonus is constant across compared calls
-(see existing tests in the file for the pattern):
-
+After that test, still inside `describe('recordSuccess', ...)`, before its closing `})`, add:
 ```ts
 // Frequency credit: settled by tickets/implement/25-frequency-credit-relevance-core (formerly
 // tickets/backlog/bug-frequency-credit-only-from-gossip). A completed RPC is an access.
@@ -178,7 +104,7 @@ it('scores 500 successes strictly above 1 success', () => {
 })
 ```
 
-And inside `describe('recordFailure', ...)`:
+Inside `describe('recordFailure', ...)`, add:
 ```ts
 it('does not score 500 failures above 1 failure', () => {
 	const now = FIXED_NOW
@@ -194,7 +120,9 @@ it('does not score 500 failures above 1 failure', () => {
 })
 ```
 
-New top-level `describe('initialRelevance', ...)` block (import `initialRelevance` as above):
+New top-level `describe('initialRelevance', ...)` block (place it near the other top-level
+describes, e.g. after `describe('recordFailure', ...)`'s closing `})`, before the outer
+`describe('Relevance scoring properties', ...)`'s own closing `})`):
 ```ts
 describe('initialRelevance', () => {
 	it('does not move model.occupancy (a mention is not an observed distance)', () => {
@@ -216,10 +144,11 @@ describe('initialRelevance', () => {
 
 ## TODO (execution order)
 
-- Apply edit 1–5 to `relevance.ts` exactly as specified above.
-- Apply the test edits to `relevance.properties.spec.ts` exactly as specified above.
-- Leave `docs/fret.md` alone — the companion ticket owns every doc edit.
-- `cd packages/fret && npx tsc --noEmit && yarn test`
+- Apply the test edits above to `relevance.properties.spec.ts` exactly as specified.
+- Leave `docs/fret.md` and `fret-service.ts` alone — the companion ticket owns those.
+- `cd packages/fret && npx tsc --noEmit && yarn test` — run for real this time, fix anything that
+  doesn't compile/pass (should be clean given the source is already correct and tests match its
+  behavior, but verify — don't assume).
 - Produce the review/ handoff per the standard implement-stage output (distilled summary,
   emphasis on test coverage/use cases, honest about any gaps found while applying the above).
 

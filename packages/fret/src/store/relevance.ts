@@ -67,6 +67,10 @@ function recencyScore(entry: PeerEntry, now: number): number {
 	return Math.exp(-lambda * dt);
 }
 
+// NOTE: log1p slows but does not cap — frequency is unbounded in principle. Bounded in practice
+// by real traffic now that hearsay (touch-only) accrual is gone: at accessCount 1e6 the term
+// contributes 0.55 against recency/health ceilings of 0.4 each. Not a defect today; if it ever
+// shows up as a problem, consider capping or re-scaling the term.
 function frequencyScore(entry: PeerEntry): number {
 	return Math.log1p(entry.accessCount) / 5; // saturates slowly
 }
@@ -78,6 +82,11 @@ function frequencyScore(entry: PeerEntry): number {
  * strictly between a peer measured at 0 ms and one measured at 1000 ms. The test is on `null`
  * and not on `> 0`: a genuine 0 ms measurement is the best possible link and must score as
  * such, not be mistaken for the absence of a measurement.
+ *
+ * NOTE: accepted tradeoff — health is deliberately a pure rate (saturates after the first
+ * success) rather than a term that also grows with volume; volume lives in `frequencyScore`
+ * instead. Putting volume in both would double-count it and force every weight to be re-tuned.
+ * Revisit if the frequency term is ever removed or re-weighted to near zero.
  */
 export function healthScore(entry: PeerEntry): number {
 	const total = entry.successCount + entry.failureCount;
@@ -112,6 +121,17 @@ export function touch(entry: PeerEntry, x: number, model: SparsityModel, now = D
 }
 
 /**
+ * Score a brand-new entry once, from its own empty counters.
+ * No counter is incremented and the KDE is NOT observed: a name we were handed is not
+ * a distance we accessed.
+ */
+export function initialRelevance(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): number {
+	const base = baseRelevance(entry, now);
+	const bonus = sparsityBonus(model, x);
+	return base * bonus;
+}
+
+/**
  * Blend a new latency sample into a peer's running average.
  *
  * `null` means never measured, so the first sample seeds the average outright instead of being
@@ -129,32 +149,21 @@ function blendLatency(avg: number | null, sample: number | undefined): number | 
 /**
  * Record a completed RPC against `entry`.
  *
- * `latencyMs` is **optional** because not every success carries a usable measurement. Timing a
- * forwarded route, for instance, measures the whole downstream subtree rather than the link to
- * the next hop, so recording it would penalize a healthy adjacent peer for a long path behind
- * it. Such callers omit the argument and the peer's `avgLatencyMs` is left exactly as it was —
- * still `null` if it has never been pinged. Callers must likewise omit `avgLatencyMs` from any
- * patch they derive from the result when they supplied no sample.
+ * `latencyMs` is **optional** because not every success carries a usable measurement — see
+ * `blendLatency` above. Callers that supply no sample must likewise omit `avgLatencyMs` from
+ * any patch they derive from the result.
  *
- * NOTE: a *repeated* success does not raise relevance, and successful contact earns no frequency
- * credit at all. `successCount` feeds only the success/failure ratio in {@link healthScore},
- * which saturates the moment the first success lands — measured at a fixed clock, ten successive
- * calls score an identical 1.2600, and an entry with 500 recorded successes scores exactly what
- * one with a single success does. Meanwhile `accessCount`, the only input to the frequency term,
- * is incremented by {@link touch} alone, and `touch` is what an *inbound* snapshot naming a peer
- * runs — so a peer we merely heard about 500 times scores 1.5275, above a peer we successfully
- * called 500 times. Those two figures hold the sparsity bonus fixed at `sMax` (a fresh model per
- * call); on one shared model, whose occupancy every call moves, the same pair measures 1.0449 vs
- * 0.8619 — lower, same ordering, since the taper applies to both alike.
- * Whether that ranking is intended is an open question owned by
- * `tickets/backlog/bug-frequency-credit-only-from-gossip`; `test/relevance.properties.spec.ts`
- * therefore asserts only that a success outranks a failure, and pins no direction on either
- * behavior described here.
+ * Frequency credit rule (settled): a completed RPC counts as an access, so `accessCount` is
+ * incremented here exactly as `touch` increments it — repeated proven contact now raises
+ * relevance instead of saturating after the first success. `recordFailure` does not accrue
+ * frequency. A peer we were merely *told about* (never contacted) scores once at creation via
+ * `initialRelevance`, and never again — it does not accumulate frequency from being renamed in
+ * subsequent snapshots.
  */
 export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
 	observeDistance(model, x);
 	const avgLatencyMs = blendLatency(entry.avgLatencyMs, latencyMs);
-	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1 }, now);
+	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1, accessCount: entry.accessCount + 1 }, now);
 	const bonus = sparsityBonus(model, x);
 	const relevance = base * bonus;
 	return {
@@ -162,6 +171,7 @@ export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x
 		lastAccess: now,
 		relevance,
 		successCount: entry.successCount + 1,
+		accessCount: entry.accessCount + 1,
 		avgLatencyMs
 	};
 }
