@@ -4,18 +4,28 @@ files: packages/fret/test/payload-bounds-ttl.spec.ts, packages/fret/test/rpc.cod
 difficulty: easy
 ---
 
-## Progress so far (this pass, 3rd refiling)
+## Progress so far (this pass, 4th refiling)
 
 `packages/fret/test/profile.behavior.spec.ts` is done and verified (already landed by a prior
 pass — unchanged this pass).
 
-**This pass did research only — no edits landed.** Ran `cd packages/fret && npx tsc --noEmit`
+**This pass (3rd) did research only — no edits landed.** Ran `cd packages/fret && npx tsc --noEmit`
 to get the current authoritative error list (paste below) and read
 `test/rpc.codec-properties.spec.ts` lines 1320-1670 in full, working out exactly which bucket/
 field each failing site needs. That mapping is recorded below so the next pass can go straight to
 editing without re-reading the file. Hit the token budget immediately after, before editing or
 reading the other three files (payload-bounds-ttl.spec.ts, rpc.handler-fuzz.spec.ts,
 rpc.handler-fuzz.wire.spec.ts) or docs/fret.md.
+
+**This pass (4th) re-verified the item-1 mapping against a fresh read of
+`rpc.codec-properties.spec.ts` lines 1320-1670 — it matches the prior pass's map exactly, no
+drift, ready to edit as written.** Also confirmed `packages/fret/test/helpers/wait-for.ts` exists
+and is a good style reference for the new `sumRateLimited` helper (item 2): plain exported
+function, one-line JSDoc-style comment block explaining the non-obvious *why*, no class. Hit the
+token budget again immediately after this check, before making any edit. **No edits landed this
+pass either** — same state as before, just the mapping re-confirmed. Next pass should stop
+re-reading rpc.codec-properties.spec.ts (it's stable, re-verified twice now) and go straight to
+writing the 8 line-edits + the helper file.
 
 ## Current authoritative tsc error list (2026-08-21, this pass)
 
