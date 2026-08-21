@@ -5,10 +5,19 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**All 9 source edits landed** (confirmed a third time this run via `npx tsc --noEmit`, which
-compiles clean against `src/` — zero errors from `fret-service.ts` or `maybe-act.ts`). Killed by
-`BUDGET_WARNING` a third time. **Zero edits landed this run** — only ran `tsc --noEmit` for
-triage. Do NOT re-verify source edits, they are done and correct.
+**All 9 source edits landed** (confirmed a third time via `npx tsc --noEmit`, clean against
+`src/`). Killed by `BUDGET_WARNING` a **fourth** time, this run even earlier than the third —
+before any edit landed. **Zero edits this run either** — only 2 greps for triage (below). Do NOT
+re-verify source edits, they are done and correct. Do NOT re-run tsc/grep to re-derive the site
+list below — it is now confirmed exhaustive (two independent greps + the prior run's tsc error
+list all agree), spend the next run's budget on edits, not more triage.
+
+**Grep confirmation this run** (`grep -rn "rejected\.rateLimited\|rejected\.concurrencyLimited" test/`):
+matched exactly the site list already in this note (`announce-rate-limit.spec.ts`,
+`inflight-concurrency.spec.ts`, `payload-bounds-ttl.spec.ts`, `profile.behavior.spec.ts`,
+`rpc.codec-properties.spec.ts`) — no new files. Also grepped `rpc.handler-fuzz.spec.ts`
+specifically for `rateLimited` — confirms the `:1184` site from the previous tsc run **and**
+reveals its exact shape, which the previous note had not yet read (new detail, see below).
 
 **New this run: ran `cd packages/fret && npx tsc --noEmit` for the first time this ticket.**
 It is clean on `src/`, and fails only on test files reading `diag.rejected.rateLimited` as a
@@ -32,13 +41,30 @@ the left/right operand is still the whole object, not a number):
 - `test/profile.behavior.spec.ts:340`
 - `test/rpc.codec-properties.spec.ts:1363`, `:1376`, `:1389`, `:1405`, `:1426`, `:1451`, `:1473`,
   `:1553`, `:1657`
-- `test/rpc.handler-fuzz.spec.ts:1184` — **brand new site, not in the original ticket `files:`
-  list, not in the previous resume-note's grep-derived exhaustive list either.** Needs its own
-  read-and-fix pass: read `test/rpc.handler-fuzz.spec.ts` around line 1184 (±20 lines for
-  context — what protocol/handler is under test there, whether it's a single-field delta or a
-  summed one like the `rpc.codec-properties.spec.ts:1429` five-path-sum case) and fix the same
-  way as the other sites (keyed field, or sum of keyed sub-fields if it's a multi-path assertion).
-  Add it to whatever grep/sweep step 9 runs so it doesn't get missed again.
+- `test/rpc.handler-fuzz.spec.ts:1184` — **shape now confirmed** (read this run, lines
+  1177-1187):
+  ```
+  const before = { ...edge.getDiagnostics().rejected }      // line 1177
+  ...send a burst of 12 messages (mixed malformed + rate-limited)...
+  const after = edge.getDiagnostics().rejected               // line 1182
+  const malformed = after.malformed - before.malformed
+  const rateLimited = after.rateLimited - before.rateLimited // line 1184 — TS2362/2363 here
+  expect(malformed + rateLimited, 'every message hit exactly one of the two').to.equal(12)
+  expect(malformed, '...').to.be.at.least(8)
+  expect(rateLimited, '...').to.be.at.least(1)
+  ```
+  This is a **sum-across-protocols** site, same shape as the `rpc.codec-properties.spec.ts:1429`
+  five-path case — it doesn't care which protocol was rate-limited, only the total count. Fix:
+  replace line 1184 with a sum over the five keyed sub-fields, e.g.
+  `const sumRL = (r) => r.rateLimited.neighbors + r.rateLimited.ping + r.rateLimited.maybeAct + r.rateLimited.leave + r.rateLimited.announce`
+  then `const rateLimited = sumRL(after) - sumRL(before)`. (`before` is a shallow spread —
+  `before.rateLimited` is the *same object reference* as the live counter, so `sumRL(before)` must
+  be read before line numbers matter only insofar as the spread already captured it at the top;
+  no ordering bug, just note the shallow-spread means `before.rateLimited` was never actually
+  snapshotted by value — harmless here since it's only summed, not mutated.) Consider defining
+  `sumRL` once near the top of the block (or hoist to a small test-local helper) since the same
+  pattern likely recurs at the `rpc.codec-properties.spec.ts:1429` five-path site — a shared
+  helper avoids writing the five-field sum twice. Add it to whatever grep/sweep step 9 runs.
 
 A prior run's grep (`grep -n "rejected.rateLimited\|rejected\.rateLimited\|concurrencyLimited" -r
 src test`) had already surfaced `test/announce-rate-limit.spec.ts` and
@@ -81,6 +107,13 @@ proven to miss something the others catch.
 immediately after the six `rateLimited++` edits landed one-by-one (arithmetic-on-object errors,
 expected mid-sequence) but every site has since been converted to the keyed form. No compiler run
 has confirmed the final state — that is part of step 9 below, do it first before touching tests.
+
+**This is the 4th consecutive `BUDGET_WARNING` kill on this ticket, each ending before any test
+edit landed.** The site inventory (steps 6-9 below, plus 7a) is now complete and cross-verified by
+three independent methods (grep, tsc errors, direct read) — treat it as final. Next run: skip
+straight to editing steps 6, 7, 7a, 8 in file order, do not re-grep or re-derive the list, and
+only run tsc/tests once at the end (step 9) rather than after each file, to leave more budget for
+edits.
 
 ## Steps remaining
 
