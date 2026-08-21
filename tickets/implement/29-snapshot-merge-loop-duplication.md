@@ -2,6 +2,29 @@ description: Two places in the service do the identical job of taking a neighbou
 files: packages/fret/src/service/fret-service.ts, packages/fret/test/rpc.handler-fuzz.spec.ts, packages/fret/test/announce-rate-limit.spec.ts, packages/fret/test/rpc.snapshot-merge-cap.spec.ts
 difficulty: easy
 
+<!-- resume-note -->
+Prior run hit BUDGET_WARNING before making any edit — pure research/verification only, no code
+touched yet. Log: `tickets/.logs/29-snapshot-merge-loop-duplication.implement.2026-08-21T19-59-48-556Z.log`.
+
+Confirmed by direct read (not just ticket claim):
+- `mergeAnnounceSnapshot` loops are at `fret-service.ts:2035-2042` (successors/predecessors) and
+  `2045-2061` (sample), accumulator `discovered` (declared line 2013).
+- `fetchAndMergeSnapshot` loops are at `fret-service.ts:2660-2667` (successors/predecessors) and
+  `2668-2674` (sample), accumulator `announced` (declared line 2627).
+- Both shapes match the ticket's description exactly — no drift beyond what's already documented.
+  Nothing else needs re-discovery; go straight to the edit below.
+
+Next agent: implement per the "What to build" section as-is — add a private
+`mergeDiscoveredId(pid, into, logLabel)` method (or equivalent name) on `FretService`, call it from
+both loop bodies (successor/predecessor loop passes `pid` directly; sample loop passes `s.id`), keep
+each site's own accumulator var name and per-site log label distinguishable, keep the sample-loop's
+re-hash-not-trust comment in exactly one place (the extracted method or immediately above it) with
+both call sites' remaining comments pointing at it rather than restating it. Do not touch
+`mergeSnapshotCaps`/parsers. Then run:
+- `cd packages/fret && npx tsc --noEmit`
+- `cd packages/fret && yarn test` (or targeted: `rpc.handler-fuzz.spec.ts`,
+  `announce-rate-limit.spec.ts`, `rpc.snapshot-merge-cap.spec.ts`)
+
 ## Correction to the plan-stage research
 
 The plan ticket this was promoted from claimed the fetch-path loop logs a dropped id through
