@@ -181,6 +181,45 @@ describe('FretService start/stop lifecycle', function () {
 		expect(fretProtocols(node), 'protocol count after second start').to.have.length(protocols)
 	})
 
+	it('detaches every listener it registered from the real node on stop(), by handler identity', async () => {
+		// listenerCount() only proves the tracking array's size; this proves the tracked closures
+		// actually call node.removeEventListener with the *same* handler function object that was
+		// passed to addEventListener, not merely the same event name.
+		type Handler = (evt: unknown) => void
+		const added: Array<{ type: string; handler: Handler }> = []
+		const removed: Array<{ type: string; handler: Handler }> = []
+		type LooseListenerFn = (type: string, handler: Handler, opts?: unknown) => void
+		const originalAdd = node.addEventListener.bind(node) as unknown as LooseListenerFn
+		const originalRemove = node.removeEventListener.bind(node) as unknown as LooseListenerFn
+		;(node as unknown as { addEventListener: unknown }).addEventListener = (type: string, handler: Handler, opts?: unknown) => {
+			added.push({ type, handler })
+			return originalAdd(type, handler, opts)
+		}
+		;(node as unknown as { removeEventListener: unknown }).removeEventListener = (type: string, handler: Handler, opts?: unknown) => {
+			removed.push({ type, handler })
+			return originalRemove(type, handler, opts)
+		}
+		try {
+			await svc.start()
+			await svc.stop()
+
+			const expectedTypes = ['peer:connect', 'peer:disconnect', 'peer:identify', 'peer:update']
+			for (const type of expectedTypes) {
+				expect(added.map((a) => a.type), `listener registered for ${type}`).to.include(type)
+			}
+
+			for (const add of added) {
+				expect(
+					removed.some((r) => r.type === add.type && r.handler === add.handler),
+					`removeEventListener called with the same handler object for ${add.type}`,
+				).to.equal(true)
+			}
+		} finally {
+			;(node as unknown as { addEventListener: unknown }).addEventListener = originalAdd
+			;(node as unknown as { removeEventListener: unknown }).removeEventListener = originalRemove
+		}
+	})
+
 	it('re-runs the first-tick proactive announce after a restart', async () => {
 		let announces = 0
 		const internals = svc as unknown as {
