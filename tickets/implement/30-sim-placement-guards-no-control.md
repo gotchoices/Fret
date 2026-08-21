@@ -1,98 +1,105 @@
-description: A simulation test claims that grouping peers into clusters makes message routing take more steps, but it would pass whether or not that were true; the previous attempt to fix it turned out to be aimed at the wrong cause, and the real cause is now identified but not yet fixed.
+description: A simulation test claims that grouping peers into clusters makes message routing take more steps, but it would pass whether or not that were true; two earlier attempts to fix it were aimed at the wrong cause, and the setup the last attempt proposed has now been shown not to work either.
 files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/placement.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/churn-scenarios.spec.ts, docs/fret.md
 difficulty: medium
 tradeoffs: n/a (implement ticket)
 ---
 
-Ninth run in this chain. **Read this section before anything else — it overturns the plan the
-previous eight runs were following.** Two small edits landed this run and typecheck clean; the
-rest is a re-aimed plan, not a re-verification request.
+Tenth run in this chain. No code changed this run — it ended on the token budget partway through
+building the measurement sweep. What it did produce is a finding that **invalidates the
+configuration the previous ticket told you to measure**, so read both "finding" sections before
+writing any code.
 
 ## What is already done — do not touch, do not re-measure
 
-- **Step 1 (the first placement test) is finished.** `test/message-bus.spec.ts` L293
-  `describe('Placement distributions', ...)`, first test `clustered placement: peers cluster
-  around centers` (L296-345): threshold `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5`, measured
-  table in a comment, both directions asserted in a loop over `PLACEMENT_SEEDS`. Correct.
-- **`test/churn-scenarios.spec.ts` is finished** — verified present this run (L3 imports
-  `MAX_PEERS_IN_ONE_SPACING_ARC`, L369-395 asserts both arms). Not reverted.
+- **Step 1 (the first placement test) is finished.** `test/message-bus.spec.ts` L296-345,
+  `clustered placement: peers cluster around centers`: threshold
+  `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5`, measured table in a comment, both directions
+  asserted over `PLACEMENT_SEEDS`. Correct as it stands.
+- **`test/churn-scenarios.spec.ts` is finished** (L3 imports `MAX_PEERS_IN_ONE_SPACING_ARC`,
+  L369-395 asserts both arms).
 - **`test/simulation/placement-assertions.ts` is finished** — exports `coordToBigInt`,
   `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
   `MAX_PEERS_IN_ONE_SPACING_ARC = 7`.
-- **New this run:** `CoordPlacement.centers` getter (`test/simulation/placement.ts` ~L69) and
-  `FretSimulation.getClusterCenters()` (`test/simulation/fret-sim.ts` ~L908). These are the
-  "option 1" cluster-center exposure the previous ticket asked for. `npx tsc --noEmit` passes.
-  Nothing consumes them yet.
+- **`CoordPlacement.centers` (`test/simulation/placement.ts` ~L69) and
+  `FretSimulation.getClusterCenters()` (`test/simulation/fret-sim.ts` ~L908) exist and typecheck.**
+  They are the cluster-center exposure needed to aim a target at a real cluster. Nothing consumes
+  them yet. The working tree at the start of this run held exactly these two modified files.
 
-## The finding that changes the plan
+## Finding A (confirmed at the code site): every route is one hop, and why
 
-The previous ticket concluded that the second test
-(`clustered placement: inter-cluster routing takes more hops`, `test/message-bus.spec.ts`
-L347-395) fails to separate because its target coordinates are synthetic — hashed from `seed`,
-with no idea where the cluster centers landed — so routes never reliably cross a cluster
-boundary. It measured this across all five seeds and got, for both `clustered` and `uniform`:
+The second test (`clustered placement: inter-cluster routing takes more hops`,
+`test/message-bus.spec.ts` L347-395) measured 0.9-1.0 average hops in *both* arms on *every* seed
+with 10/10 successes. That is not "the targets landed in the wrong place" — it is "there is nowhere
+to route to". The mechanism is now confirmed rather than inferred:
 
-```
-seed 8008: clustered 1    | uniform 0.9      seed 4242: clustered 0.9 | uniform 0.9
-seed 8009: clustered 0.9  | uniform 1        seed 99:   clustered 1   | uniform 0.9
-seed 8010: clustered 1    | uniform 1
-```
+`FretSimulation.handleRoute` (`test/simulation/fret-sim.ts` L785-793) declares a route successful
+the moment the peer currently holding the message is the target coordinate's **anchor in its own
+store** (`neighborsRight(target, 1)` / `neighborsLeft(target, 1)`, or the successor/predecessor of
+the coordinate). At n=30 with `capacity` unset, 5 s of stabilization leaves every peer holding
+every other peer, so the originator's own store already names the globally-nearest peer to any
+target: it delivers one hop and that peer is the anchor. No target-generation scheme can produce a
+multi-hop route against a store that already contains the destination's neighbours. This matches
+`docs/fret.md` under *Testing strategy* ("unbounded stores plus a per-tick gossip merge ... arrive
+in one or two hops under any roughly-monotone metric").
 
-**Those numbers say something the previous ticket did not read out of them: every route is
-completing in one hop or zero, in both arms, on every seed, with 10/10 successes.** That is not
-"targets landed in the wrong place". That is "there is nowhere to route to" — the sender already
-knows a peer adjacent to the target, so it hands the message over directly and the walk ends.
+So the root cause is the unbounded store, and aiming targets at real cluster centers is necessary
+but not sufficient.
 
-That is a documented property of this harness, not a surprise. `docs/fret.md`, under *Testing
-strategy*, says of the routing spec's unbounded cases: "unbounded stores plus a per-tick gossip
-merge of every neighbour's window leave each peer a large near-uniform slice of the ring (63% at
-n=200, 19% at n=1000) over which greedy routing arrives in one or two hops under any
-roughly-monotone metric". This test runs at **n=30 with no `capacity` set**, so that slice is
-essentially the whole ring: after 5 s of stabilization every peer holds every other peer. No
-target-generation scheme can produce a multi-hop route against a store that already contains the
-destination's neighbours.
+## Finding B (new this run): a store bound is unreachable at n=30 — you must raise n
 
-So aiming targets at real cluster centers is **necessary but not sufficient**, and it was never
-the root cause. The root cause is the unbounded store.
+The previous ticket said to "pick a capacity that is a small fraction of the population here". That
+does not work, and the reason is structural rather than a matter of tuning.
+`FretSimulation.enforceCapacity` (`test/simulation/fret-sim.ts` L701-721) mirrors production:
+eviction skips a protection set, and **protection outranks the cap** — its own comment states that
+with `capacity < 2m + 1` the evictable set runs out and the store simply stays over capacity. At
+m = 8 that floor is 17. Any capacity that is a "small fraction" of n = 30 (about 3-4) is far below
+17, so setting it changes nothing at all: `store.size()` stays at the full population and the test
+still measures one hop.
+
+Consequence: the second test needs its own, larger `n`. It does not have to share n=30 with the
+first test — they are independent tests. The working reference is
+`test/simulation.routing.spec.ts`, which gets p90 7-8 hops from `capacity: 32` on a 1000-peer ring
+(3.2%); 32 is comfortably above the 2m+1 = 17 floor. Something in the n = 200-400 range with
+`capacity: 32` is the obvious first configuration to measure, and it keeps runtime in the same
+class as the routing spec's existing 200-peer case.
+
+Note the interaction already recorded at `nearRadiusFor` (`fret-sim.ts` ~L860): the near radius is
+`4k/store.size()` of maximum ring distance, so at k=15 and a 32-entry store the fraction is
+60/32 > 1 and clamps to half the ring, putting every candidate in the selector's *near* branch.
+That is fine for a hop-count measure, but it means the test discriminates the distance metric and
+the placement, not the cost function's slack constants — say so in the test comment rather than
+letting a future reader over-claim.
 
 ## What this needs
 
-Both arms, together — either alone still measures nothing:
+Both arms together — either alone still measures nothing:
 
-- **Bound the store.** `SimConfig` already has `capacity?: number`
-  (`test/simulation/fret-sim.ts` L83); `test/simulation.routing.spec.ts` uses `capacity: 32` on a
-  1000-peer ring for exactly this reason (3.2% of the ring) and gets p90 7-8 hops out of it. Pick a
-  capacity that is a small fraction of the population here, or raise `n`, or both. Note the
-  interaction recorded at `FretSimulation.nearRadiusFor` (fret-sim.ts ~L860): the near radius is
-  `4k/store.size()` of maximum ring distance, so a small store clamps every candidate into the
-  selector's *near* branch. That is fine for a hop-count measure, but it means the test
-  discriminates the distance metric and placement, not the cost function's slack constants — say so
-  in the test comment rather than letting a future reader over-claim.
-- **Aim targets at real clusters**, using `sim.getClusterCenters()` (already landed). Suggested
-  shape, kept symmetric so the `uniform` arm is a genuine control rather than a different
-  experiment: take the centers from the `clustered` run once, then for `i` in 0..9 use
-  `A = centers[i % numClusters]`, `B = centers[(i + 1) % numClusters]`, and in **both** arms route
-  from "the alive peer nearest `A`" to coordinate `B`. Same two coordinates in both runs, same
-  selection rule, so the only difference is where the placement put the peers. A helper for this
-  belongs in `test/simulation/placement-assertions.ts` beside `maxPeersInOneSpacingArc`, so a
-  scratch measurement script and the eventual spec share one implementation.
+- **Bound the store, which means raising `n`** (see Finding B). Report `store.size()` for one
+  sender per run; it is the number that tells you at a glance whether the bound actually bit.
+- **Aim targets at real clusters**, using `sim.getClusterCenters()` (already landed). Keep it
+  symmetric so the `uniform` arm is a genuine control rather than a different experiment: take the
+  centers from the `clustered` run once, then for `i` in 0..9 use `A = centers[i % numClusters]`,
+  `B = centers[(i + 1) % numClusters]`, and in **both** arms route from "the alive peer nearest
+  `A`" to coordinate `B`. Same two coordinates in both runs, same selection rule, so the only
+  difference is where the placement put the peers. The "alive peer nearest a coordinate" helper
+  belongs in `test/simulation/placement-assertions.ts` beside `maxPeersInOneSpacingArc`, so the
+  scratch measurement and the eventual spec share one implementation.
 
 ## The outcome that is allowed to be "no"
 
-Be prepared for this to still not separate, and do not force it if so. With
-`clusterConfig: { numClusters: 3, spreadBits: 32 }`, the spread is 2^32 against a 2^256 ring —
-about 1 part in 10^67. The three clusters are, for routing purposes, three *points*. A ring made of
-three points may simply not produce longer paths than a uniform one no matter how the store is
-bounded, because there is nothing between the clusters to route through. Widening `spreadBits`
-(say to 200-240, giving clusters of real width) is a legitimate thing to try before concluding.
+With `clusterConfig: { numClusters: 3, spreadBits: 32 }` the spread is 2^32 against a 2^256 ring —
+about 1 part in 10^67. Three clusters are, for routing purposes, three *points*, and a ring made of
+three points may simply not produce longer paths than a uniform one however the store is bounded,
+because there is nothing between the clusters to route through. Widening `spreadBits` (say 200-240,
+giving clusters of real width) is a legitimate thing to try before concluding.
 
-If, after bounding capacity **and** aiming at real centers **and** trying a wider spread, the two
-arms still do not separate cleanly across all five `PLACEMENT_SEEDS`, then the honest resolution is
-to **delete the second test**, not to loosen it. It currently asserts `clustered > uniform` with no
-margin on a single hardcoded seed and would pass on noise; a deleted vacuous test is strictly
+If, after raising `n`, bounding `capacity`, aiming at real centers **and** trying a wider spread,
+the two arms still do not separate cleanly across all five `PLACEMENT_SEEDS`, the honest resolution
+is to **delete the second test**, not to loosen it. It currently asserts `clustered > uniform` with
+no margin on a single hardcoded seed and would pass on noise; a deleted vacuous test is strictly
 better than a retained one. The first test already covers clustered placement's real, measured
-effect (peers pack into one spacing arc), which is the property that actually holds. Deleting is a
-result to report plainly in the handoff, with the numbers behind it — not a failure.
+effect. Deleting is a result to report plainly in the handoff, with the numbers behind it — not a
+failure.
 
 ## How to measure without rediscovering the workflow
 
@@ -102,20 +109,21 @@ single process run, then delete it:
 - File: `test/simulation/seed-check.tmp.ts` (relative imports work from there; `git status` on that
   directory must be clean before handoff).
 - Run: `node --import ./register.mjs test/simulation/seed-check.tmp.ts` from `packages/fret/`.
-- Sweep in one go: all 5 `PLACEMENT_SEEDS` x {clustered, uniform} x {capacity unset, capacity
-  ~10-15% of n} x {spreadBits 32, spreadBits ~224}. Print `avgRoutingHops`, the success count, and
-  `store.size()` for one sender per run — `store.size()` is the number that tells you at a glance
-  whether the store bound actually bit.
-- Ship a numeric margin only if separation is clean and consistent across all five seeds. 1-vs-0.9
-  is noise, as established above.
+- **Time one run first** at the chosen `n` before sweeping — a 5x2x2x2 sweep at n=400 is 40 sims,
+  and the runner kills on a 10-minute idle. Print per-variant as you go so output keeps streaming.
+- Sweep: all 5 `PLACEMENT_SEEDS` x {clustered, uniform} x {capacity 32, capacity unset as a sanity
+  control} x {spreadBits 32, spreadBits ~224}. Print `avgRoutingHops`, the success count, and
+  `store.size()` for one sender per run.
+- Ship a numeric margin only if separation is clean and consistent across all five seeds.
+  1-vs-0.9 is noise.
 
 TODO:
 - Write and run the sweep script above; record the table.
-- If it separates: add the shared target helper to `placement-assertions.ts`, rewrite
-  `test/message-bus.spec.ts` L347-395 to use it plus a store bound, assert both
-  `clustered > uniform` **and** a measured numeric margin over all 5 `PLACEMENT_SEEDS`, with the
-  measured table in a comment — mirroring the `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` pattern from
-  the first test.
+- If it separates: add the shared "alive peer nearest a coordinate" helper to
+  `placement-assertions.ts`, rewrite `test/message-bus.spec.ts` L347-395 to use it plus the raised
+  `n` and the store bound, assert both `clustered > uniform` **and** a measured numeric margin over
+  all 5 `PLACEMENT_SEEDS`, with the measured table in a comment — mirroring the
+  `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` pattern the first test already uses.
 - If it does not separate: delete that test, and delete `CoordPlacement.centers` /
   `FretSimulation.getClusterCenters()` if nothing else consumes them.
 - Delete the scratch script either way.
@@ -126,11 +134,12 @@ TODO:
   ```
 - Write the `review/` ticket (slug `sim-placement-guards-no-control`): the first test's measured
   threshold, what happened to the second test (fixed with numbers, or deleted with the numbers that
-  justified deleting), and the one-hop finding above so the reviewer understands why the earlier
-  target-generation plan was abandoned. Delete this file once the review ticket is written.
+  justified deleting), and Findings A and B above so the reviewer understands why the earlier
+  target-generation and small-capacity plans were both abandoned. Delete this file once the review
+  ticket is written.
 
 ## Hygiene
 
-Working tree at handoff holds exactly two modified files — `test/simulation/placement.ts` and
-`test/simulation/fret-sim.ts`, both additive getters — plus this ticket rewrite. No scratch files,
-no logs.
+The working tree at handoff should hold `test/simulation/placement.ts` and
+`test/simulation/fret-sim.ts` (both additive getters, already there), whatever this ticket's work
+changes, and nothing else. No scratch files, no logs.
