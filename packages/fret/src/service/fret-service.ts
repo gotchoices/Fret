@@ -16,7 +16,7 @@ import type {
 import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
-import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
+import { makeProtocols, validateTimestamp, type FretProtocols } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
 import {
@@ -207,7 +207,7 @@ export class FretService implements IFretService, Startable {
 	private postBootstrapAnnounced = false;
 	private readonly sparsity: SparsityModel = createSparsityModel();
 	private cachedSelfCoord: Uint8Array | null = null;
-	private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
+	private readonly protocols: FretProtocols;
 	private metadata?: Record<string, unknown>;
 	private activityHandler?: ActivityHandler;
 	/** Sized in the constructor, where the profile is known — see the sizing note there. */

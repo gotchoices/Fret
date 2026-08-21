@@ -1,51 +1,38 @@
 description: Finish a batch of low-risk housekeeping cleanups in the core service file — deduplicate a near-copy of the connection warm-up logic, tighten a few loosely-typed spots, merge two listeners that do the same job, and make the service's "ready" promise actually resolve when the ring is ready.
-files: packages/fret/src/service/fret-service.ts
+files: packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/protocols.ts
 difficulty: easy
 
 <!-- resume-note -->
-Third interrupted run. First two runs stopped on BUDGET_WARNING before any edits (pure
-investigation). This run made exactly ONE edit before hitting BUDGET_WARNING again — see
-"Done this run" below — then stopped per the workflow rule (no further tool calls once a
-ticket update starts). This note supersedes the previous one; everything below is carried
-forward and still accurate.
+Fourth interrupted run. Runs 1-2: pure investigation, stopped on BUDGET_WARNING before any
+edits. Run 3: landed one edit (added `FretProtocols` type export to `protocols.ts`), then hit
+BUDGET_WARNING before wiring it in. Run 4 (this run): wired that type in (below), re-verified
+all prior anchors still hold, found one new concrete duplication, hit BUDGET_WARNING again
+before applying anything else. This note supersedes all previous ones; everything below is
+carried forward and still accurate. **No `tsc`/test run has happened across any of the four
+runs yet** — run it early next time, before doing more edits, to catch anything the accumulated
+type-only edits might have broken (low risk, but unverified).
 
 ## Done this run (already landed in the working tree — do not redo)
 
-- `packages/fret/src/rpc/protocols.ts`: added a named type export right after `makeProtocols`
-  (around line 38-39):
-  ```ts
-  /** Network-namespaced protocol id set produced by {@link makeProtocols}. */
-  export type FretProtocols = ReturnType<typeof makeProtocols>;
-  ```
-  Purely additive — new export, nothing consumes it yet, cannot have broken anything. This is
-  the named type the `import type()` replacement TODO (see below) needs; the wiring at the
-  `fret-service.ts` call site is NOT done yet.
-
-## Immediate next step (small, do this first)
-
-Wire the type just added into `fret-service.ts`:
-1. Add `FretProtocols` to the existing type-only import from `../rpc/protocols.js` at line 19:
-   currently `import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';` — add
-   `import type { FretProtocols } from '../rpc/protocols.js';` as a separate type-only import
-   line (or merge via `import { makeProtocols, validateTimestamp, type FretProtocols } from ...`
-   — check house style elsewhere in the file for which form is preferred, both compile).
-2. Replace line 210:
-   ```ts
-   private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;
-   ```
-   with:
-   ```ts
-   private readonly protocols: FretProtocols;
-   ```
-That closes out the last piece of the "inline `import()` type" TODO item.
+- `packages/fret/src/service/fret-service.ts` line 19: import changed from
+  `import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';` to
+  `import { makeProtocols, validateTimestamp, type FretProtocols } from '../rpc/protocols.js';`
+  — matches house style in this file (see `PeerEntry`/`PeerPatch`, `PoolResult`,
+  `NextHopOptions` — all merged `type X` into their value import rather than separate lines).
+- `packages/fret/src/service/fret-service.ts` line 210: field type changed from
+  `private readonly protocols: ReturnType<typeof import('../rpc/protocols.js').makeProtocols>;`
+  to `private readonly protocols: FretProtocols;`.
+- Both edits are same-line replacements — no line-count shift, so every file:line anchor below
+  and from prior runs is still accurate at time of writing.
+- This closes out the "inline `import()` type" TODO item completely.
 
 ## Confirmed file:line anchors (re-verified this run, current file state)
 
 - `nodeListeners` field: line 203 — `private readonly nodeListeners: Array<{ type: string; handler: (evt: any) => void }> = [];`
 - `firstStabilizeDone` field: line 339 — `private firstStabilizeDone = false;`
-- `protocols` field (inline `import()` type to replace): line 210.
-- `start()`: lines 874-972. Listener registration order unchanged from before: post-bootstrap
-  one-shot `peer:connect` at 902, per-connect `peer:connect` at 907, `peer:disconnect` at 923,
+- `protocols` field: line 210 — now `FretProtocols` (done, see above).
+- `start()`: lines 874-972. Listener registration order unchanged: post-bootstrap one-shot
+  `peer:connect` at 902, per-connect `peer:connect` at 907, `peer:disconnect` at 923,
   `peer:identify` at 944, `peer:update` at 958. `firstStabilizeDone = false` reset at line 886
   (right after `this.postBootstrapAnnounced = false;`) — **this is the spot to also reset the
   new ready-gate state**, see design below.
@@ -57,10 +44,10 @@ That closes out the last piece of the "inline `import()` type" TODO item.
 - `addNodeListener`: lines 1020-1024 (`(evt: any) => void` param; `type as any` cast at 1023).
   `removeNodeListeners`: lines 1026-1032 (`type as any` cast again inside).
 - `ready()` stub: line 1039 — `async ready(): Promise<void> {}`.
-- `startStabilizationLoop`: lines 1945-1971 (confirmed full body this run, was only grepped
-  before). `tick()` closure captures `const gen = this.runGen;` once at line 1947 — **the
-  ready-gate design below mirrors this exact pattern**, capturing the deferred object the same
-  way `gen` is captured, for the same reason (see design). Success path at 1954-1958:
+- `startStabilizationLoop`: lines 1945-1971 (confirmed full body in run 3). `tick()` closure
+  captures `const gen = this.runGen;` once at line 1947 — **the ready-gate design below mirrors
+  this exact pattern**, capturing the deferred object the same way `gen` is captured, for the
+  same reason. Success path at 1954-1958:
   ```
   if (!this.firstStabilizeDone) {
       this.firstStabilizeDone = true;
@@ -68,21 +55,63 @@ That closes out the last piece of the "inline `import()` type" TODO item.
   }
   ```
   This is exactly where the ready-gate resolve call goes.
+- `pingWarmupTargets` (lines 1461-1486): **already exists** as the shared pooled-ping fan-out
+  helper — takes `(ids, label, budget?)`, filters dialable, pools at `maintenanceConcurrency`
+  against the run signal. This is NOT what the "factor onto one shared helper" TODO is about;
+  see next section for what actually still duplicates.
+- `preconnectNeighbors` (lines 1488-1500) and `activePreconnectTick` (lines 1527-1539): read in
+  full this run (not reached in runs 1-2). Both already call `pingWarmupTargets` for the actual
+  ping fan-out — the duplication is upstream of that, in how each gathers its target id list:
+  ```ts
+  // preconnectNeighbors, lines 1494-1497:
+  const ids = Array.from(new Set([
+      ...this.store.neighborsRight(selfCoord, Math.min(6, this.cfg.m)),
+      ...this.store.neighborsLeft(selfCoord, Math.min(6, this.cfg.m))
+  ])).filter((id) => id !== selfStr);
 
-## Not yet located (next agent must still find these — never reached this run either)
+  // activePreconnectTick, lines 1533-1536:
+  const ids = Array.from(new Set([
+      ...this.store.neighborsRight(selfCoord, Math.min(12, this.cfg.m)),
+      ...this.store.neighborsLeft(selfCoord, Math.min(12, this.cfg.m))
+  ])).filter((id) => id !== selfStr);
+  ```
+  Identical shape, differing only in the radius constant (6 vs 12) — both preceded by the same
+  `const selfCoord = await this.selfCoord(); const selfStr = this.node.peerId.toString();`.
+  **Concrete, ready-to-apply fix:**
+  ```ts
+  private async warmupTargetIds(radius: number): Promise<string[]> {
+      const selfCoord = await this.selfCoord();
+      const selfStr = this.node.peerId.toString();
+      return Array.from(new Set([
+          ...this.store.neighborsRight(selfCoord, Math.min(radius, this.cfg.m)),
+          ...this.store.neighborsLeft(selfCoord, Math.min(radius, this.cfg.m))
+      ])).filter((id) => id !== selfStr);
+  }
+  ```
+  Then in `preconnectNeighbors`: replace lines 1490-1497 with
+  `const ids = await this.warmupTargetIds(6);` (keep the existing `await this.pingWarmupTargets(ids, 'preconnectNeighbors');` after it).
+  In `activePreconnectTick`: replace lines 1529-1536 with
+  `const ids = await this.warmupTargetIds(12);` (keep the `budget` line and the
+  `pingWarmupTargets(ids, 'active preconnect', budget)` call after it).
+  Both call sites keep their own comment about "unfiltered store walk... ring reads use
+  getNeighbors" — fold that comment into the new `warmupTargetIds` doc comment instead of
+  repeating it at both call sites.
 
-- `preconnectNeighbors` (~1488) and the active-tick warm-up body (~1538) — not read either run.
-- `pingWarmupTargets` — not read either run.
+## Not yet located (next agent must still find, if not already obvious from above)
 
-## Already done (from the original plan/18 pass — no further action, listed only so it isn't re-investigated)
+- Nothing outstanding — `preconnectNeighbors`/`pingWarmupTargets` now fully read (see above).
+
+## Already done (from the original plan/18 pass and run 3 — no further action, listed only so
+it isn't re-investigated)
 
 - `console.warn`/`console.error` → `log.error(...)` conversion: done.
 - Broken-indentation import block fix: done.
 - Dead `nextSuccessor`/`nextPredecessor` methods: already absent, nothing to do.
 - `(res as any).busy` / `Record<string, any>` metadata type-laziness items from the *original*
   ticket text: not present in current file, already clean, don't re-search.
+- Inline `import()` type at line 210 → named `FretProtocols` import: **done this run**, see above.
 
-## Concrete design for the `ready()` TODO (derived this run, not yet applied)
+## Concrete design for the `ready()` TODO (derived run 3, re-confirmed run 4, not yet applied)
 
 Requirement recap (edge cases from the ticket body, unchanged): pre-start call must not throw
 and must resolve once the *first* stabilize pass after `start()` completes; a late call after
@@ -96,6 +125,9 @@ currently holding" from "hand out a fresh pending promise for the next run" — 
 reference would then never settle (nothing points to it anymore). Fix: only replace the
 deferred in `start()` when the previous one has already settled; otherwise reuse it (covers
 both "first ever start()" and "ready() was called before start() and is still waiting").
+
+No existing test references `.ready(` (grepped `test/` this run — zero matches), so this is
+greenfield: nothing to reconcile against, just implement to the design below.
 
 **1. New fields, next to `firstStabilizeDone` (line 339):**
 ```ts
@@ -179,11 +211,10 @@ This design is complete enough to type in directly; the only open question is ex
 place a shared `createReadyDeferred()` helper (or just accept the small duplication between the
 field initializer and the `start()` branch — it's two lines, arguably not worth extracting).
 
-## Remaining scope, still to do in this file (TODO items 1-3, unchanged from original ticket)
+## Remaining scope, still to do in this file
 
-- **Factor `preconnectNeighbors` (~1488) and the active-tick warm-up body (~1538) onto one
-  shared private helper.** Both gather a target peer-id list and hand it to
-  `pingWarmupTargets`. Not yet located this run or last — find them first.
+- **Apply the `warmupTargetIds` extraction above** — the actual remaining "factor onto one
+  shared helper" work; concrete diff is written out, just needs typing in.
 - **Merge the two `peer:connect` listeners** (`start()` lines 902 and 907) into one — same
   trigger, no reason to register twice and pay two dispatches per event. Preserve both
   behaviors: the one-shot post-bootstrap announce (guarded by `postBootstrapAnnounced`) and the
@@ -196,10 +227,8 @@ field initializer and the `start()` branch — it's two lines, arguably not wort
     `@libp2p/interface` instead of `any`. Comments at ~910/~926 already note "libp2p v3:
     evt.detail is the PeerId directly, not `{ id: PeerId }`" — the tightened type must reflect
     that shape, not `{ id: PeerId }`.
-  - Inline `import()` type at line 210 (`private readonly protocols: ReturnType<typeof
-    import('../rpc/protocols.js').makeProtocols>;`) → replace with a named top-level `import
-    type { ... } from '../rpc/protocols.js'` per `AGENTS.md`'s "don't use inline `import()`
-    unless dynamically loading" rule.
+- **Wire `ready()`** per the concrete design above (fields, `start()`, `stop()`,
+  `startStabilizationLoop()`, `ready()` body) — code is drafted above, just needs typing in.
 
 ## Edge cases & interactions (unchanged from original ticket, still the acceptance bar)
 
@@ -214,19 +243,22 @@ field initializer and the `start()` branch — it's two lines, arguably not wort
   connect, including the same event that trips the one-time announce.
 - Typed event handlers: confirm the tightened type matches the real libp2p payload shape
   (`evt.detail` is the PeerId directly per the existing comments), not a guessed shape.
+- `warmupTargetIds` extraction: confirm `preconnectNeighbors` still uses radius 6 and
+  `activePreconnectTick` still uses radius 12 post-refactor (easy to transpose by accident).
 
 ## TODO tasks
 
-- Factor `preconnectNeighbors` and the active-tick warm-up body onto one shared private helper.
+- Apply the `warmupTargetIds(radius)` extraction (design above) to de-duplicate
+  `preconnectNeighbors` and `activePreconnectTick`.
 - Merge the two `peer:connect` listeners into one.
 - Replace `evt: any` / `type as any` on the node-listener registry and its four handler bodies
-  with real libp2p event types; replace the inline `import()` type at ~210 with a named type
-  import.
+  with real libp2p event types.
 - Wire `ready()` per the concrete design above (fields, `start()`, `stop()`,
-  `startStabilizationLoop()`, `ready()` body) — code is drafted above, just needs typing in and
-  verifying against `test/*.spec.ts` if any exercise `ready()` (grep for `.ready(` in `test/`
-  first — not checked yet this run).
-- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` before handoff.
+  `startStabilizationLoop()`, `ready()` body).
+- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` before handoff — has not been run
+  once across any of the four runs on this ticket; do this early in the next run, right after
+  picking it up, to catch anything the accumulated edits (including this run's type-only ones)
+  might have broken, before adding more changes on top.
 
 ## End
 Work ticket as described above.
