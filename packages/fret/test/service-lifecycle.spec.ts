@@ -185,6 +185,12 @@ describe('FretService start/stop lifecycle', function () {
 		// listenerCount() only proves the tracking array's size; this proves the tracked closures
 		// actually call node.removeEventListener with the *same* handler function object that was
 		// passed to addEventListener, not merely the same event name.
+		// NOTE: two conditional fragilities, both fine today. `expectedTypes` restates the four
+		// addNodeListener call sites in fret-service.ts; a fifth would still be leak-checked by the
+		// matching-remove loop below, but its absence would go unnoticed here - extend the list if
+		// one lands. And the loop asserts over *every* add seen on the node, so if libp2p ever
+		// starts attaching a node-level listener of its own during start(), it would fail here
+		// rather than on a FRET leak; narrow it to the four types if that happens.
 		type Handler = (evt: unknown) => void
 		const added: Array<{ type: string; handler: Handler }> = []
 		const removed: Array<{ type: string; handler: Handler }> = []

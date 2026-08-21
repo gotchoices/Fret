@@ -425,7 +425,14 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     (unhandle only removes *inbound* handlers, so outbound leaves still go out). Both are
     idempotent: `start()` is guarded against re-entry and resets run-scoped flags, and `stop()`
     returns immediately unless a run is in progress, so start→stop→start is safe and a repeated
-    `stop()` does not re-send the leave fan-out to peers already told goodbye.
+    `stop()` does not re-send the leave fan-out to peers already told goodbye. The detach half is
+    pinned **by handler identity**, not by name or by count: `test/service-lifecycle.spec.ts`
+    intercepts the node's own `addEventListener` / `removeEventListener` and requires every
+    registered `(type, handler)` pair to be removed with the same function object. Counting the
+    service's own tracking array cannot see this — a detach that reconstructs the handler instead
+    of reusing the captured closure empties the array while leaving the listener attached to the
+    node, and every other lifecycle spec still passes because each listener body opens with
+    `if (this.stopped) return;`, so a leaked listener is inert until the node outlives the service.
   - **Run generation.** Background loops (stabilization, active preconnect) capture the run
     generation when armed and exit — rather than rescheduling — once it no longer matches.
     A boolean "am I running" flag cannot do this: `stop()` clears it but cannot cancel a timer
