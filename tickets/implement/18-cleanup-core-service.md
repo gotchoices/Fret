@@ -3,14 +3,20 @@ files: packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/protocol
 difficulty: easy
 
 <!-- resume-note -->
-Fourth interrupted run. Runs 1-2: pure investigation, stopped on BUDGET_WARNING before any
+Fifth interrupted run. Runs 1-2: pure investigation, stopped on BUDGET_WARNING before any
 edits. Run 3: landed one edit (added `FretProtocols` type export to `protocols.ts`), then hit
-BUDGET_WARNING before wiring it in. Run 4 (this run): wired that type in (below), re-verified
-all prior anchors still hold, found one new concrete duplication, hit BUDGET_WARNING again
-before applying anything else. This note supersedes all previous ones; everything below is
-carried forward and still accurate. **No `tsc`/test run has happened across any of the four
-runs yet** — run it early next time, before doing more edits, to catch anything the accumulated
-type-only edits might have broken (low risk, but unverified).
+BUDGET_WARNING before wiring it in. Run 4: wired that type in, re-verified all prior anchors
+still hold, found one new concrete duplication, hit BUDGET_WARNING again before applying
+anything else. Run 5 (this run): made **zero code edits** — spent the run verifying the build,
+per run 4's own instruction to do this before adding more changes on top. Result:
+`cd packages/fret && npx tsc --noEmit` is clean (no errors), and `yarn test` is fully green —
+**1116 passing, 0 failing**. So every type-only edit from runs 3-4 (the `FretProtocols` import
+and field type at lines 19/210) is confirmed safe. Hit BUDGET_WARNING immediately after the test
+run completed, before starting on any of the remaining TODO items below. This note supersedes
+all previous ones; everything below is carried forward and still accurate. **The tsc/test
+verification is now done — do not re-run it reflexively at the very start of the next run just
+because past notes said to; it was clean as of this run's commit. Do re-run it after applying
+the remaining edits below, since those are real code changes (not just type-only ones).**
 
 ## Done this run (already landed in the working tree — do not redo)
 
@@ -255,10 +261,9 @@ field initializer and the `start()` branch — it's two lines, arguably not wort
   with real libp2p event types.
 - Wire `ready()` per the concrete design above (fields, `start()`, `stop()`,
   `startStabilizationLoop()`, `ready()` body).
-- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` before handoff — has not been run
-  once across any of the four runs on this ticket; do this early in the next run, right after
-  picking it up, to catch anything the accumulated edits (including this run's type-only ones)
-  might have broken, before adding more changes on top.
+- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` again after applying the edits
+  above, before handoff. (Run 5 already confirmed a clean baseline — tsc clean, 1116 passing,
+  0 failing — so this is a re-check after new code changes, not the first-ever run.)
 
 ## End
 Work ticket as described above.
