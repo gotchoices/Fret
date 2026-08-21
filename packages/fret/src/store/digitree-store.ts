@@ -149,8 +149,44 @@ function assertCoordWidth(coord: Uint8Array): void {
 	}
 }
 
+/**
+ * Tree keys, cached against the *entry object* that produced them.
+ *
+ * `digitree` derives an entry's key on demand rather than storing it, and calls the extractor
+ * once per binary-search probe inside a leaf node — measured 5 calls per `find`, 6 per seek.
+ * Every one of those calls ran `coordToHex` (a 32-iteration loop building a 64-character
+ * string) plus a concatenation, which measured ~83% of a `find` (20 000 `find` calls over a
+ * 2048-entry store: 39.0 ms rebuilding vs 6.4 ms cached). `find` is not a rare call —
+ * `getById`, `remove`, `update`, `put`, and the seek that starts every ring walk each perform
+ * one.
+ *
+ * Keyed on **object identity**, and deliberately not a field on `PeerEntry`. Every write path
+ * builds its new entry by spreading the old one (`{ ...prev, coord, lastAccess }` in `upsert`,
+ * `{ ...cur, ...patch }` in `update`), so a key field would carry the previous entry's key
+ * across a coordinate change and be silently stale — the re-key case this store's write seam
+ * exists to handle. A re-keyed entry is a *different object*, so it simply misses the cache:
+ * staleness is unrepresentable rather than merely unlikely. It would also widen an exported
+ * public interface, and a non-enumerable symbol property that dodged the spread would cost a
+ * `defineProperty` per write plus a shape transition on the hottest object in the package.
+ * Entries are dropped from the cache by the garbage collector when the store drops them, so
+ * there is no eviction path to maintain and no ceiling to state.
+ *
+ * NOTE: the cache rests on one invariant, and that invariant is already load-bearing at HEAD:
+ * an entry's `id` and `coord` are never mutated in place while it sits in the tree. Because
+ * `digitree` re-derives keys from entries on demand, in-place mutation already scrambles tree
+ * order *without* the cache — so the cache is exactly as safe as the status quo, no safer and
+ * no less. Verified by grep across `src/` and `test/` at the time of writing: every write path
+ * replaces the entry object. `test/digitree.neighbors.spec.ts` pins the re-key path so the two
+ * cannot drift.
+ */
+const keyCache = new WeakMap<PeerEntry, string>();
+
 function makeKey(entry: PeerEntry): string {
-	return `${coordToHex(entry.coord)}|${entry.id}`;
+	const cached = keyCache.get(entry);
+	if (cached !== undefined) return cached;
+	const key = `${coordToHex(entry.coord)}|${entry.id}`;
+	keyCache.set(entry, key);
+	return key;
 }
 
 /**
@@ -386,15 +422,47 @@ export class DigitreeStore {
 		return undefined;
 	}
 
+	// Both directional walks below collect straight into a `Set` and **return on the first id
+	// already in it**. A repeat proves the walk has lapped the ring, because the store
+	// guarantees exactly one tree entry per peer id (see the class doc, and the property test
+	// in test/digitree.invariants.spec.ts). Without it an unfiltered walk keeps circling a ring
+	// smaller than `count`, re-pushing the same ids until it has pushed `count` of them — cost
+	// O(count) rather than O(ring size). Measured on a 4-entry ring, 2000 walks: `count` 4 →
+	// 3.5 ms, 20 → 3.9 ms, 200 → 19.9 ms, 2000 → 98.9 ms, all returning the same 4 ids.
+	// Production `count` reaches ~30 (`assembleCohort` asks for `wants * 2 + excludeSet.size`),
+	// so it was a bounded ~7× lap factor on a young ring — waste, not catastrophe, and bounded
+	// only by an accident of today's callers.
+	//
+	// Sets are insertion-ordered, so `Array.from(set)` yields byte-for-byte the ordering the
+	// previous `Array.from(new Set(out))` produced: this changes cost, not results.
+	//
+	// NOTE: two soundness conditions, neither obvious.
+	// (1) One-entry-per-id is what makes a repeat mean "lapped". Before that invariant landed
+	//     (`store-index-tree-invariant`) a duplicated id could appear mid-walk with no wrap, and
+	//     this exit would silently truncate the walk. If that invariant is ever weakened, this
+	//     exit must go with it.
+	// (2) With a filter supplied a skipped entry is never added, so the exit only fires on a
+	//     *matching* entry — but if the walk laps, the first matching entry re-matches and the
+	//     exit still fires within one lap. That assumes the filter is **pure** (same entry, same
+	//     answer). Every caller today passes `isLiveMember` or a plain field comparison.
+	// The `maxScan` guard stays: it is the guard for the *filtered zero-match* case, where
+	// nothing is ever added and the early exit therefore never fires. Neither subsumes the
+	// other — deleting either one reopens a spin.
+	//
+	// NOTE: `plan/cleanup-store-ring` extracts these two (and the near-identical walks above)
+	// into one shared directional walker. The collect-into-a-set and early-exit logic belongs in
+	// that walker when it lands, not copied per call site — the loop is deliberately left in one
+	// body with its guard conditions adjacent so the extraction absorbs this rather than
+	// reinventing it.
+
 	neighborsRight(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
-		const out: string[] = [];
+		const out = new Set<string>();
 		const hex = coordToHex(coord);
 		let p = this.ceilPath(hex);
 		p = p.on ? p : this.byKey.first();
 		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
-		let i = 0;
 		let scanned = 0;
-		while (i < count && scanned < maxScan) {
+		while (out.size < count && scanned < maxScan) {
 			if (!p.on) {
 				p = this.byKey.first();
 				if (!p.on) break;
@@ -402,23 +470,22 @@ export class DigitreeStore {
 			const e = this.byKey.at(p)!;
 			scanned++;
 			if (!filter || filter(e)) {
-				out.push(e.id);
-				i++;
+				if (out.has(e.id)) break; // lapped the ring — every reachable id is already collected
+				out.add(e.id);
 			}
 			p = this.byKey.next(p);
 		}
-		return Array.from(new Set(out));
+		return Array.from(out);
 	}
 
 	neighborsLeft(coord: Uint8Array, count: number, filter?: (e: PeerEntry) => boolean): string[] {
-		const out: string[] = [];
+		const out = new Set<string>();
 		const hex = coordToHex(coord);
 		let p = this.floorPath(hex);
 		p = p.on ? p : this.byKey.last();
 		const maxScan = filter ? this.size() : Number.POSITIVE_INFINITY;
-		let i = 0;
 		let scanned = 0;
-		while (i < count && scanned < maxScan) {
+		while (out.size < count && scanned < maxScan) {
 			if (!p.on) {
 				p = this.byKey.last();
 				if (!p.on) break;
@@ -426,12 +493,12 @@ export class DigitreeStore {
 			const e = this.byKey.at(p)!;
 			scanned++;
 			if (!filter || filter(e)) {
-				out.push(e.id);
-				i++;
+				if (out.has(e.id)) break; // lapped the ring — every reachable id is already collected
+				out.add(e.id);
 			}
 			p = this.byKey.prior(p);
 		}
-		return Array.from(new Set(out));
+		return Array.from(out);
 	}
 
 	/**

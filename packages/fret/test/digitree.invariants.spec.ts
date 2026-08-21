@@ -8,7 +8,7 @@ import {
 	type RingCursor,
 	type SerializedPeerEntry,
 } from '../src/store/digitree-store.js'
-import { coordToBase64url } from '../src/ring/hash.js'
+import { coordToBase64url, coordToHex } from '../src/ring/hash.js'
 
 // The store keeps two views of the same population: the ordered tree (every ring walk,
 // `list`, `exportEntries`) and the id index (`getById`, `remove`, `update`, `size`).
@@ -236,9 +236,23 @@ function checkInvariants(store: DigitreeStore, context: string): void {
 			throw new Error(`${context}: getById(${e.id}) coord differs from the listed entry's`)
 	}
 
-	// The ring walks see exactly the same population. Both walks count per pushed id and
-	// de-duplicate only at the end, so a duplicated id consumes two slots and the walk
-	// returns fewer distinct peers than asked for — this is the assertion that catches it.
+	// Tree order must agree with the coordinates the entries actually carry. This is the
+	// assertion that pins the tree-key cache: keys are derived from an entry object and cached
+	// against its identity, so a write path that started *mutating* an entry in place instead of
+	// replacing it would leave the entry sitting at its old ring position while `getById` still
+	// resolved it — invisible to every structural check above, and silently wrong for every
+	// ordered read.
+	const orderKey = (e: (typeof listed)[number]) => `${coordToHex(e.coord)}|${e.id}`
+	for (let i = 1; i < listed.length; i++) {
+		const prev = orderKey(listed[i - 1]!)
+		const cur = orderKey(listed[i]!)
+		if (!(prev < cur))
+			throw new Error(`${context}: tree order disagrees with coordinates at index ${i} (${prev} !< ${cur})`)
+	}
+
+	// The ring walks see exactly the same population. Both walks collect into a set and exit on
+	// the first repeat, so a duplicated id would end the walk early and it would return fewer
+	// distinct peers than asked for — this is the assertion that catches it.
 	const n = store.size()
 	for (const probe of [coords[0]!, coords[COORD_POOL - 1]!]) {
 		const right = store.neighborsRight(probe, n)

@@ -464,6 +464,41 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     caller skip a full-table walk outright — which is what the stabilization tick's
     phase-2 target selection does (see the *Two phases* bullet under *Stabilization and
     churn handling*).
+  - **A tree key is built once per entry object, not once per tree probe.** `digitree` derives
+    keys from entries on demand rather than storing them, and calls the extractor once per
+    binary-search probe inside a leaf — measured 5 calls per `find`, 6 per seek — so every
+    `getById` / `remove` / `update` / `put` and the seek that starts every ring walk rebuilt a
+    64-character hex string five or six times over. Measured at ~83% of a `find` (20 000 `find`s
+    over a 2048-entry store: 39.0 ms rebuilding, 4.4 ms cached). The cache is a module-level
+    `WeakMap` keyed on **entry object identity**, populated inside the key builder itself.
+    Identity rather than peer id is the whole point: every write path builds its new entry by
+    spreading the old one, so a key stored *on* the entry would be carried across a coordinate
+    change and be silently stale — the exact re-key case the write seam exists to handle — while
+    a re-keyed entry is a different object and simply misses the cache. Staleness is therefore
+    unrepresentable rather than merely unlikely, entries leave the cache with the garbage
+    collector, and there is no eviction path or ceiling to state. It rests on one invariant that
+    is **already load-bearing at HEAD**: an entry's `id` and `coord` are never mutated in place
+    while it sits in the tree. Because keys are re-derived on demand, in-place mutation already
+    scrambles tree order without the cache, so the cache is exactly as safe as the status quo.
+    `test/digitree.invariants.spec.ts` now asserts tree order agrees with the coordinates the
+    entries carry, which is the assertion a stale key fails.
+  - **A ring walk exits on the first repeated id, because a repeat proves it lapped.**
+    `neighborsRight` / `neighborsLeft` collect straight into a `Set` and return the moment they
+    see an id already in it. Unfiltered, `maxScan` is `Infinity`, so before this a walk on a ring
+    smaller than `count` kept circling and re-collecting the same ids until it had pushed `count`
+    of them, with the trailing dedup hiding it — cost O(`count`), not O(ring size). Measured on a
+    4-entry ring, 2000 walks: 3.5 ms at `count` 4 rising to 98.9 ms at `count` 2000, all returning
+    the same 4 ids; now flat at ~1.6–2.1 ms across that whole range. Production `count` reaches
+    ~30 (`assembleCohort` asks for `wants * 2 + excludeSet.size`), so it was a bounded ~7× lap
+    factor on a young ring rather than a catastrophe — but bounded only by an accident of today's
+    callers. Sets are insertion-ordered, so the returned ordering is byte-for-byte what the old
+    trailing `Array.from(new Set(out))` produced: this changes cost, not results. Two conditions
+    make it sound, both recorded at the site: **one tree entry per peer id** (above) is what makes
+    a repeat mean "lapped", and a supplied `filter` must be **pure**, since the exit fires only on
+    a matching entry and relies on the first match re-matching after a lap. The existing
+    bounded-scan `maxScan` guard stays and is not redundant — it is the guard for the *filtered
+    zero-match* walk, where nothing is ever collected so no repeat is ever seen. Neither subsumes
+    the other; deleting either reopens a spin.
   - Bounded capacity with victim selection; S/P protected by the protection set described under *Relevance scoring and table management*, not by a score.
   - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
   - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
