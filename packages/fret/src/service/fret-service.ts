@@ -45,6 +45,8 @@ import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js'
 import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
+import { SizeObserver } from './size-observer.js';
+import type { LocalSizeEstimate } from './size-observer.js';
 import { ringNeighborsBothSides } from '../ring/ring-walk.js';
 import {
 	createSparsityModel,
@@ -389,15 +391,11 @@ export class FretService implements IFretService, Startable {
 		},
 	};
 
-	// Network size observation tracking
-	private networkObservations: Array<{
-		estimate: number;
-		confidence: number;
-		timestamp: number;
-		source: string;
-	}> = [];
-	private readonly maxObservations = 100;
-	private readonly observationWindowMs = 300000; // 5 minutes
+	/**
+	 * Network size observation tracking. Store-free and clock-injectable, so the blend/decay maths
+	 * is unit-tested directly in `test/size-observer.spec.ts` rather than through a libp2p node.
+	 */
+	private readonly sizeObserver = new SizeObserver();
 
 	constructor(node: Libp2p, cfg?: Partial<FretConfig>) {
 		this.node = node;
@@ -1043,6 +1041,10 @@ export class FretService implements IFretService, Startable {
 		// that fan-out still sees the run's state. Mirrors `FretPeerDiscovery.stop()`.
 		this.backoffMap.clear();
 		this.departureDebounce.clear();
+		// Same rule for the size observations: peer-reported estimates are a run's view of the
+		// network, and carrying them into the next run would blend a stale ring's size into a
+		// fresh one's.
+		this.sizeObserver.clear();
 	}
 
 	/** Cancel any pending loop timers. Ticks already in flight exit on the generation check. */
@@ -2943,90 +2945,31 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * The local FRET estimate the observer blends against — member-scoped, so a co-resident
+	 * foreign network cannot inflate this network's size estimate or the derived cluster span /
+	 * near-radius. Callable before `start()` has hashed the self coordinate; when it is not yet
+	 * populated the estimator falls through to its whole-store gap population.
+	 */
+	private localSizeEstimate(): LocalSizeEstimate {
+		const e = estimateSizeAndConfidence(this.store, this.cfg.m, {
+			filter: isLiveMember,
+			self: this.cachedSelfCoord ? { coord: this.cachedSelfCoord, id: this.selfIdStr } : undefined
+		});
+		return { n: e.n, confidence: e.confidence };
+	}
+
+	/**
 	 * Add an external network size observation (e.g., from cluster messages, peer queries)
 	 */
 	reportNetworkSize(estimate: number, confidence: number, source: string = 'external'): void {
-		const now = Date.now();
-		this.networkObservations.push({
-			estimate,
-			confidence,
-			timestamp: now,
-			source
-		});
-
-		// Trim old observations
-		const cutoff = now - this.observationWindowMs;
-		this.networkObservations = this.networkObservations.filter(o => o.timestamp > cutoff);
-
-		// Keep only most recent observations
-		if (this.networkObservations.length > this.maxObservations) {
-			this.networkObservations = this.networkObservations.slice(-this.maxObservations);
-		}
+		this.sizeObserver.report(estimate, confidence, source);
 	}
 
 	/**
 	 * Get enhanced network size estimate combining FRET's estimate with external observations
 	 */
 	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
-		// Get FRET's own estimate (member-scoped: a co-resident foreign network must not
-		// inflate this network's size estimate or the derived cluster span / near-radius).
-		// This method is public and callable before `start()` has hashed the self coordinate;
-		// when it is not yet populated the estimator falls through to its whole-store path.
-		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
-			filter: isLiveMember,
-			self: this.cachedSelfCoord ? { coord: this.cachedSelfCoord, id: this.selfIdStr } : undefined
-		});
-
-		// Add FRET estimate as an observation
-		const now = Date.now();
-		const allObservations = [
-			{
-				estimate: fretEstimate.n,
-				confidence: fretEstimate.confidence,
-				timestamp: now,
-				source: 'fret'
-			},
-			...this.networkObservations
-		];
-
-		// Weight recent observations more heavily with exponential decay. Two different
-		// denominators are in play and mixing them up is what made the reported confidence
-		// collapse: `size_estimate` is weighted by recency × confidence (a confident, recent
-		// observation should dominate the size), while the average confidence is weighted by
-		// recency *only* — dividing a recency-weighted numerator by an unweighted count drags
-		// the result toward zero as observations age even when every one of them agrees.
-		let totalWeight = 0;
-		let weightedSum = 0;
-		let confidenceSum = 0;
-		let recencySum = 0;
-
-		for (const obs of allObservations) {
-			const age = now - obs.timestamp;
-			const recencyWeight = Math.exp(-age / (this.observationWindowMs / 3));
-			const weight = recencyWeight * obs.confidence;
-
-			weightedSum += obs.estimate * weight;
-			confidenceSum += obs.confidence * recencyWeight;
-			recencySum += recencyWeight;
-			totalWeight += weight;
-		}
-
-		// Reachable when every observation carries confidence 0 (the local FRET estimate is
-		// always present, so an *empty* observation set is not).
-		if (totalWeight === 0 || recencySum === 0) {
-			return { size_estimate: 0, confidence: 0, sources: 0 };
-		}
-
-		const estimate = Math.round(weightedSum / totalWeight);
-		const avgConfidence = confidenceSum / recencySum;
-
-		return {
-			size_estimate: estimate,
-			confidence: Math.min(1, avgConfidence),
-			// Observations contributing, not distinct observers: repeated snapshots from one
-			// peer each add an entry. Diagnostic only — nothing branches on it.
-			sources: allObservations.length
-		};
+		return this.sizeObserver.blend(this.localSizeEstimate());
 	}
 
 	/**
@@ -3034,63 +2977,14 @@ export class FretService implements IFretService, Startable {
 	 * Returns change per minute
 	 */
 	getNetworkChurn(): number {
-		if (this.networkObservations.length < 2) {
-			return 0;
-		}
-
-		const now = Date.now();
-		const halfWindow = this.observationWindowMs / 2;
-		const cutoff = now - halfWindow;
-
-		const recentObs = this.networkObservations.filter(o => o.timestamp > cutoff);
-		const olderObs = this.networkObservations.filter(o => o.timestamp <= cutoff);
-
-		if (recentObs.length === 0 || olderObs.length === 0) {
-			return 0;
-		}
-
-		const recentAvg = recentObs.reduce((sum, o) => sum + o.estimate, 0) / recentObs.length;
-		const olderAvg = olderObs.reduce((sum, o) => sum + o.estimate, 0) / olderObs.length;
-
-		// Return change per minute
-		const changePerMs = (recentAvg - olderAvg) / halfWindow;
-		return changePerMs * 60000;
+		return this.sizeObserver.churnPerMinute();
 	}
 
 	/**
 	 * Detect if we're likely in a network partition based on sudden drop
 	 */
 	detectPartition(): boolean {
-		if (this.networkObservations.length < 10) {
-			return false; // Not enough data
-		}
-
-		const current = this.getNetworkSizeEstimate();
-		if (current.confidence < 0.3) {
-			return false; // Not confident enough
-		}
-
-		// Get estimate from 30 seconds ago
-		const thirtySecondsAgo = Date.now() - 30000;
-		const oldObs = this.networkObservations.filter(o => o.timestamp < thirtySecondsAgo);
-
-		if (oldObs.length < 3) {
-			return false;
-		}
-
-		const oldAvg = oldObs.slice(-5).reduce((sum, o) => sum + o.estimate, 0) / Math.min(5, oldObs.length);
-
-		// Detect sudden drop of more than 50%
-		const dropRatio = current.size_estimate / oldAvg;
-		if (dropRatio < 0.5) {
-			return true;
-		}
-
-		// Also check churn rate
-		const churn = Math.abs(this.getNetworkChurn());
-		const churnThreshold = current.size_estimate * 0.1; // 10% per minute is suspicious
-
-		return churn > churnThreshold;
+		return this.sizeObserver.detectPartition(this.localSizeEstimate());
 	}
 
 	setActivityHandler(handler: ActivityHandler): void {

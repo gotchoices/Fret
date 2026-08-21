@@ -270,44 +270,21 @@ describe('Seed new peers — estimator calibration from snapshots', function () 
 	it('reportNetworkSize reflects externally reported size on near-empty store', async () => {
 		const { node, svc } = await createService()
 		try {
+			const before = svc.getNetworkSizeEstimate()
+
 			// Directly report a size (mimicking what fetchAndMergeSnapshot does)
 			svc.reportNetworkSize(200, 0.9, 'snapshot:test')
 
+			// The service delegates to `SizeObserver`; this asserts the wiring over the public
+			// surface only. The blend maths itself — decay, the two denominators, the degenerate
+			// guards — is unit-tested directly in `test/size-observer.spec.ts` with an injected
+			// clock, which is what the extraction exists to make possible.
 			const est = svc.getNetworkSizeEstimate()
 			expect(est.size_estimate).to.be.greaterThan(0)
-			expect(est.sources).to.be.greaterThanOrEqual(1)
-		} finally {
-			await svc.stop()
-			await node.stop()
-		}
-	})
-
-	// The reported confidence is a recency-weighted average, so a set of observations that all
-	// agree must report exactly that agreed value no matter how they are spread in time.
-	// Dividing the recency-weighted numerator by an unweighted count instead made every
-	// observation older than "now" drag the result toward zero: four agreeing observations
-	// spread over the 5-minute window reported 0.23 instead of 0.50.
-	it('reported confidence is unaffected by the age spread of agreeing observations', async () => {
-		const { node, svc } = await createService()
-		try {
-			// Baseline: with no external observations the only observation is the local FRET
-			// estimate at age 0, so the reported confidence is exactly that estimate's own.
-			const baseline = svc.getNetworkSizeEstimate().confidence
-			expect(baseline).to.be.greaterThan(0)
-
-			// Add observations that agree on confidence but sit at increasing ages across the
-			// window. `reportNetworkSize` stamps `Date.now()`, so the ages are injected directly.
-			const now = Date.now()
-			const observations = (svc as any).networkObservations as Array<{
-				estimate: number; confidence: number; timestamp: number; source: string
-			}>
-			for (const ageMs of [60_000, 120_000, 240_000]) {
-				observations.push({ estimate: 200, confidence: baseline, timestamp: now - ageMs, source: 'aged' })
-			}
-
-			const aged = svc.getNetworkSizeEstimate().confidence
-			expect(aged).to.be.closeTo(baseline, 1e-9,
-				`agreeing observations must average to their common value, got ${aged} vs ${baseline}`)
+			expect(est.sources).to.equal(before.sources + 1,
+				'a reported observation must show up in the blended answer')
+			expect(est.size_estimate).to.be.greaterThan(before.size_estimate,
+				'reporting 200 against a near-empty store must pull the blended size up')
 		} finally {
 			await svc.stop()
 			await node.stop()
