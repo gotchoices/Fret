@@ -924,8 +924,13 @@ After import, the normal stabilization loop probes restored peers to update conn
     peer a large near-uniform slice of the ring (63% at n=200, 19% at n=1000) over which greedy
     routing arrives in one or two hops under any roughly-monotone metric. Making metric quality
     measurable needs sparse, finger-shaped stores, which needs the sim's eviction to stop being
-    degenerate (every entry ties at relevance 0, so it collapses to ring order) — until then
-    `capacity` is left unset in that spec, since setting it would measure eviction instead.
+    degenerate — until then `capacity` is left unset in that spec, since setting it would
+    measure eviction instead. Note the *reason* eviction is degenerate has moved: the sim's
+    per-tick contact sweep now scores every reachable entry through production's own
+    `recordSuccess` / `recordFailure` (`test/simulation/liveness.ts`), so entries no longer all
+    tie at relevance 0. What is still degenerate is the store shape — unbounded stores plus a
+    per-tick gossip merge of every neighbour's window leave each peer a large near-uniform slice
+    of the ring, so eviction has nothing sparse to choose between.
 - Benchmarks: Routing latency, memory usage, message overhead
 
 ### Open questions / next steps

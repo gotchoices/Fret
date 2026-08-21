@@ -140,6 +140,11 @@ export class FretSimulation {
 					const p = this.peers.get(id)
 					return !!p && p.alive
 				},
+				// Both non-null assertions hold because neither map is ever pruned: a departed
+				// peer keeps its `peers` entry (with `alive = false`) and its model, and both
+				// are only ever called with a peer id the harness itself is sweeping or
+				// routing from. See the NOTE in `handleLeave` — reclaiming those maps, which
+				// that NOTE floats as a memory fix, would turn both of these into crashes.
 				modelFor: (selfId) => this.models.get(selfId)!,
 				coordOf: (id) => this.peers.get(id)!.coord,
 			},
@@ -406,7 +411,9 @@ export class FretSimulation {
 		// NOTE: a departed peer keeps its entry in `peers` and its store in `stores` — every
 		// hot path filters on `alive`, so this is memory, not per-tick cost. Continuous churn
 		// makes both maps grow linearly in run length x rate (59 entries for a 40-peer 10s run
-		// at 2/s). If a long or high-rate run ever runs out of memory, reclaim here.
+		// at 2/s). If a long or high-rate run ever runs out of memory, reclaim here - but note
+		// `LivenessModel`'s `modelFor` / `coordOf` deps read `models` / `peers` by id and assume
+		// no entry is ever removed, so reclaiming needs those two to gain a failure mode first.
 		peer.alive = false
 		peer.connected.clear()
 		peer.neighbors.clear()
