@@ -45,6 +45,10 @@ export function wrongWidthCoord(byteLength: number): string {
 export const PEER_CLAIMED = peerIdStr(1)
 export const PEER_ACTUAL = peerIdStr(2)
 
+// NOTE: seven files under test/ each define their own one-line `sleep(ms)`. This one was
+// relocated here by the fixture move, not added by it. `wait-for.ts` offers no `sleep` to
+// re-point at, and consolidating touches seven files for no behavior change; if a shared
+// timing helper ever lands, fold all seven into it then.
 export function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
 }

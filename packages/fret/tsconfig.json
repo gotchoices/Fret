@@ -6,6 +6,7 @@
 		"rootDir": ".",
 		"target": "ES2022",
 		"module": "Node16",
+		"verbatimModuleSyntax": true,
 		"moduleResolution": "Node16",
 		"strict": true,
 		"skipLibCheck": true

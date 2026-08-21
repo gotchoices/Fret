@@ -41,6 +41,12 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - **Workspace name**: `p2p-fret` (not `fret`, not `@nichetech/fret`)
 - **Test framework**: Mocha + Chai; tests `*.spec.ts` (not `*.test.ts`)
 - **TS execution**: `--import ./register.mjs` loader hook (not `tsx`, not `ts-node`)
+  - The loader strips type syntax **per file**, so it cannot know that a name imported from
+    another module is declared there as a type: such an import survives stripping and throws
+    `SyntaxError: ... does not provide an export named 'X'` at runtime, while `tsc --noEmit`
+    stays silent (it is legal TypeScript). `verbatimModuleSyntax` in `packages/fret/tsconfig.json`
+    turns that whole class into a compile error (TS1484) — keep it on; every cross-module type
+    import must be written `import type`.
 - **No root tsconfig** — always run `tsc` from `packages/fret/`
 - **Exit watchdog**: `packages/fret/.mocharc.json` requires `test/mocha-exit-watchdog.ts` into
   every mocha run started from `packages/fret/`. If the process is still alive 10s after the last
