@@ -5,16 +5,49 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-Second run hit BUDGET_WARNING before any code edit landed (investigation-only run again). Still
-zero files touched — safe to resume from scratch, nothing to undo or revert.
+**Third run also hit BUDGET_WARNING before any code edit landed** — three runs in, still ZERO
+files touched. This run confirmed exact line content (below) so the fourth run can edit
+immediately with no exploring: read nothing except the three narrow context-reads called out
+below, then start editing.
 
-Confirmed this run, on top of everything the first run already confirmed (six call sites, the
-`diag.rejected` block at 415-424, `handleMaybeAct` 1370-1433 not being the gap):
+## Exact current content, pinned this run (safe to trust, no re-read needed)
 
-**Second-arm gap is now precisely located — no more searching needed.** It is
-`packages/fret/src/rpc/maybe-act.ts`, function `registerMaybeAct` (lines 15-32):
-
+**`diag.rejected` block, `fret-service.ts` lines 415-424 (exact, verified this run):**
 ```ts
+415		rejected: {
+416			payloadTooLarge: 0,
+417			timestampBounds: 0,
+418			ttlExpired: 0,
+419			rateLimited: 0,
+420			identityMismatch: 0,
+421			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+422			malformed: 0,
+423		},
+424	};
+```
+Replace per "Resolved design" section below: `rateLimited: 0,` (line 419) becomes a
+`Record<RateLimitedProtocol, number>` initialized inline, plus add sibling `concurrencyLimited: 0,`
+after it (before the closing `},` at 423). Add the `RateLimitedProtocol` type alias somewhere above
+the `rejected:` field (private to this file, not exported — no test imports it directly, confirmed
+by earlier runs).
+
+**`packages/fret/src/rpc/maybe-act.ts` — FULL FILE, exact, 59 lines (verified this run, paste this
+mentally instead of re-reading the file):**
+```ts
+import type { Libp2p } from 'libp2p';
+import {
+	PROTOCOL_MAYBE_ACT,
+	encodeJson,
+	decodeJson,
+	readFramed,
+	sendFramed,
+	registerRpcHandler,
+} from './protocols.js';
+import { rpcRequest } from './request.js';
+import { parseMaybeActReply, parseOrThrow, MAX_ACTIVITY_BYTES, MAYBE_ACT_OVERHEAD_BYTES } from './validate.js';
+import type { RpcOutcome } from './outcome.js';
+import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';
+
 export async function registerMaybeAct(
 	node: Libp2p,
 	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
@@ -23,46 +56,102 @@ export async function registerMaybeAct(
 ): Promise<void> {
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		const bytes = await readFramed(stream, maxBytes);
-		const msg = decodeJson<RouteAndMaybeActV1>(bytes);          // <-- line 28, unguarded
+		const msg = decodeJson<RouteAndMaybeActV1>(bytes);
 		const res = await handle(msg, connection.remotePeer.toString());
 		sendFramed(stream, encodeJson(res));
 	});
 }
+
+/**
+ * Route one `RouteAndMaybeAct` to `peerIdStr` and await its answer.
+ *
+ * `opts.timeoutMs` budgets the whole RPC (dial + open + write + read) and defaults to
+ * {@link RPC_TIMEOUT_MS}. It is deliberately left at that default by every call site: this call
+ * returns only once the *entire remaining route* has completed downstream, so its budget is a
+ * route budget rather than a link budget, and tightening it truncates healthy long routes.
+ */
+export async function sendMaybeAct(
+	node: Libp2p,
+	peerIdStr: string,
+	msg: RouteAndMaybeActV1,
+	protocol = PROTOCOL_MAYBE_ACT,
+	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
+): Promise<RpcOutcome<NearAnchorV1 | { commitCertificate: string }>> {
+	return rpcRequest(node, peerIdStr, protocol, {
+		...opts,
+		body: msg,
+		halfCloseBeforeRead: true,
+		maxBytes: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
+		// A reply that is neither shape is `decode-error`, not a half-parsed cast.
+		decode: (b) => parseOrThrow(parseMaybeActReply, decodeJson(b)),
+	});
+}
 ```
+No `createLogger` import exists yet in this file. Confirmed this run: `leave.ts`, `neighbors.ts`,
+`ping.ts`, `protocols.ts`, `validate.ts` each do `import { createLogger } from '../logger.js';` and
+name their own logger `createLogger('rpc:<name>')` (e.g. `createLogger('rpc:leave')`). Follow that
+exact pattern: `createLogger('rpc:maybe-act')`.
 
-Line 28's `decodeJson` throws on an undecodable/non-object body. That throw propagates out of
-`serve()` into `registerRpcHandler`'s own try/catch (`src/rpc/protocols.ts` ~124-148), which logs
-and `abort()`s the stream — no `diag` counter touched anywhere. Compare
-`registerJsonHandler` (`protocols.ts` ~213-221), which the other four handlers sit on: it wraps
-the same `decodeJson` call in try/catch, calls `opts.onMalformed?.('decode')`, and **returns
-normally** (so the seam's ordinary budgeted `close()` runs, not abort). `registerMaybeAct` needs
-the same shape, by hand, since it deliberately stays off that seam (bucket-before-parse).
+**Concrete fix for `maybe-act.ts` (still not applied):**
+1. Add `import { createLogger } from '../logger.js';` and `const log = createLogger('rpc:maybe-act');`.
+2. Add 5th param `onMalformed?: () => void` to `registerMaybeAct`, after `maxBytes`.
+3. Replace the two-line body:
+   ```ts
+   const bytes = await readFramed(stream, maxBytes);
+   const msg = decodeJson<RouteAndMaybeActV1>(bytes);
+   ```
+   with:
+   ```ts
+   const bytes = await readFramed(stream, maxBytes);
+   let msg: RouteAndMaybeActV1;
+   try {
+   	msg = decodeJson<RouteAndMaybeActV1>(bytes);
+   } catch (err) {
+   	log.error('%s: undecodable body - dropping - %e', protocol, err);
+   	onMalformed?.();
+   	sendFramed(stream, encodeJson({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 } satisfies NearAnchorV1));
+   	return;
+   }
+   ```
+   (leave the `readFramed` call itself unwrapped — truncation/over-cap must keep throwing to the
+   seam's abort path, per the ticket's edge-cases section; only `decodeJson` is body-level here.)
+4. At the call site in `fret-service.ts` `registerRpcHandlers` (need one quick Read of lines
+   ~1225-1245 first — not yet captured verbatim this run, only that line 1234 is
+   `registerMaybeAct(` and line 1238 is `return await this.handleMaybeAct(msg);`), pass
+   `() => { this.diag.rejected.malformed++; }` as the new 5th positional arg.
 
-**Concrete fix (not yet applied):**
-1. Add an `onMalformed?: () => void` param to `registerMaybeAct` (5th param, after `maxBytes`).
-2. Wrap line 28 in try/catch: on catch, call `onMalformed?.()`, log
-   (`log.error('%s: undecodable body - dropping - %e', protocol, err)` — needs a
-   `createLogger` import in `maybe-act.ts`; check whether one already exists in a sibling rpc
-   file, e.g. `leave.ts` or `neighbors.ts`, before adding a fresh namespace string — reuse the
-   existing house style, likely `optimystic:fret:rpc:maybe-act` or similar, don't invent one
-   inconsistent with siblings), reply with the same static-reject shape `handleMaybeAct` already
-   uses on its own malformed path (`{ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size:
-   0, confidence: 0 } satisfies NearAnchorV1` — copy the literal, don't import
-   `FretService`'s private `staticReject()`), then `return` (no throw) so the seam's normal
-   success-path budgeted close runs instead of abort.
-3. At the call site in `fret-service.ts` `registerRpcHandlers` (~1234-1242), pass
-   `() => { this.diag.rejected.malformed++; }` as the new 5th arg — same counter
-   `handleMaybeAct`'s own parse-failure path already increments, per the ticket's stated design
-   (undecodable body counts under the *existing* `malformed` bucket, not a new one).
-4. Do **not** touch `readFramed`'s own failures (truncation, over-cap) — those stay frame-level
-   and must keep aborting per `registerJsonHandler`'s documented drop/abort split; only the
-   `decodeJson` call is body-level here.
+## Six call-site edits — exact text pinned this run
 
-Everything else in this ticket (six rateLimited++ call-site edits, the `diag.rejected` type
-change, both spec files, the three `docs/fret.md` sites, tsc/test run) is **still fully
-untouched** — resume the TODO list top to bottom exactly as written below, this second-arm item
-now has a fully specified fix so it should be fast. Do the `diag.rejected` type change and the
-six call-site edits first (mechanical), then this second-arm fix, then tests/docs.
+Three of six already have unique full-line text (safe to `Edit` directly, `old_string` = the
+whole line, no extra context needed — each is unique in the file):
+- **Line 1381** (`handleMaybeAct` token bucket): `if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }` → replace `this.diag.rejected.rateLimited++` with `this.diag.rejected.rateLimited.maybeAct++`
+- **Line 1421** (`handleMaybeAct` concurrency cap): `if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }` → replace `this.diag.rejected.rateLimited++` with `this.diag.rejected.concurrencyLimited++` (NOT `rateLimited.maybeAct` — this is the mechanism split, see Edge cases section below)
+- **Line 1838** (`handleLeave`): `if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }` → replace with `this.diag.rejected.rateLimited.leave++`
+
+The other three (**1290** `handleNeighborsRequest`, **1298** `handlePingRequest`, **1999**
+`handleAnnounce`) are each a bare line `this.diag.rejected.rateLimited++;` with no other
+distinguishing text on that line — grep confirmed this run but did NOT capture surrounding
+context, so `Edit`'s `old_string` will hit "not unique" (3 identical matches) if used bare. Next
+agent must `Read` roughly lines 1285-1302 and 1995-2003 (one Read each, ~20 lines) first to grab
+2-3 lines of surrounding context per site, then `Edit` each with that context included:
+- line ~1290 → `this.diag.rejected.rateLimited.neighbors++`
+- line ~1298 → `this.diag.rejected.rateLimited.ping++`
+- line ~1999 → `this.diag.rejected.rateLimited.announce++`
+
+## Order of operations for next run
+1. Type change at 415-424 (mechanical, content pinned above — no read needed).
+2. Three unique-line edits (1381, 1421, 1838 — content pinned above, no read needed).
+3. One Read of ~1285-1302, one Read of ~1995-2003 → three remaining call-site edits.
+4. One Read of ~1225-1245 → wire `onMalformed` into the `registerMaybeAct(...)` call.
+5. `maybe-act.ts` edit (full diff pinned above, no read needed — content already captured verbatim).
+6. `test/inflight-concurrency.spec.ts`: assert on `concurrencyLimited`, drop/rewrite stale comment.
+7. `test/profile.behavior.spec.ts`: update reads to keyed shape.
+8. `docs/fret.md`: three sites named in "Edge cases & interactions" section below.
+9. `cd packages/fret && npx tsc --noEmit && yarn test`.
+
+Everything below this note (Resolved design, second-arm design, edge cases, TODO) is unchanged
+from the original ticket and still the source of truth for *what* to build — this note is only
+about *exactly what's already been verified* so the next run stops re-discovering it.
 <!-- /resume-note -->
 
 ## Resolved design
