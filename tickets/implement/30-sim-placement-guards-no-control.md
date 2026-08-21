@@ -1,192 +1,108 @@
-description: Two simulation tests claimed to prove placement strategies produce different ring shapes but would pass without that behavior; one of the two replacement checks now has a real measured threshold — the other passes today but its separation margin is thin and unverified across seeds, still needs that check before handoff, then the whole suite needs a run and a review handoff.
-files: packages/fret/test/message-bus.spec.ts, packages/fret/test/churn-scenarios.spec.ts, packages/fret/test/simulation/placement-assertions.ts
-difficulty: easy
+description: Two simulation tests claimed to prove placement strategies produce different ring shapes but would pass without that behavior; one of the two replacement checks now has a real measured threshold — the other still needs a working check before handoff, then the whole suite needs a run and a review handoff.
+files: packages/fret/test/message-bus.spec.ts, packages/fret/test/churn-scenarios.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/simulation/placement.ts
+difficulty: medium
 tradeoffs: n/a (implement ticket)
 ---
 
-<!-- resume-note -->
-**Rewritten 2026-08-21 by a seventh interrupted run (BUDGET_WARNING).** First run in the chain to
-actually get the script onto disk — prior six all died re-reading/confirming and never wrote it.
-This run wrote it, correctly, then hit BUDGET_WARNING before the `node` invocation. So: **the
-script content below is now proven to write cleanly; the only remaining step is running it.**
+Eighth run in this ticket's chain (prior seven: six died re-reading/confirming without writing
+the check script, one wrote and ran it but hit BUDGET_WARNING right after getting the result —
+this run). **The measurement is now done — do not re-run it.** What's left is a real fix, not
+more verification.
 
-**Import-path problem solved differently than every prior note assumed.** Don't write the script
-into the scratchpad dir and fight relative-path arithmetic across the temp-dir/repo-dir boundary
-— that's dead weight nobody has actually needed to solve. Instead write it as a **sibling file
-inside `packages/fret/test/simulation/`** (same dir as `fret-sim.ts`), using plain `./fret-sim.js`
-/ `./placement-assertions.js` imports. This run did exactly that, to
-`packages/fret/test/simulation/seed-check.tmp.ts`, and the write succeeded with no import-path
-adjustment needed. **Do not commit it** — delete it (`rm`) immediately after reading its output,
-before doing anything else, so it never lingers in `git status`.
+## Step 1 — DONE, do not touch
 
-**Next run, do this, in order, as the first actions — no file re-reading first:**
-1. Write the exact script from the "Step 2" section below to
-   `packages/fret/test/simulation/seed-check.tmp.ts` (content unchanged from prior notes, already
-   proven correct — imports are `./fret-sim.js` and `./placement-assertions.js`, no path
-   adjustment).
-2. From `packages/fret/`, run: `node --import ./register.mjs test/simulation/seed-check.tmp.ts`
-3. Immediately `rm packages/fret/test/simulation/seed-check.tmp.ts` — do not leave it on disk
-   past reading the output.
-4. Apply the decision rule already spelled out under "Step 2" below (separates cleanly → ship
-   as-is; doesn't → try `successfulRouteHops` average; still doesn't → target-generation fix).
-5. Run Step 3's gate (mocha + tsc).
-6. Write the review/ handoff, delete this ticket file.
+`test/simulation/placement-assertions.ts` exports `coordToBigInt`, `maxPeersInOneSpacingArc`,
+`PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`, `MAX_PEERS_IN_ONE_SPACING_ARC = 7`.
+`test/message-bus.spec.ts` L293 `describe('Placement distributions', ...)`; the first test
+(`'clustered placement: peers cluster around centers'`, L296-345) has
+`CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5` with a measured-table comment and asserts both
+directions in a loop over `PLACEMENT_SEEDS`. Correct and complete. Leave alone.
 
-Do not re-read fret-sim.ts, sim-metrics.ts, event-scheduler.ts, placement.ts,
-placement-assertions.ts, or message-bus.spec.ts — seven runs running now have confirmed them
-unchanged and API-compatible, and re-verification is what has burned every prior run's budget.
+## Step 2 — the actual finding: hop-count separation does not hold, needs a real fix
 
-Previous run's confirmation (still valid, restated for continuity): it read the four sim-harness
-files the step-2 script imports/depends on (`fret-sim.ts`, `sim-metrics.ts`, `event-scheduler.ts`,
-`placement.ts`) end-to-end and confirmed **every API the script below calls exists with exactly
-the signature the script assumes** — no adjustment needed to the script body itself:
-- `FretSimulation` constructor takes `SimConfig` (seed/n/k/m/churnRatePerSec/
-  stabilizationIntervalMs/durationMs/placement/clusterConfig) — matches.
-- `sim.initialize()`, `sim.scheduler.advanceTo(ms)` (returns fired events, also advances current
-  time), `sim.processEvent(evt)`, `sim.scheduler.pending()`, `sim.scheduler.nextEvent()`,
-  `sim.getPeers()` (→ `ReadonlyMap<string, SimPeer>`, each with `.alive`, `.id`, `.coord`),
-  `sim.scheduleRoute(fromId, targetCoord, atMs)` — all present, all match the script's usage.
-- `sim.metrics.finalize()` → `SimMetrics` with `avgRoutingHops`, `successfulRouteHops: number[]`,
-  `routingAttempts` — all present, matches the script's return shape.
-- `PLACEMENT_SEEDS` import from `placement-assertions.js` — confirmed present (step 1, done).
+The second test (`'clustered placement: inter-cluster routing takes more hops'`,
+`test/message-bus.spec.ts` L347-395) currently hardcodes `seed: 42` and asserts only
+`clustered > uniform` with no margin (L394), `n: 30, k: 15`.
 
-**One thing worth knowing before attempting the target-generation fallback fix (script step 3,
-"neither statistic separates" branch):** `CoordPlacement.clusterCenters` (`placement.ts` L44) is
-a **private** field with no getter — the cluster centers `clusteredCoord()` draws from are not
-exposed anywhere outside that class. So the fallback fix sketched in the prior version of this
-note ("aim each target near a *different* cluster, e.g. bucket by `i % numClusters`") cannot read
-real cluster centers directly. If that branch is reached, the practical option is: after
-`sim.initialize()` + advancing, read actual peer coordinates via `sim.getPeers()` (which are
-already clustered per the placement strategy), pick one alive peer's coordinate per bucket
-(`i % numClusters`, using peers sorted by coordinate or just distinct sampled peers) as each
-target instead of hashing `seed`. This still needs verifying once reached — do not assume it
-works without running it. This is a fallback path only reached if the primary statistic swap
-(returning `successfulRouteHops` average) also fails to separate; most likely the primary swap
-alone resolves it and this paragraph is never needed.
-
-Step 1 is done (measured, not guessed) — no further action there. Step 2 is exactly where every
-prior run left it: reachable, understood, script content fully specified below, and now doubly
-confirmed to match the actual harness API with zero adjustments needed — **the next run's first
-action must be pasting and running the script**, not reading any of the four sim files above
-again (all four fully read and confirmed this run — do not re-read them) and not re-reading
-`placement-assertions.ts` or `message-bus.spec.ts` (confirmed unchanged five runs running now).
-
-## Verified state (this run re-confirmed by reading files directly; ran nothing)
-
-- `test/simulation/placement-assertions.ts` exists and exports `coordToBigInt`,
-  `maxPeersInOneSpacingArc`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
-  `MAX_PEERS_IN_ONE_SPACING_ARC = 7`. Unchanged, correct, done — no further action.
-- `test/message-bus.spec.ts` imports all three at L7. `describe('Placement distributions', ...)`
-  starts at L293.
-- Step 1 test (`'clustered placement: peers cluster around centers'`, L296-345) has
-  `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5` with a measured-table comment (worst uniform 1,
-  best clustered 12 across all 5 `PLACEMENT_SEEDS` — 5 sits 5x above worst / 2.4x below best) and
-  asserts both directions in a loop over `PLACEMENT_SEEDS`. Leave as-is.
-- Step 2 test (`'clustered placement: inter-cluster routing takes more hops'`, L347-395) is
-  UNCHANGED from the prior run's description: single hardcoded `seed: 42` (L350), returns
-  `metrics.avgRoutingHops` (L389), asserts only `clustered > uniform` with no numeric margin
-  (L394). `n: 30, k: 15` (half the ring in-cluster). Prior run's measured single-seed result
-  (not re-run this session): clustered avgRoutingHops 1 vs uniform 0.9 — a one-hop gap out of 10
-  routes, all 10 succeeding both times.
-- `test/churn-scenarios.spec.ts` edit landed per earlier handoffs; still not re-verified this run
-  — no reason to doubt it, out of scope for this ticket's remaining budget.
-
-## Step 2 — hop statistic for case 2, still not seed-verified
-
-**Next agent, do this — no further investigation needed, just execute. Three runs in a row died
-of BUDGET_WARNING before running anything, only re-reading files, so the script is now spelled
-out verbatim below — paste it and run it, first action of the run.**
-
-1. Write this exact file to the scratchpad (NOT under `packages/fret/` — do not commit it) as
-   `seed-check.ts`, then run `node --import ./register.mjs <path-to>/seed-check.ts` from
-   `packages/fret/`:
-
-   ```ts
-   import { FretSimulation } from '../../packages/fret/test/simulation/fret-sim.js' // adjust relative path to wherever the scratchpad file lands
-   import { PLACEMENT_SEEDS } from '../../packages/fret/test/simulation/placement-assertions.js'
-
-   function avgHopsFor(seed: number, placement?: 'clustered') {
-   	const sim = new FretSimulation({
-   		seed,
-   		n: 30,
-   		k: 15,
-   		m: 8,
-   		churnRatePerSec: 0,
-   		stabilizationIntervalMs: 500,
-   		durationMs: 8000,
-   		...(placement ? { placement, clusterConfig: { numClusters: 3, spreadBits: 32 } } : {}),
-   	})
-   	sim.initialize()
-   	for (const evt of sim.scheduler.advanceTo(5000)) sim.processEvent(evt)
-   	const alivePeers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
-   	for (let i = 0; i < 10; i++) {
-   		const from = alivePeers[i % alivePeers.length]!
-   		const target = new Uint8Array(32)
-   		const s = seed + i * 13
-   		for (let j = 0; j < 32; j++) target[j] = (s * (j + 1) * 37) & 0xff
-   		sim.scheduleRoute(from.id, target, 5001 + i)
-   	}
-   	while (sim.scheduler.pending() > 0) {
-   		const evt = sim.scheduler.nextEvent()
-   		if (!evt || evt.time > 8000) break
-   		sim.processEvent(evt)
-   	}
-   	const metrics = sim.metrics.finalize()
-   	const successAvg =
-   		metrics.successfulRouteHops.length > 0
-   			? metrics.successfulRouteHops.reduce((a, b) => a + b, 0) / metrics.successfulRouteHops.length
-   			: NaN
-   	return { avgRoutingHops: metrics.avgRoutingHops, successAvg, attempts: metrics.routingAttempts }
-   }
-
-   for (const seed of PLACEMENT_SEEDS) {
-   	const c = avgHopsFor(seed, 'clustered')
-   	const u = avgHopsFor(seed)
-   	console.log(
-   		`seed ${seed}: clustered avgRoutingHops=${c.avgRoutingHops} successAvg=${c.successAvg} | ` +
-   			`uniform avgRoutingHops=${u.avgRoutingHops} successAvg=${u.successAvg}`
-   	)
-   }
-   ```
-
-   (Fix the two relative import paths to match wherever the scratchpad file actually lands
-   relative to `packages/fret/test/simulation/` — the paths above assume a sibling-of-repo-root
-   layout and must be adjusted to the real scratchpad path before running.)
-
-2. **If separation holds cleanly across all 5 seeds** (clustered consistently > uniform,
-   comfortable margin, not 1-vs-0 flukes): the test is fine as shipped — leave the code
-   untouched. Just record in the review ticket (see Handoff below) that the margin was checked
-   and is real, with the per-seed numbers.
-3. **If it does not hold** (flips sign on some seeds, or margin is inconsistently 0-1 hops):
-   - First try returning `successfulRouteHops` average instead of `metrics.avgRoutingHops`
-     (already computed in the existing log line at L384-388) as the returned/asserted statistic;
-     add a one-line comment saying why, mirroring the `successfulRouteHops` doc comment in
-     `sim-metrics.ts`; re-run across seeds again.
-   - If **neither statistic separates**: the target-generation loop (`target[j] = (seed * (j + 1)
-     * 37) & 0xff`, L372) is not reliably landing targets across cluster boundaries. Read
-     `test/simulation/placement.ts` for where cluster centers come from (`clusterConfig: {
-     numClusters: 3, spreadBits: 32 }`) and aim each target near a *different* cluster (e.g.
-     bucket by `i % numClusters`). **Do not ship the case unseparating.** This is real
-     investigation — if budget is short again, split it into its own follow-up ticket rather
-     than rushing it, and say so plainly in the handoff.
-
-## Step 3 — gate (only after step 2 is genuinely resolved, not left on an unchecked single-seed pass)
+This run measured all 5 `PLACEMENT_SEEDS` (script + exact numbers below — reproducible, not
+guessed) with **both** `avgRoutingHops` and `successfulRouteHops` average as the candidate
+statistic:
 
 ```
-node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 60000
-npx tsc --noEmit
+seed 8008: clustered avgRoutingHops=1   successAvg=1   attempts=10 | uniform avgRoutingHops=0.9 successAvg=0.9 attempts=10
+seed 8009: clustered avgRoutingHops=0.9 successAvg=0.9 attempts=10 | uniform avgRoutingHops=1   successAvg=1   attempts=10
+seed 8010: clustered avgRoutingHops=1   successAvg=1   attempts=10 | uniform avgRoutingHops=1   successAvg=1   attempts=10
+seed 4242: clustered avgRoutingHops=0.9 successAvg=0.9 attempts=10 | uniform avgRoutingHops=0.9 successAvg=0.9 attempts=10
+seed 99:   clustered avgRoutingHops=1   successAvg=1   attempts=10 | uniform avgRoutingHops=0.9 successAvg=0.9 attempts=10
 ```
 
-Both from `packages/fret/`. An unrelated failure follows the pre-existing-failure protocol in the
-workflow rules rather than being chased here.
+**Result: does not separate.** Sign flips across seeds (8008 clustered wins, 8009 uniform wins,
+8010/4242 tie, 99 clustered wins) — a coin flip, not a real effect. All 10/10 routes succeed
+every time, so `successfulRouteHops` average is numerically identical to `avgRoutingHops` here —
+switching statistics buys nothing, contrary to the fallback this ticket's prior notes assumed
+would help. **Per the ticket's own decision rule, this means the target-generation approach is
+broken and needs the fallback fix, not the seed swap.**
 
-## Handoff
+Root cause (inferred, not yet confirmed by reading — next agent should verify): the target
+coordinates are synthetic, hashed from `seed` (`target[j] = (s * (j + 1) * 37) & 0xff`) with no
+knowledge of where the actual cluster centers landed on the ring. They are not reliably landing
+on opposite sides of a cluster boundary, so "clustered" and "uniform" routes end up choosing
+similar-length paths by chance.
 
-Write the `review/` ticket (slug `sim-placement-guards-no-control`) covering: the two vacuous
-tests replaced with both-directions clustered-vs-uniform checks following the
-`assertPlacementSeparates` pattern already proven in `churn-scenarios.spec.ts`; the new shared
-module; the measured threshold and its provenance for step 1 (final); and for step 2, which hop
-statistic was used, whether it needed the target-generation fix, and the actual per-seed numbers
-that justify calling the separation real (not just "it passed once at seed 42"). Say plainly if
-step 2 needed the target-generation fix — that is a real change beyond the original snippet.
-Delete this file once the review ticket is written.
+### The fix this needs
+
+`CoordPlacement.clusterCenters` (`test/simulation/placement.ts` ~L44) is a **private** field with
+no getter — cluster centers `clusteredCoord()` draws from are not exposed outside that class. Two
+options, in order of preference:
+
+1. **Add a getter/export for cluster centers** (or a way to construct target coordinates near a
+   given cluster index) on `CoordPlacement`, and have the check script/test aim each target at
+   a *different* cluster (e.g. bucket by `i % numClusters`, using real center coordinates ± small
+   offset). This is the clean fix — it makes the test's intent (routes that cross cluster
+   boundaries take more hops) actually true of the generated targets.
+2. **Fallback if (1) turns out awkward**: after `sim.initialize()` + advancing, read actual peer
+   coordinates via `sim.getPeers()` (already clustered per the placement strategy in the
+   `clustered` run), and pick one alive peer's coordinate per bucket (`i % numClusters`) as each
+   target instead of hashing `seed`. Needs its own re-verification once written — do not assume
+   it separates without measuring across all 5 seeds again.
+
+Either way: **re-run the per-seed measurement after the fix**, using the same shape as the
+numbers above (all 5 `PLACEMENT_SEEDS`, both `clustered` and `uniform`, `n: 30, k: 15, m: 8,
+durationMs: 8000`), and only ship the test with a numeric margin if the separation is clean and
+consistent (not 1-vs-0.9 noise) across all 5 seeds. If neither the getter approach nor the
+peer-coordinate fallback produces clean separation, that is itself a real finding — write it up
+plainly in the next handoff rather than shipping a loosened assertion.
+
+**Do not repeat the "write scratch script → run → delete" cycle from scratch if avoidable** — the
+numbers above are already representative of the *current* (broken) target generation; the next
+run's job is to change target generation and re-measure, not to re-confirm today's numbers.
+
+TODO:
+- Read `test/simulation/placement.ts` `CoordPlacement` class fully (not yet re-read this run —
+  confirmed by two runs prior; layout may still have shifted, verify `clusterCenters` field name
+  and `clusteredCoord()` still match this description before editing).
+- Implement option 1 (preferred) or option 2 above in `test/simulation/placement-assertions.ts`
+  (add a shared helper there, mirroring how `maxPeersInOneSpacingArc` already lives there) so both
+  the eventual spec and any scratch verification script can import it.
+- Update `test/message-bus.spec.ts` L347-395 to use the fixed target generation, assert both
+  `clustered > uniform` **and** a numeric margin measured across all 5 `PLACEMENT_SEEDS`, mirroring
+  the `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` pattern from step 1.
+- Verify `test/churn-scenarios.spec.ts` edit (from earlier handoffs in this ticket's history) is
+  still present and correct — not re-checked this run, no reason to doubt it but flag if it looks
+  reverted.
+- Gate, both from `packages/fret/`:
+  ```
+  node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 60000
+  npx tsc --noEmit
+  ```
+- Write `review/` ticket (slug `sim-placement-guards-no-control`): cover step 1's final measured
+  threshold, step 2's fix (which option taken, why), the actual per-seed numbers post-fix that
+  justify calling the separation real, and explicitly note the pre-fix numbers above showed no
+  separation (so the reviewer understands what changed and why it was necessary). Delete this
+  file once the review ticket is written.
+
+## Gitignore / hygiene note
+
+Nothing to commit from this run except this ticket rewrite — the verification script was written
+to `test/simulation/seed-check.tmp.ts`, run, and deleted before this handoff; `git status` on
+`test/simulation/` is clean.
