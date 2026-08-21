@@ -42,9 +42,59 @@ function firstByte(b: number): Uint8Array {
 
 const NO_SELF = 'not-a-stored-peer'
 
-/** Even indices are the successor side, odd the predecessor side — see the interleave rule. */
+/**
+ * Even indices are the successor side, odd the predecessor side — see the interleave rule.
+ *
+ * NOTE: the even/odd correspondence holds only while the two sides are **disjoint**. Once they
+ * overlap, `interleave`'s dedup drops an id mid-list and every later index shifts parity, so these
+ * two helpers report nonsense. Every case that uses them anchors on a window narrower than the
+ * ring; the overlapping cases (wrap-around at count 4, the property) assert on the whole list
+ * instead. If a case is ever added where the sides can meet, assert the full array, not the sides.
+ */
 const successorSide = (out: readonly string[]) => out.filter((_, i) => i % 2 === 0)
 const predecessorSide = (out: readonly string[]) => out.filter((_, i) => i % 2 === 1)
+
+/**
+ * An **independent** oracle for the whole result, not just its size: walk the ring *by index* in
+ * both directions from the anchor, take the first `perSide` reachable ids on each side, and weave
+ * them. It is derived from the fixture's ring layout (`coordAt` is monotone in `i`, so index order
+ * *is* ring order) rather than from the helper's own over-fetch arithmetic, so it pins **which**
+ * peers come back and in what order. A size-only oracle cannot: a helper that walked the two
+ * directions the wrong way round, or returned the wrong side first, returns the right count.
+ */
+function expectedWindow(
+	n: number,
+	anchorIdx: number,
+	anchorOnPeer: boolean,
+	reachable: ReadonlySet<string>,
+	count: number
+): string[] {
+	const perSide = Math.min(Math.max(count, 0), reachable.size)
+	if (perSide === 0) return []
+	const walk = (start: number, step: number): string[] => {
+		const side: string[] = []
+		for (let k = 0; k < n && side.length < perSide; k++) {
+			const id = `p${(((start + step * k) % n) + n) % n}`
+			if (reachable.has(id)) side.push(id)
+		}
+		return side
+	}
+	// `betweenCoord(i)` sits strictly after `coordAt(i)`, so the successor walk starts at `i + 1`
+	// while the predecessor walk still starts at `i`. Anchored *on* a peer, both start at `i` —
+	// which is the off-by-one this helper exists to absorb.
+	const successors = walk(anchorOnPeer ? anchorIdx : anchorIdx + 1, 1)
+	const predecessors = walk(anchorIdx, -1)
+	const out: string[] = []
+	const seen = new Set<string>()
+	for (let i = 0; i < perSide; i++) {
+		for (const id of [successors[i], predecessors[i]]) {
+			if (id === undefined || seen.has(id)) continue
+			seen.add(id)
+			out.push(id)
+		}
+	}
+	return out
+}
 
 describe('ringNeighborsBothSides', () => {
 	describe('the off-by-one it exists to fix', () => {
@@ -199,6 +249,20 @@ describe('ringNeighborsBothSides', () => {
 			expect(successorSide(out)).to.deep.equal(['p3', 'p4', 'p5'])
 			expect(predecessorSide(out)).to.deep.equal(['p18', 'p17', 'p16'])
 		})
+
+		it('excludes a dead member — the state half of the predicate, not only membership', () => {
+			// `isLiveMember` is two independent conditions. A suite that only ever demotes
+			// `membership` leaves `state !== 'dead'` unexercised, so a filter that dropped that
+			// half would stay green.
+			const store = ringStore(20)
+			for (let i = 0; i < 20; i++) store.setMembership(`p${i}`, 'member')
+			for (const id of ['p1', 'p2', 'p19']) store.setState(id, 'dead')
+
+			const out = ringNeighborsBothSides(store, coordAt(0), 3, 'p0', { filter: isLiveMember })
+
+			expect(successorSide(out)).to.deep.equal(['p3', 'p4', 'p5'])
+			expect(predecessorSide(out)).to.deep.equal(['p18', 'p17', 'p16'])
+		})
 	})
 
 	describe('property', function () {
@@ -246,9 +310,10 @@ describe('ringNeighborsBothSides', () => {
 					const anchorInR = anchorOnPeer && reachable.has(`p${anchorIdx}`)
 					// The anchor entry heads *both* sides, hence the -1; the whole union is capped
 					// at the reachable population, which is what the two sides meeting produces.
-					const expected = count <= 0 || r === 0
+					const expectedSize = count <= 0 || r === 0
 						? 0
 						: Math.min(anchorInR ? 2 * perSide - 1 : 2 * perSide, r)
+					const expected = expectedWindow(n, anchorIdx, anchorOnPeer, reachable, count)
 
 					if (anchorInR) region.anchorOnReachablePeer++
 					if (count > 0 && n < count) region.ringSmallerThanCount++
@@ -256,7 +321,12 @@ describe('ringNeighborsBothSides', () => {
 					const coord = anchorOnPeer ? coordAt(anchorIdx) : betweenCoord(anchorIdx)
 					const out = ringNeighborsBothSides(store, coord, count, selfId, { filter, exclude })
 
-					expect(out.length, 'union size').to.equal(expected)
+					// Two independently-derived oracles cross-checked against each other: the
+					// arithmetic one reasons from the store's walk semantics, the enumerated one
+					// from the ring layout. If the arithmetic reasoning is wrong, this disagrees
+					// rather than being wrong in the same direction as the code.
+					expect(expected.length, 'the two oracles disagree on size').to.equal(expectedSize)
+					expect(out, 'the window is exactly the enumerated one').to.deep.equal(expected)
 					expect(new Set(out).size, 'no duplicates').to.equal(out.length)
 					expect(out, 'self is never present').to.not.include(selfId)
 					for (const id of out) {
