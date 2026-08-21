@@ -10,6 +10,31 @@ hit its token budget during reconnaissance — no code was changed. This ticket 
 `sim-metric-guard-case` (prereq-chained behind this one). Everything under *Settled design* was
 verified against the code this session — implement it, don't re-derive it.
 
+<!-- resume-note -->
+**Resume note (run 2, 2026-08-21).** This run also ended on BUDGET_WARNING during
+reconnaissance — **no code changed**. What it accomplished: re-verified the entire *Settled
+design* section against HEAD. All five upsert-site line numbers in the table below are still
+accurate, as are `DigitreeStore.update` `:307` / `upsert` `:282` / `remove` `:322`,
+`enforceCapacity` `fret-sim.ts:590`, and every `relevance.ts` export. No drift; nothing to
+re-derive. Additional exact signatures confirmed, to spare the next run the reads:
+
+- `liveness.ts` — `contactSweep(selfId, store, time)` `:78` (success call `:89`, failure `:87`,
+  both with `peer.id`/`time` in scope); `recordContactFailure(store, entry, time)` `:101`;
+  `recordContactSuccess(store, entry)` `:114` (the `contactFailures > 0` early-out and its stale
+  doc comment are at `:113-115`); `reprobeDeadEntries(selfId, store, time)` `:128`.
+  `LivenessDeps` (`:17-30`) currently has only `contactAllowed(a, b)` and `isAlive(id)` — add
+  `modelFor`, `coordOf`, `now` there per the seam-widening bullet.
+- `fret-sim.ts` — `handleRoute` holds `current` (selfId) at both scoring call sites `:711`/`:716`;
+  the sweep/reprobe calls at `:482`/`:485` already pass `time`. Constructor builds `LivenessModel`
+  at `:124-136` — the natural place to inject the new deps (`modelFor` reads the per-peer model
+  map, `coordOf` reads `this.peers`, `now` reads `this.scheduler.getCurrentTime()`).
+- `enforceCapacity` (`:590-604`) — its NOTE at `:594-598` states the degenerate-eviction limit and
+  must be rewritten when scoring lands (`28.5-sim-metric-guard-case` expects that).
+
+Next run: skip reconnaissance entirely — start editing `liveness.ts` (seam widening) and
+`fret-sim.ts` (model map + five sites + protection set) directly, then measure.
+<!-- /resume-note -->
+
 ## Why
 
 `test/simulation.routing.spec.ts` guards ring routing but cannot tell one plausible ring metric
