@@ -10,7 +10,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   ├── service/libp2p-fret-service.ts
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
 │   │   ├── store/{digitree-store,relevance}.ts
-│   │   ├── ring/{distance,hash}.ts
+│   │   ├── ring/{distance,hash,ring-walk}.ts
 │   │   ├── rpc/{protocols,neighbors,maybe-act,leave,ping}.ts
 │   │   ├── selector/next-hop.ts
 │   │   ├── estimate/size-estimator.ts

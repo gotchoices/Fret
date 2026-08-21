@@ -1,5 +1,5 @@
 import type { DigitreeStore, PeerEntry } from '../store/digitree-store.js'
-import { ringNeighborsBothSides } from '../service/ring-walk.js'
+import { ringNeighborsBothSides } from '../ring/ring-walk.js'
 
 export type SizeEstimate = { n: number; confidence: number };
 

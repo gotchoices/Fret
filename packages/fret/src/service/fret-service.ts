@@ -45,7 +45,7 @@ import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js'
 import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
-import { ringNeighborsBothSides } from './ring-walk.js';
+import { ringNeighborsBothSides } from '../ring/ring-walk.js';
 import {
 	createSparsityModel,
 	normalizedLogDistance,
@@ -169,6 +169,8 @@ export class FretService implements IFretService, Startable {
 	// re-derives one at a read site.
 	private readonly cfg: Required<FretConfig>;
 	private readonly node: Libp2p;
+	/** Own peer id as a string. Bound once: `node` is readonly, so this cannot go stale. */
+	private readonly selfIdStr: string;
 	private stopped = false;
 	private started = false;
 	/**
@@ -399,6 +401,7 @@ export class FretService implements IFretService, Startable {
 
 	constructor(node: Libp2p, cfg?: Partial<FretConfig>) {
 		this.node = node;
+		this.selfIdStr = node.peerId.toString();
 		this.cfg = {
 			k: cfg?.k ?? 15,
 			m: cfg?.m ?? Math.ceil((cfg?.k ?? 15) / 2),
@@ -522,7 +525,7 @@ export class FretService implements IFretService, Startable {
 		// successor and m-th predecessor are protected too — self no longer consumes a slot per
 		// side. Self is added explicitly rather than drawn from the walk: on a ring of exactly
 		// one peer the walk returns nothing at all, and self must still be protected.
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const protectedIds = new Set(ringNeighborsBothSides(
 			this.store,
 			self,
@@ -642,7 +645,7 @@ export class FretService implements IFretService, Startable {
 		// Self is never a normal RPC target, but a dead self would drop out of every ring view —
 		// and out of the capacity protection that keeps it there — with no path back short of a
 		// restart. Cheap guard, unrecoverable failure avoided.
-		if (id === this.node.peerId.toString()) return;
+		if (id === this.selfIdStr) return;
 		const e = this.store.getById(id);
 		if (!e) return;
 		// A *run* means observations separated in time. Several forwards to one restarting hop all
@@ -1269,7 +1272,7 @@ export class FretService implements IFretService, Startable {
 		const keyBytes = u8FromString(msg.key, 'base64url');
 
 		// Breadcrumb loop detection: reject if self already visited
-		const selfId = this.node.peerId.toString();
+		const selfId = this.selfIdStr;
 		if (msg.breadcrumbs?.includes(selfId)) return this.staticReject();
 
 		// Correlation-ID dedup: return cached result if seen before
@@ -1459,10 +1462,12 @@ export class FretService implements IFretService, Startable {
 	 * bounds *who we contact* while leaving the window itself two-sided: a Core fanout of 8
 	 * against `m = 8` used to eat the second walk whole and announce to successors only. `exclude`
 	 * is passed into the helper rather than filtered off its result, so the helper's over-fetch
-	 * pays for the excluded ids instead of the walk coming up short (self is dropped regardless).
+	 * pays for the excluded ids instead of the walk coming up short. The helper drops **self**
+	 * unconditionally, so `exclude` carries only the extra ids (the departed peer, on that path)
+	 * — naming self there would spend an over-fetch slot on a peer already dropped.
 	 */
-	private announceTargetsAround(coord: Uint8Array, exclude: Set<string>, fanout: number): string[] {
-		const all = ringNeighborsBothSides(this.store, coord, this.cfg.m, this.node.peerId.toString(), { exclude });
+	private announceTargetsAround(coord: Uint8Array, exclude: Set<string> | undefined, fanout: number): string[] {
+		const all = ringNeighborsBothSides(this.store, coord, this.cfg.m, this.selfIdStr, { exclude });
 		const nonConnected = all.filter((id) => !this.isConnected(id) && this.hasAddresses(id));
 		const connected = all.filter((id) => this.isConnected(id));
 		return [...nonConnected, ...connected].slice(0, fanout);
@@ -1470,8 +1475,7 @@ export class FretService implements IFretService, Startable {
 
 	private async announceNeighborsBounded(maxCount?: number): Promise<void> {
 		const selfCoord = await this.selfCoord();
-		const exclude = new Set([this.node.peerId.toString()]);
-		const ids = this.announceTargetsAround(selfCoord, exclude, maxCount ?? this.announceFanout);
+		const ids = this.announceTargetsAround(selfCoord, undefined, maxCount ?? this.announceFanout);
 		if (ids.length === 0) return;
 		await this.sendAnnouncementsRateLimited(ids, await this.snapshot());
 	}
@@ -1539,7 +1543,7 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async warmupTargetIds(radius: number): Promise<string[]> {
 		const selfCoord = await this.selfCoord();
-		return ringNeighborsBothSides(this.store, selfCoord, Math.min(radius, this.cfg.m), this.node.peerId.toString());
+		return ringNeighborsBothSides(this.store, selfCoord, Math.min(radius, this.cfg.m), this.selfIdStr);
 	}
 
 	private async preconnectNeighbors(): Promise<void> {
@@ -1636,7 +1640,7 @@ export class FretService implements IFretService, Startable {
 		const sendOpts = { signal: budget.signal, timeoutMs: FretService.LEAVE_NOTICE_TIMEOUT_MS };
 		try {
 			const selfCoord = await this.selfCoord();
-			const selfStr = this.node.peerId.toString();
+			const selfStr = this.selfIdStr;
 			// Unfiltered store walk, deliberately: unlike every other ring read (which uses the
 			// member-scoped views) this list is not one we advertise — it *defines* the S/P window
 			// the replacement list excludes, so a `foreign` or `dead` id costs one skipped dial
@@ -1662,7 +1666,7 @@ export class FretService implements IFretService, Startable {
 			const ids = ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, selfStr);
 			const spSet = new Set(ids);
 			const replacements = this.computeReplacements(selfCoord, spSet, selfStr);
-			const notice = { v: 1, from: this.node.peerId.toString(), replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
+			const notice = { v: 1, from: this.selfIdStr, replacements: replacements.length > 0 ? replacements : undefined, timestamp: Date.now() } as const;
 			for (const id of ids) {
 				if (budget.signal.aborted) break;
 				// Doomed dials are skipped, not attempted (see `isDoomedDial`): this runs inside
@@ -1755,7 +1759,7 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async recordLeaveReplacements(replacements: string[] | undefined, departedId: string): Promise<void> {
 		if (!replacements || replacements.length === 0) return;
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const seen = new Set<string>();
 		for (const id of replacements) {
 			// Skipping self is a correctness guard, not tidiness: were self ever absent from the
@@ -1811,7 +1815,7 @@ export class FretService implements IFretService, Startable {
 		if (this.departureDebounce.has(regionKey)) return;
 		this.departureDebounce.set(regionKey, Date.now());
 
-		const exclude = new Set([this.node.peerId.toString(), departedId]);
+		const exclude = new Set([departedId]);
 		const targets = this.announceTargetsAround(coord, exclude, this.announceFanout);
 		if (targets.length === 0) return;
 		await this.sendAnnouncementsRateLimited(targets, await this.snapshot());
@@ -1825,11 +1829,11 @@ export class FretService implements IFretService, Startable {
 	private isNearNeighbor(id: string, _coord: Uint8Array): boolean {
 		const selfCoord = this.cachedSelfCoord;
 		if (!selfCoord) return false;
-		return ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, this.node.peerId.toString()).includes(id);
+		return ringNeighborsBothSides(this.store, selfCoord, this.cfg.m, this.selfIdStr).includes(id);
 	}
 
 	private async announceToNewPeers(ids: string[]): Promise<void> {
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const targets = ids
 			.filter((id) => id !== selfStr && !this.isConnected(id) && this.hasAddresses(id))
 			.slice(0, this.announceFanout);
@@ -2004,7 +2008,7 @@ export class FretService implements IFretService, Startable {
 			this.addressKnown = addressKnown;
 			try {
 				const coord = await this.selfCoord();
-				const selfStr = this.node.peerId.toString();
+				const selfStr = this.selfIdStr;
 				this.store.upsert(selfStr, coord);
 				// Self always serves its own network.
 				this.store.setMembership(selfStr, 'member');
@@ -2160,7 +2164,7 @@ export class FretService implements IFretService, Startable {
 	 * tick should skip the 4th-closest and never the immediate successor; it self-corrects next tick.
 	 */
 	private async nearProbeTargets(): Promise<string[]> {
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const nearAll = this.getNeighbors(await this.selfCoord(), 'both', Math.max(2, this.cfg.m));
 		return nearAll.filter((id) => id !== selfStr && this.isDialable(id)).slice(0, 4);
 	}
@@ -2299,7 +2303,7 @@ export class FretService implements IFretService, Startable {
 	 * without having to know that.
 	 */
 	private classifyTargets(entries: PeerEntry[] = this.store.list()): string[] {
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
 		const unknown = entries.filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && e.state !== 'dead'
@@ -2373,7 +2377,7 @@ export class FretService implements IFretService, Startable {
 	 * factor grows, so it sorts behind the ones a truncated tick never reached.
 	 */
 	private reprobeOffRingTargets(entries: PeerEntry[], isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const candidates = entries.filter(
 			(e) => e.id !== selfStr && this.getBackoffPenalty(e.id) === 0 && isCandidate(e)
 		);
@@ -2533,7 +2537,7 @@ export class FretService implements IFretService, Startable {
 		// advertise describes only this network's reachable peers — and never re-introduces a
 		// foreign peer to same-network neighbors via the sample (the transitive-propagation
 		// guard), nor advertises a peer we have already given up on as a neighbor.
-		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.node.peerId.toString() } });
+		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.selfIdStr } });
 		const capSucc = this.cfg.profile === 'core' ? 12 : 6;
 		const capPred = this.cfg.profile === 'core' ? 12 : 6;
 		const capSample = this.cfg.profile === 'core' ? 8 : 6;
@@ -2541,7 +2545,7 @@ export class FretService implements IFretService, Startable {
 		const rawPred = this.getNeighbors(selfCoord, 'left', this.cfg.m);
 		const successors = rawSucc.slice(0, capSucc);
 		const predecessors = rawPred.slice(0, capPred);
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const excludeIds = new Set([selfStr, ...successors, ...predecessors]);
 		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
 		// NOTE: nothing here validates the *encoded* snapshot against MAX_NEIGHBORS_BYTES — the
@@ -2569,7 +2573,7 @@ export class FretService implements IFretService, Startable {
 		}
 		return {
 			v: 1,
-			from: this.node.peerId.toString(),
+			from: this.selfIdStr,
 			timestamp: Date.now(),
 			successors,
 			predecessors,
@@ -2728,7 +2732,7 @@ export class FretService implements IFretService, Startable {
 		// `keyBytes` is supplied on the inbound-handler path, which validated and decoded the
 		// key once; decoding here covers direct callers (public API, tests).
 		const coord = await hashKey(keyBytes ?? u8FromString(msg.key, 'base64url'));
-		const selfId = this.node.peerId.toString();
+		const selfId = this.selfIdStr;
 		const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
 			self: { coord: await this.selfCoord(), id: selfId }
@@ -2970,7 +2974,7 @@ export class FretService implements IFretService, Startable {
 		// when it is not yet populated the estimator falls through to its whole-store path.
 		const fretEstimate = estimateSizeAndConfidence(this.store, this.cfg.m, {
 			filter: isLiveMember,
-			self: this.cachedSelfCoord ? { coord: this.cachedSelfCoord, id: this.node.peerId.toString() } : undefined
+			self: this.cachedSelfCoord ? { coord: this.cachedSelfCoord, id: this.selfIdStr } : undefined
 		});
 
 		// Add FRET estimate as an observation
@@ -3107,12 +3111,12 @@ export class FretService implements IFretService, Startable {
 	 * need not be secret.
 	 */
 	private newCorrelationId(phase: 'digest' | 'act'): string {
-		return `${this.node.peerId.toString()}-${Date.now()}-${randomToken()}-${phase}`;
+		return `${this.selfIdStr}-${Date.now()}-${randomToken()}-${phase}`;
 	}
 
 	async *iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {
 		const coord = await hashKey(key);
-		const selfId = this.node.peerId.toString();
+		const selfId = this.selfIdStr;
 		const selfCoord = await this.selfCoord();
 		const ttl = options.ttl ?? 8;
 		const maxAttempts = options.maxAttempts ?? ttl + 2;
@@ -3140,7 +3144,7 @@ export class FretService implements IFretService, Startable {
 		const visited = new Set<string>([selfId]);
 
 		for (let attempt = 0; attempt < maxAttempts; attempt++) {
-			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.node.peerId.toString() } });
+			const { n, confidence } = estimateSizeAndConfidence(this.store, this.cfg.m, { filter: isLiveMember, self: { coord: selfCoord, id: this.selfIdStr } });
 
 			// Decide whether to include payload
 			const distToKey = minDistance(selfCoord, coord);
@@ -3359,7 +3363,7 @@ export class FretService implements IFretService, Startable {
 	exportTable(): SerializedTable {
 		return {
 			v: 1,
-			peerId: this.node.peerId.toString(),
+			peerId: this.selfIdStr,
 			timestamp: Date.now(),
 			entries: this.store.exportEntries(),
 		};
@@ -3374,7 +3378,7 @@ export class FretService implements IFretService, Startable {
 		// the next stabilization tick's peer-store re-seed, but dropping self's record is one
 		// rule instead of two repairs — and the local entry is better information regardless.
 		// The count therefore reports ids actually stored, self excluded.
-		const selfStr = this.node.peerId.toString();
+		const selfStr = this.selfIdStr;
 		const count = this.store.importEntries(table.entries.filter((e) => e.id !== selfStr));
 		await this.enforceCapacity();
 		return count;

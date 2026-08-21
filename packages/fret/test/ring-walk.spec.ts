@@ -3,7 +3,7 @@ import { expect } from 'chai'
 import fc from 'fast-check'
 import { DigitreeStore, type PeerEntry } from '../src/store/digitree-store.js'
 import { isLiveMember } from '../src/service/live-member.js'
-import { ringNeighborsBothSides } from '../src/service/ring-walk.js'
+import { ringNeighborsBothSides } from '../src/ring/ring-walk.js'
 
 /**
  * Ascending, distinct first-byte coordinates: `coordAt(i)` is `i * 7`, so a ring built from
@@ -344,6 +344,47 @@ describe('ringNeighborsBothSides', () => {
 				.to.be.greaterThan(0)
 			expect(region.filtered, 'no membership-filtered case was generated').to.be.greaterThan(0)
 			expect(region.unfiltered, 'no unfiltered case was generated').to.be.greaterThan(0)
+		})
+	})
+
+	/**
+	 * The two service behaviors this helper exists to fix, pinned at the level where the
+	 * arithmetic actually lives rather than through the private methods that wrap it.
+	 *
+	 * - `FretService.announceTargetsAround` slices the helper's result to `announceFanout`.
+	 *   Over a side-major concatenation a Core fanout of 8 against `m = 8` was successors-only,
+	 *   so the predecessor side received no announce at all.
+	 * - `FretService.isNearNeighbor` asks for `m` per side and tests membership of the result.
+	 *   Without the helper's `count + 1` over-fetch a self-anchored walk spends a slot on self,
+	 *   so the m-th neighbor on each side falls outside the window.
+	 */
+	describe('the two-sided window the announce and near-neighbor paths depend on', () => {
+		const M = 8
+
+		it('a fanout-sized slice at fanout = m still reaches both sides', () => {
+			// p10 is self, so the window is p2..p9 (predecessors) and p11..p18 (successors).
+			const store = ringStore(20)
+			const out = ringNeighborsBothSides(store, coordAt(10), M, 'p10')
+			const slice = out.slice(0, M)
+
+			expect(slice.length, 'the slice is the whole fanout').to.equal(M)
+			expect(successorSide(slice), 'half the fanout is successors')
+				.to.deep.equal(['p11', 'p12', 'p13', 'p14'])
+			expect(predecessorSide(slice), 'the other half is predecessors — not an empty side')
+				.to.deep.equal(['p9', 'p8', 'p7', 'p6'])
+		})
+
+		it('a self-anchored window at count = m includes the m-th neighbor on both sides', () => {
+			// The over-fetch is what pays for the anchor entry: without it each side would stop
+			// at p17 / p3 and the m-th neighbor would test as *not* near.
+			const store = ringStore(20)
+			const out = ringNeighborsBothSides(store, coordAt(10), M, 'p10')
+
+			expect(out, 'the m-th successor').to.include('p18')
+			expect(out, 'the m-th predecessor').to.include('p2')
+			expect(out.length, 'exactly m per side, self excluded').to.equal(2 * M)
+			expect(out, 'and nothing beyond the m-th').to.not.include('p19')
+			expect(out, 'on either side').to.not.include('p1')
 		})
 	})
 })

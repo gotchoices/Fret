@@ -2,7 +2,7 @@ import { describe, it, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import { buildMaintenanceRig, type MaintenanceRig, type PeerRig } from './helpers/maintenance-rig.js'
 import type { FretService as CoreFretService } from '../src/service/fret-service.js'
-import { ringNeighborsBothSides } from '../src/service/ring-walk.js'
+import { ringNeighborsBothSides } from '../src/ring/ring-walk.js'
 
 // The two connection warm-up passes — the one-shot `preconnectNeighbors` at `start()` and the
 // per-second active-mode tick (`activePreconnectTick`) — share one pooled fan-out
