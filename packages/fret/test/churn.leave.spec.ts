@@ -369,8 +369,11 @@ describe('Leave amplification cap', function () {
 	// removed peer (`applyTouch`/`applySuccess`/`applyFailure` return early on a miss — see
 	// `docs/fret.md`, *Relevance scoring and table management*), so removal is durable through the
 	// `peer:disconnect` that follows a graceful departure too, not just observable in isolation.
-	// This rig's receiver service is never started, so this test covers the leave notice alone;
-	// a real-`peer:disconnect` sibling case is still owed (see `tickets/implement/`).
+	// This rig's receiver service is never started, so this test covers the leave notice alone.
+	// The real-`peer:disconnect` half is covered against a *started* service in
+	// `test/scoring-never-creates.spec.ts` ('does not resurrect a peer that was removed while
+	// connected'). Still uncovered: both halves driven in one sequence against one started
+	// receiver - a real leave notice removing the peer, then that peer's real disconnect.
 	it('removes the departing peer from the id map and from the ring window', async () => {
 		const rig = await makeLeaveRig()
 		try {
