@@ -1,6 +1,6 @@
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
-import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { buildMesh, type Mesh } from './helpers/mesh.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { hashPeerId } from '../src/ring/hash.js'
@@ -15,32 +15,21 @@ import type { NearAnchorV1, RouteAndMaybeActV1 } from '../src/index.js'
 
 // --- helpers ---
 
-async function makeMesh(n: number, opts?: { k?: number; profile?: 'edge' | 'core' }) {
-	const k = opts?.k ?? 7
-	const profile = opts?.profile ?? 'edge'
-	const nodes: Libp2p[] = []
-	for (let i = 0; i < n; i++) {
-		const node = await createMemNode()
-		await node.start()
-		nodes.push(node)
-	}
+/** `n` memory-transport nodes: every service started first, then dialed into a star. */
+async function makeMesh(n: number): Promise<Mesh> {
+	const mesh = await buildMesh(n)
 	// Start ALL services first so RPC handlers and peer:connect listeners
 	// are registered before connections are established.
-	const services: CoreFretService[] = []
-	for (let i = 0; i < n; i++) {
-		const boot = i === 0 ? [] : [nodes[0]!.peerId.toString()]
-		const svc = new CoreFretService(nodes[i]!, { profile, k, bootstraps: boot })
-		await svc.start()
-		services.push(svc)
-	}
+	await mesh.addServices((i, m) => ({
+		profile: 'edge',
+		k: 7,
+		bootstraps: i === 0 ? [] : [m.ids[0]!]
+	}))
 	// Connect in a star AFTER services start — peer:connect events fire
 	// and populate each node's store.  Star ensures bootstrap knows all
 	// peers immediately and leave notices can reach it via direct connection.
-	for (let i = 1; i < n; i++) {
-		const ma = nodes[0]!.getMultiaddrs()[0]!
-		await nodes[i]!.dial(ma)
-	}
-	return { nodes, services }
+	await mesh.connect('star')
+	return mesh
 }
 
 function makeRouteMsg(keyB64: string, ttl = 5): RouteAndMaybeActV1 {
@@ -110,24 +99,22 @@ function allHaveNeighbors(
 describe('libp2p in-process integration', function () {
 	this.timeout(30000)
 
-	let nodes: Libp2p[] = []
-	let services: CoreFretService[] = []
+	let mesh: Mesh | undefined
+	/** Indices a test stopped itself mid-case; afterEach must not double-stop them. */
+	let alreadyStopped: number[] = []
 
 	afterEach(async () => {
-		for (const s of services) {
-			if (!s) continue
-			try { await s.stop() } catch {}
-		}
-		await stopAll(nodes.filter(Boolean))
-		nodes = []
-		services = []
+		await mesh?.stop({ skip: alreadyStopped })
+		mesh = undefined
+		// Reset here rather than in the test body so a case that throws part-way through
+		// still hands the next one a clean slate.
+		alreadyStopped = []
 	})
 
 	// 1. Neighbor exchange — 3 nodes
 	it('3 nodes discover each other via neighbor exchange', async () => {
-		const mesh = await makeMesh(3)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(3)
+		const { nodes, services } = mesh
 
 		const selfIds = nodes.map(n => n.peerId.toString())
 
@@ -166,9 +153,8 @@ describe('libp2p in-process integration', function () {
 
 	// 2. Neighbor exchange — 10 nodes
 	it('10 nodes converge and populate S/P sets', async () => {
-		const mesh = await makeMesh(10)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(10)
+		const { nodes, services } = mesh
 
 		const m = 4 // ceil(7/2)
 		const selfCoords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)))
@@ -205,9 +191,8 @@ describe('libp2p in-process integration', function () {
 
 	// 3. routeAct — returns NearAnchor with anchors and cohort hints
 	it('routeAct returns NearAnchor with anchors and cohort hints', async () => {
-		const mesh = await makeMesh(5)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(5)
+		const { nodes, services } = mesh
 
 		const selfIds = nodes.map(n => n.peerId.toString())
 		await waitFor(() => allKnowRemotes(services, selfIds, 2), 8000, 25, '5-node convergence before routeAct')
@@ -225,9 +210,8 @@ describe('libp2p in-process integration', function () {
 
 	// 4. routeAct — activity handler fires at anchor
 	it('routeAct with activity triggers handler at anchor node', async () => {
-		const mesh = await makeMesh(5)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(5)
+		const { nodes, services } = mesh
 
 		const selfIds = nodes.map(n => n.peerId.toString())
 		await waitFor(() => allKnowRemotes(services, selfIds, 2), 8000, 25, '5-node convergence before activity routing')
@@ -269,9 +253,8 @@ describe('libp2p in-process integration', function () {
 
 	// 5. Ring invariant — successors/predecessors match sorted ring order
 	it('successor/predecessor sets match ring order after stabilization', async () => {
-		const mesh = await makeMesh(6)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(6)
+		const { nodes, services } = mesh
 
 		const ring = await ringPositions(nodes)
 		const m = 4 // ceil(7/2)
@@ -316,9 +299,8 @@ describe('libp2p in-process integration', function () {
 
 	// 6. Graceful leave — remaining peers continue to function
 	it('graceful leave: remaining peers route and stabilize after departure', async () => {
-		const mesh = await makeMesh(5)
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(5)
+		const { nodes, services } = mesh
 
 		const leavingIdx = 2
 		const leavingId = nodes[leavingIdx]!.peerId.toString()
@@ -339,6 +321,9 @@ describe('libp2p in-process integration', function () {
 		// Stop the leaving service (sends leave notice internally)
 		await services[leavingIdx]!.stop()
 		await nodes[leavingIdx]!.stop()
+		// Record the departure before the assertions below, so a failure there still leaves
+		// afterEach skipping the index rather than double-stopping it.
+		alreadyStopped.push(leavingIdx)
 
 		/** Every node but the departed one still holds at least one neighbor other than itself. */
 		const survivorsHaveNeighbors = (): boolean => services.every((svc, i) => i === leavingIdx ||
@@ -361,17 +346,12 @@ describe('libp2p in-process integration', function () {
 		const msg = makeRouteMsg(keyB64, 8)
 		const res = await services[0]!.routeAct(msg)
 		expect(res).to.have.property('anchors')
-
-		// Prevent afterEach from double-stopping
-		services[leavingIdx] = null as any
-		nodes[leavingIdx] = null as any
 	})
 
 	// 7. Scale routing — 10 nodes, multiple route requests
 	it('10 nodes route multiple messages with bounded hops', async () => {
-		const mesh = await makeMesh(10, { k: 7 })
-		nodes = mesh.nodes
-		services = mesh.services
+		mesh = await makeMesh(10)
+		const { nodes, services } = mesh
 
 		const m = 4 // ceil(7/2)
 		const selfCoords = await Promise.all(nodes.map(n => hashPeerId(n.peerId)))
@@ -408,10 +388,8 @@ describe('libp2p in-process integration', function () {
 		}
 
 		// Check forwarding diagnostics — total forwarded hops should be bounded
-		const totalForwarded = services.reduce((sum, svc) => {
-			if (!svc) return sum
-			return sum + svc.getDiagnostics().maybeActForwarded
-		}, 0)
+		const totalForwarded = services.reduce((sum, svc) =>
+			sum + svc.getDiagnostics().maybeActForwarded, 0)
 		const maxExpected = Math.ceil(Math.log2(10) + 2) * keys.length
 		expect(totalForwarded).to.be.at.most(maxExpected,
 			`total forwarded hops ${totalForwarded} exceeds expected bound ${maxExpected}`)
