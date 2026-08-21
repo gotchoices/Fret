@@ -4,12 +4,44 @@ difficulty: easy
 ----
 
 <!-- resume-note -->
-Second continuation. Prior run on this ticket hit BUDGET_WARNING having only **read** files —
-zero edits landed. No log file was produced (no Bash/tee use before the cutoff), so the findings
-below are the full state; there is nothing else to go re-read. Everything under "What already
-landed" and the source-change bullets further down (the `applyTouch`/`applySuccess`/`applyFailure`
-signature change etc.) is still accurate and verified true at HEAD — only the test/doc work below
-remains, and none of it has been started.
+Third continuation. Second run also hit BUDGET_WARNING having only **read** files — zero edits
+landed again. No log file was produced. This run pinned exact line numbers/text for the two
+already-identified edit sites so the next run can act without re-reading those files. Nothing
+below has changed in substance from the second run's notes — only precision added. Still zero
+edits made; everything remains to do.
+
+Exact confirmation from this run (verified at HEAD, `packages/fret/src/service/fret-service.ts`):
+
+- `applyTouch` (private, line 566), `applySuccess` (line 637), `applyFailure` (line 670) all open
+  `const entry = this.store.getById(id); if (!entry) return;` before any `await`. Doc comments
+  above each already state "Scoring never creates". This matches the ticket's "What already
+  landed" section exactly — **no further verification of the source change is needed**, do not
+  re-read this range again.
+- `test/rpc.snapshot-merge-cap.spec.ts` lines 137–139 (the stale comment inside the doc block
+  above `countUpserts`, function body starts line 150) reads verbatim:
+  ```
+  	 * `applyTouch` opens with `getById(id) ?? upsert(id, coord)` and the loop has always just
+  	 * upserted that id, so it does not double-count — a doubled count is the first assumption
+  	 * to re-check if these numbers ever drift.
+  ```
+  This is the exact text to replace. Rewrite to state the new reasoning: `applyTouch` no longer
+  creates (returns early on a miss); the reason counted upserts still don't double-count is that
+  the announce/fetch paths call `noteDiscovered` (not `applyTouch`) for every remote-named id
+  (`from`'s successors/predecessors/sample entries), and `noteDiscovered` itself already
+  early-returns on an id already held (`fret-service.ts:608`, `if (this.store.getById(id)) return
+  false;`) — so a repeated id in one snapshot, or an id already in the store, upserts at most
+  once, and it's `noteDiscovered`'s own guard doing that, not `applyTouch`. (Note: `mergeAnnounceSnapshot`/`fetchAndMergeSnapshot` call `noteDiscovered` for every successor/predecessor/sample
+  id — confirmed at `fret-service.ts:2005,2027,2604` — there is no separate explicit upsert of
+  `from` itself in the merge loop bodies visible in the ranges read so far; do not assert a
+  "from is upserted one line before the loop" claim — that phrasing from the second run's note
+  was **not confirmed** this run and should be dropped. The correct, confirmed reasoning is the
+  `noteDiscovered` early-return guard above, which is sufficient on its own to explain why counted
+  upserts don't double-count.)
+
+Everything else — the three new tests needed, the `churn.leave.spec.ts` rewrite (~line 373, the
+`'removes the departing peer...'` test and its stale comment at lines 368–372), the
+`docs/fret.md` edits, and the full validation pass — is unchanged from the prior resume-note and
+is copied below verbatim (still nothing started on any of it).
 
 Exact discoveries from this run, so the next one can act directly instead of re-reading:
 
