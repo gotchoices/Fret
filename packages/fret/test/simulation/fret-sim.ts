@@ -813,15 +813,16 @@ export class FretSimulation {
 		let current = fromPeerId
 		const visited = new Set<string>()
 		let hops = 0
-		// Bounds hops taken *and* contact attempts spent, so a route into a fully
-		// partitioned-away window terminates. It keeps reading the global alive count on
-		// purpose: this is a harness cutoff rather than a decision a peer makes, and deriving
-		// it from a peer's own store size would make the budget vary per hop and per partition
-		// side. Every routing *decision* below is local.
+		// Bounds contact attempts spent, so a route into a fully partitioned-away window
+		// terminates. Every hop consumes an attempt, so this bounds hops too — no separate
+		// `hops` term is needed. It keeps reading the global alive count on purpose: this is a
+		// harness cutoff rather than a decision a peer makes, and deriving it from a peer's own
+		// store size would make the budget vary per hop and per partition side. Every routing
+		// *decision* below is local.
 		const maxHops = Math.ceil(Math.log2(this.aliveCount()) * 2) + 4
 		let attempts = 0
 
-		while (hops < maxHops && attempts < maxHops) {
+		while (attempts < maxHops) {
 			visited.add(current)
 			const store = this.stores.get(current)
 			const currentPeer = this.peers.get(current)
@@ -863,6 +864,9 @@ export class FretSimulation {
 			// hop is a *candidate*, not a delivered message.
 			const tried = new Set<string>()
 			let next: string | undefined
+			// Fixed for the whole hop — `store` does not change inside the retry loop, and the
+			// derivation allocates a BigInt division plus a 32-byte coordinate.
+			const nearRadius = this.nearRadiusFor(store)
 			while (attempts < maxHops) {
 				const candidates = pool.filter((id) => !tried.has(id))
 				if (candidates.length === 0) break
@@ -879,7 +883,7 @@ export class FretSimulation {
 					(id) => currentPeer.connected.has(id),
 					() => 0, // sim models no link latency; a constant keeps runs deterministic
 					{
-						nearRadius: this.nearRadiusFor(store),
+						nearRadius,
 						selfCoord: hops > 0 ? currentPeer.coord : undefined,
 						confidence: 0.5,
 					},
