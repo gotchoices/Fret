@@ -307,7 +307,7 @@ describe('FretService capacity enforcement and victim selection', function () {
 
 	// The tripwire recorded at `enforceCapacity`: protection wins over the cap, so a capacity
 	// below the size of the protected set is not a bound at all. Only reachable by
-	// misconfiguration (`capacity < 2m - 1`), and pinned here as current behavior rather than as
+	// misconfiguration (`capacity < 2m + 1`), and pinned here as current behavior rather than as
 	// something desirable.
 	it('leaves the table over capacity when the protected set is larger than the cap', async () => {
 		const service = await seededService({ m: 8, capacity: 4 })

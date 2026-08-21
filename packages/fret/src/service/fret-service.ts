@@ -522,14 +522,15 @@ export class FretService implements IFretService, Startable {
 		// successor and m-th predecessor are protected too — self no longer consumes a slot per
 		// side. Self is added explicitly rather than drawn from the walk: on a ring of exactly
 		// one peer the walk returns nothing at all, and self must still be protected.
+		const selfStr = this.node.peerId.toString();
 		const protectedIds = new Set(ringNeighborsBothSides(
 			this.store,
 			self,
 			Math.max(2, this.cfg.m),
-			this.node.peerId.toString(),
+			selfStr,
 			{ filter: isLiveMember }
 		));
-		protectedIds.add(this.node.peerId.toString());
+		protectedIds.add(selfStr);
 		// Evict the lowest relevance non-protected entries until under cap.
 		// NOTE: lists and fully sorts the store to drop a handful of entries. Only reachable once
 		// the table is at capacity, so it is a no-op in the common case; if a ring settles at cap
