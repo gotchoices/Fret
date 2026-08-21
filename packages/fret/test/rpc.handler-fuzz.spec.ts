@@ -4,9 +4,8 @@ import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import { createIdentifyNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import {
-	InboundHandler,
-	InboundStub,
-	InboundStubOpts,
+	type InboundHandler,
+	type InboundStub,
 	NETWORK,
 	P,
 	PEER_ACTUAL,
