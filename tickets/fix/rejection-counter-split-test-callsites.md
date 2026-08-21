@@ -4,7 +4,19 @@ files: packages/fret/test/payload-bounds-ttl.spec.ts, packages/fret/test/rpc.cod
 difficulty: easy
 ---
 
-## Progress so far (this pass, 4th refiling)
+## Progress so far (this pass, 5th refiling)
+
+**This pass (5th) hit BUDGET_WARNING immediately after re-reading and re-confirming lines
+1320-1670 of `rpc.codec-properties.spec.ts` against the prior pass's exact fix map — matches
+again, third confirmation, no drift. Also re-read `test/helpers/wait-for.ts` as the style
+reference for the new helper (plain exported function, `DEFAULT_*` consts, one JSDoc block
+explaining non-obvious behavior, no class — same conclusion as pass 4).** Zero edits landed this
+pass, same as passes 3 and 4. **The mapping is now stable across three independent reads and
+should not be re-verified a fourth time — next pass must go straight to editing, starting with
+the helper file (item 2) then the 8 `rpc.codec-properties.spec.ts` line edits (item 1), in that
+order so item 1's five-path test can import the already-written helper.**
+
+## Progress so far (prior pass, 4th refiling)
 
 `packages/fret/test/profile.behavior.spec.ts` is done and verified (already landed by a prior
 pass — unchanged this pass).
