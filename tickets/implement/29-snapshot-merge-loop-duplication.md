@@ -3,75 +3,74 @@ files: packages/fret/src/service/fret-service.ts, packages/fret/test/rpc.handler
 difficulty: easy
 
 <!-- resume-note -->
-Second run: made the edit, then hit BUDGET_WARNING before running `tsc`/tests. Code change is
-done and believed correct (mechanical extraction, no logic change) but **unverified** — next
-agent's first job is verification, not more editing.
+Third run: hit BUDGET_WARNING right after confirming `tsc --noEmit` clean, before running
+`yarn test`. **Do not re-edit anything** — the extraction is done and already committed at HEAD
+(`047ee72`, "ticket(implement): snapshot-merge-loop-duplication"). `git status --short` shows a
+clean tree (only an untracked `tickets/.in-progress` marker, unrelated). `git diff` is empty —
+there is nothing uncommitted to lose.
 
-Done in `packages/fret/src/service/fret-service.ts`:
-- Added private `mergeDiscoveredId(pid, into, logLabel)` right before `mergeAnnounceSnapshot`
-  (~line 2005), matching the ticket's suggested shape exactly.
-- `mergeAnnounceSnapshot`'s two loops (successor/predecessor, sample) now call it, passing
-  `discovered` and labels `'mergeAnnounceSnapshot'` / `'mergeAnnounceSnapshot sample'`. The
-  re-hash-not-trust rationale comment is kept once, on the extracted method's docstring, with a
-  short comment above the sample loop still explaining why the sample specifically needs it
-  (content preserved, not deleted — matches "have comments point at it rather than restate it").
-- `fetchAndMergeSnapshot`'s two loops now call the same method, passing `announced` and labels
-  `'fetchAndMergeSnapshot'` / `'fetchAndMergeSnapshot sample'`, with a one-line pointer comment
-  ("Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`") kept above its
-  sample loop.
-- Did not touch `mergeSnapshotCaps`, the parsers, `calibrateSizeFromSnapshot`, or anything else
-  around the loops.
+Confirmed this run:
+- `cd packages/fret && npx tsc --noEmit` → clean, no output, exit 0.
+- `git log --oneline` shows the extraction already landed at HEAD; nothing pending in the working
+  tree.
 
-Not done yet — do these next, in order:
-1. `cd packages/fret && npx tsc --noEmit` — expect clean; only a transient "declared but never
-   read" diagnostic was seen mid-edit (before the second call site was wired in), which should be
-   gone now that both call sites use the method, but confirm.
-2. `cd packages/fret && yarn test` (or targeted: `rpc.handler-fuzz.spec.ts`,
-   `announce-rate-limit.spec.ts`, `rpc.snapshot-merge-cap.spec.ts` — the last counts
-   `store.upsert` calls on both paths, the most direct check the extraction didn't change write
-   counts).
-3. If both pass: write the `tickets/review/` handoff per the Implement stage rules (distilled
-   summary, emphasis on test/validation use cases, honest about what wasn't independently
-   verified beyond the three specs above), then delete this file from `tickets/implement/`.
-4. If either fails: diagnose against this specific diff (it's a small mechanical change — the
-   likely failure mode is a typo or a dropped `await`, not a design issue) and fix before handing
-   off.
+Not done yet — next agent's whole job, in order:
+1. `cd packages/fret && yarn test` (full suite). If that's too slow/noisy, at minimum run the
+   three targeted specs the ticket calls out:
+   `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/rpc.handler-fuzz.spec.ts" "test/announce-rate-limit.spec.ts" "test/rpc.snapshot-merge-cap.spec.ts" --timeout 30000`
+   `rpc.snapshot-merge-cap.spec.ts` is the most direct check — it counts `store.upsert` calls on
+   both the announce and fetch merge paths, which is exactly what the extraction must not change.
+2. If green: read the extracted method in `fret-service.ts` (grep `mergeDiscoveredId`) and confirm
+   by eye it matches the ticket's "What to build" section below — private method, per-entry
+   `try/catch` preserved (one bad id drops only itself), both call sites pass their own accumulator
+   and log label, sample-loop re-hash-not-trust comment kept in exactly one place. Then write the
+   `tickets/review/` handoff per the Implement stage rules (distilled summary, emphasis on
+   test/validation use cases, honest that verification stopped at tsc + these three specs / full
+   suite — whichever you ran), and delete this file from `tickets/implement/`.
+3. If tests fail: check whether the failure is plainly pre-existing (unrelated subsystem, fails on
+   `main` at HEAD before this diff) — if so follow the `.pre-existing-error.md` protocol in the
+   ticket workflow rules rather than chasing it here. If the failure looks caused by the
+   extraction itself, diagnose against the diff in `047ee72` (`git show 047ee72 -- packages/fret/src/service/fret-service.ts`) — it's a small mechanical change, likely failure mode is a typo or a
+   dropped `await`, not a design issue — and fix before handing off.
 
-Original prior-run research (still valid, no drift found beyond what's documented below):
+Everything below this point is the original ticket's full research and spec, still accurate and
+worth reading if you need to verify the extraction against intent — it hasn't changed since the
+first run.
 
-Confirmed by direct read (not just ticket claim):
-- `mergeAnnounceSnapshot` loops are at `fret-service.ts:2035-2042` (successors/predecessors) and
-  `2045-2061` (sample), accumulator `discovered` (declared line 2013).
-- `fetchAndMergeSnapshot` loops are at `fret-service.ts:2660-2667` (successors/predecessors) and
-  `2668-2674` (sample), accumulator `announced` (declared line 2627).
-- Both shapes match the ticket's description exactly — no drift beyond what's already documented.
-  Nothing else needs re-discovery; go straight to the edit below.
+## Original prior-run research (still valid, no drift found beyond what's documented below)
 
-Next agent: implement per the "What to build" section as-is — add a private
-`mergeDiscoveredId(pid, into, logLabel)` method (or equivalent name) on `FretService`, call it from
-both loop bodies (successor/predecessor loop passes `pid` directly; sample loop passes `s.id`), keep
-each site's own accumulator var name and per-site log label distinguishable, keep the sample-loop's
-re-hash-not-trust comment in exactly one place (the extracted method or immediately above it) with
-both call sites' remaining comments pointing at it rather than restating it. Do not touch
-`mergeSnapshotCaps`/parsers. Then run:
-- `cd packages/fret && npx tsc --noEmit`
-- `cd packages/fret && yarn test` (or targeted: `rpc.handler-fuzz.spec.ts`,
-  `announce-rate-limit.spec.ts`, `rpc.snapshot-merge-cap.spec.ts`)
+Confirmed by direct read (not just ticket claim), prior to the extraction landing:
+- `mergeAnnounceSnapshot` loops were at `fret-service.ts:2035-2042` (successors/predecessors) and
+  `2045-2061` (sample), accumulator `discovered`.
+- `fetchAndMergeSnapshot` loops were at `fret-service.ts:2660-2667` (successors/predecessors) and
+  `2668-2674` (sample), accumulator `announced`.
+- Both shapes matched the ticket's description exactly — no drift beyond what's already documented.
 
 ## Correction to the plan-stage research
 
 The plan ticket this was promoted from claimed the fetch-path loop logs a dropped id through
-`console.warn`. That is no longer true — grepped at promotion time, zero `console.warn` hits in
-`fret-service.ts`. Both loops already log through the package logger (`log.error`). Some other
-change fixed that already. The remaining, still-true case for extracting is just: two copies of
-the same ~20-line loop, and the accumulator is named differently in each (`discovered` in
-`mergeAnnounceSnapshot`, `announced` in `fetchAndMergeSnapshot`) — cosmetic, but it makes the two
+`console.warn`. That was not true even before this ticket's edit — grepped at promotion time, zero
+`console.warn` hits in `fret-service.ts`. Both loops already logged through the package logger
+(`log.error`). The remaining, still-true case for extracting was just: two copies of the same
+~20-line loop, with the accumulator named differently in each (`discovered` in
+`mergeAnnounceSnapshot`, `announced` in `fetchAndMergeSnapshot`) — cosmetic, but it made the two
 read as unrelated code to anyone grepping, and a future change to how a received id is stored
-(different scoring call, an extra guard) can be applied to one copy and forgotten on the other.
+(different scoring call, an extra guard) could be applied to one copy and forgotten on the other.
 
-## The two sites (read both before touching either)
+## What was built (second run, per the resume-note that was here before)
 
-`packages/fret/src/service/fret-service.ts`:
+Added private `mergeDiscoveredId(pid, into, logLabel)` on `FretService`, right before
+`mergeAnnounceSnapshot`. Both of `mergeAnnounceSnapshot`'s loops (successor/predecessor, sample)
+call it, passing `discovered` and labels `'mergeAnnounceSnapshot'` / `'mergeAnnounceSnapshot
+sample'`. Both of `fetchAndMergeSnapshot`'s loops call the same method, passing `announced` and
+labels `'fetchAndMergeSnapshot'` / `'fetchAndMergeSnapshot sample'`. The re-hash-not-trust
+rationale comment is kept once, on the extracted method's docstring, with a short pointer comment
+above each sample loop instead of restating it. `mergeSnapshotCaps`, the parsers, and
+`calibrateSizeFromSnapshot` were not touched.
+
+## The two sites (for reference, read both before touching either if further edits are needed)
+
+`packages/fret/src/service/fret-service.ts`, before extraction:
 
 - `mergeAnnounceSnapshot` (~line 2005), the loops from ~2035–2062:
   ```ts
@@ -91,8 +90,7 @@ read as unrelated code to anyone grepping, and a future change to how a received
   }
   ```
 - `fetchAndMergeSnapshot` (~line 2626), the loops from ~2660–2674: line-for-line the same shape,
-  same `hashPeerId(peerIdFromString(...))` → `noteDiscovered` → push-if-new, same per-entry
-  `try`/`catch`, just accumulating into `announced` instead of `discovered`.
+  accumulating into `announced` instead of `discovered`.
 
 Both loops feed the **same** two inputs each call site already has: an array of plain peer-id
 strings (`successors`/`predecessors` concatenated) and `snap.sample` (`Array<{id, coord,
@@ -101,86 +99,21 @@ comment at the sample loop for why). Both loops write into `this.store` via `not
 (never `applyTouch`/`upsert` directly — a gossiped id gets the one-off hearsay baseline, not
 frequency credit; see `docs/fret.md` under *Relevance scoring and table management*).
 
-## What to build
-
-Extract one private method on `FretService` that does the "take an id, hash it, note it as
-discovered, remember if it's new" step, and have both loops call it. Suggested shape (adjust
-naming to match house style, not load-bearing):
-
-```ts
-/**
- * Hash + noteDiscovered one remote-supplied id, appending it to `into` if it was new to the
- * store. Shared by mergeAnnounceSnapshot and fetchAndMergeSnapshot — both take a peer's
- * neighbour list and store it identically; this is that "store it" step in one place so a future
- * change to it (a different scoring call, an extra guard) cannot land on one path and not the
- * other.
- */
-private async mergeDiscoveredId(pid: string, into: string[], logLabel: string): Promise<void> {
-	try {
-		const coord = await hashPeerId(peerIdFromString(pid));
-		if (await this.noteDiscovered(pid, coord)) into.push(pid);
-	} catch (err) {
-		log.error('%s: failed for %s - %e', logLabel, pid, err);
-	}
-}
-```
-
-Both call sites become e.g.:
-
-```ts
-for (const pid of [...(snap.successors ?? []), ...(snap.predecessors ?? [])]) {
-	await this.mergeDiscoveredId(pid, discovered, 'mergeAnnounceSnapshot');
-}
-for (const s of snap.sample ?? []) {
-	await this.mergeDiscoveredId(s.id, discovered, 'mergeAnnounceSnapshot sample');
-}
-```
-
-(and the fetch path the same, with its own accumulator variable name and log label). Keep each
-site's accumulator variable named as it is today (`discovered` / `announced`) if you prefer — the
-duplication being removed is the *loop body*, not the variable name; renaming both to match is a
-nice-to-have, not the point.
-
-Do **not** move or duplicate the sample id-vs-coord re-hash rationale comment — keep it once, at
-the extracted method or immediately above it, and have both call sites' comments (if any remain)
-point at it rather than restate it.
-
-Do **not** touch `mergeSnapshotCaps()`, the parsers (`makeSnapshotParser`), or anything upstream of
-these loops — the size-limit enforcement already lives in the parser, not the loop (see the `NOTE:`
-at `mergeSnapshotCaps` in `fret-service.ts` and the corresponding section in `docs/fret.md`); this
-ticket is purely the per-entry store step downstream of that.
-
-## Edge cases & interactions
+## Edge cases & interactions (must hold after extraction — verify these when checking tests)
 
 - **One bad id still drops only itself.** The extracted method's `try`/`catch` must keep failing
-  per-entry, not let one bad id throw out of the shared method and abort the whole calling loop —
-  this is the exact behaviour both existing loops have today and the tests below pin it.
-- **`noteDiscovered` races are unaffected.** Both call sites can run concurrently against the same
-  store (announce inbound vs. a stabilization-tick fetch); `noteDiscovered` already handles the
-  double-write race (writes only for an id it just created — see the comment above
-  `fetchAndMergeSnapshot`). The extraction must not add a second write path around it.
+  per-entry, not let one bad id throw out of the shared method and abort the whole calling loop.
+- **`noteDiscovered` races are unaffected.** The extraction must not add a second write path around
+  it.
 - **Sample entries and successor/predecessor entries take the same store treatment** despite
   arriving in different wire shapes (`string` vs `{id, coord, relevance}`) — the extracted method
   takes just the id string, so the caller does the `s.id` projection, not the shared method.
-  Do not fold the coord-decode-and-vet step (already done by the parser before either loop runs)
-  into this method.
 - **`discovered`/`announced` still feeds its caller correctly**: `mergeAnnounceSnapshot` uses it to
-  call `announceToNewPeers`; `fetchAndMergeSnapshot` returns it to its caller for the same
-  purpose. Confirm both still do after extraction — this is what
-  `test/announce-rate-limit.spec.ts` and `test/rpc.snapshot-merge-cap.spec.ts` exercise.
-- **Log label per call site.** The four distinct log messages today (`mergeAnnounceSnapshot:
-  failed for %s`, `mergeAnnounceSnapshot sample upsert failed for %s`, `failed to merge neighbor
-  %s`, `fetchAndMergeSnapshot sample upsert failed for %s`) do not need to survive verbatim, but
-  each call site's failures should still be distinguishable in logs (which loop, which path) —
-  don't collapse all four into one indistinguishable message.
-
-## Expected behaviour after the change
-
-- One unusable entry still drops only itself, on both paths (unchanged).
-- Both paths still report which ids were new, so the caller can announce them (unchanged).
-- Failed ids are logged through the package logger on both paths (already true; not part of this
-  change, just don't regress it).
-- The store-it step exists in exactly one place in the source; both merge sites call it.
+  call `announceToNewPeers`; `fetchAndMergeSnapshot` returns it to its caller for the same purpose.
+  This is what `test/announce-rate-limit.spec.ts` and `test/rpc.snapshot-merge-cap.spec.ts`
+  exercise.
+- **Log label per call site** — each call site's failures should still be distinguishable in logs
+  (which loop, which path).
 
 ## Tests
 
@@ -189,15 +122,15 @@ ticket is purely the per-entry store step downstream of that.
   - `packages/fret/test/rpc.handler-fuzz.spec.ts`
   - `packages/fret/test/announce-rate-limit.spec.ts`
   - `packages/fret/test/rpc.snapshot-merge-cap.spec.ts` (counts `store.upsert` calls on both
-    announce and fetch paths — the most direct check that the extraction didn't change how many
-    times either loop writes)
-- `cd packages/fret && npx tsc --noEmit`
-- `cd packages/fret && yarn test`
+    announce and fetch paths — the most direct check that the extraction didn't change write
+    counts)
+- `cd packages/fret && npx tsc --noEmit` — **done, confirmed clean this run.**
+- `cd packages/fret && yarn test` — **still to do.**
 
 ## TODO
 
-Extract shared per-id merge step from `mergeAnnounceSnapshot` and `fetchAndMergeSnapshot` into one
-private method; update both call sites to use it; run the tests above.
+Run the test suites above (tsc already confirmed clean), verify the extraction by eye against the
+edge cases listed, then write the `tickets/review/` handoff and delete this ticket.
 
 ## End
 Do NOT commit — runner handles commits after you complete.
