@@ -6,6 +6,7 @@ import type { PeerId, Stream } from '@libp2p/interface'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import { disable, enable } from '@libp2p/logger'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import * as lp from 'it-length-prefixed'
@@ -401,6 +402,89 @@ describe('RPC codec properties', function () {
 			padded.set([10, 0], body.byteLength + 2)
 
 			expect(await decodeJson(padded)).to.deep.equal(message)
+		})
+	})
+
+	// ---------------------------------------------------------------------------------------------
+	// A NUL in the padding points at a framing bug on the sender, so `decodeJson` counts the NULs it
+	// stripped and writes one line naming the count. Ordinary whitespace padding stays silent. The
+	// line is namespace-gated, which is what keeps it from being an amplification path given that
+	// `decodeJson` runs ahead of the maybeAct token bucket (see the `NOTE:` at the site).
+	// ---------------------------------------------------------------------------------------------
+	describe('decodeJson reports stripped NUL padding, and only NUL padding', () => {
+		const HANDLER_ERROR_NAMESPACE = 'optimystic:fret:rpc:handler:error'
+
+		/**
+		 * `log` is a module-private const in `protocols.ts`, so re-creating the logger here yields a
+		 * different weald instance and would intercept nothing. Enable the real namespace instead and
+		 * capture weald's node sink, `process.stderr.write`.
+		 *
+		 * `enable()` writes `process.env.DEBUG` as a side effect (weald's `enable` calls `save()`), so
+		 * the developer's own `DEBUG` is read first and restored afterwards.
+		 */
+		async function linesFromDecode(body: Uint8Array): Promise<string[]> {
+			const previousDebug = process.env.DEBUG
+			const previousWrite = process.stderr.write.bind(process.stderr)
+			const lines: string[] = []
+
+			enable(HANDLER_ERROR_NAMESPACE)
+			process.stderr.write = ((chunk: unknown) => {
+				lines.push(String(chunk))
+				return true
+			}) as typeof process.stderr.write
+
+			try {
+				decodeJson(body)
+			} finally {
+				process.stderr.write = previousWrite
+				if (previousDebug === undefined) {
+					disable()
+					delete process.env.DEBUG
+				} else {
+					enable(previousDebug)
+				}
+			}
+
+			return lines
+		}
+
+		function padded(before: number[], after: number[]): Uint8Array {
+			const body = encodeJson({ v: 1, from: 'p', timestamp: 1 })
+			const out = new Uint8Array(before.length + body.byteLength + after.length)
+			out.set(before, 0)
+			out.set(body, before.length)
+			out.set(after, before.length + body.byteLength)
+			return out
+		}
+
+		// `%d` is not a weald formatter, so it falls through to `util.format`, which substitutes it —
+		// the count really is in the emitted line. The whole formatted string is not pinned because it
+		// carries weald's namespace prefix and its elapsed `+Nms` suffix.
+		function strippedCount(line: string): number {
+			const match = /stripped (\d+) NUL/.exec(line)
+			expect(match, `no NUL count in ${JSON.stringify(line)}`).to.not.equal(null)
+			return Number(match?.[1])
+		}
+
+		const nulCases: Array<[string, number[], number[], number]> = [
+			['at the start only', [0, 0], [], 2],
+			['at the end only', [], [0], 1],
+			['at both ends', [0, 32], [10, 0, 0], 3],
+		]
+
+		for (const [where, before, after, expected] of nulCases) {
+			it(`logs once with the count when NUL padding sits ${where}`, async () => {
+				const lines = await linesFromDecode(padded(before, after))
+
+				expect(lines.length, 'exactly one line per decode').to.equal(1)
+				expect(strippedCount(lines[0])).to.equal(expected)
+			})
+		}
+
+		it('says nothing about padding that carries no NUL', async () => {
+			const lines = await linesFromDecode(padded([9, 32], [10, 13, 32]))
+
+			expect(lines).to.deep.equal([])
 		})
 	})
 
