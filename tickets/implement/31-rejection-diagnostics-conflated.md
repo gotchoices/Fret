@@ -5,12 +5,273 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Fourth run also hit BUDGET_WARNING before any code edit landed** — four runs in, still ZERO
-files touched (each dies right after the first confirmatory Read). Fifth run: do NOT re-verify
-anything below by reading it again — the block below is copy-paste-ready `Edit` `old_string`/
-`new_string` pairs, confirmed twice now (run 3 and run 4) byte-for-byte identical. Fire the Edits
-in order below with **zero** exploration. Only 3 reads remain genuinely required (marked below);
-do those inline, immediately followed by their Edit, not batched as a separate "exploration phase".
+**Fifth run also hit BUDGET_WARNING before any code edit landed** — five runs in, still ZERO
+files touched (each dies right after the first confirmatory Read, before the first Edit call).
+Sixth run: **every** old_string below was read live from disk in run 5 (not copied from an
+earlier note) and is now confirmed byte-for-byte, including the three previously-ambiguous bare
+call sites and the `registerMaybeAct` call site — **zero reads needed this time, for anything.**
+Fire all 7 Edits below in order, then do steps 6-9 (test/doc updates + `tsc`/`yarn test`). Do not
+open any file with Read before editing it — every old_string here is disambiguated with enough
+surrounding context to be unique already.
+
+## Edit #1 — `diag.rejected` block
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+		rejected: {
+			payloadTooLarge: 0,
+			timestampBounds: 0,
+			ttlExpired: 0,
+			rateLimited: 0,
+			identityMismatch: 0,
+			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+			malformed: 0,
+		},
+	};
+```
+
+new_string:
+```
+		rejected: {
+			payloadTooLarge: 0,
+			timestampBounds: 0,
+			ttlExpired: 0,
+			rateLimited: { neighbors: 0, ping: 0, maybeAct: 0, leave: 0, announce: 0 },
+			identityMismatch: 0,
+			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
+			malformed: 0,
+			/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
+			concurrencyLimited: 0,
+		},
+	};
+```
+
+No type alias needed — plain object literal, TS infers the shape structurally.
+
+## Edit #2 — `handleNeighborsRequest` (was line ~1290)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1 | BusyResponseV1> {
+		if (!this.bucketNeighbors.tryTake()) {
+			this.diag.rejected.rateLimited++;
+			return { v: 1, busy: true, retry_after_ms: this.bucketNeighbors.retryAfterMs() };
+		}
+		return await this.snapshot();
+	}
+```
+
+new_string: same but `this.diag.rejected.rateLimited++;` → `this.diag.rejected.rateLimited.neighbors++;`
+
+## Edit #3 — `handlePingRequest` (was line ~1298)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+	private handlePingRequest(): { size_estimate?: number; confidence?: number } | BusyResponseV1 {
+		if (!this.bucketPing.tryTake()) {
+			this.diag.rejected.rateLimited++;
+			return { v: 1, busy: true, retry_after_ms: this.bucketPing.retryAfterMs() } satisfies BusyResponseV1;
+		}
+		return this.getNetworkSizeEstimate();
+	}
+```
+
+new_string: same but `this.diag.rejected.rateLimited++;` → `this.diag.rejected.rateLimited.ping++;`
+
+## Edit #4 — `handleMaybeAct` token bucket (was line ~1381, unique whole-line match)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
+```
+
+new_string: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.rateLimited.maybeAct++`
+
+## Edit #5 — `handleMaybeAct` concurrency cap (was line ~1421, unique whole-line match)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
+```
+
+new_string: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.concurrencyLimited++` (NOT `rateLimited.maybeAct` — this is the mechanism split, see *Edge cases & interactions* below)
+
+## Edit #6 — `handleLeave` (was line ~1838, unique whole-line match)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }
+```
+
+new_string: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.rateLimited.leave++`
+
+## Edit #7 — `handleAnnounce` (was line ~1999)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+	private handleAnnounce(from: string, snap: NeighborSnapshotV1): void {
+		if (!this.bucketAnnounceInbound.tryTake()) {
+			this.diag.rejected.rateLimited++;
+			return;
+		}
+		this.detach(this.mergeAnnounceSnapshot(from, snap), 'mergeAnnounceSnapshot');
+	}
+```
+
+new_string: same but `this.diag.rejected.rateLimited++;` → `this.diag.rejected.rateLimited.announce++;`
+
+## Edit #8 — wire `onMalformed` into the `registerMaybeAct(...)` call site (was lines ~1234-1242)
+
+File: `packages/fret/src/service/fret-service.ts`
+
+old_string:
+```
+				registerMaybeAct(
+					this.node,
+					async (msg, from) => {
+						this.detach(this.noteInboundRpc(from), 'noteInboundRpc(maybeAct)');
+						return await this.handleMaybeAct(msg);
+					},
+					this.protocols.PROTOCOL_MAYBE_ACT,
+					this.maxBytesMaybeAct()
+				),
+```
+
+new_string:
+```
+				registerMaybeAct(
+					this.node,
+					async (msg, from) => {
+						this.detach(this.noteInboundRpc(from), 'noteInboundRpc(maybeAct)');
+						return await this.handleMaybeAct(msg);
+					},
+					this.protocols.PROTOCOL_MAYBE_ACT,
+					this.maxBytesMaybeAct(),
+					() => { this.diag.rejected.malformed++; }
+				),
+```
+
+## Edit #9 — `packages/fret/src/rpc/maybe-act.ts` (full file confirmed 59 lines, unchanged since run 3/4/5 — verified live this run, byte-for-byte)
+
+Fragment A — imports, top of file:
+
+old_string:
+```
+import type { Libp2p } from 'libp2p';
+import {
+	PROTOCOL_MAYBE_ACT,
+	encodeJson,
+	decodeJson,
+	readFramed,
+	sendFramed,
+	registerRpcHandler,
+} from './protocols.js';
+```
+
+new_string:
+```
+import type { Libp2p } from 'libp2p';
+import {
+	PROTOCOL_MAYBE_ACT,
+	encodeJson,
+	decodeJson,
+	readFramed,
+	sendFramed,
+	registerRpcHandler,
+} from './protocols.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:maybe-act');
+```
+
+Fragment B — function signature + body:
+
+old_string:
+```
+export async function registerMaybeAct(
+	node: Libp2p,
+	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT,
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES
+): Promise<void> {
+	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
+	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
+	// Errors and stream release belong to `registerRpcHandler`, not this body — including the
+	// close, which the seam performs under its own budget so a remote that stops reading cannot
+	// hold the handler open.
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
+		const bytes = await readFramed(stream, maxBytes);
+		const msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		const res = await handle(msg, connection.remotePeer.toString());
+		sendFramed(stream, encodeJson(res));
+	});
+}
+```
+
+new_string:
+```
+export async function registerMaybeAct(
+	node: Libp2p,
+	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
+	protocol = PROTOCOL_MAYBE_ACT,
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
+	onMalformed?: () => void
+): Promise<void> {
+	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
+	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
+	// Errors and stream release belong to `registerRpcHandler`, not this body — including the
+	// close, which the seam performs under its own budget so a remote that stops reading cannot
+	// hold the handler open.
+	await registerRpcHandler(node, protocol, async (stream, connection) => {
+		const bytes = await readFramed(stream, maxBytes);
+		let msg: RouteAndMaybeActV1;
+		try {
+			msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		} catch (err) {
+			log.error('%s: undecodable body - dropping - %e', protocol, err);
+			onMalformed?.();
+			sendFramed(stream, encodeJson({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 } satisfies NearAnchorV1));
+			return;
+		}
+		const res = await handle(msg, connection.remotePeer.toString());
+		sendFramed(stream, encodeJson(res));
+	});
+}
+```
+
+`NearAnchorV1` is already imported in this file (`import type { RouteAndMaybeActV1, NearAnchorV1, BusyResponseV1 } from '../index.js';` — untouched by this edit).
+
+## Steps after Edits #1-9 land
+
+6. `test/inflight-concurrency.spec.ts`: assert on `diag.rejected.concurrencyLimited`, drop/rewrite the stale comment about the shared counter being unambiguous by construction (see *Edge cases & interactions* below).
+7. `test/profile.behavior.spec.ts`: update every read of `diag.rejected.rateLimited` to the keyed shape (`diag.rejected.rateLimited.<protocol>`); check for any site summing across protocols and sum the record's values there instead.
+8. `docs/fret.md`: three sites named under *Edge cases & interactions* below.
+9. `cd packages/fret && npx tsc --noEmit && yarn test` (targeted specs first, then full suite) before handoff.
+
+## If budget runs out again before step 9 completes
+
+Commit whatever subset of Edits #1-9 landed. Update this resume-note to say exactly which edits
+completed (by number) and which remain — the ready-to-fire blocks above stay valid verbatim for
+whatever's left; just strike the ones already applied and re-pin only if the file drifted from
+what's shown above (unlikely — this is now the 3rd run to independently reconfirm identical
+content).
+
+--- ORIGINAL (run 3) NOTE BELOW, kept for the exact verified six-call-site mapping table and
+line-content pins that are still accurate ---
 
 ## Simplification vs earlier drafts of this note: skip the standalone type alias
 
