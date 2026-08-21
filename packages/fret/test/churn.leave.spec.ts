@@ -690,21 +690,27 @@ describe('Leave notice replacements (sender side)', function () {
 	 * inside 8 — the cap never bit, so neither could see any of this.
 	 */
 	describe('at the shipped k of 15', function () {
-		// Windows at m = 8 over 24 seeded peers: clockwise {+1..+8}, counter-clockwise
-		// {+24..+17}. That leaves {+9..+16} outside both — the replacement pool, and where the
-		// one connected non-neighbor sits.
-		const COUNT = 24
+		// Windows at m = 8 over 40 seeded peers: clockwise {+1..+8}, counter-clockwise
+		// {+40..+33}. The replacement walk reaches 16 per side beyond those, so the pool is
+		// {+9..+24} clockwise and {+32..+17} counter-clockwise — and {+25..+32} is reachable
+		// **only** counter-clockwise, which is what makes the interleave observable at all.
+		const COUNT = 40
 		const SUCC_WINDOW = [1, 2, 3, 4, 5, 6, 7, 8]
-		const PRED_WINDOW = [24, 23, 22, 21, 20, 19, 18, 17]
-		const OUTSIDE = [9, 10, 11, 12, 13, 14, 15, 16]
+		const PRED_WINDOW = [40, 39, 38, 37, 36, 35, 34, 33]
+		const OUTSIDE = Array.from({ length: 24 }, (_, i) => i + 9)
+		/** Reachable counter-clockwise only: a side-major cap can never include one of these. */
+		const PRED_ONLY = [25, 26, 27, 28, 29, 30, 31, 32]
 		/** One real, dialable node per side of the window, plus one outside it. */
 		const SUCC_RECEIVER = 1
-		const PRED_RECEIVER = 24
+		const PRED_RECEIVER = 40
 		// Outside the S/P window but still inside the beyond-S/P arm's reach: that arm asks
 		// `expandCohort` for `ids.length + fanOut` = 20 ids around self, which the alternating
-		// walk fills from {+1..+10} and {+24..+15}. A peer past +10 is outside the window *and*
-		// outside the fan-out, so it would test nothing.
-		const OUTSIDE_RECEIVER = 10
+		// walk fills 10 per side, i.e. {+1..+10} and {+40..+31}. +9 leaves a slot of margin;
+		// a peer past +10 is outside the window *and* outside the fan-out, so it tests nothing.
+		// NOTE: this offset assumes `expandCohort`'s reach rather than asserting it; a future
+		// change to `fanOut` or to its over-fetch would make the fan-out case vacuous rather
+		// than fail. Assert the reach here if that ever bites.
+		const OUTSIDE_RECEIVER = 9
 
 		let rig: SenderRig | undefined
 		let notice: LeaveNoticeV1
@@ -737,20 +743,21 @@ describe('Leave notice replacements (sender side)', function () {
 		})
 
 		it('draws every replacement from beyond that window, both sides', () => {
-			const outside = OUTSIDE.map((o) => rig!.idAt(o))
+			const idsAt = (offsets: number[]) => offsets.map((o) => rig!.idAt(o))
 			// 16 ids excluded from a 2m = 16-per-side walk: without the helper's `+ exclude.size`
 			// over-fetch, a side the exclusions blanket yields nothing and the list comes from one
 			// side only.
 			expect(notice.replacements!.length, 'maxReplacements, filled').to.equal(6)
 			for (const id of notice.replacements!) {
-				expect(outside, 'the pool is the wider walk minus the window').to.include(id)
+				expect(idsAt(OUTSIDE), 'the pool is the wider walk minus the window').to.include(id)
 			}
-			const from = (offsets: number[]) =>
-				notice.replacements!.filter((id) => offsets.map((o) => rig!.idAt(o)).includes(id))
-			expect(from([9, 10, 11, 12]).length,
-				'interleaved, so the cap does not empty the clockwise side first').to.be.greaterThan(0)
-			expect(from([13, 14, 15, 16]).length,
-				'interleaved, so the cap does not empty the counter-clockwise side first').to.be.greaterThan(0)
+			// The discriminating half. {+25..+32} is past the clockwise walk's 16-id trim, so it
+			// is reachable only counter-clockwise: under the side-major ordering this change
+			// replaced, the six-id cap fills from {+9..+14} and none of these can appear.
+			const fromPredOnly = notice.replacements!.filter((id) => idsAt(PRED_ONLY).includes(id))
+			expect(fromPredOnly.length,
+				'interleaved, so the cap takes from both sides rather than emptying the clockwise one')
+				.to.be.greaterThan(0)
 		})
 
 		it('sends each peer exactly one notice, S/P and beyond-S/P together', () => {
