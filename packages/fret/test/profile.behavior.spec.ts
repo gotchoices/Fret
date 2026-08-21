@@ -5,6 +5,7 @@ import { buildMesh, type Mesh } from './helpers/mesh.js'
 import { useCleanup, type Cleanup } from './helpers/cleanup.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
+import { ExpiringMap } from '../src/utils/expiring-map.js'
 import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
 import { peerDiscoverySymbol } from '@libp2p/interface'
 import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
@@ -380,6 +381,41 @@ describe('Profile behavior tests', function () {
 			const svc = new Libp2pFretService({}, { profile: 'core', k: 7 }, { maxTracked: 77 })
 			const disc = svc[peerDiscoverySymbol] as any
 			expect(disc.emitted.capacity).to.equal(77)
+		})
+
+		it('stabilizeOnce sweeps expired entries from backoffMap and departureDebounce', async () => {
+			const { svc } = await createService('core')
+
+			let clockNow = Date.now()
+			const clock = { now: () => clockNow, advance: (ms: number) => { clockNow += ms } }
+
+			const backoffTtl = (CoreFretService as any).BACKOFF_RETAIN_MS
+			const departureTtl = (CoreFretService as any).DEPARTURE_DEBOUNCE_MS
+
+			;(svc as any).backoffMap = new ExpiringMap({ capacity: 8, ttlMs: backoffTtl, now: clock.now })
+			;(svc as any).departureDebounce = new ExpiringMap({ capacity: 8, ttlMs: departureTtl, now: clock.now })
+
+			// backoffMap survivor must already be a store member, or pruneBackoffMap (which runs
+			// inside the same sweepBoundedMaps call) drops it regardless of expiry.
+			const selfId: string = (svc as any).selfIdStr
+			const backoffExpiredId = 'backoff-expired-peer'
+			const departureExpiredId = 'departure-expired-peer'
+			const departureLiveId = 'departure-live-peer'
+
+			;(svc as any).backoffMap.set(backoffExpiredId, { until: clockNow, factor: 1 })
+			;(svc as any).departureDebounce.set(departureExpiredId, clockNow)
+
+			clock.advance(Math.min(backoffTtl, departureTtl) + 1)
+
+			;(svc as any).backoffMap.set(selfId, { until: clockNow, factor: 1 })
+			;(svc as any).departureDebounce.set(departureLiveId, clockNow)
+
+			await (svc as any).stabilizeOnce()
+
+			expect((svc as any).backoffMap.has(backoffExpiredId)).to.equal(false)
+			expect((svc as any).departureDebounce.has(departureExpiredId)).to.equal(false)
+			expect((svc as any).backoffMap.has(selfId)).to.equal(true)
+			expect((svc as any).departureDebounce.has(departureLiveId)).to.equal(true)
 		})
 	})
 })

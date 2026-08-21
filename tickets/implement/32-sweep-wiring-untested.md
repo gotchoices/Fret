@@ -4,10 +4,56 @@ difficulty: easy
 ----
 
 <!-- resume-note -->
-Prior run stopped on a BUDGET_WARNING after read-only investigation, before writing any test
-code or making any edit. Nothing in the repo has changed. All file:line references in the
-`files:` header above were verified against the current source during that investigation (they
-match the original ticket's claims exactly, so they can be trusted without re-grepping):
+SECOND interruption on BUDGET_WARNING, this time after the test code was written (not before).
+Do NOT repeat the investigation below — it is already done and the test is already in the file.
+What is left is purely mechanical: run tsc, run the spec file, fix anything that fails, write
+the review/ handoff, delete this ticket.
+
+## What's already done
+
+The test `'stabilizeOnce sweeps expired entries from backoffMap and departureDebounce'` has been
+added to `test/profile.behavior.spec.ts`, inside the `Bounded internal map capacities` describe
+block, immediately after the `an explicit discoveryCfg.maxTracked...` case (around line 386 as of
+this writing — grep the title string to find it if line numbers have drifted). An
+`import { ExpiringMap } from '../src/utils/expiring-map.js'` was added to the file's import block
+alongside the existing `TokenBucket` import.
+
+The test: starts a real `core` service via `createService('core')`; builds a mutable
+`{ now, advance }` fake-clock closure; swaps `(svc as any).backoffMap` and
+`(svc as any).departureDebounce` for fresh `ExpiringMap`s built with `now: clock.now` (same
+idiom as `ring-membership.spec.ts:455-482`); seeds one expiring entry in each map
+(`backoff-expired-peer`, `departure-expired-peer`); advances the clock past
+`min(BACKOFF_RETAIN_MS, DEPARTURE_DEBOUNCE_MS) + 1`; seeds one surviving entry in each map
+*after* advancing (`departure-live-peer`, and — critically — `(svc as any).selfIdStr` as the
+backoffMap survivor id, since `pruneBackoffMap` would otherwise drop a synthetic id that isn't in
+the routing store, regardless of its expiry); calls `await (svc as any).stabilizeOnce()`; asserts
+both expired entries are gone and both survivors remain.
+
+## What is NOT done — do this next, in order
+
+1. **Run tsc first**: `cd packages/fret && npx tsc --noEmit`. A background diagnostics pass
+   flagged two issues on save that need checking for real (they may be stale/transient — one is
+   `'ExpiringMap' is declared but its value is never read` at the import, which is very likely
+   wrong since the new test does call `new ExpiringMap(...)` twice; the other is an arithmetic
+   type error on a pre-existing, untouched line — `expect(after - before).to.equal(3)` — in the
+   unrelated `'Three rejected requests'` test above the new one. If tsc reports the arithmetic
+   error for real and it is on code this ticket did not touch, treat it as a pre-existing failure
+   per the pre-existing-test-failure protocol (check `tickets/.pre-existing-known.md` first, else
+   write `tickets/.pre-existing-error.md`) — do not fix unrelated pre-existing code as part of
+   this ticket, and do not paper over it. If tsc is clean, both diagnostics were stale and can be
+   ignored.
+2. **Run the spec**: `cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/profile.behavior.spec.ts" --timeout 30000`. Confirm the new test passes and nothing else in the file regressed.
+3. If both pass: write the review/ handoff ticket (delete this implement/ ticket, create
+   `tickets/review/sweep-wiring-untested.md` — no need to keep a sequence prefix, or keep `32-` if
+   convenient) summarizing what the test proves (stabilizeOnce actually drives sweepBoundedMaps →
+   both ExpiringMaps get swept, proven by a surviving entry alongside the swept ones so a
+   tick-clears-everything implementation would also be caught) and noting it is a single targeted
+   regression test with no build-wide changes.
+
+## Original investigation (for reference only — already applied above, no need to re-verify)
+
+All file:line references in the `files:` header above were verified against the current source
+during the original investigation (they match the original ticket's claims exactly):
 
 - `stabilizeOnce` (fret-service.ts:2246) opens with `this.sweepBoundedMaps();` — confirmed.
 - `sweepBoundedMaps` (fret-service.ts:3084) calls `this.pruneBackoffMap();` (fret-service.ts:3087)
