@@ -14,7 +14,7 @@ import type {
 	LookupOptions,
 } from '../index.js';
 import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
-import { hashKey, hashPeerId, coordToBase64url, base64urlToCoord } from '../ring/hash.js';
+import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
 import { makeProtocols, validateTimestamp } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
@@ -1765,7 +1765,7 @@ export class FretService implements IFretService, Startable {
 	 * option to `fetchNeighbors` in `fetchAndMergeSnapshot` (fetch path) — so a message is already
 	 * truncated by the time either merge loop sees it. Neither loop slices: enforcing in two
 	 * places is exactly how two copies of a cap drift apart, and the loops' own `try/catch` is a
-	 * separate guard (a `base64urlToCoord` throw), not a cap. Do not re-add a slice; widen or
+	 * separate guard (a bad peer id or a failed re-hash), not a cap. Do not re-add a slice; widen or
 	 * narrow the numbers here and both paths follow.
 	 */
 	private mergeSnapshotCaps(): { successors: number; predecessors: number; sample: number } {
@@ -1825,12 +1825,23 @@ export class FretService implements IFretService, Startable {
 					log.error('mergeAnnounceSnapshot: failed for %s - %e', pid, err);
 				}
 			}
-			// merge sample if present — truncated and per-entry coord-vetted by the parser above,
-			// so `base64urlToCoord` throws only on a parser-bypassed body; the try/catch also
-			// covers `upsert` / `applyTouch`, which the parser says nothing about.
+			// merge sample if present — truncated by the parser above; the try/catch covers the
+			// id parse, the re-hash, and `upsert` / `applyTouch`.
 			for (const s of snap.sample ?? []) {
 				try {
-					const coord = base64urlToCoord(s.coord);
+					// RE-HASH, never trust `s.coord`. A ring coordinate is *defined* as
+					// SHA-256(peerId.toMultihash().bytes), so it is derivable from the id and the
+					// wire field is at best a redundant copy — and at worst a free choice of ring
+					// position for any id the sender names. Trusting it let a transport-
+					// authenticated peer place *another* peer's id anywhere on the ring with no id
+					// grinding, making that id a neighbor, anchor and cohort member for keys it
+					// must never serve. The successor/predecessor loops above always re-hashed;
+					// only the sample was ever trusted, and there is no reason for the difference.
+					// The parser still checks `s.coord` decodes to 32 bytes: the field stays part
+					// of the wire shape (removing it is a format change), and a sender emitting
+					// malformed coordinates is worth dropping the entry over even though nothing
+					// reads the value.
+					const coord = await hashPeerId(peerIdFromString(s.id));
 					if (!this.store.getById(s.id)) discovered.push(s.id);
 					this.store.upsert(s.id, coord);
 					await this.applyTouch(s.id, coord);
@@ -2333,7 +2344,8 @@ export class FretService implements IFretService, Startable {
 		}
 		for (const s of snap.sample ?? []) {
 			try {
-				const coord = base64urlToCoord(s.coord);
+				// Re-hashed, not trusted — see the sample loop in `mergeAnnounceSnapshot`.
+				const coord = await hashPeerId(peerIdFromString(s.id));
 				if (!this.store.getById(s.id)) announced.push(s.id);
 				this.store.upsert(s.id, coord);
 				await this.applyTouch(s.id, coord);
