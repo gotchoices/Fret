@@ -187,6 +187,11 @@ export class DigitreeStore {
 		this.byId = new Map();
 	}
 
+	// NOTE: a would-be negative count is folded into delete rather than raised. Unreachable while
+	// every write goes through `put`/`remove` (pinned by the property test in
+	// test/digitree.invariants.spec.ts, which recounts after every op); if a future write path
+	// ever lands outside those seams, make this throw so the desync is loud rather than a
+	// silently-clamped zero.
 	private bumpCount<K>(counts: Map<K, number>, key: K, delta: number): void {
 		const next = (counts.get(key) ?? 0) + delta;
 		if (next <= 0) counts.delete(key);

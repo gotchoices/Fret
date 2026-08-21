@@ -452,6 +452,16 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     which coerces to `0` when assigned into a `Uint8Array`, so garbage decoded to a plausible
     near-zero coordinate), so a malformed wire value is rejected at the boundary it entered by
     and the seam is the backstop.
+  - **Per-label counts are maintained at that same write seam, not derived by walking.**
+    The store keeps an O(1) tally of how many entries carry each `membership` label and each
+    `state` (`countByMembership` / `countByState`), bumped only by `put` (outgoing prior entry
+    down, incoming entry up — so an insert, a re-key and a replace are all one rule) and by
+    `remove`. They ride the seam the tree/id-index invariant already depends on, so anything
+    that would desync those two would desync the counts identically, and the same property test
+    covers all three. Counting rather than branching keeps the store network-agnostic: it tallies
+    fields it already owns and still never asks what a label *means*. A zero count is a sound
+    proof that any compound predicate narrowing that label matches nothing, which is what lets a
+    caller skip a full-table walk outright.
   - Bounded capacity with victim selection; S/P protected by the protection set described under *Relevance scoring and table management*, not by a score.
   - Import/export compact snapshots for bootstrap and neighbors (NeighborSnapshotV1).
   - Import/export full routing table snapshots for persistence and fast bootstrap (see Routing table persistence below).
