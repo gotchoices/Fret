@@ -22,6 +22,28 @@ resume-note below, which confirms that prereq landed and re-verifies each item a
 code; item 3 not yet located; item 4's fix depends on one unverified assumption. No code edited
 this run — stopped by BUDGET_WARNING before implement handoff. -->
 
+<!-- resume-note (2026-08-21, run 2): item 3 investigated and RESOLVED BY PRIOR WORK — no code
+change needed for it (see below). Item 4 still open: registerJsonHandler's undefined-serve
+handling not yet read. Stopped by BUDGET_WARNING again before implement handoff; no code edited
+this run. -->
+
+**Item 3 re-investigation (2026-08-21, run 2): the non-null-assertion pattern described no longer
+exists — already fixed by the `rpc-shared-helper` consolidation.** Grepped all of
+`packages/fret/src/rpc/*.ts` for `openRpcStream(` (one call site: `request.ts:259`, inside
+`rpcRequest`) and for stream-typed non-null assertions (`\w!\)`, `\w!;`, `\w!,`, `\w!\.` across
+`packages/fret/src`). The only `!` hits are `signal!` in `protocols.ts:574,592` (`readFramed`),
+which assert `opts.signal` is non-null after an entry check already guarantees it (`timeoutMs ===
+Infinity && signal == null` throws at entry) — unrelated to streams and not what this item
+describes. `openRpcStream` already returns `Stream | undefined` (`protocols.ts:654-674`), and its
+one caller (`rpcRequest`, `request.ts:259-263`) already does a plain `if (stream == null) return {
+kind: 'skipped' }` — no assertion. So the "stream-open helper require-existing overload" design
+this item asked for was effectively superseded: `rpcRequest` centralized every sender
+(`sendPing`/`fetchNeighbors`/`sendMaybeAct`/`announceNeighbors`/`sendLeave`) during the
+`rpc-shared-helper` split, and that consolidation already replaced whatever per-sender `!`
+assertions this item was filed against with one clean null-check. **Action for implement/: none —
+drop this item from the cleanup ticket**, or if the implementer wants an overload anyway purely
+for the type ergonomics, that's optional polish, not a bug fix (no unsafe assertion exists today).
+
 **Prereq status: `rpc-shared-helper` fully landed.** It was split into `15.1-rpc-length-prefix-framing`,
 `15.2-rpc-request-helper`, `15.3-rpc-message-validators` (see `git show d0e90df`), which further
 split into `15.2a3-rpc-request-seam`, `15.31/15.32/15.33-*` etc. — all now sitting in
@@ -95,7 +117,7 @@ Re-verified against current code (2026-08-21):
    when a non-whitespace byte is stripped" rather than "reject the message."
 
 **Remaining TODO before this can go to implement/:**
-- [ ] Locate item 3's actual call sites (grep starting points above) and confirm/adjust the overload design.
-- [ ] Read `registerJsonHandler`'s `undefined`-serve-result handling in `protocols.ts` to confirm item 4's fix is safe on the success path, not just the reject path.
-- [ ] Once both are confirmed, this ticket has no remaining open design question and should move to `tickets/implement/` as one ticket (all five items are small, same-directory, same-risk-class — no need to split).
+- [x] ~~Locate item 3's actual call sites~~ — done (run 2, 2026-08-21): resolved by prior work, no code change needed, item drops out.
+- [ ] Read `registerJsonHandler`'s `undefined`-serve-result handling in `protocols.ts` (around line 198-200 per the `export function registerJsonHandler` overloads found this run — body not yet read) to confirm item 4's fix (`leave.ts:51`, `neighbors.ts:78`: change `return { ok: true };` to `return undefined;`) is safe on the success path (message accepted, notice/snapshot applied), not just the identity-mismatch/reject path the existing code comment covers. Specifically confirm the seam's `close()` still runs regardless of whether `serve` returns `undefined` vs `{ok:true}` on this path — i.e. that skipping the reply body doesn't skip the seam's own stream release.
+- [ ] Once confirmed, this ticket has 4 remaining items (1, 2, 4, 5 — item 3 dropped) and should move to `tickets/implement/` as one ticket (small, same-directory, same-risk-class — no need to split).
 
