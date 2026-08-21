@@ -144,26 +144,80 @@ describe('FretService capacity enforcement and victim selection', function () {
 	// The headline case, and the doc-promised path in *Routing table persistence*: importing a
 	// table larger than capacity evicts by relevance — except where protection says otherwise.
 	it('protects the ring neighbors around self even though they score lowest in the table', async () => {
-		// m 3 → protection breadth 3 → each walk starts *on* self, so self plus 2 live members
-		// clockwise and 2 counter-clockwise: 5 protected ids.
+		// m 3 → `ringNeighborsBothSides(self, 3)` → self plus the 3 nearest live members
+		// clockwise and the 3 nearest counter-clockwise: 7 protected ids (`2m + 1`). The walk
+		// over-fetches by one per side so self does not consume a slot, which is what makes the
+		// m-th successor and m-th predecessor protected rather than evictable.
 		//
-		// Note that this is one *fewer* live member per side than the configured m: the walks
-		// spend a slot on self, so the m-th successor and m-th predecessor are not protected even
-		// though `docs/fret.md` calls the whole of S(p) ∪ P(p) retained. Pinned here as current
-		// behavior; reconciling the self-anchored walks is `plan/23-fret-service-decomposition`.
-		const service = await seededService({ m: 3, capacity: 6 })
+		// Only ±1 and ±2 are placed near self, so the 3rd member on each side is a *far* peer:
+		// `far-1` clockwise and `far-6` counter-clockwise (by wrap-around).
+		const service = await seededService({ m: 3, capacity: 8 })
 
 		const stored = await service.importTable(tableOf(records(standardLayout(self))))
 
 		expect(stored, 'all ten records stored; self is not in the snapshot').to.equal(10)
-		// 11 entries (10 imported + self), capacity 6, so 5 evictions. The four near peers are
-		// the *lowest*-scoring entries in the whole table and survive anyway; the far peers at
-		// 1.0–5.0 are evicted despite outscoring them by two orders of magnitude.
+		// 11 entries (10 imported + self), capacity 8, so 3 evictions. The four near peers are
+		// the *lowest*-scoring entries in the whole table and survive anyway; `far-2` … `far-4`
+		// are evicted despite outscoring them by two orders of magnitude.
 		expect(survivors(service)).to.have.members([
 			selfId,
 			...NEAR_IDS,
+			'far-1',
+			'far-5',
 			'far-6',
 		])
+	})
+
+	// The specific arm the `2m + 1` protection set buys: the *m-th* member on each side. Both
+	// walks are anchored exactly on self, so before the over-fetch each spent a slot on self and
+	// protected only `m - 1` peers per side, leaving these two evictable despite being genuine
+	// S(p) / P(p) members. Here they are also the two lowest-scoring entries in the whole table,
+	// so surviving can only be protection — nothing about their relevance would save them.
+	it('protects the m-th successor and m-th predecessor, the outermost member on each side', async () => {
+		const service = await seededService({ m: 3, capacity: 8 })
+		const ring: Placed[] = [
+			{ id: 'succ-1', coord: ringOffset(self, 1), relevance: 0.05 },
+			{ id: 'succ-2', coord: ringOffset(self, 2), relevance: 0.04 },
+			{ id: 'succ-3', coord: ringOffset(self, 3), relevance: 0.01 },
+			{ id: 'pred-1', coord: ringOffset(self, -1), relevance: 0.06 },
+			{ id: 'pred-2', coord: ringOffset(self, -2), relevance: 0.03 },
+			{ id: 'pred-3', coord: ringOffset(self, -3), relevance: 0.02 },
+		]
+		const far: Placed[] = Array.from({ length: 4 }, (_, i) => ({
+			id: `far-${i + 1}`,
+			coord: ringOffset(self, (i + 1) * 1000),
+			relevance: i + 1,
+		}))
+
+		await service.importTable(tableOf(records([...ring, ...far])))
+
+		const ids = survivors(service)
+		// 11 entries, capacity 8, so 3 evictions — and every one of them is a far peer scoring
+		// one to two orders of magnitude above the ring members that survive.
+		expect(ids, 'm-th successor protected').to.include('succ-3')
+		expect(ids, 'm-th predecessor protected').to.include('pred-3')
+		expect(ids).to.have.members([
+			selfId, 'succ-1', 'succ-2', 'succ-3', 'pred-1', 'pred-2', 'pred-3', 'far-4',
+		])
+	})
+
+	// Self is added to the protection set explicitly, not drawn from the ring walk. On a ring
+	// whose only live member is self the walk returns nothing at all — a filtered walk that
+	// matches only self yields an empty list, since self is excluded by id — so relying on the
+	// walk to carry self would leave the lowest-scoring entry in the table unprotected.
+	it('protects self when the ring walk returns nothing because no other peer is a live member', async () => {
+		const service = await seededService({ m: 3, capacity: 1 })
+		place(service, [
+			{ id: 'foreign-1', coord: ringOffset(self, 1), relevance: 5, membership: 'foreign' },
+			{ id: 'foreign-2', coord: ringOffset(self, -1), relevance: 6, membership: 'foreign' },
+			{ id: 'foreign-3', coord: ringOffset(self, 2), relevance: 7, membership: 'foreign' },
+		])
+
+		await enforce(service)
+
+		// Self alone is protected and is also the lowest-scoring entry (relevance 0), so a
+		// protection set drawn purely from the walk would have evicted it first.
+		expect(survivors(service)).to.deep.equal([selfId])
 	})
 
 	// `standardLayout` gives the far peers ascending relevance in ascending ring order, so
@@ -172,7 +226,7 @@ describe('FretService capacity enforcement and victim selection', function () {
 	// the far peers score *descending* with ring distance, so only a relevance-ordered eviction
 	// keeps the ring-nearest far peer.
 	it('picks victims by relevance, not by ring position or insertion order', async () => {
-		const service = await seededService({ m: 3, capacity: 6 })
+		const service = await seededService({ m: 3, capacity: 8 })
 		const layout: Placed[] = [
 			...standardLayout(self).filter((p) => NEAR_IDS.includes(p.id)),
 			...Array.from({ length: 6 }, (_, i) => ({
@@ -184,14 +238,15 @@ describe('FretService capacity enforcement and victim selection', function () {
 
 		await service.importTable(tableOf(records(layout)))
 
-		// Protection is unchanged (self plus the four near peers), so the one surviving far peer
-		// is whichever scores highest — `far-1` at 6.0, which is also the *first* far peer in
-		// ring order and would therefore be the first evicted by a ring-ordered loop.
-		expect(survivors(service)).to.have.members([selfId, ...NEAR_IDS, 'far-1'])
+		// Protection is unchanged (self, the four near peers, and the 3rd member on each side —
+		// `far-1` and `far-6`), so the one survivor decided by score is `far-2` at 5.0: the
+		// ring-*nearest* unprotected far peer, and therefore the first a ring-ordered loop would
+		// have evicted.
+		expect(survivors(service)).to.have.members([selfId, ...NEAR_IDS, 'far-1', 'far-2', 'far-6'])
 	})
 
 	it('drops a dead neighbor from protection and shifts the window outward rather than shrinking it', async () => {
-		const service = await seededService({ m: 3, capacity: 6 })
+		const service = await seededService({ m: 3, capacity: 8 })
 		place(service, standardLayout(self))
 		// Written directly, not imported: `importEntries` forces every record to
 		// `state: 'disconnected'`, so `dead` is unreachable through a snapshot.
@@ -202,12 +257,15 @@ describe('FretService capacity enforcement and victim selection', function () {
 		const ids = survivors(service)
 		expect(ids, 'dead neighbor lost its protection').to.not.include('near-cw-2')
 		// Both halves matter. The filtered ring walk *skips and keeps advancing*, so the
-		// clockwise window does not shrink to one peer — it reaches past the dead peer to the
-		// next live member, which is `far-1`. That is why `far-1` survives at relevance 1.0
-		// while `far-2` … `far-5` are evicted despite scoring higher.
+		// clockwise window does not shrink to two peers — it reaches past the dead peer to the
+		// next live members, `far-1` and `far-2`. That is why both survive at relevance 1.0 and
+		// 2.0 while `far-3` and `far-4` are evicted despite scoring higher.
 		expect(ids, 'window reached past the dead peer').to.include('far-1')
-		expect(ids).to.not.include('far-2')
-		expect(ids).to.have.members([selfId, 'near-cw-1', 'near-ccw-1', 'near-ccw-2', 'far-1', 'far-6'])
+		expect(ids).to.include('far-2')
+		expect(ids).to.not.include('far-3')
+		expect(ids).to.have.members([
+			selfId, 'near-cw-1', 'near-ccw-1', 'near-ccw-2', 'far-1', 'far-2', 'far-5', 'far-6',
+		])
 	})
 
 	// Protection is `membership === 'member' && state !== 'dead'`, so sitting next to self buys
@@ -215,7 +273,7 @@ describe('FretService capacity enforcement and victim selection', function () {
 	// and the window reaches past it, exactly as for a dead peer.
 	for (const membership of ['foreign', 'unknown'] as const) {
 		it(`does not protect an adjacent peer labelled ${membership}`, async () => {
-			const service = await seededService({ m: 3, capacity: 6 })
+			const service = await seededService({ m: 3, capacity: 8 })
 			const layout = standardLayout(self).map((p) =>
 				p.id.startsWith('near-cw') ? { ...p, membership } : p
 			)
@@ -225,9 +283,12 @@ describe('FretService capacity enforcement and victim selection', function () {
 			const ids = survivors(service)
 			expect(ids).to.not.include('near-cw-1')
 			expect(ids).to.not.include('near-cw-2')
-			// The clockwise window reached past both of them, so the two nearest live members
-			// clockwise are now `far-1` and `far-2` — protected despite being mid-table.
-			expect(ids).to.have.members([selfId, 'near-ccw-1', 'near-ccw-2', 'far-1', 'far-2', 'far-6'])
+			// The clockwise window reached past both of them, so the three nearest live members
+			// clockwise are now `far-1` … `far-3` — protected despite being mid-table, while
+			// `far-4` is evicted at a higher score.
+			expect(ids).to.have.members([
+				selfId, 'near-ccw-1', 'near-ccw-2', 'far-1', 'far-2', 'far-3', 'far-5', 'far-6',
+			])
 		})
 	}
 
@@ -259,10 +320,10 @@ describe('FretService capacity enforcement and victim selection', function () {
 
 		await enforce(service)
 
-		// Protection breadth 8: self + 7 clockwise + 7 counter-clockwise = 15 protected ids. The
-		// six peers beyond that window (±8, ±9, ±10) are evicted and the loop then runs out of
-		// candidates, three times over the configured cap of 4.
-		expect(service.getStore().size(), 'protected set is the floor, not the capacity').to.equal(15)
+		// Protection breadth 8: self + 8 clockwise + 8 counter-clockwise = 17 protected ids
+		// (`2m + 1`). The four peers beyond that window (±9, ±10) are evicted and the loop then
+		// runs out of candidates, more than four times over the configured cap of 4.
+		expect(service.getStore().size(), 'protected set is the floor, not the capacity').to.equal(17)
 		expect(service.getStore().size()).to.be.greaterThan(4)
 		expect(survivors(service)).to.include(selfId)
 	})

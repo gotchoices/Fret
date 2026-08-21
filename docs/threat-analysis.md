@@ -15,7 +15,7 @@ An attacker generates many libp2p identities whose SHA-256 ring coordinates clus
 
 - **Preconditions**: Ability to generate libp2p key pairs and connect to the network.
 - **Impact**: Attacker controls the cohort for targeted keys. Can intercept, censor, or forge activity results (commit certificates). Undermines the entire cluster-based consensus model since `assembleCohort` draws from the two-sided walk which Sybil nodes dominate.
-- **Current mitigations**: Capacity limit (C=2048) bounds total stored peers. Relevance-based eviction may eventually remove inactive Sybils. Protected S/P neighbors cannot be evicted (`protectedIdsAround`). But none of these prevent a determined Sybil attacker with enough identities.
+- **Current mitigations**: Capacity limit (C=2048) bounds total stored peers. Relevance-based eviction may eventually remove inactive Sybils. Protected S/P neighbors cannot be evicted (the protection set `FretService.enforceCapacity` builds around self). But none of these prevent a determined Sybil attacker with enough identities.
 - **Missing**: No proof-of-work, stake, or identity-cost mechanism. No diversity requirements (IP/AS) despite being mentioned in the design doc. The `report()` method is a no-op.
 
 #### 1.2 ID Grinding for Strategic Ring Placement
@@ -72,7 +72,7 @@ The attack proceeds:
 
 - **Preconditions**: ~2m Sybil IDs near the target (where m=8), plus connectivity to the target.
 - **Impact**: Total control over target's network view. All routing, cluster membership, and activity forwarding go through the attacker. Target cannot discover honest peers.
-- **Current mitigations**: S/P entries are protected from eviction (`protectedIdsAround`). Multiple bootstrap peers provide initial diversity. `seedFromPeerStore` pulls from libp2p's peer store each stabilization tick. But if the attacker controls all near positions, these mitigations are insufficient.
+- **Current mitigations**: S/P entries are protected from eviction (`FretService.enforceCapacity`). Multiple bootstrap peers provide initial diversity. `seedFromPeerStore` pulls from libp2p's peer store each stabilization tick. But if the attacker controls all near positions, these mitigations are insufficient.
 - **Missing**: Mandatory multi-path bootstrap verification. Random walk discovery. Alert on sudden S/P set changes (mentioned in design doc but not implemented).
 
 #### 2.2 Route Hijacking for Specific Keys

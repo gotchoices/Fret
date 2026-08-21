@@ -45,6 +45,7 @@ import { shouldIncludePayload, computeNearRadius } from './payload-heuristic.js'
 import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
+import { ringNeighborsBothSides } from './ring-walk.js';
 import {
 	createSparsityModel,
 	normalizedLogDistance,
@@ -510,13 +511,25 @@ export class FretService implements IFretService, Startable {
 		// eviction-specific handling of its own.
 		// NOTE: protection wins over the cap, so a table whose protected set is already at least
 		// `capacity` stays over capacity — the loop below finds nothing evictable and exits with
-		// `size() > cap`. The protected set is self plus up to `max(2, m) - 1` live members on
-		// each side, i.e. up to `2m - 1` ids, so this needs `capacity < 2m - 1`: unreachable with
-		// the shipped numbers (m 8, capacity 2048) and only reachable by misconfiguration.
+		// `size() > cap`. The protected set is self plus up to `max(2, m)` live members on each
+		// side, i.e. up to `2m + 1` ids, so this needs `capacity < 2m + 1`: unreachable with the
+		// shipped numbers (m 8, capacity 2048) and only reachable by misconfiguration.
 		// Pinned by `test/relevance.eviction.spec.ts`. If a profile ever ships a capacity that
 		// small, capacity stops being a bound and this needs a floor at construction (or
 		// protection needs to yield past some multiple of the cap).
-		const protectedIds = this.store.protectedIdsAround(self, Math.max(2, this.cfg.m), isLiveMember);
+		//
+		// `count` here means *peers besides self* (see `ringNeighborsBothSides`), so the m-th
+		// successor and m-th predecessor are protected too — self no longer consumes a slot per
+		// side. Self is added explicitly rather than drawn from the walk: on a ring of exactly
+		// one peer the walk returns nothing at all, and self must still be protected.
+		const protectedIds = new Set(ringNeighborsBothSides(
+			this.store,
+			self,
+			Math.max(2, this.cfg.m),
+			this.node.peerId.toString(),
+			{ filter: isLiveMember }
+		));
+		protectedIds.add(this.node.peerId.toString());
 		// Evict the lowest relevance non-protected entries until under cap.
 		// NOTE: lists and fully sorts the store to drop a handful of entries. Only reachable once
 		// the table is at capacity, so it is a no-op in the common case; if a ring settles at cap

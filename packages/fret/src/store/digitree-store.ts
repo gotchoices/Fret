@@ -348,13 +348,6 @@ export class DigitreeStore {
 		this.update(id, { membership });
 	}
 
-	protectedIdsAround(coord: Uint8Array, breadth: number, filter?: (e: PeerEntry) => boolean): Set<string> {
-		const ids = new Set<string>();
-		for (const id of this.neighborsRight(coord, breadth, filter)) ids.add(id);
-		for (const id of this.neighborsLeft(coord, breadth, filter)) ids.add(id);
-		return ids;
-	}
-
 	private ceilPath(hexCoord: string) {
 		// find first >= hexCoord by seeking hexCoord + "|\x00"
 		const seek = `${hexCoord}|\x00`;
