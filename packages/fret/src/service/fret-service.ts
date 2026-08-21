@@ -2181,6 +2181,12 @@ export class FretService implements IFretService, Startable {
 		if (this.store.countByMembership('unknown') === 0
 			&& this.store.countByMembership('foreign') === 0
 			&& this.store.countByState('dead') === 0) return [];
+		// NOTE: the walk is captured once and `put` writes a *new* entry object rather than editing
+		// in place, so a store mutation made after this line is invisible to the arms that run
+		// after it. Sound today: all three arms are pure selection — they read `backoffMap`,
+		// connections and the address set, and write nothing — and the probing that does write
+		// happens later, in the pooled phase. If an arm ever writes to the store while selecting,
+		// re-walk per arm rather than leaving the later arms on a stale array.
 		const entries = this.store.list();
 		return [...this.classifyTargets(entries), ...this.reprobeExcludedTargets(entries)];
 	}
