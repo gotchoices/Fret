@@ -1,7 +1,7 @@
 import type { PeerDiscovery, Startable } from '@libp2p/interface';
 import { peerDiscoverySymbol } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
-import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable } from '../index.js';
+import type { FretConfig, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable, ActivityHandler, LookupOptions, RouteProgress } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
 import { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryConfig } from './peer-discovery.js';
 
@@ -20,7 +20,9 @@ type FretServiceFacade = Pick<FretService,
 	| 'start' | 'stop' | 'ready' | 'setMode'
 	| 'routeAct' | 'neighborDistance' | 'getNeighbors' | 'assembleCohort' | 'expandCohort'
 	| 'report' | 'setMetadata' | 'getMetadata' | 'listPeers'
-	| 'exportTable' | 'importTable'>;
+	| 'exportTable' | 'importTable'
+	| 'reportNetworkSize' | 'getNetworkSizeEstimate' | 'getNetworkChurn' | 'detectPartition'
+	| 'setActivityHandler' | 'iterativeLookup'>;
 
 export class Libp2pFretService implements Startable, FretServiceFacade {
 	private inner: CoreFretService | null = null;
@@ -131,18 +133,6 @@ export class Libp2pFretService implements Startable, FretServiceFacade {
 		return await this.ensure().routeAct(msg);
 	}
 
-	getNeighborsForKey(
-		key: Uint8Array,
-		direction: 'left' | 'right' | 'both',
-		wants: number
-	): string[] {
-		return this.ensure().getNeighbors(key, direction, wants);
-	}
-
-	assembleCohortForKey(key: Uint8Array, wants: number): string[] {
-		return this.ensure().assembleCohort(key, wants);
-	}
-
 	getDiagnostics(): ReturnType<CoreFretService['getDiagnostics']> {
 		return this.ensure().getDiagnostics();
 	}
@@ -194,6 +184,30 @@ export class Libp2pFretService implements Startable, FretServiceFacade {
 
 	importTable(table: SerializedTable): Promise<number> {
 		return this.ensure().importTable(table);
+	}
+
+	reportNetworkSize(estimate: number, confidence: number, source?: string): void {
+		this.ensure().reportNetworkSize(estimate, confidence, source);
+	}
+
+	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
+		return this.ensure().getNetworkSizeEstimate();
+	}
+
+	getNetworkChurn(): number {
+		return this.ensure().getNetworkChurn();
+	}
+
+	detectPartition(): boolean {
+		return this.ensure().detectPartition();
+	}
+
+	setActivityHandler(handler: ActivityHandler): void {
+		this.ensure().setActivityHandler(handler);
+	}
+
+	iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {
+		return this.ensure().iterativeLookup(key, options);
 	}
 }
 
