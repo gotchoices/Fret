@@ -94,7 +94,6 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 			.to.have.property('commitCertificate')
 		expect(fired, 'activity handler should fire exactly once').to.equal(1)
 		expect(seenCorrelationIds[0]).to.equal(corrId)
-
 	})
 
 	it('still dedups within the activity phase: a repeated activity send performs the work once', async () => {
@@ -116,7 +115,6 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		expect(retry, 'a retry must return the stored certificate, not redo the work')
 			.to.deep.equal(first)
 		expect(fired, 'work must be performed exactly once').to.equal(1)
-
 	})
 
 	it('still dedups within the digest phase: a repeated probe is answered from cache', async () => {
@@ -131,7 +129,6 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 
 		expect(first).to.have.property('anchors')
 		expect(replay).to.deep.equal(first)
-
 	})
 
 	it('does not cache a NearAnchor as the answer to an activity-bearing message', async () => {
@@ -157,7 +154,6 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		expect(retry, 'the retry must re-attempt the work, not replay the cached refusal')
 			.to.have.property('commitCertificate')
 		expect(fired).to.equal(1)
-
 	})
 
 	it('completes a find-then-act lookup end to end through iterativeLookup', async () => {
@@ -184,7 +180,6 @@ describe('maybeAct dedup is keyed on phase, not just correlation id', function (
 		expect(completed, `lookup did not complete; events: ${events.join(' -> ')}`)
 			.to.deep.equal({ commitCertificate: 'cert-e2e' })
 		expect(fired, 'activity performed exactly once').to.equal(1)
-
 	})
 })
 

@@ -1,20 +1,23 @@
 import { describe, it } from 'mocha'
 import { createMemoryNode } from './helpers/libp2p.js'
-import { buildMesh, type Mesh } from './helpers/mesh.js'
+import { buildMesh, type Mesh, type ServiceConfig } from './helpers/mesh.js'
 import { useCleanup, type Cleanup } from './helpers/cleanup.js'
-import type { FretConfig } from '../src/index.js'
 
 /**
  * Two TCP nodes, B dialed to A **before** either service starts (so each `start()`'s
- * `seedFromPeerStore` already sees the connection), then a service on each with its own config.
+ * `seedFromPeerStore` already sees the connection), then a service on each.
+ *
+ * `cfg` is the mesh's own per-node form, so a case that needs the mesh's peer ids (for
+ * `bootstraps`) takes the `(index, mesh)` function and one that does not passes a plain object —
+ * both cases below go through here rather than one of them re-inlining the three calls.
  *
  * Registered for teardown at construction: a failed assertion below must report *itself* rather
  * than leave the nodes running for the exit watchdog to dump an open-handle list on top of it.
  */
-async function makePair(cleanup: Cleanup, cfgA: Partial<FretConfig>, cfgB: Partial<FretConfig>): Promise<Mesh> {
+async function makePair(cleanup: Cleanup, cfg: ServiceConfig): Promise<Mesh> {
 	const mesh = await buildMesh(2, { factory: createMemoryNode, cleanup })
 	await mesh.connect('line')
-	await mesh.addServices(i => (i === 0 ? cfgA : cfgB))
+	await mesh.addServices(cfg)
 	return mesh
 }
 
@@ -23,11 +26,10 @@ describe('Network isolation', function () {
 	const cleanup = useCleanup()
 
 	it('different networkNames cannot exchange neighbor snapshots', async () => {
-		const mesh = await makePair(
-			cleanup,
-			{ profile: 'edge', networkName: 'network-alpha' },
-			{ profile: 'edge', networkName: 'network-beta' }
-		)
+		const mesh = await makePair(cleanup, i => ({
+			profile: 'edge',
+			networkName: i === 0 ? 'network-alpha' : 'network-beta'
+		}))
 
 		await new Promise((r) => setTimeout(r, 1000))
 
@@ -42,9 +44,7 @@ describe('Network isolation', function () {
 	})
 
 	it('same networkName allows neighbor snapshots', async () => {
-		const mesh = await buildMesh(2, { factory: createMemoryNode, cleanup })
-		await mesh.connect('line')
-		await mesh.addServices((i, m) => ({
+		const mesh = await makePair(cleanup, (i, m) => ({
 			profile: 'edge',
 			networkName: 'network-gamma',
 			...(i === 1 ? { bootstraps: [m.ids[0]!] } : {})

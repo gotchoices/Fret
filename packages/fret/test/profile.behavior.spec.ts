@@ -1,7 +1,8 @@
-import { describe, it, afterEach } from 'mocha'
+import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import { createMemNode } from './helpers/libp2p.js'
 import { buildMesh, type Mesh } from './helpers/mesh.js'
+import { useCleanup, type Cleanup } from './helpers/cleanup.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
 import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
@@ -11,23 +12,14 @@ import type { FretConfig } from '../src/index.js'
 import type { Libp2p } from 'libp2p'
 
 /**
- * Teardown registry. A case registers what it built here instead of stopping it as its last
- * statement, so a case whose assertion throws still tears down — otherwise its libp2p handles
- * leak and surface as an exit-watchdog dump stacked on top of the real failure. Entries are
- * unwound in reverse construction order, best-effort per entry so one throwing `stop()` cannot
- * strand the ones behind it (the contract `mesh.stop()` already applies to its own services).
+ * Teardown registry, assigned by the `describe` below before any case runs. The helpers here are
+ * module-level but only ever *called* from inside a case, so resolving `cleanup` at call time is
+ * enough and none of them has to move into the suite body.
  */
-const cleanups: Array<() => Promise<void>> = []
+let cleanup: Cleanup
 
-function onCleanup(fn: () => Promise<void>): void {
-	cleanups.push(fn)
-}
-
-async function runCleanups(): Promise<void> {
-	for (let i = cleanups.length - 1; i >= 0; i--) {
-		try { await cleanups[i]!() } catch { /* teardown is best-effort */ }
-	}
-	cleanups.length = 0
+function onCleanup(fn: () => Promise<void> | void): void {
+	cleanup.add(fn)
 }
 
 /** A started node with a started service on it, both registered for teardown. */
@@ -42,8 +34,7 @@ async function createService(profile: 'edge' | 'core') {
 
 /** `buildMesh` + star dial, registered for teardown. */
 async function starRig(count: number): Promise<Mesh> {
-	const mesh = await buildMesh(count)
-	onCleanup(() => mesh.stop())
+	const mesh = await buildMesh(count, { cleanup })
 	await mesh.connect('star')
 	return mesh
 }
@@ -96,8 +87,7 @@ function makeMaybeActMsg(correlationId: string) {
 
 describe('Profile behavior tests', function () {
 	this.timeout(15000)
-
-	afterEach(runCleanups)
+	cleanup = useCleanup()
 
 	// ----- Phase 1: Token bucket capacity and refill per profile -----
 
@@ -258,7 +248,6 @@ describe('Profile behavior tests', function () {
 
 			const diag = svc.getDiagnostics()
 			expect(diag.rejected.rateLimited).to.be.greaterThan(0)
-
 		})
 
 		it('handleNeighborsRequest returns BusyResponseV1 when bucket exhausted', async () => {
@@ -269,7 +258,6 @@ describe('Profile behavior tests', function () {
 			const result = await (svc as any).handleNeighborsRequest()
 			expect(result).to.have.property('busy', true)
 			expect(result).to.have.property('retry_after_ms')
-
 		})
 
 		it('handlePingRequest returns BusyResponseV1 when bucket exhausted', async () => {
@@ -280,7 +268,6 @@ describe('Profile behavior tests', function () {
 			const result = (svc as any).handlePingRequest()
 			expect(result).to.have.property('busy', true)
 			expect(result).to.have.property('retry_after_ms')
-
 		})
 	})
 
@@ -351,7 +338,6 @@ describe('Profile behavior tests', function () {
 
 			const after = svc.getDiagnostics().rejected.rateLimited
 			expect(after - before).to.equal(3)
-
 		})
 	})
 
