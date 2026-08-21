@@ -1197,5 +1197,54 @@ describe('RPC handler fault isolation', function () {
 			expect(rateLimited, 'the bucket then emptied — malformed messages are metered').to.be.at.least(1)
 			expect(replies.some((r) => 'busy' in r && r.busy === true), 'busy replies observed').to.equal(true)
 		})
+
+		// The negative half of the rule above. An *undecodable* body is refused by
+		// `registerMaybeAct`'s own catch arm, which sits upstream of the bucket taken inside
+		// `handleMaybeAct` — so it must spend no token, and must not answer (an unmetered reply
+		// would hand a peer one free reply frame per undecodable message). Driven through the
+		// service's real registration wiring rather than a hand-rolled `registerMaybeAct`,
+		// because what is under test is which of the service's own counters moves.
+		it('spends no token on an undecodable body, and answers nothing', async () => {
+			interface RegistrableService {
+				registerRpcHandlers(): Promise<void>
+				protocols: { PROTOCOL_MAYBE_ACT: string }
+			}
+			const edge = new CoreFretService(node, { profile: 'edge', networkName: `${NETWORK}-undecodable` })
+			// Capture the handler instead of registering it: the point is to invoke the service's
+			// own handler closure directly. The node is rebuilt per test, so the stub cannot leak.
+			const handlers = new Map<string, InboundHandler>()
+			;(node as unknown as { handle: unknown }).handle =
+				async (protocol: string, h: InboundHandler): Promise<void> => { handlers.set(protocol, h) }
+			const reg = edge as unknown as RegistrableService
+			await reg.registerRpcHandlers()
+			const handler = handlers.get(reg.protocols.PROTOCOL_MAYBE_ACT)
+			expect(handler, 'maybeAct handler registered').to.not.equal(undefined)
+
+			const before = edge.getDiagnostics().rejected
+			const beforeMalformed = before.malformed
+			const beforeRateLimited = before.rateLimited.maybeAct
+			const connection = { remotePeer: { toString: () => 'peer-a' } } as unknown as Connection
+
+			// 12 undecodable bodies — more than the edge burst of 8, so a metered arm would show.
+			const stubs: InboundStub[] = []
+			for (let i = 0; i < 12; i++) {
+				const stub = inboundStub([framed('{ not: json }')])
+				stubs.push(stub)
+				await handler!(stub.stream, connection)
+			}
+
+			const after = edge.getDiagnostics().rejected
+			expect(after.malformed - beforeMalformed, 'every undecodable body counted malformed').to.equal(12)
+			expect(after.rateLimited.maybeAct - beforeRateLimited, 'and none of them spent a token').to.equal(0)
+			expect(stubs.every((s) => s.sends === 0), 'the drop arm writes no reply frame').to.equal(true)
+
+			// The discriminator, which is what makes this more than "the callback was not invoked":
+			// the bucket is still full, so a following well-formed batch the size of the whole
+			// burst is answered. Had the flood been metered, those 12 would have drained the burst
+			// of 8 and most of this batch would come back busy.
+			const replies: Reply[] = []
+			for (let i = 0; i < 8; i++) replies.push(await drive(edge, baseMsg()))
+			expect(replies.some((r) => 'busy' in r && r.busy === true), 'burst intact - no busy reply').to.equal(false)
+		})
 	})
 })
