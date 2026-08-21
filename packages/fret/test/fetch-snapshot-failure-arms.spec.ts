@@ -62,16 +62,16 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 		expect(svc.getDiagnostics().snapshotsFetched, 'not counted as fetched').to.equal(fetchedBefore)
 	})
 
-	it('decode-error: a genuinely unusable reply is bookkeeping-identical to skipped', async () => {
-		const before = seed(FROM)
-		const fetchedBefore = svc.getDiagnostics().snapshotsFetched
-
-		// Rejected by makeSnapshotParser: `from` must be a parseable peer id.
-		const body = { v: 1, from: 'not-a-peer-id', timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
+	/**
+	 * Hand back an open connection whose stream yields `body` as one framed JSON chunk then EOF,
+	 * for the duration of `fn`. `pulls` proves the stream was actually read, so a test using this
+	 * cannot pass by silently taking the `skipped` arm instead.
+	 */
+	async function withStubReply<T>(body: unknown, fn: () => Promise<T>): Promise<{ result: T, pulls: number }> {
 		let pulls = 0
 		const chunk = json(body)
 		const stream = {
-			id: 'decode-error-stub',
+			id: 'stub-reply',
 			send: (): boolean => true,
 			close: async (): Promise<void> => { /* released */ },
 			abort: (): void => { /* released */ },
@@ -86,18 +86,49 @@ describe('fetchAndMergeSnapshot failure arms', function () {
 		const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
 		const real = holder.getConnections.bind(node)
 		holder.getConnections = () => [{ status: 'open', newStream: async () => stream }] as unknown as Connection[]
-
-		let announced: string[]
 		try {
-			announced = await (svc as any).fetchAndMergeSnapshot(FROM, undefined)
+			return { result: await fn(), pulls }
 		} finally {
 			holder.getConnections = real
 		}
+	}
+
+	function snapshotBody(from: string): unknown {
+		return { v: 1, from, timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
+	}
+
+	it('decode-error: a genuinely unusable reply is bookkeeping-identical to skipped', async () => {
+		const before = seed(FROM)
+		const fetchedBefore = svc.getDiagnostics().snapshotsFetched
+
+		// Rejected by makeSnapshotParser: `from` must be a parseable peer id.
+		const { result: announced, pulls } = await withStubReply(
+			snapshotBody('not-a-peer-id'),
+			async () => await (svc as any).fetchAndMergeSnapshot(FROM, undefined) as string[],
+		)
 
 		expect(announced, 'nothing announced').to.deep.equal([])
 		expect(pulls, 'the stub stream was actually read, not skipped').to.be.greaterThan(0)
-		expect(readEntry(FROM), 'entry unchanged — bookkeeping-identical to skipped').to.deep.equal(before)
+		expect(readEntry(FROM), 'entry unchanged - bookkeeping-identical to skipped').to.deep.equal(before)
 		expect(svc.getDiagnostics().snapshotsFetched, 'not counted as fetched').to.equal(fetchedBefore)
+	})
+
+	// Positive control for the test above. `decode-error` and `busy` are both silent arms, so
+	// "nothing was scored" alone cannot prove which one ran - nor that the stub is capable of
+	// reaching a scoring arm at all. Same stub, same node, only the body differs: a parseable
+	// snapshot must count as fetched. Without this, deleting the whole switch would still leave
+	// the decode-error test green.
+	it('the same stub with a parseable body reaches the ok arm and is counted', async () => {
+		seed(FROM)
+		const fetchedBefore = svc.getDiagnostics().snapshotsFetched
+
+		const { pulls } = await withStubReply(
+			snapshotBody(FROM),
+			async () => await (svc as any).fetchAndMergeSnapshot(FROM, undefined) as string[],
+		)
+
+		expect(pulls, 'the stub stream was actually read').to.be.greaterThan(0)
+		expect(svc.getDiagnostics().snapshotsFetched, 'a parseable reply is a fetch').to.equal(fetchedBefore + 1)
 	})
 
 	// cancelled arm: already covered directly by dead-state.spec.ts:1035
