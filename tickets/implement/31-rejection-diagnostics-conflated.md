@@ -5,19 +5,19 @@ tradeoffs: n/a (implement ticket)
 ---
 
 <!-- resume-note -->
-**Run 6 in a row hit BUDGET_WARNING immediately after the confirmatory Read, before any Edit
-call.** Content re-verified byte-for-byte AGAIN this run (both `fret-service.ts` lines 410-424 and
-the full 59-line `maybe-act.ts`) — identical to every prior run. The ticket file itself was bloated
-with 3 duplicated copies of this same resume-note (each run's "verification" got appended instead
-of replacing) — that's likely *why* budget died so early: the file was ballooning context on load.
-This rewrite deletes all that duplication and keeps only what's needed to fire the 9 edits below
-with **zero reads** (the Edit tool requires one Read call per file per conversation before its
-first Edit — do ONE small Read on each file, e.g. `fret-service.ts` lines 410-430 and
-`maybe-act.ts` in full, purely to satisfy that tool precondition, NOT to re-verify content — then
-fire every edit below back-to-back with no further Reads).
+**8th run in a row died to BUDGET_WARNING right after the two precondition Reads, before any Edit
+fired.** Nothing has landed in the codebase yet — zero edits applied across all runs so far. Prior
+tickets kept re-verifying content and re-pasting rationale every run, which is likely why this
+keeps dying early; this rewrite strips every section that isn't needed to execute, down to just the
+9 literal edits + the follow-up steps. **Do not re-read fret-service.ts or maybe-act.ts beyond the
+one small precondition Read each** (Edit tool requires one Read per file per conversation before
+its first Edit on that file — e.g. `fret-service.ts` lines 405-430, `maybe-act.ts` in full — this
+is NOT re-verification, the content below is already confirmed correct across 8 runs). Fire Edits
+#1-#9b back to back with no reasoning pauses, then do steps 6-9.
 
-Do the two small Reads, then fire Edits #1-#9 in order, then steps 6-9 (test/doc updates +
-`tsc`/`yarn test`). Nothing here has changed across 6 runs — stop re-verifying, just execute.
+If this run also dies before finishing: commit whatever landed, overwrite this resume-note in place
+(don't append) naming exactly which edits completed, strike them from the list below, do not
+re-paste rationale.
 
 ## Edit #1 — `diag.rejected` block
 
@@ -109,7 +109,7 @@ old_string:
 		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 ```
 
-new_string: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.concurrencyLimited++` (NOT `rateLimited.maybeAct` — mechanism split, see *Edge cases* below)
+new_string: same but `this.diag.rejected.rateLimited++` → `this.diag.rejected.concurrencyLimited++` (NOT `rateLimited.maybeAct` — this is the exact conflation the ticket exists to split apart: a token-bucket flood vs. an inflight-capacity issue, mechanism split, different remediation)
 
 ## Edit #6 — `handleLeave` (~line 1838, unique whole-line match)
 
@@ -203,6 +203,12 @@ const log = createLogger('rpc:maybe-act');
 
 ## Edit #9b — `packages/fret/src/rpc/maybe-act.ts` `registerMaybeAct` body
 
+Purpose: today an undecodable maybeAct body throws out of the handler, which `registerRpcHandler`
+aborts the stream for — no diagnostic counter moves at all. This wraps the decode in try/catch,
+counts it under `diag.rejected.malformed` (same bucket a structurally-invalid-but-decodable message
+already falls into via `parseRouteAndMaybeAct` returning `undefined`), and replies with the same
+static empty-anchor reject the malformed-structure path already returns, instead of aborting.
+
 old_string:
 ```
 export async function registerMaybeAct(
@@ -260,101 +266,24 @@ export async function registerMaybeAct(
 
 ## Steps after Edits #1-9b land
 
-6. `test/inflight-concurrency.spec.ts`: assert on `diag.rejected.concurrencyLimited`, drop/rewrite the stale comment about the shared counter being unambiguous by construction (see *Edge cases* below).
-7. `test/profile.behavior.spec.ts`: update every read of `diag.rejected.rateLimited` to the keyed shape (`diag.rejected.rateLimited.<protocol>`); check for any site summing across protocols and sum the record's values there instead.
-8. `docs/fret.md`: three sites named under *Edge cases* below.
-9. `cd packages/fret && npx tsc --noEmit && yarn test` (targeted specs first, then full suite) before handoff.
-
-## If budget runs out again before step 9 completes
-
-Commit whatever subset landed. Update this resume-note in place (don't append a duplicate copy —
-overwrite) to say exactly which edits completed and which remain, striking completed ones from the
-list above. Do not re-paste the whole history again.
-
-## Resolved design
-
-Replace the single `rejected.rateLimited: number` field with a keyed record, one slot per
-protocol, plus one new sibling field for the concurrency-cap case (a different mechanism
-entirely, not a rate limit):
-
-```ts
-rejected: {
-	payloadTooLarge: number;
-	timestampBounds: number;
-	ttlExpired: number;
-	identityMismatch: number;
-	malformed: number;
-	/** Per-protocol token-bucket rejections — which wire protocol's bucket was empty. */
-	rateLimited: Record<'neighbors' | 'ping' | 'maybeAct' | 'leave' | 'announce', number>;
-	/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: this fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
-	concurrencyLimited: number;
-}
-```
-
-This is a keyed record rather than a tagged-enum log or anything heavier, because the only
-requirement is "read out per protocol, cheaply, synchronously" — a record satisfies that with the
-least churn to the public diagnostics shape, and a reason added later gets a new record key or a
-new sibling field rather than reusing someone else's.
-
-### Call-site mapping (six sites → their own slot)
-
-- line 1290, `handleNeighborsRequest` (`bucketNeighbors.tryTake()` fails) → `rateLimited.neighbors++`
-- line 1298, `handlePingRequest` (`bucketPing.tryTake()` fails) → `rateLimited.ping++`
-- line 1381, `handleMaybeAct` (`bucketMaybeAct.tryTake()` fails — the token bucket) → `rateLimited.maybeAct++`
-- line 1421, `handleMaybeAct` (`this.inflightAct >= limit` — the concurrency cap) → `concurrencyLimited++` (**not** `rateLimited.maybeAct` — this is the mechanism the original ticket singled out as "a different mechanism entirely")
-- line 1838, `handleLeave` (`bucketLeave.tryTake()` fails) → `rateLimited.leave++`
-- line 1999, `handleAnnounce` (`bucketAnnounceInbound.tryTake()` fails) → `rateLimited.announce++`
-
-## Second arm: maybeAct silently drops undecodable bodies with no counter movement
-
-`handleMaybeAct` is not on the shared `registerJsonHandler` seam the other four handlers use (its
-token bucket must be taken before any per-message work, which that seam cannot do). Today an
-undecodable body in `registerMaybeAct` throws out of the handler, which `registerRpcHandler`'s
-wrapper catches by `abort()`-ing the stream — tearing the connection down with **no diagnostic
-counter incremented at all**. Edit #9b fixes this: wrap the decode in try/catch, count it under
-`diag.rejected.malformed` (the same bucket a structurally-invalid-but-decodable message already
-falls into via `parseRouteAndMaybeAct` returning `undefined`), and reply with the same static
-reject the malformed-structure path already returns instead of aborting the connection.
-
-## Edge cases & interactions
-
-- **Concurrency-cap saturation must never be counted under `rateLimited.maybeAct`.** This is the
-  exact conflation the original ticket flagged as sharpest (a flood vs. a sizing/capacity issue an
-  operator would act on differently) — a regression here silently re-merges the two counters the
-  ticket exists to split apart. `test/inflight-concurrency.spec.ts` must assert on
-  `diag.rejected.concurrencyLimited`, not `rateLimited.maybeAct`.
-- **A busy reply from the token bucket and a busy reply from the concurrency cap still look
-  identical on the wire** (`{busy: true, retry_after_ms: ...}` either way) — only the local
-  diagnostic distinguishes them now. Not a wire-protocol change; none needed or in scope.
-- **The maybeAct concurrency-cap spec (`test/inflight-concurrency.spec.ts`) currently relies on the
-  shared counter being unambiguous by construction** — it sizes fan-out to stay inside the token
-  bucket so no too-fast rejection mixes into the tally it asserts on. Once the counters split, that
-  constraint is no longer load-bearing; remove/update the comment explaining it, since the spec
-  should now assert on `concurrencyLimited` directly regardless of bucket sizing.
-- **`profile.behavior.spec.ts` reads the old flat `rateLimited` counter** — update every read site to
-  the new keyed shape (`diag.rejected.rateLimited.<protocol>`), and check whether it asserts a
-  *sum* across protocols anywhere (if so, sum the record's values rather than reading one field).
-- **`docs/fret.md` names this counter in (at least) three places** needing coordinated updates:
-  - the departure-notice section ("The only local signal is `diag.rejected.rateLimited`" — update
-    to name the specific keyed field, `rateLimited.leave`);
-  - the concurrency-cap bullet under *Operating profiles* ("a bucket rejection and an inflight
-    rejection both increment `diag.rejected.rateLimited` and differ only in `retry_after_ms`" —
-    this sentence is now **false** under the new design and must be rewritten to say they increment
-    different fields, which is the fix);
-  - the security section's rate-limiting bullet mentioning `diag.rejected.rateLimited` generically —
-    update to describe the per-protocol keyed shape.
-- **Don't touch the other five `rejected.*` fields** (`payloadTooLarge`, `timestampBounds`,
-  `ttlExpired`, `identityMismatch`, `malformed`) — they are already unambiguous and out of scope.
-
-## TODO
-
-- Change the `diag.rejected` type/initializer (~line 415) to the resolved shape above.
-- Update all six call sites (1290, 1298, 1381, 1421, 1838, 1999) per the mapping above.
-- Locate and fix the maybeAct undecodable-body silent-drop (second arm) so it counts under
-  `diag.rejected.malformed` instead of aborting the stream with no diagnostic.
-- Update `test/inflight-concurrency.spec.ts` to assert on `concurrencyLimited` and drop/rewrite the
-  now-stale comment about the shared counter being unambiguous by construction.
-- Update `test/profile.behavior.spec.ts` for the new keyed shape.
-- Update the three `docs/fret.md` sites named above.
-- Run `cd packages/fret && npx tsc --noEmit` and `yarn test` (targeted specs first, then full suite)
-  before handoff.
+6. `test/inflight-concurrency.spec.ts`: assert on `diag.rejected.concurrencyLimited` (not
+   `rateLimited.maybeAct` — that would silently re-merge the two counters this ticket splits
+   apart). Drop/rewrite the comment about the shared counter being unambiguous by construction —
+   it relied on sizing fan-out to stay inside the token bucket so no too-fast rejection mixed into
+   the tally; once split that constraint is no longer load-bearing.
+7. `test/profile.behavior.spec.ts`: update every read of `diag.rejected.rateLimited` to the keyed
+   shape (`diag.rejected.rateLimited.<protocol>`); if any site sums across protocols, sum the
+   record's values there instead.
+8. `docs/fret.md` — three sites name the old flat counter, update all three:
+   - departure-notice section: "The only local signal is `diag.rejected.rateLimited`" → name the
+     specific keyed field, `rateLimited.leave`.
+   - concurrency-cap bullet under *Operating profiles*: "a bucket rejection and an inflight
+     rejection both increment `diag.rejected.rateLimited` and differ only in `retry_after_ms`" —
+     this sentence becomes **false** under the new design; rewrite to say they increment different
+     fields (`rateLimited.maybeAct` vs `concurrencyLimited`), which is the fix.
+   - security section's rate-limiting bullet mentioning `diag.rejected.rateLimited` generically —
+     update to describe the per-protocol keyed shape.
+   - Do not touch the other five `rejected.*` fields (`payloadTooLarge`, `timestampBounds`,
+     `ttlExpired`, `identityMismatch`, `malformed`) — already unambiguous, out of scope.
+9. `cd packages/fret && npx tsc --noEmit && yarn test` (targeted specs first, then full suite)
+   before handoff to review/.
