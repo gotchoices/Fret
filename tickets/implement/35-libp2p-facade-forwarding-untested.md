@@ -4,18 +4,190 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Second run in a row stopped on BUDGET_WARNING before writing any code — again read-only, no edits
-made, nothing to revert. This run re-read `libp2p-fret-service.ts` (full file) and
-`libp2p-service-node-source.spec.ts` (full file) fresh, independent of the prior run's notes below,
-and confirms **zero drift**: every line number, method name, throw message, and pattern the prior
-run recorded still matches the current source exactly (`ensure()` still line 86 with the same
-throw text, `getDiagnostics` still line 142, both `get` accessors still lines 62/114,
-`discoverySource` still line 102, all skip-list candidates still present, construction pattern in
-the existing spec unchanged). Nothing here needed correction — the design below is still exactly
-right and requires no re-derivation. The only work left is the mechanical act of writing the file;
-two runs in a row have now spent their whole budget confirming that fact rather than doing it, so
-the next run should skip straight to writing `test/libp2p-facade-forwarding.spec.ts` without
-re-reading the source files first.
+Third run in a row stopped on BUDGET_WARNING. This run got further than the prior two: it
+re-confirmed the source is unchanged (same as before — zero drift), then went on to work out the
+exact mechanics the Design section below left implicit — arities, sync-vs-async-vs-throw
+classification per method, and the accessor-invocation trap — and wrote the **complete, ready-to-
+paste file content** below. Nothing is left to design. The next run should create
+`test/libp2p-facade-forwarding.spec.ts` with exactly the content in the fenced block below (no
+re-reading of `libp2p-fret-service.ts`, no re-deriving arities), then run the two verification
+commands at the bottom of this note. If it still passes only for lack of a spare cycle, the next
+run after that has truly nothing left to do but paste and run.
+
+**One correctness trap found this run that the original Design section did not call out:**
+`Libp2pFretService` has a private `get node()` accessor (string-keyed, not a symbol) at what was
+line 82. Enumerating prototype methods via `Object.getOwnPropertyNames(proto)` and then checking
+`typeof proto[name] === 'function'` by **directly indexing `proto[name]`** invokes that getter
+immediately (`proto` here is the bare prototype object, not a constructed instance) — its body
+reads `this.components.libp2p`, and `this.components` is `undefined` on the bare prototype, so the
+enumeration itself throws. The fix is to check the property **descriptor** instead of touching the
+property: `typeof Object.getOwnPropertyDescriptor(proto, name)?.value === 'function'`. This never
+invokes any getter, so `node`, `[Symbol.toStringTag]`, and `[peerDiscoverySymbol]` are all excluded
+safely (the latter two are also simply invisible to `getOwnPropertyNames`, since it only returns
+string keys and both are computed symbol keys — but `node` is a real trap the naive filter walks
+into). The file below uses the descriptor form throughout.
+
+**Arity-driven sentinel args.** Every wrapper method's optional trailing parameters compile to
+plain (non-default) JS parameters, so `Function.prototype.length` already equals the number of
+arguments the design wants exercised, optional ones included — no per-method arg-count table
+needed. `sentinelArgs(fn)` below just builds `fn.length` distinct `{__arg: i}` objects.
+
+**Exact classification derived by reading every wrapper method body** (all still match — see
+prior runs' confirmation of zero drift):
+- `ASYNC_UNWRAP = ['routeAct', 'ready', 'importTable']` — for the **forwarding-with-mock**
+  property, these three need `await` before comparing the resolved value to the mock's sentinel,
+  because their wrappers return a `Promise` (either via `async`/`await`, or via bare `return
+  this.ensure().importTable(table)` which forwards the promise object itself).
+- `REJECTS = ['routeAct', 'ready']` only — for the **not-injected-throws** property. This is
+  narrower than `ASYNC_UNWRAP` and is the one subtlety easy to get wrong: `importTable`'s wrapper
+  is **not** marked `async` (`importTable(table): Promise<number> { return
+  this.ensure().importTable(table); }`), so when `ensure()` throws, it throws **synchronously**
+  out of the `importTable(...)` call itself — there is no promise yet to reject. Only the two
+  methods whose wrapper body actually has the `async` keyword ahead of the `ensure()` call
+  (`routeAct`, `ready`) convert that synchronous throw into a rejected promise. Every other
+  method — including `importTable` and `iterativeLookup` — throws synchronously when uninjected,
+  because every non-`async` wrapper calls `this.ensure()` as its first statement.
+- `ASYNC_GENERATOR = ['iterativeLookup']` — call it (no `await`), assert identity on the returned
+  generator object directly; never iterate it.
+- Every other enumerated method is synchronous request/response: call directly, assert identity
+  on the return value directly.
+
+**Pinned expected count: `forwarding.length === 20`.** Counted by hand from the full method list
+in `libp2p-fret-service.ts`: 27 total function-valued own properties on the prototype (26 methods
++ `constructor`), minus the 7-entry skip list (`constructor, start, stop, setLibp2p,
+getPeerDiscovery, ensure, discoverySource`) = 20. (The original ticket's "22-ish" estimate was an
+approximation and undercounts the skip list; 20 is the exact, derived number — hardcode it so a
+future skip-list addition without updating this number is a loud, deliberate failure, per the
+Design section's "future interface member... doesn't silently fall into an ever-growing skip list
+unnoticed.")
+
+**Complete file to create at `test/libp2p-facade-forwarding.spec.ts`:**
+```ts
+import { describe, it } from 'mocha'
+import { expect } from 'chai'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
+
+function coreOf(svc: Libp2pFretService): { inner: unknown } {
+	return svc as unknown as { inner: unknown }
+}
+
+const SKIP_LIST = ['constructor', 'start', 'stop', 'setLibp2p', 'getPeerDiscovery', 'ensure', 'discoverySource']
+// Wrappers whose body has `async` ahead of the ensure() call: a missing core surfaces as a
+// rejected promise. Every other method (including importTable, whose wrapper forwards a promise
+// but is not itself async) throws synchronously when uninjected.
+const REJECTS = new Set(['routeAct', 'ready'])
+// Methods whose wrapper returns a Promise that must be awaited to reach the mock's sentinel.
+const ASYNC_UNWRAP = new Set(['routeAct', 'ready', 'importTable'])
+// Returns a generator object synchronously; identity-check the object itself, never iterate it.
+const ASYNC_GENERATOR = new Set(['iterativeLookup'])
+
+type AnyFn = (...args: unknown[]) => unknown
+
+function protoRecord(): Record<string, unknown> {
+	return Libp2pFretService.prototype as unknown as Record<string, unknown>
+}
+
+// Uses property descriptors, never direct indexing: Libp2pFretService has a private `get node()`
+// accessor whose body dereferences `this.components`, which is undefined on the bare prototype
+// object — indexing `proto['node']` directly invokes it and throws.
+function enumerateForwardingMethods(): string[] {
+	const proto = protoRecord()
+	return Object.getOwnPropertyNames(proto)
+		.filter(name => typeof Object.getOwnPropertyDescriptor(proto, name)?.value === 'function')
+		.filter(name => !SKIP_LIST.includes(name))
+}
+
+function sentinelArgs(fn: AnyFn): unknown[] {
+	return Array.from({ length: fn.length }, (_, i) => ({ __arg: i }))
+}
+
+function call(svc: unknown, name: string, args: unknown[]): unknown {
+	return (svc as Record<string, AnyFn>)[name]!(...args)
+}
+
+describe('Libp2pFretService — forwarding', function () {
+	this.timeout(20_000)
+
+	it('skip list entries all still exist on the prototype', () => {
+		const proto = protoRecord()
+		for (const name of SKIP_LIST) {
+			if (name === 'constructor') continue
+			expect(typeof Object.getOwnPropertyDescriptor(proto, name)?.value, name).to.equal('function')
+		}
+	})
+
+	it('enumerates a non-empty, exactly-20-member forwarding set (getters excluded)', () => {
+		const forwarding = enumerateForwardingMethods()
+		expect(forwarding.length).to.equal(20)
+		expect(forwarding).to.include('getDiagnostics')
+		expect(forwarding).to.not.include.members(SKIP_LIST.filter(n => n !== 'constructor'))
+	})
+
+	it('forwards every non-skipped method to the core with exact args, order, and return identity', async () => {
+		const node = await createMemNode(); await node.start()
+		const svc = new Libp2pFretService({ libp2p: node }, { profile: 'core', k: 7 })
+		try {
+			svc.setMode('passive') // cheap real pass-through: forces ensure() to build the real core once
+			const calls: Array<{ name: string; args: unknown[] }> = []
+			const proto = protoRecord() as Record<string, AnyFn>
+			const methods = enumerateForwardingMethods()
+			const sentinels = new Map<string, unknown>()
+			const mockCore: Record<string, AnyFn> = {}
+			for (const name of methods) {
+				const sentinel = { __sentinel: name }
+				sentinels.set(name, sentinel)
+				mockCore[name] = (...args: unknown[]) => {
+					calls.push({ name, args })
+					return ASYNC_UNWRAP.has(name) ? Promise.resolve(sentinel) : sentinel
+				}
+			}
+			coreOf(svc).inner = mockCore
+
+			for (const name of methods) {
+				calls.length = 0
+				const args = sentinelArgs(proto[name]!)
+				let result = call(svc, name, args)
+				if (ASYNC_UNWRAP.has(name)) result = await result
+				expect(calls, `${name} called once`).to.have.length(1)
+				expect(calls[0]!.name).to.equal(name)
+				expect(calls[0]!.args, `${name} args in order`).to.deep.equal(args)
+				expect(result, `${name} return identity`).to.equal(sentinels.get(name))
+			}
+		} finally {
+			await svc.stop()
+			await stopAll([node])
+		}
+	})
+
+	it('every non-skipped method fails with the not-injected error when no core exists', async () => {
+		const svc2 = new Libp2pFretService({})
+		const proto = protoRecord() as Record<string, AnyFn>
+		const methods = enumerateForwardingMethods()
+		for (const name of methods) {
+			const args = sentinelArgs(proto[name]!)
+			if (REJECTS.has(name)) {
+				let err: unknown
+				try { await call(svc2, name, args) } catch (e) { err = e }
+				expect(err, `${name} rejects`).to.be.instanceOf(Error)
+				expect((err as Error).message, name).to.match(/libp2p node not injected/)
+			} else {
+				expect(() => call(svc2, name, args), name).to.throw(/libp2p node not injected/)
+			}
+		}
+	})
+})
+```
+
+**Verification commands (run both, in order, after creating the file):**
+```
+cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000
+cd packages/fret && npx tsc --noEmit
+```
+If the mocha run fails on a specific method's arg count or sync/async classification, the fix is
+almost certainly a one-line correction to `REJECTS` / `ASYNC_UNWRAP` / `ASYNC_GENERATOR` above (or,
+if `libp2p-fret-service.ts` has genuinely changed since this note, re-deriving that one method's
+row from its current wrapper body) — not a redesign.
 
 Confirmed facts below (unchanged from the original ticket, now double-checked) save the next run a
 re-discovery pass; the Design/Edge-cases/TODO sections are otherwise unchanged and still the spec
