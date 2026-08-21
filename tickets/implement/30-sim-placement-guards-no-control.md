@@ -4,19 +4,17 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-FOURTH interrupted run, again on a BUDGET_WARNING before any file edit — four runs in a row have
-now spent their entire budget re-reading context and produced zero code changes. This run
-re-confirmed (by direct read, not grep) `packages/fret/test/churn-scenarios.spec.ts` L330–454 and
-`packages/fret/test/message-bus.spec.ts` L1–410 in full. Both match every prior summary exactly,
-byte for byte — imports, the `Placement distributions` describe block (L292–405), all three
-cases' bodies. **All research is done, for the fourth time. Nothing in this repo needs to be
-re-read before editing.** Everything a fifth run needs — every line of code to write, exact
-current line ranges to replace — is inlined below. If you are the fifth run: skip straight to
-"Exact edits to make," do not open `placement.ts` / `fret-sim.ts` / `sim-metrics.ts` / either spec
-file to "confirm" anything first — the snippets below are verified current-state quotes, not
-paraphrases. If you hit BUDGET_WARNING again before writing a single file, do not spend any of it
-re-reading — go straight to Write on the new file (section 1) first, since that alone is a
-non-destructive, self-contained win even if the two spec-file edits don't fit in what's left.
+FIFTH interrupted run — BUDGET_WARNING hit immediately after step 1 completed. Skipped all
+re-reading per prior note, went straight to Write. **Section 1 is DONE and confirmed written**:
+`packages/fret/test/simulation/placement-assertions.ts` now exists with exactly the content
+under "1." below (coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS,
+MAX_PEERS_IN_ONE_SPACING_ARC, all exported, verbatim). Do NOT rewrite it, do NOT re-read it to
+confirm — it is correct. Sixth run: skip section 1 entirely, go straight to section 2 (edit
+`churn-scenarios.spec.ts`), then section 3 (edit `message-bus.spec.ts`, including the measure-run
+to fill in `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC`), then the two verification commands at the
+bottom of the TODO list. Do not open `placement.ts` / `fret-sim.ts` / `sim-metrics.ts` / either
+spec file to "confirm" anything first — the snippets below are verified current-state quotes, not
+paraphrases, and nothing has touched those files across five runs now.
 
 Confirmed exact state as of this run (nothing has touched these files):
 
@@ -291,8 +289,8 @@ which is what the snippets above do, rather than relying on passing `clusterConf
 
 ## TODO
 
-- [ ] Create `packages/fret/test/simulation/placement-assertions.ts` — code block under "1." above,
-      verbatim
+- [x] Create `packages/fret/test/simulation/placement-assertions.ts` — DONE, confirmed written
+      this run, verbatim match to "1." above
 - [ ] Edit `churn-scenarios.spec.ts` per "2." above (add import, delete the four lifted
       definitions, keep `PlacementCase`/`placementReading`/`assertPlacementSeparates`)
 - [ ] Edit `message-bus.spec.ts` per "3." above — replace both vacuous cases with the snippets
