@@ -4,15 +4,31 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Third run in a row stopped on BUDGET_WARNING. This run got further than the prior two: it
-re-confirmed the source is unchanged (same as before — zero drift), then went on to work out the
-exact mechanics the Design section below left implicit — arities, sync-vs-async-vs-throw
-classification per method, and the accessor-invocation trap — and wrote the **complete, ready-to-
-paste file content** below. Nothing is left to design. The next run should create
-`test/libp2p-facade-forwarding.spec.ts` with exactly the content in the fenced block below (no
-re-reading of `libp2p-fret-service.ts`, no re-deriving arities), then run the two verification
-commands at the bottom of this note. If it still passes only for lack of a spare cycle, the next
-run after that has truly nothing left to do but paste and run.
+Fourth run stopped on BUDGET_WARNING, immediately after writing the file (budget fired on the
+Write tool call itself — no cycles left to also run tests this run).
+
+**`test/libp2p-facade-forwarding.spec.ts` now EXISTS on disk, byte-for-byte the fenced block
+below.** Nothing left to write or design. The only remaining work is running the two verification
+commands at the bottom of this note and reading their output:
+
+```
+cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000
+cd packages/fret && npx tsc --noEmit
+```
+
+Next run: do NOT re-read `libp2p-fret-service.ts` or re-derive anything — just run both commands.
+- Both green → ticket is done. Write the review/ handoff (see ticket's own "End" instructions and
+  AGENTS.md implement-stage rules) summarizing the 4 test cases in the file (skip-list-exists,
+  exactly-20-forwarding-methods, forward-with-mock-identity-and-order, not-injected-throws), note
+  this file is new (no pre-existing coverage to compare against), then delete this ticket from
+  implement/.
+- Mocha fails on a specific method → almost certainly a one-line fix to `REJECTS` / `ASYNC_UNWRAP`
+  / `ASYNC_GENERATOR` in the test file (see prior runs' classification reasoning still below this
+  note) or, only if `libp2p-fret-service.ts` genuinely changed since these notes were written,
+  re-deriving that one method's arity/sync-async classification from its current wrapper body.
+  Not a redesign either way.
+- `tsc --noEmit` fails → check for a stray type issue in the new file (e.g. the `coreOf` cast); the
+  rest of the package was type-clean before this ticket touched it.
 
 **One correctness trap found this run that the original Design section did not call out:**
 `Libp2pFretService` has a private `get node()` accessor (string-keyed, not a symbol) at what was
