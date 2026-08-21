@@ -147,7 +147,11 @@ describe('Ring membership classification (identify-driven)', function () {
 		expect(store.getById(idC)?.membership).to.equal('member', 'C should first be confirmed a member')
 
 		nodeA.dispatchEvent(new CustomEvent('peer:update', {
-			detail: { peer: { id: nodeC.peerId, protocols: ['/ipfs/id/1.0.0', '/ipfs/ping/1.0.0'] } }
+			// `addresses` is not optional on libp2p's `Peer`, and the peer:update listener reads it
+			// directly (no optional chain) now that the event is typed — a synthetic event missing
+			// it throws inside the handler, which is caught and logged, silently skipping the
+			// address bookkeeping that runs after the classification this test asserts on.
+			detail: { peer: { id: nodeC.peerId, protocols: ['/ipfs/id/1.0.0', '/ipfs/ping/1.0.0'], addresses: [] } }
 		}))
 
 		expect(store.getById(idC)?.membership).to.equal('member',
