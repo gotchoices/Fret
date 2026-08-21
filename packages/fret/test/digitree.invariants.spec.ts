@@ -246,6 +246,20 @@ function checkInvariants(store: DigitreeStore, context: string): void {
 		if (right.length !== n) throw new Error(`${context}: neighborsRight returned ${right.length} distinct of ${n}`)
 		if (left.length !== n) throw new Error(`${context}: neighborsLeft returned ${left.length} distinct of ${n}`)
 	}
+
+	// The O(1) tallies must agree with a manual recount over the same `listed` population —
+	// pinning both directions: a tally that over-reports (never decremented) and one that
+	// under-reports (decremented on a no-op write) are equally wrong.
+	for (const s of STATES) {
+		const want = listed.filter((e) => e.state === s).length
+		const got = store.countByState(s)
+		if (got !== want) throw new Error(`${context}: countByState(${s}) is ${got}, expected ${want}`)
+	}
+	for (const m of MEMBERSHIPS) {
+		const want = listed.filter((e) => e.membership === m).length
+		const got = store.countByMembership(m)
+		if (got !== want) throw new Error(`${context}: countByMembership(${m}) is ${got}, expected ${want}`)
+	}
 }
 
 describe('DigitreeStore index/tree invariant', () => {
@@ -322,6 +336,80 @@ describe('DigitreeStore index/tree invariant', () => {
 			if (restored !== 1) throw new Error(`expected 1 distinct id, got ${restored}`)
 			if (store.size() !== 1) throw new Error(`expected size 1, got ${store.size()}`)
 			if (store.list().length !== 1) throw new Error(`expected 1 tree entry, got ${store.list().length}`)
+		})
+	})
+
+	describe('counts', () => {
+		it('is zero for every label on an empty store', () => {
+			const store = new DigitreeStore()
+			for (const s of STATES) if (store.countByState(s) !== 0) throw new Error(`countByState(${s}) !== 0 on empty store`)
+			for (const m of MEMBERSHIPS)
+				if (store.countByMembership(m) !== 0) throw new Error(`countByMembership(${m}) !== 0 on empty store`)
+		})
+
+		it('setMembership shifts both membership counters by one, leaving state counts unchanged', () => {
+			const store = new DigitreeStore()
+			store.upsert('p1', coords[1]!) // membership: 'unknown', state: 'disconnected'
+			const deadBefore = store.countByState('disconnected')
+
+			store.setMembership('p1', 'member')
+
+			if (store.countByMembership('unknown') !== 0) throw new Error('unknown count did not decrement')
+			if (store.countByMembership('member') !== 1) throw new Error('member count did not increment')
+			if (store.countByState('disconnected') !== deadBefore) throw new Error('state counts moved on a membership-only change')
+		})
+
+		it('setState(dead) shifts state counters only, membership counts unchanged', () => {
+			const store = new DigitreeStore()
+			store.upsert('p1', coords[1]!)
+			store.setMembership('p1', 'foreign')
+			const foreignBefore = store.countByMembership('foreign')
+
+			store.setState('p1', 'dead')
+
+			if (store.countByState('disconnected') !== 0) throw new Error('disconnected count did not decrement')
+			if (store.countByState('dead') !== 1) throw new Error('dead count did not increment')
+			if (store.countByMembership('foreign') !== foreignBefore) throw new Error('membership counts moved on a state-only change')
+		})
+
+		it('remove of a dead foreign peer decrements both its state and membership counts', () => {
+			const store = new DigitreeStore()
+			store.upsert('p1', coords[1]!)
+			store.setMembership('p1', 'foreign')
+			store.setState('p1', 'dead')
+
+			store.remove('p1')
+
+			if (store.countByState('dead') !== 0) throw new Error(`countByState('dead') !== 0 after remove`)
+			if (store.countByMembership('foreign') !== 0) throw new Error(`countByMembership('foreign') !== 0 after remove`)
+		})
+
+		it('importEntries replacing an existing id recounts rather than summing old and new labels', () => {
+			const store = new DigitreeStore()
+			store.upsert('p1', coords[1]!) // 'unknown' / 'disconnected'
+			store.update('p1', { membership: 'unknown', state: 'disconnected' })
+
+			store.importEntries([serialized('p1', coords[2]!, { membership: 'member', state: 'connected' })])
+
+			if (store.countByMembership('unknown') !== 0) throw new Error('old membership count not decremented on replace')
+			if (store.countByState('disconnected') !== 0) throw new Error('old state count not decremented on replace')
+			if (store.countByMembership('member') !== 1) throw new Error('new membership count not incremented on replace')
+			if (store.countByState('connected') !== 1) throw new Error('new state count not incremented on replace')
+		})
+
+		it('never goes negative when removing an id twice, or an id never inserted', () => {
+			const store = new DigitreeStore()
+			store.upsert('p1', coords[1]!)
+			store.setMembership('p1', 'member')
+
+			store.remove('p1')
+			store.remove('p1') // second remove: no-op
+			store.remove('does-not-exist') // never inserted: no-op
+
+			if (store.countByMembership('member') !== 0) throw new Error('member count went negative or stayed after double remove')
+			for (const s of STATES) if (store.countByState(s) !== 0) throw new Error(`countByState(${s}) !== 0 after double remove`)
+			for (const m of MEMBERSHIPS)
+				if (store.countByMembership(m) !== 0) throw new Error(`countByMembership(${m}) !== 0 after double remove`)
 		})
 	})
 
