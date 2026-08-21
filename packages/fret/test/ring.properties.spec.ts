@@ -7,7 +7,7 @@ import {
 	coordToBase64url, base64urlToCoord,
 	COORD_BYTES,
 } from '../src/ring/hash.js'
-import { toBigInt } from './helpers/ring.js'
+import { toBigInt, toCoord, refMinDistance } from './helpers/ring.js'
 
 const arbCoord = fc.uint8Array({ minLength: COORD_BYTES, maxLength: COORD_BYTES })
 
@@ -42,23 +42,6 @@ function addMod(a: Uint8Array, b: Uint8Array): Uint8Array {
 }
 
 const RING = 1n << BigInt(COORD_BYTES * 8)
-
-function toCoord(v: bigint): Uint8Array {
-	let x = ((v % RING) + RING) % RING
-	const out = new Uint8Array(COORD_BYTES)
-	for (let i = COORD_BYTES - 1; i >= 0; i--) { out[i] = Number(x & 0xffn); x >>= 8n }
-	return out
-}
-
-/**
- * Independent BigInt oracle for the ring metric — deliberately shares no code
- * with `src/ring/distance.ts`, so a bug in `clockwiseDistance` or `lexLess`
- * cannot hide behind a test that re-derives the answer from the same helpers.
- */
-function refMinDistance(a: Uint8Array, b: Uint8Array): bigint {
-	const cw = (toBigInt(b) - toBigInt(a) + RING) % RING
-	return cw <= RING - cw ? cw : RING - cw
-}
 
 describe('Ring arithmetic properties', function () {
 	this.timeout(30_000)

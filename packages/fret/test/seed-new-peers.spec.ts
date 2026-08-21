@@ -7,6 +7,7 @@ import { selectDiverseSample } from '../src/service/fret-service.js'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { COORD_BYTES } from '../src/ring/hash.js'
+import { toCoord } from './helpers/ring.js'
 
 /**
  * Build a 32-byte coordinate with a single distinguishing byte at position `pos`.
@@ -329,9 +330,7 @@ describe('Seed new peers — estimator calibration from snapshots', function () 
 			const step = (1n << 256n) / 64n
 			for (let i = 0; i < 64; i++) {
 				const v = BigInt(i) * step
-				const coord = new Uint8Array(COORD_BYTES)
-				let rem = v
-				for (let b = 31; b >= 0; b--) { coord[b] = Number(rem & 0xffn); rem >>= 8n }
+				const coord = toCoord(v)
 				store.upsert(`pre${i}`, coord)
 				store.setMembership(`pre${i}`, 'member')
 			}

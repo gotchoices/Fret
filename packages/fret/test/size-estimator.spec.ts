@@ -3,21 +3,11 @@ import { expect } from 'chai'
 import { DigitreeStore } from '../src/store/digitree-store.js'
 import { estimateSizeAndConfidence } from '../src/estimate/size-estimator.js'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
+import { toCoord as bigIntToCoord } from './helpers/ring.js'
 
 const RING_SIZE = 1n << 256n
 
 // --- Coordinate generation helpers ---
-
-function bigIntToCoord(v: bigint): Uint8Array {
-	const u = new Uint8Array(32)
-	let rem = v % RING_SIZE
-	if (rem < 0n) rem += RING_SIZE
-	for (let i = 31; i >= 0; i--) {
-		u[i] = Number(rem & 0xffn)
-		rem >>= 8n
-	}
-	return u
-}
 
 /** Evenly spaced coords: i * (2^256 / n) */
 function uniformCoords(n: number): Uint8Array[] {

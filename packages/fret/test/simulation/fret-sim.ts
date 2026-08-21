@@ -4,6 +4,7 @@ import { MetricsCollector, type SimMetrics } from './sim-metrics.js'
 import { SimMessageBus, type MessageBusConfig, type SimMessage } from './message-bus.js'
 import { DigitreeStore, type PeerEntry } from '../../src/store/digitree-store.js'
 import { chooseNextHop } from '../../src/selector/next-hop.js'
+import { toCoord as bigintToCoord } from '../helpers/ring.js'
 
 export interface SimPeerConfig {
 	profile: 'edge' | 'core'
@@ -1046,15 +1047,4 @@ export class FretSimulation {
 	getBus(): SimMessageBus | undefined {
 		return this.bus
 	}
-}
-
-/** Convert a BigInt to a 32-byte Uint8Array (big-endian). */
-function bigintToCoord(val: bigint): Uint8Array {
-	const coord = new Uint8Array(32)
-	let v = val
-	for (let i = 31; i >= 0; i--) {
-		coord[i] = Number(v & 0xffn)
-		v >>= 8n
-	}
-	return coord
 }

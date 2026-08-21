@@ -4,12 +4,6 @@ import { COORD_BYTES } from '../../src/ring/hash.js'
 const RING = 1n << BigInt(COORD_BYTES * 8)
 
 /**
- * NOTE: this module is the landing place for coordinate arithmetic hand-rolled inside specs.
- * Copies still living in `test/ring.properties.spec.ts` (`toCoord`, `refMinDistance`) and
- * `test/size-estimator.spec.ts` (`bigIntToCoord`) should migrate here rather than multiply.
- */
-
-/**
  * `base` shifted by `delta` ring units, exact modulo 2^256. The delta is added at the
  * *least-significant* byte (index `length - 1`) with carry/borrow propagated leftward across
  * every byte — dropping the carry anywhere along the chain would change the coordinate by more
@@ -25,15 +19,8 @@ const RING = 1n << BigInt(COORD_BYTES * 8)
  * across a wide arc, which is what let a uniformly random self coordinate land among them by
  * chance and made the calling specs flaky.
  */
-export function ringOffset(base: Uint8Array, delta: number): Uint8Array {
-	const out = new Uint8Array(base.length)
-	let carry = delta
-	for (let i = base.length - 1; i >= 0; i--) {
-		const v = (base[i] ?? 0) + carry
-		carry = Math.floor(v / 256)
-		out[i] = ((v % 256) + 256) % 256
-	}
-	return out
+export function ringOffset(base: Uint8Array, delta: number | bigint): Uint8Array {
+	return toCoord(toBigInt(base) + BigInt(delta))
 }
 
 /**

@@ -8,6 +8,7 @@ import { hashKey } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
 import { toString as u8ToString } from 'uint8arrays/to-string'
+import { ringOffset } from './helpers/ring.js'
 
 /**
  * Regression coverage for a bug where anchor selection measured distance from the all-zero
@@ -44,17 +45,6 @@ function seedMember(priv: AnchorInternals, id: string, coord: Uint8Array): void 
 function oneBitFrom(coord: Uint8Array, byte = 31): Uint8Array {
 	const out = Uint8Array.from(coord)
 	out[byte]! ^= 0x01
-	return out
-}
-
-/** `coord` moved `delta` steps around the ring (negative = counter-clockwise), mod 2^256. */
-function shiftCoord(coord: Uint8Array, delta: bigint): Uint8Array {
-	const mod = 1n << 256n
-	let v = 0n
-	for (const b of coord) v = (v << 8n) | BigInt(b)
-	v = (((v + delta) % mod) + mod) % mod
-	const out = new Uint8Array(32)
-	for (let i = 31; i >= 0; i--) { out[i] = Number(v & 0xffn); v >>= 8n }
 	return out
 }
 
@@ -133,9 +123,9 @@ describe('pickAnchors measures distance from the target coordinate', function ()
 		// peer d counter-clockwise of it sit at the same arc length. `betterByDist` resolves
 		// that by lexicographic peer id, which is what fret.md prescribes.
 		const keyCoord = await hashKey(u8FromString('pick-anchors-tie', 'utf8'))
-		seedMember(priv, 'zzz-clockwise', shiftCoord(keyCoord, 4096n))
-		seedMember(priv, 'aaa-counter', shiftCoord(keyCoord, -4096n))
-		seedMember(priv, 'far-peer', shiftCoord(keyCoord, 1n << 200n))
+		seedMember(priv, 'zzz-clockwise', ringOffset(keyCoord, 4096n))
+		seedMember(priv, 'aaa-counter', ringOffset(keyCoord, -4096n))
+		seedMember(priv, 'far-peer', ringOffset(keyCoord, 1n << 200n))
 
 		const anchors = priv.pickAnchors(['zzz-clockwise', 'aaa-counter', 'far-peer'], keyCoord)
 		expect(anchors).to.deep.equal(['aaa-counter', 'zzz-clockwise'])

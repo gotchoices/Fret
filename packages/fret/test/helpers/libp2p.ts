@@ -61,7 +61,7 @@ export async function connectLine(nodes: any[]): Promise<void> {
 }
 
 export async function stopAll(nodes: any[]): Promise<void> {
-	for (const n of nodes.reverse()) {
+	for (const n of [...nodes].reverse()) {
 		try { await n.stop() } catch {}
 	}
 }
