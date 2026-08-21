@@ -7,6 +7,9 @@ import {
 	sendFramed,
 	registerRpcHandler,
 } from './protocols.js';
+import { createLogger } from '../logger.js';
+
+const log = createLogger('rpc:maybe-act');
 import { rpcRequest } from './request.js';
 import { parseMaybeActReply, parseOrThrow, MAX_ACTIVITY_BYTES, MAYBE_ACT_OVERHEAD_BYTES } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
@@ -16,7 +19,8 @@ export async function registerMaybeAct(
 	node: Libp2p,
 	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
 	protocol = PROTOCOL_MAYBE_ACT,
-	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES
+	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
+	onMalformed?: () => void
 ): Promise<void> {
 	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
@@ -25,7 +29,15 @@ export async function registerMaybeAct(
 	// hold the handler open.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		const bytes = await readFramed(stream, maxBytes);
-		const msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		let msg: RouteAndMaybeActV1;
+		try {
+			msg = decodeJson<RouteAndMaybeActV1>(bytes);
+		} catch (err) {
+			log.error('%s: undecodable body - dropping - %e', protocol, err);
+			onMalformed?.();
+			sendFramed(stream, encodeJson({ v: 1, anchors: [], cohort_hint: [], estimated_cluster_size: 0, confidence: 0 } satisfies NearAnchorV1));
+			return;
+		}
 		const res = await handle(msg, connection.remotePeer.toString());
 		sendFramed(stream, encodeJson(res));
 	});

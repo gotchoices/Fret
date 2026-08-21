@@ -416,10 +416,12 @@ export class FretService implements IFretService, Startable {
 			payloadTooLarge: 0,
 			timestampBounds: 0,
 			ttlExpired: 0,
-			rateLimited: 0,
+			rateLimited: { neighbors: 0, ping: 0, maybeAct: 0, leave: 0, announce: 0 },
 			identityMismatch: 0,
 			/** Inbound maybeAct messages that failed `parseRouteAndMaybeAct` (structure/type). */
 			malformed: 0,
+			/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
+			concurrencyLimited: 0,
 		},
 	};
 
@@ -1238,7 +1240,8 @@ export class FretService implements IFretService, Startable {
 						return await this.handleMaybeAct(msg);
 					},
 					this.protocols.PROTOCOL_MAYBE_ACT,
-					this.maxBytesMaybeAct()
+					this.maxBytesMaybeAct(),
+					() => { this.diag.rejected.malformed++; }
 				),
 				// NOTE: leave is deliberately the one inbound handler with no `noteInboundRpc`
 				// hook (compare neighbors / maybeAct / ping above and below). That hook applies
@@ -1287,7 +1290,7 @@ export class FretService implements IFretService, Startable {
 
 	private async handleNeighborsRequest(): Promise<NeighborSnapshotV1 | BusyResponseV1> {
 		if (!this.bucketNeighbors.tryTake()) {
-			this.diag.rejected.rateLimited++;
+			this.diag.rejected.rateLimited.neighbors++;
 			return { v: 1, busy: true, retry_after_ms: this.bucketNeighbors.retryAfterMs() };
 		}
 		return await this.snapshot();
@@ -1295,7 +1298,7 @@ export class FretService implements IFretService, Startable {
 
 	private handlePingRequest(): { size_estimate?: number; confidence?: number } | BusyResponseV1 {
 		if (!this.bucketPing.tryTake()) {
-			this.diag.rejected.rateLimited++;
+			this.diag.rejected.rateLimited.ping++;
 			return { v: 1, busy: true, retry_after_ms: this.bucketPing.retryAfterMs() } satisfies BusyResponseV1;
 		}
 		return this.getNetworkSizeEstimate();
@@ -1378,7 +1381,7 @@ export class FretService implements IFretService, Startable {
 		// regression of idempotency — the work is still never performed twice, and the sender
 		// has `retry_after_ms` — but if retry latency under load ever matters, the fix is a
 		// cheaper dedup-only pre-check, not moving the bucket back behind the guards.
-		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
+		if (!this.bucketMaybeAct.tryTake()) { this.diag.rejected.rateLimited.maybeAct++; return { v: 1, busy: true, retry_after_ms: this.bucketMaybeAct.retryAfterMs() }; }
 
 		// Structural validation immediately after the bucket (so malformed floods are metered
 		// too, never an unmetered pre-filter) and before every guard below — each of which reads
@@ -1418,7 +1421,7 @@ export class FretService implements IFretService, Startable {
 		if (msg.ttl <= 0) { this.diag.rejected.ttlExpired++; return this.staticReject(); }
 		if (msg.activity && msg.activity.length > MAX_ACTIVITY_BYTES) { this.diag.rejected.payloadTooLarge++; return this.staticReject(); }
 		const limit = this.cfg.profile === 'core' ? 16 : 4;
-		if (this.inflightAct >= limit) { this.diag.rejected.rateLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
+		if (this.inflightAct >= limit) { this.diag.rejected.concurrencyLimited++; return { v: 1, busy: true, retry_after_ms: 500 }; }
 		this.inflightAct++;
 		try {
 			const result = await this.routeAct(msg, keyBytes);
@@ -1835,7 +1838,7 @@ export class FretService implements IFretService, Startable {
 	// most ~4 KB of pure parsing per message — cheaper than the `readFramed` this bucket never
 	// metered either. Keep the bucket first *inside* this method; do not move it into the seam.
 	private async handleLeave(notice: { from: string; replacements?: string[]; timestamp: number }): Promise<void> {
-		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited++; return; }
+		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited.leave++; return; }
 		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		const peerId = notice.from;
 		try {
@@ -1996,7 +1999,7 @@ export class FretService implements IFretService, Startable {
 	 */
 	private handleAnnounce(from: string, snap: NeighborSnapshotV1): void {
 		if (!this.bucketAnnounceInbound.tryTake()) {
-			this.diag.rejected.rateLimited++;
+			this.diag.rejected.rateLimited.announce++;
 			return;
 		}
 		this.detach(this.mergeAnnounceSnapshot(from, snap), 'mergeAnnounceSnapshot');
