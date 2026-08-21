@@ -145,7 +145,7 @@ async function writeBody(
 	deadlineSignal: AbortSignal
 ): Promise<RpcOutcome<never> | undefined> {
 	try {
-		const hasRoom = sendFramed(stream, await encodeJson(body));
+		const hasRoom = sendFramed(stream, encodeJson(body));
 		if (!hasRoom) await awaitDrain(stream, deadlineSignal);
 		return undefined;
 	} catch (err) {
@@ -174,7 +174,7 @@ async function decodeReply<T>(
 ): Promise<RpcOutcome<T>> {
 	let parsed: unknown;
 	try {
-		parsed = await decodeJson(bytes);
+		parsed = decodeJson(bytes);
 	} catch (err) {
 		return decodeFailure(err, callerSignal);
 	}

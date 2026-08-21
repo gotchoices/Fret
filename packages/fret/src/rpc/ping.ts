@@ -90,6 +90,6 @@ export async function sendPing(
 		// boolean, so the coercion could only ever have hidden a malformed peer. A rejection
 		// throws (see `parseOrThrow`) and surfaces as `decode-error` — proof of life, never a
 		// contact strike.
-		decode: async (b) => parseOrThrow(parsePingResponse, await decodeJson(b)),
+		decode: (b) => parseOrThrow(parsePingResponse, decodeJson(b)),
 	});
 }

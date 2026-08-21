@@ -75,7 +75,7 @@ export async function registerNeighbors(
 					return undefined;
 				}
 				onAnnounce(snap.from, snap);
-				return { ok: true };
+				return undefined;
 			},
 		});
 	}
@@ -112,7 +112,7 @@ export async function fetchNeighbors(
 		timeoutMs: opts.timeoutMs,
 		dial: 'never',
 		maxBytes: MAX_NEIGHBORS_BYTES,
-		decode: async (b) => parseOrThrow(parse, await decodeJson(b)),
+		decode: (b) => parseOrThrow(parse, decodeJson(b)),
 	});
 }
 

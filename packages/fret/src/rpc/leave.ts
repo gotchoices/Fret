@@ -48,7 +48,7 @@ export async function registerLeave(
 				return undefined;
 			}
 			await onLeave(msg);
-			return { ok: true };
+			return undefined;
 		},
 	});
 }

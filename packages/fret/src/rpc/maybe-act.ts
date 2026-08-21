@@ -25,9 +25,9 @@ export async function registerMaybeAct(
 	// hold the handler open.
 	await registerRpcHandler(node, protocol, async (stream, connection) => {
 		const bytes = await readFramed(stream, maxBytes);
-		const msg = await decodeJson<RouteAndMaybeActV1>(bytes);
+		const msg = decodeJson<RouteAndMaybeActV1>(bytes);
 		const res = await handle(msg, connection.remotePeer.toString());
-		sendFramed(stream, await encodeJson(res));
+		sendFramed(stream, encodeJson(res));
 	});
 }
 
@@ -52,7 +52,7 @@ export async function sendMaybeAct(
 		halfCloseBeforeRead: true,
 		maxBytes: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
 		// A reply that is neither shape is `decode-error`, not a half-parsed cast.
-		decode: async (b) => parseOrThrow(parseMaybeActReply, await decodeJson(b)),
+		decode: (b) => parseOrThrow(parseMaybeActReply, decodeJson(b)),
 	});
 }
 

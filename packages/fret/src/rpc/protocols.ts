@@ -41,11 +41,12 @@ export function makeProtocols(networkName = 'default') {
 export type FretProtocols = ReturnType<typeof makeProtocols>;
 
 // Backward compatibility: default export uses 'default' network
-export const PROTOCOL_NEIGHBORS = '/optimystic/default/fret/1.0.0/neighbors';
-export const PROTOCOL_NEIGHBORS_ANNOUNCE = '/optimystic/default/fret/1.0.0/neighbors/announce';
-export const PROTOCOL_MAYBE_ACT = '/optimystic/default/fret/1.0.0/maybeAct';
-export const PROTOCOL_LEAVE = '/optimystic/default/fret/1.0.0/leave';
-export const PROTOCOL_PING = '/optimystic/default/fret/1.0.0/ping';
+const defaultProtocols = makeProtocols('default');
+export const PROTOCOL_NEIGHBORS = defaultProtocols.PROTOCOL_NEIGHBORS;
+export const PROTOCOL_NEIGHBORS_ANNOUNCE = defaultProtocols.PROTOCOL_NEIGHBORS_ANNOUNCE;
+export const PROTOCOL_MAYBE_ACT = defaultProtocols.PROTOCOL_MAYBE_ACT;
+export const PROTOCOL_LEAVE = defaultProtocols.PROTOCOL_LEAVE;
+export const PROTOCOL_PING = defaultProtocols.PROTOCOL_PING;
 
 /**
  * True when `err` is libp2p's protocol-negotiation failure — i.e. the remote does
@@ -205,14 +206,14 @@ export function registerJsonHandler(
 	return registerRpcHandler(node, protocol, async (stream, connection) => {
 		if (!('parse' in opts)) {
 			// Reply-only: reads no body at all, so there is nothing to decode or parse.
-			sendFramed(stream, await encodeJson(await opts.serve(connection)));
+			sendFramed(stream, encodeJson(await opts.serve(connection)));
 			return;
 		}
 		// Frame-level failures propagate — see the abort half of the rule above.
 		const bytes = await readFramed(stream, opts.maxBytes);
 		let decoded: unknown;
 		try {
-			decoded = await decodeJson(bytes);
+			decoded = decodeJson(bytes);
 		} catch (err) {
 			opts.onMalformed?.('decode');
 			log.error('%s: undecodable body - dropping - %e', protocol, err);
@@ -227,7 +228,7 @@ export function registerJsonHandler(
 		const res = await opts.serve(msg, connection);
 		// Drop without replying; the seam still closes.
 		if (res === undefined) return;
-		sendFramed(stream, await encodeJson(res));
+		sendFramed(stream, encodeJson(res));
 	}, { closeBudgetMs: opts.closeBudgetMs });
 }
 
@@ -246,12 +247,12 @@ export function registerJsonHandler(
  * Everything else the wire formats admit is lossless, lone surrogates included (`JSON.stringify`
  * is well-formed since ES2019, so an unpaired code unit is escaped rather than mangled by UTF-8).
  */
-export async function encodeJson(obj: unknown): Promise<Uint8Array> {
+export function encodeJson(obj: unknown): Uint8Array {
 	const text = JSON.stringify(obj);
 	return new TextEncoder().encode(text);
 }
 
-export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
+export function decodeJson<T = unknown>(bytes: Uint8Array): T {
 	// guard against binary frames or empty buffers
 	if (bytes.byteLength === 0) throw new Error('empty response');
 	// Interop-defensive trim: with length-prefix framing the reader hands over exactly the
@@ -259,8 +260,18 @@ export async function decodeJson<T = unknown>(bytes: Uint8Array): Promise<T> {
 	// (e.g. `JSON + "\n"`) — no longer from a padding muxer.
 	let start = 0;
 	let end = bytes.byteLength;
-	while (start < end && (bytes[start] === 0 || bytes[start] === 9 || bytes[start] === 10 || bytes[start] === 13 || bytes[start] === 32)) start++;
-	while (end > start && (bytes[end - 1] === 0 || bytes[end - 1] === 9 || bytes[end - 1] === 10 || bytes[end - 1] === 13 || bytes[end - 1] === 32)) end--;
+	let nulsStripped = 0;
+	while (start < end && (bytes[start] === 0 || bytes[start] === 9 || bytes[start] === 10 || bytes[start] === 13 || bytes[start] === 32)) {
+		if (bytes[start] === 0) nulsStripped++;
+		start++;
+	}
+	while (end > start && (bytes[end - 1] === 0 || bytes[end - 1] === 9 || bytes[end - 1] === 10 || bytes[end - 1] === 13 || bytes[end - 1] === 32)) {
+		if (bytes[end - 1] === 0) nulsStripped++;
+		end--;
+	}
+	if (nulsStripped > 0) {
+		log.error('decodeJson: stripped %d NUL byte(s) from message padding - possible framing bug', nulsStripped);
+	}
 	if (end <= start) throw new Error('whitespace response');
 	const text = new TextDecoder().decode(bytes.subarray(start, end));
 	const parsed = JSON.parse(text) as unknown;
