@@ -4,179 +4,203 @@ difficulty: easy
 tradeoffs: n/a (implement ticket)
 ----
 
-This is a narrowed continuation of a ticket (`fetch-snapshot-failure-arms-tests`) that hit the
-session token budget twice in a row during discovery and once more before any test code got
-written. Discovery is now done — this ticket is scoped to the two arms that need **no new test
-machinery**, reusing what already exists in `rpc.snapshot-merge-cap.spec.ts`. A sibling ticket
-(`fetch-snapshot-failure-arms-hard`, prereq on this one, same target file) covers the three arms
-that need new stubbing (rejecting connections, hanging streams, real two-node negotiation
-failure) — don't do that work here, leave it to that ticket.
+Third continuation of this ticket — the prior two runs both hit the session token budget during
+discovery/re-verification before writing test code. Discovery is now fully done and re-confirmed
+this run (code at `fetchAndMergeSnapshot` lines 2637–2681 read directly, `dead-state.spec.ts`
+cancelled test read directly at lines 1035–1046, `rpc.snapshot-merge-cap.spec.ts` helpers read
+directly lines 154–221, `test/helpers/rpc-fuzz.ts` read in full). A ready-to-paste draft test file
+is below — the only remaining work is: paste it in, adjust anything that doesn't compile/pass, and
+run `yarn test`. **Do not re-open `fret-service.ts` or the merge-cap spec to re-derive anything —
+everything needed is already extracted below.**
 
-## Where this is
+A sibling ticket (`fetch-snapshot-failure-arms-hard`, prereq on this one, same target file) covers
+`foreign-protocol` / `unreachable` / `timeout` / `busy` — don't do that work here.
 
-`packages/fret/src/service/fret-service.ts`, `fetchAndMergeSnapshot` (private method, confirmed at
-lines 2637–2681 this run) — a `switch (out.kind)` over `RpcOutcome<NeighborSnapshotV1>`
-(`src/rpc/outcome.ts`). Exact current code for the arms this ticket covers (read directly, no need
-to re-open the file for this part):
+## Confirmed facts (do not re-derive)
 
-```ts
-switch (out.kind) {
-    case 'skipped':      // no connection — nothing attempted, count nothing
-    case 'cancelled':    // our own cancellation — not evidence about the peer
-        return announced;
-    case 'busy':
-    case 'decode-error':
-        // Answered badly / refused: alive. Today's empty-snapshot path scored nothing — preserved.
-        log.error('fetchNeighbors %s from %s', out.kind, id);
-        return announced;
-    case 'foreign-protocol':
-    case 'unreachable':
-    case 'timeout':
-        await this.noteRpcFailure(id, out);
-        return announced;
-    case 'ok':
-        break;
-}
-```
+- `fetchAndMergeSnapshot(id, signal)` is a **private** method on `FretService`
+  (`packages/fret/src/service/fret-service.ts:2637`), called via `(svc as any).fetchAndMergeSnapshot(id, signal)`.
+- Switch arms relevant here (exact code, confirmed this run):
+  ```ts
+  switch (out.kind) {
+      case 'skipped':      // no connection — nothing attempted, count nothing
+      case 'cancelled':    // our own cancellation — not evidence about the peer
+          return announced;
+      case 'busy':
+      case 'decode-error':
+          // Answered badly / refused: alive. Today's empty-snapshot path scored nothing — preserved.
+          log.error('fetchNeighbors %s from %s', out.kind, id);
+          return announced;
+      case 'foreign-protocol':
+      case 'unreachable':
+      case 'timeout':
+          await this.noteRpcFailure(id, out);
+          return announced;
+      case 'ok':
+          break;
+  }
+  ```
+  `skipped` and `decode-error` are **bookkeeping-identical**: nothing is scored, nothing touched,
+  only a `log.error` call distinguishes `decode-error` (and that isn't observable from outside).
+  This corrects the original ticket's assumption that `decode-error` should show relevance decay —
+  it does not, by design ("Today's empty-snapshot path scored nothing — preserved").
+- `svc.getDiagnostics().snapshotsFetched` only increments on `ok` (confirmed both in the switch
+  above — `this.diag.snapshotsFetched++` sits right after the switch, before the merge loops — and
+  in `dead-state.spec.ts`'s own comment at line ~1030).
+- `svc.getStore()` returns the store; `store.upsert(id, coord)`, `store.setMembership(id, 'member')`,
+  `store.getById(id)` (returns `{contactFailures, negotiateFailures, relevance, membership, state, ...}`)
+  are all confirmed in use in `dead-state.spec.ts` (its `unreachablePeer`/`expectUnscored` helpers,
+  lines ~897–929).
+- **Arm 3 (`cancelled`) is already directly covered — confirmed this run, no new test needed.**
+  `packages/fret/test/dead-state.spec.ts`, lines 1035–1046, test
+  `'merges nothing and scores nothing when a snapshot fetch is cancelled'`:
+  ```ts
+  it('merges nothing and scores nothing when a snapshot fetch is cancelled', async () => {
+      const id = await unreachablePeer()
+      cancelRun()
+      const before = svc.getDiagnostics().snapshotsFetched
+      const entriesBefore = store.list().length
 
-**Critical correction to the original ticket's assumptions — read this before writing the
-decode-error test.** The original ticket text (still describing the overall feature below) claims
-the `decode-error` arm should be asserted as: "peer's membership signal raised toward `member` /
-contact-failure run cleared ..., relevance decayed, but no contact-failure strike recorded." That
-is **wrong for this method**, confirmed by reading the code above this run: `busy` and
-`decode-error` fall into the *same* switch arm as each other, and that arm calls **only**
-`log.error` — it never calls `noteRpcFailure`, never touches membership, never decays relevance.
-The comment directly above it says why: *"Today's empty-snapshot path scored nothing — preserved."*
-This is a deliberate compatibility decision, not a bug. (The evidence-strength promotion the
-original ticket describes may be real for *other* call sites like `probeNeighborLatency` — it is
-simply not what this method does.)
+      await (svc as any).fetchAndMergeSnapshot(id, (svc as any).runSignal)
 
-So the correct test for `decode-error` pins the **opposite** of what the original ticket assumed:
-that this method's bookkeeping reaction to `decode-error` is **identical to `skipped`/`cancelled`**
-— nothing moves — reached via a genuinely different `RpcOutcome` kind (a real stream was opened
-and a real, unusable reply was read, rather than nothing being attempted at all). The two
-observable differences from `skipped`: (1) a connection/stream really was exercised (the stub records
-that its stream's async iterator was pulled), and (2) `log.error` was called — everything else
-(`contactFailures`, `negotiateFailures`, relevance, membership label, `snapshotsFetched`) must be
-provably unchanged. If you want an even cheaper single source of truth: assert the peer's full
-routing-table entry (`store.getById(id)`) is deep-equal before and after the call, plus
-`snapshotsFetched` unchanged (it only increments on `ok`) and `announced` returns `[]`.
+      expect(svc.getDiagnostics().snapshotsFetched, 'a cancelled fetch is not a fetch').to.equal(before)
+      expect(store.list().length, 'nothing merged').to.equal(entriesBefore)
+      expectUnscored(id)
+  })
+  ```
+  This calls `fetchAndMergeSnapshot` **directly** with a pre-aborted run signal (`cancelRun()` sets
+  it up), which is exactly the direct test the original ticket wanted. Just cite this location in
+  the handoff — do not duplicate it.
 
-## Reusable scaffolding (already exists, don't rebuild)
+## Ready-to-paste draft: `packages/fret/test/fetch-snapshot-failure-arms.spec.ts`
 
-`packages/fret/test/rpc.snapshot-merge-cap.spec.ts`, inside `describe('RPC snapshot merge caps')` →
-`describe('snapshot merge caps')` (read the whole block — it's ~450 lines and every helper below is
-copy-adaptable):
-
-- `replyStream(body)` (~line 171): builds a stub `Stream` that serves exactly one framed JSON
-  reply from `body` via `json(body)` (from `test/helpers/rpc-fuzz.ts`), then ends. `send`/`close`/
-  `abort` are no-ops that satisfy the `Stream` type; only the async iterator matters for a
-  fetch (`fetchNeighbors` never writes a body and never half-closes).
-- `fetchMerged(node, svc, body)` (~line 205): overrides `node.getConnections` to return one stub
-  connection (`{status: 'open', newStream: async () => replyStream(body)}`), restores the real
-  `getConnections` in a `finally`, and calls `(svc as any).fetchAndMergeSnapshot(FROM, undefined)`
-  directly. `FROM = peerIdStr(60)` in that file — pick a **different** seed for your own `FROM` in
-  the new file to avoid any accidental id collision if both files ever share a store (they don't,
-  each test gets its own `beforeEach`-created node/service, so this is just hygiene).
-- `countUpserts(svc)` (~line 154): wraps `store.upsert` to record every id upserted, in call order.
-- Both node and service are created fresh per test: `node = await createMemNode(); await
-  node.start(); svc = new CoreFretService(node, { profile, networkName: NETWORK })` — **service is
-  deliberately never `start()`ed** (no stabilization loop, no registered handlers, so nothing else
-  touches the store during the test).
-- `peerIdStr(n)` (from `test/helpers/rpc-fuzz.ts`) produces a distinct, parseable peer-id string
-  from a small integer seed — reuse it for your own test peer ids.
-
-Create a new file `packages/fret/test/fetch-snapshot-failure-arms.spec.ts` (not the merge-cap file
-— that file already owns a different subject). Import the same helpers (`createMemNode`, `stopAll`
-from `./helpers/libp2p.js`; `NETWORK`, `peerIdStr`, `json`, `sleep` from `./helpers/rpc-fuzz.js`;
-`FretService as CoreFretService` from `../src/service/fret-service.js`). You do not need
-`registerNeighbors` or `makeSnapshotParser` directly for this ticket's two arms — `fetchMerged`-style
-driving goes through the service's own `fetchAndMergeSnapshot`, which builds its own parser
-internally.
-
-## Arm 1: `skipped`
-
-No connection stubbed at all — just don't override `getConnections`. On an unstarted, never-dialed
-node, `node.getConnections(peerId)` returns `[]` for any id, so `fetchNeighbors`'s `dial: 'never'`
-mode yields `skipped` with zero stream activity.
-
-- Pre-seed a routing-table entry for the target peer first (`svc.getStore().upsert(id, coord)` —
-  use a real 32-byte `Uint8Array` coordinate, e.g. `new Uint8Array(32).fill(7)`, or hash a real
-  peer id via `hashPeerId` like the merge-cap spec's re-hash test does) so there is something
-  concrete to assert stayed untouched. Capture the entry (or the fields you care about:
-  `contactFailures`, `negotiateFailures`, `relevance`, `membership`, `state`) before the call.
-- Call `(svc as any).fetchAndMergeSnapshot(id, undefined)` directly.
-- Assert: return value is `[]`; the pre-seeded entry's fields are unchanged; `svc.getDiagnostics
-  ().snapshotsFetched` (or whatever the diagnostics getter is named — grep `diag.snapshotsFetched`
-  in `fret-service.ts` for the exact accessor) did not increment.
-
-## Arm 2: `decode-error`
-
-Use a `fetchMerged`-style connection override (copy the pattern, don't import the private helper
-across files) with a stub stream that serves a body the snapshot parser will reject outright — not
-merely truncate. `makeSnapshotParser` (`src/rpc/validate.ts`) rejects (returns `undefined`) when
-`from` is not a parseable peer id, or when `timestamp` is not finite — either is a one-line way to
-force a genuine parser rejection (which surfaces as `RpcOutcome` kind `decode-error` via
-`parseOrThrow`/`ReplyRejectedError` inside `rpcRequest` — see `docs/fret.md`'s *Wire-shape parsers*
-section, "every reply parser is wired into its sender"). A body like:
+Paste this in as a starting point, then compile-check and adjust (e.g. if `store.setMembership` or
+`PeerEntry` field names differ slightly from what's assumed, or if `Connection`/`PeerId`/`Stream`
+type imports need tweaking to match the merge-cap spec's exact import list):
 
 ```ts
-{ v: 1, from: 'not-a-peer-id', timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
+import { afterEach, beforeEach, describe, it } from 'mocha'
+import { expect } from 'chai'
+import type { Libp2p } from 'libp2p'
+import type { Connection, PeerId, Stream } from '@libp2p/interface'
+import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { NETWORK, peerIdStr, json } from './helpers/rpc-fuzz.js'
+import { FretService as CoreFretService } from '../src/service/fret-service.js'
+
+describe('fetchAndMergeSnapshot failure arms', function () {
+	this.timeout(30000)
+
+	// Distinct seed from rpc.snapshot-merge-cap.spec.ts's FROM (peerIdStr(60)) — hygiene only,
+	// each test gets its own store so collision isn't actually reachable.
+	const FROM = peerIdStr(220)
+
+	let node: Libp2p
+	let svc: CoreFretService
+
+	beforeEach(async () => {
+		node = await createMemNode()
+		await node.start()
+		// Deliberately unstarted: no stabilization loop, no registered handlers.
+		svc = new CoreFretService(node, { profile: 'core', networkName: NETWORK })
+	})
+
+	afterEach(async () => { await stopAll([node]) })
+
+	interface EntrySnapshot {
+		contactFailures: number
+		negotiateFailures: number
+		relevance: number
+		membership: string
+		state: string
+	}
+
+	function readEntry(id: string): EntrySnapshot {
+		const e = svc.getStore().getById(id)
+		expect(e, `${id} present in routing table`).to.not.equal(undefined)
+		return {
+			contactFailures: e!.contactFailures,
+			negotiateFailures: e!.negotiateFailures,
+			relevance: e!.relevance,
+			membership: e!.membership,
+			state: e!.state,
+		}
+	}
+
+	function seed(id: string): EntrySnapshot {
+		svc.getStore().upsert(id, new Uint8Array(32).fill(7))
+		svc.getStore().setMembership(id, 'member')
+		return readEntry(id)
+	}
+
+	it('skipped: no connection leaves the peer entirely untouched', async () => {
+		const before = seed(FROM)
+		const fetchedBefore = svc.getDiagnostics().snapshotsFetched
+
+		const announced = await (svc as any).fetchAndMergeSnapshot(FROM, undefined)
+
+		expect(announced, 'nothing announced').to.deep.equal([])
+		expect(readEntry(FROM), 'entry unchanged').to.deep.equal(before)
+		expect(svc.getDiagnostics().snapshotsFetched, 'not counted as fetched').to.equal(fetchedBefore)
+	})
+
+	it('decode-error: a genuinely unusable reply is bookkeeping-identical to skipped', async () => {
+		const before = seed(FROM)
+		const fetchedBefore = svc.getDiagnostics().snapshotsFetched
+
+		// Rejected by makeSnapshotParser: `from` must be a parseable peer id.
+		const body = { v: 1, from: 'not-a-peer-id', timestamp: Date.now(), successors: [], predecessors: [], sig: '' }
+		let pulls = 0
+		const chunk = json(body)
+		const stream = {
+			id: 'decode-error-stub',
+			send: (): boolean => true,
+			close: async (): Promise<void> => { /* released */ },
+			abort: (): void => { /* released */ },
+			[Symbol.asyncIterator]: () => ({
+				next: async (): Promise<IteratorResult<Uint8Array>> => {
+					pulls++
+					return pulls === 1 ? { done: false, value: chunk } : { done: true, value: undefined }
+				},
+			}),
+		} as unknown as Stream
+
+		const holder = node as unknown as { getConnections: (p?: PeerId) => Connection[] }
+		const real = holder.getConnections.bind(node)
+		holder.getConnections = () => [{ status: 'open', newStream: async () => stream }] as unknown as Connection[]
+
+		let announced: string[]
+		try {
+			announced = await (svc as any).fetchAndMergeSnapshot(FROM, undefined)
+		} finally {
+			holder.getConnections = real
+		}
+
+		expect(announced, 'nothing announced').to.deep.equal([])
+		expect(pulls, 'the stub stream was actually read, not skipped').to.be.greaterThan(0)
+		expect(readEntry(FROM), 'entry unchanged — bookkeeping-identical to skipped').to.deep.equal(before)
+		expect(svc.getDiagnostics().snapshotsFetched, 'not counted as fetched').to.equal(fetchedBefore)
+	})
+
+	// cancelled arm: already covered directly by dead-state.spec.ts:1035
+	// ('merges nothing and scores nothing when a snapshot fetch is cancelled') — verified this run
+	// to call fetchAndMergeSnapshot directly with a pre-aborted run signal. Not duplicated here.
+})
 ```
 
-should do it (mirrors patterns already used in `rpc.snapshot-merge-cap.spec.ts`, e.g. its
-`'not-a-peer-id'` sample-entry case, just applied to the snapshot's own `from` field this time
-instead of a sample entry's `id`).
-
-- Pre-seed the target peer's routing-table entry the same way as Arm 1, capture its fields.
-- Drive `fetchAndMergeSnapshot` through the stub connection (copy `fetchMerged`'s override-then-
-  restore pattern).
-- Assert (per the correction above): return value `[]`; the pre-seeded entry's fields
-  (`contactFailures`, `negotiateFailures`, `relevance`, `membership`, `state`) are **all**
-  unchanged — identical to Arm 1's assertion, proving this arm is bookkeeping-equivalent to
-  `skipped` despite reaching a different `RpcOutcome` kind; `snapshotsFetched` unchanged.
-- Optional but cheap: assert the stub stream's async iterator was actually pulled (e.g. a counter
-  incremented inside `next()`), so the test can't accidentally pass because the connection override
-  silently didn't engage (i.e. because it degraded to `skipped` instead of genuinely reaching
-  `decode-error`).
-
-## Arm 3 (verify-only, no new test needed if confirmed): `cancelled`
-
-A prior discovery pass (still trusted, not re-verified this run) found
-`packages/fret/test/dead-state.spec.ts`, describe block `'cancellation is not evidence about a
-peer'`, test `'merges nothing and scores nothing when a snapshot fetch is cancelled'` (~line
-1035–1046), which calls `(svc as any).fetchAndMergeSnapshot(id, (svc as any).runSignal)` **directly**
-with an aborted run signal, and asserts `snapshotsFetched` unchanged, store size unchanged, and
-`expectUnscored(id)` (no contact strike, no relevance decay, no negotiate failure, no backoff — see
-`expectUnscored` ~line 920).
-
-- Read that test once to confirm it really does directly exercise `fetchAndMergeSnapshot` with a
-  pre-aborted signal (not some other method).
-- If confirmed: do **not** duplicate it. Just note in your handoff "cancelled arm already covered
-  directly, see `dead-state.spec.ts:1035`" — this satisfies the original ticket's requirement for
-  a *direct* (not merely indirect) cancelled-arm test.
-- If it turns out to be testing something else (e.g. a different method, or only the broader
-  indirect rule): add a minimal direct test here instead, following the same pattern as Arms 1–2
-  but passing an already-aborted `AbortSignal` (`AbortSignal.abort()` or a fresh
-  `AbortController().abort()`) as `fetchAndMergeSnapshot`'s second argument, with no connection
-  stub needed (an aborted signal is checked before dialing, per `rpcRequest`'s cancellation-first
-  rule in `docs/fret.md`'s *Stream management* section).
-
-## Expected outcome
-
-New file `fetch-snapshot-failure-arms.spec.ts` with tests for `skipped` and `decode-error`, plus a
-confirmed-or-added `cancelled` direct test. `yarn test` (from `packages/fret/`) green. Leave
-`foreign-protocol`, `unreachable`, `timeout`, and `busy` to the sibling
-`fetch-snapshot-failure-arms-hard` ticket (busy stays fully out of scope per the original ticket's
-tradeoff, tracked in `tickets/backlog/debt-maintenance-rig-non-ok-replies.md`).
+Notes on likely adjustment points (not re-verified this run, flagged so the next agent checks fast
+rather than re-discovering from scratch):
+- `store.setMembership` signature/name — used as-is in `dead-state.spec.ts`, should be exact.
+- `PeerEntry.membership` / `.state` string literal types — `deep.equal` against a captured object
+  sidesteps needing the exact union type names.
+- If `CoreFretService` constructor signature differs from `{ profile, networkName: NETWORK }`,
+  copy the exact constructor call from `rpc.snapshot-merge-cap.spec.ts` line ~252 instead.
 
 ## TODO
 
-- Create `packages/fret/test/fetch-snapshot-failure-arms.spec.ts`
-- Add `skipped` arm test
-- Add `decode-error` arm test (assert bookkeeping-identical to `skipped` — see correction above)
-- Read `dead-state.spec.ts:~1035` and confirm/add direct `cancelled` arm test
-- Run `yarn test` from `packages/fret/` and confirm green
+- Create `packages/fret/test/fetch-snapshot-failure-arms.spec.ts` from the draft above
+- Compile-check (`npx tsc --noEmit` from `packages/fret/`) and fix any type mismatches
+- Run `yarn test` from `packages/fret/` and confirm the new file + full suite green
+- In the review handoff, cite `dead-state.spec.ts:1035` for the `cancelled` arm (no new test needed for it)
 
 ## End
 Work ticket as described above.
