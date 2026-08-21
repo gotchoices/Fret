@@ -108,9 +108,10 @@ describe('RPC handler fault isolation over the wire', function () {
 		/**
 		 * reject — answered with the static reject (validator);
 		 * abort — stream aborted (a frame-level failure, or the handler threw): the sender's read
-		 *   fails non-truncation. **No row in this matrix uses it today**, and the variant is
-		 *   kept deliberately rather than deleted as dead: `runMatrix`'s `abort` arm is the
-		 *   assertion that a frame-level failure is still distinguishable from a body-level drop,
+		 *   fails non-truncation. **No row in this matrix uses it today**. NOTE: accepted
+		 *   tradeoff — the variant is kept deliberately rather than deleted as dead:
+		 *   `runMatrix`'s `abort` arm is the assertion that a frame-level failure is still
+		 *   distinguishable from a body-level drop,
 		 *   which is the whole two-tier split. A payload string cannot produce one — framing
 		 *   failures come out of `readFramed`, above anything `sendRaw` can express — so a row
 		 *   needing it must drive the frame itself.
