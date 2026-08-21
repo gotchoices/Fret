@@ -3,13 +3,16 @@ files: packages/fret/src/rpc/protocols.ts, packages/fret/src/rpc/leave.ts, packa
 difficulty: easy
 ----
 <!-- resume-note -->
-Prior run (2026-08-21) hit its token budget right after re-reading all six files in `files:` above
-and confirming every line reference below still matches current code — byte for byte, nothing
-drifted since the ticket was written. **Zero edits made.** All four items below are ready to
-implement exactly as written; no further investigation needed on items 2-4.
+Second run (2026-08-21) again hit its token budget right after finishing discovery — **still zero
+edits made** — but this run completed the one item the first run left outstanding, so the next
+agent can go straight to editing with no further grepping needed.
 
-For item 1 (needless async), the prior run located every `await encodeJson(`/`await decodeJson(`
-call site so the next agent does not need to re-grep the five named files:
+For item 1 (needless async), every `await encodeJson(`/`await decodeJson(` call site in
+`packages/fret` (grepped with `(await\s+)?(encodeJson|decodeJson)\(` over the whole package, plus
+a separate check that `src/index.ts` has no matches at all):
+
+Production (must lose their `await`, alongside dropping `async` from the two functions'
+signatures at `protocols.ts:249,254`):
 - `protocols.ts:208` — `sendFramed(stream, await encodeJson(await opts.serve(connection)));` (reply-only branch of `registerJsonHandler`)
 - `protocols.ts:215` — `decoded = await decodeJson(bytes);` (request branch of `registerJsonHandler`)
 - `protocols.ts:230` — `sendFramed(stream, await encodeJson(res));` (request branch of `registerJsonHandler`)
@@ -20,19 +23,24 @@ call site so the next agent does not need to re-grep the five named files:
 - `maybe-act.ts:30` — `registerMaybeAct`: `sendFramed(stream, await encodeJson(res));`
 - `maybe-act.ts:55` — `sendMaybeAct`'s `decode`: `parseOrThrow(parseMaybeActReply, await decodeJson(b))`
 - `ping.ts:93` — `sendPing`'s `decode`: `parseOrThrow(parsePingResponse, await decodeJson(b))`
-- `leave.ts` — **no direct calls**; `registerLeave`/`sendLeave` only go through `registerJsonHandler`/`rpcRequest`, never call either function directly.
+- `leave.ts` — **no direct calls**; `registerLeave`/`sendLeave` only go through `registerJsonHandler`/`rpcRequest`.
 
-**Still outstanding, not yet done by the prior run:** the ticket's own edge-case instruction to
-grep `packages/fret/src` and `test/` *beyond* the six files above for any other
-`await decodeJson(`/`await encodeJson(` call site (e.g. `fret-service.ts`, or spec files that call
-either function directly rather than through the RPC senders). Do this grep before removing
-`async`, since a hit outside the eleven sites above would need its own `await` stripped too.
+Test-only (found by the wider grep, all under `test/`): `test/helpers/maintenance-rig.ts:118,121`,
+`test/ring-membership.spec.ts:688`, `test/rpc.handler-fuzz.spec.ts:322,1203,1209`, and ~20 sites in
+`test/rpc.codec-properties.spec.ts`. **None of these need editing for correctness** —
+`await nonPromiseValue` is legal JS and just resolves immediately, so once `encodeJson`/`decodeJson`
+return plain values instead of Promises these call sites keep working unchanged. Leave the test
+`await`s in place; stripping them would be a cosmetic-only touch of files outside `files:` and is
+not worth the diff. `src/index.ts` re-exports neither function, so nothing there to check.
 
 After the async change, the return types change from `Promise<Uint8Array>`/`Promise<T>` to
 `Uint8Array`/`T` — check the `Parser`/`decode` callback types in `validate.ts` and `request.ts`
 (`RpcRequestOptions.decode: (bytes: Uint8Array) => T | Promise<T>`) still accept a non-Promise
 return with no signature change needed (they already union in the non-Promise case, so this should
 be a no-op, but confirm with `tsc`).
+
+Discovery for items 2-4 (from the first run, still valid, still nothing drifted) is unchanged —
+see the item descriptions below, which are ready to implement exactly as written.
 
 Mechanical cleanups in the rpc directory, fully re-verified against current code
 (post `rpc-shared-helper` consolidation) on 2026-08-21. Four items — the original ticket's item 3
