@@ -1,6 +1,7 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
-import { createMemNode, stopAll } from './helpers/libp2p.js'
+import { createMemNode } from './helpers/libp2p.js'
+import { buildMesh } from './helpers/mesh.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
 import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
@@ -123,17 +124,10 @@ describe('Profile behavior tests', function () {
 
 	describe('Snapshot export caps', () => {
 		it('Edge snapshot caps successors/predecessors ≤ 6, sample ≤ 6', async () => {
-			const nodes = []
-			for (let i = 0; i < 15; i++) {
-				const n = await createMemNode()
-				await n.start()
-				nodes.push(n)
-			}
-			for (let i = 1; i < nodes.length; i++) {
-				await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-			}
+			const mesh = await buildMesh(15)
+			await mesh.connect('star')
 
-			const svc = new CoreFretService(nodes[0], { profile: 'edge', k: 15, m: 8 })
+			const svc = new CoreFretService(mesh.nodes[0], { profile: 'edge', k: 15, m: 8 })
 			await svc.start()
 			await new Promise((r) => setTimeout(r, 2000))
 
@@ -143,21 +137,14 @@ describe('Profile behavior tests', function () {
 			expect((snap.sample ?? []).length).to.be.at.most(6)
 
 			await svc.stop()
-			await stopAll(nodes)
+			await mesh.stop()
 		})
 
 		it('Core snapshot caps successors/predecessors ≤ 12, sample ≤ 8', async () => {
-			const nodes = []
-			for (let i = 0; i < 15; i++) {
-				const n = await createMemNode()
-				await n.start()
-				nodes.push(n)
-			}
-			for (let i = 1; i < nodes.length; i++) {
-				await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-			}
+			const mesh = await buildMesh(15)
+			await mesh.connect('star')
 
-			const svc = new CoreFretService(nodes[0], { profile: 'core', k: 15, m: 8 })
+			const svc = new CoreFretService(mesh.nodes[0], { profile: 'core', k: 15, m: 8 })
 			await svc.start()
 			await new Promise((r) => setTimeout(r, 2000))
 
@@ -167,7 +154,7 @@ describe('Profile behavior tests', function () {
 			expect((snap.sample ?? []).length).to.be.at.most(8)
 
 			await svc.stop()
-			await stopAll(nodes)
+			await mesh.stop()
 		})
 	})
 
@@ -175,27 +162,20 @@ describe('Profile behavior tests', function () {
 
 	describe('Snapshot receive caps', () => {
 		it('Edge truncates received successors to 8, predecessors to 8, sample to 6', async () => {
-			const nodes = []
-			for (let i = 0; i < 22; i++) {
-				const n = await createMemNode()
-				await n.start()
-				nodes.push(n)
-			}
-			for (let i = 1; i < nodes.length; i++) {
-				await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-			}
-			const sender = new CoreFretService(nodes[0]!, { profile: 'core', k: 15, m: 8 })
+			const mesh = await buildMesh(22)
+			await mesh.connect('star')
+			const sender = new CoreFretService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
 			await sender.start()
 			await new Promise((r) => setTimeout(r, 2000))
 
 			const receiverNode = await createMemNode()
 			await receiverNode.start()
-			await receiverNode.dial(nodes[0]!.getMultiaddrs()[0]!)
+			await receiverNode.dial(mesh.nodes[0]!.getMultiaddrs()[0]!)
 			const receiver = new CoreFretService(receiverNode, { profile: 'edge', k: 15, m: 8 })
 			await receiver.start()
 
 			const storeBefore = receiver.getStore().size()
-			await (receiver as any).fetchAndMergeSnapshot(nodes[0]!.peerId.toString(), (receiver as any).runSignal)
+			await (receiver as any).fetchAndMergeSnapshot(mesh.ids[0]!, (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Edge receive caps: 8 succ + 8 pred + 6 sample = 22 max unique peers merged
@@ -205,31 +185,24 @@ describe('Profile behavior tests', function () {
 			await receiver.stop()
 			await receiverNode.stop()
 			await sender.stop()
-			await stopAll(nodes)
+			await mesh.stop()
 		})
 
 		it('Core truncates received successors to 16, predecessors to 16, sample to 8', async () => {
-			const nodes = []
-			for (let i = 0; i < 22; i++) {
-				const n = await createMemNode()
-				await n.start()
-				nodes.push(n)
-			}
-			for (let i = 1; i < nodes.length; i++) {
-				await nodes[i]!.dial(nodes[0]!.getMultiaddrs()[0]!)
-			}
-			const sender = new CoreFretService(nodes[0]!, { profile: 'core', k: 15, m: 8 })
+			const mesh = await buildMesh(22)
+			await mesh.connect('star')
+			const sender = new CoreFretService(mesh.nodes[0]!, { profile: 'core', k: 15, m: 8 })
 			await sender.start()
 			await new Promise((r) => setTimeout(r, 2000))
 
 			const receiverNode = await createMemNode()
 			await receiverNode.start()
-			await receiverNode.dial(nodes[0]!.getMultiaddrs()[0]!)
+			await receiverNode.dial(mesh.nodes[0]!.getMultiaddrs()[0]!)
 			const receiver = new CoreFretService(receiverNode, { profile: 'core', k: 15, m: 8 })
 			await receiver.start()
 
 			const storeBefore = receiver.getStore().size()
-			await (receiver as any).fetchAndMergeSnapshot(nodes[0]!.peerId.toString(), (receiver as any).runSignal)
+			await (receiver as any).fetchAndMergeSnapshot(mesh.ids[0]!, (receiver as any).runSignal)
 			const storeAfter = receiver.getStore().size()
 
 			// Core receive caps: 16 succ + 16 pred + 8 sample = 40 max unique peers merged
@@ -239,7 +212,7 @@ describe('Profile behavior tests', function () {
 			await receiver.stop()
 			await receiverNode.stop()
 			await sender.stop()
-			await stopAll(nodes)
+			await mesh.stop()
 		})
 	})
 
