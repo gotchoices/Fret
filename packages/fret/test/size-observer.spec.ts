@@ -90,6 +90,33 @@ describe('SizeObserver', () => {
 			expect(blended.size_estimate).to.equal(50)
 		})
 
+		it('refuses a confidence outside [0, 1] — it is a blend weight, not just a report', () => {
+			// `FretService.reportNetworkSize` is public API and passes straight through, so this
+			// is the boundary for a local caller as well as for the two wire parsers. An
+			// out-of-range confidence re-scales every *other* observation's contribution: 5
+			// outvotes five honest reports, and a negative one subtracts from `totalWeight`.
+			const obs = new SizeObserver()
+			obs.report(100, 5, 'over')
+			obs.report(100, -1, 'under')
+			obs.report(100, 1.0000001, 'just-over')
+			expect(obs.observations()).to.have.length(0, 'no out-of-range confidence may be stored')
+
+			// The boundaries themselves are legal.
+			obs.report(100, 0, 'zero')
+			obs.report(100, 1, 'one')
+			expect(obs.observations().map(o => o.source)).to.deep.equal(['zero', 'one'])
+		})
+
+		it('a refused confidence cannot outvote honest reports in the blend', () => {
+			// The point of the refusal, stated as behavior rather than as storage: without it the
+			// weight (recency × confidence) of the crafted report dominates the sum.
+			const obs = new SizeObserver()
+			obs.report(1_000_000, 1000, 'crafted')
+			obs.report(100, 1, 'honest')
+
+			expect(obs.blend(local(100, 1)).size_estimate).to.equal(100)
+		})
+
 		it('accepts a negative estimate — the > 0 gate lives at the caller, not here', () => {
 			// `calibrateSizeFromSnapshot` gates on `size_estimate > 0`; the observer carries today's
 			// behavior across unchanged rather than adding a second, differently-placed gate.

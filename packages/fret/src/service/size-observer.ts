@@ -67,9 +67,19 @@ export class SizeObserver {
 	 * `weightedSum`/`totalWeight` are both `NaN` from then on, so `totalWeight === 0` never fires
 	 * and the degenerate guard cannot catch it. Negative values are *not* refused: the caller
 	 * gates on `> 0` and that behavior is carried across unchanged.
+	 *
+	 * A `confidence` outside `[0, 1]` is refused for the same boundary reason, one level up from
+	 * the wire parsers: `confidence` is a *weight* in `blend`, so an out-of-range value does not
+	 * merely report itself wrongly — it re-scales every other observation's contribution. A
+	 * confidence of 5 lets one report outvote five honest ones, and a negative one subtracts from
+	 * `totalWeight`, which can cancel to zero (silently returning the degenerate answer) or go
+	 * negative (inverting the blend). The two wire paths are already range-checked in their
+	 * parsers; refusing here closes the same class for `reportNetworkSize`, which is public API
+	 * and passes straight through.
 	 */
 	report(estimate: number, confidence: number, source: string = 'external'): void {
 		if (!Number.isFinite(estimate) || !Number.isFinite(confidence)) return;
+		if (confidence < 0 || confidence > 1) return;
 		const now = this.now();
 		this.observationList.push({ estimate, confidence, timestamp: now, source });
 

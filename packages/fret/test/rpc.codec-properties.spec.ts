@@ -1982,6 +1982,30 @@ describe('RPC codec properties', function () {
 				expect(mixed2?.size_estimate).to.equal(500)
 			})
 
+			// The hand-written test above pins the boundaries and a handful of sampled points; this
+			// generalizes the *rule* over the whole finite-double domain — an in-range value is
+			// preserved bit-for-bit, an out-of-range one drops that field alone, and neither ever
+			// rejects the message. It is what would fail on a `>` / `>=` slip anywhere but at the
+			// two sampled boundaries, and on a range check that rejected instead of dropping.
+			it('range rule holds over arbitrary finite numbers, for both fields', () => {
+				fc.assert(fc.property(
+					fc.double({ noNaN: true, noDefaultInfinity: true }),
+					fc.double({ noNaN: true, noDefaultInfinity: true }),
+					(confidence, size_estimate) => {
+						const out = parseSnapshot(snap({ confidence, size_estimate }))
+						expect(out, 'a numeric field is advisory — it never rejects').to.not.equal(undefined)
+
+						// `-0` is in range for both, and `Object.is` would distinguish it from the
+						// `0` the codec delivers; `equal` is the right comparison for a magnitude.
+						if (confidence >= 0 && confidence <= 1) expect(out?.confidence).to.equal(confidence)
+						else expect(out).to.not.have.property('confidence')
+
+						if (size_estimate >= 0) expect(out?.size_estimate).to.equal(size_estimate)
+						else expect(out).to.not.have.property('size_estimate')
+					}
+				), { numRuns: 500 })
+			})
+
 			it('drops `metadata` unless it is a non-null non-array object', () => {
 				for (const bad of [null, [], 'str', 7, true]) {
 					expect(parseSnapshot(snap({ metadata: bad })), JSON.stringify(bad)).to.not.have.property('metadata')
