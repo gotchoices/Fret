@@ -88,12 +88,16 @@ function classify(
 	if (isPayloadTooLargeError(err)) return { kind: 'decode-error', error: toError(err) };
 	// NOTE: this arm catches only *our own* ceiling. A **remote's** inbound-cap refusal is not
 	// distinguishable here: the remote's `onIncomingStream` throws
-	// `TooManyInboundProtocolStreamsError` and aborts the muxed stream, so what reaches us is a
-	// reset carrying at most a numeric code — the reason does not travel, and it reads as
-	// `unreachable`, booking a contact strike against a peer that is alive and merely overloaded.
-	// Accepted rather than patched: FRET's own concurrency cannot approach any peer's inbound cap
-	// (see *Stream management* in docs/fret.md), so tripping it needs a peer flooding us or a
-	// consumer opening its own streams over the same connection. Do not add a heuristic for it.
+	// `TooManyInboundProtocolStreamsError` and aborts the muxed stream, so the reason does not
+	// travel. Measured (`test/rpc.stream-caps.spec.ts`, memory and TCP+noise, yamux both): what
+	// reaches the sender is end-of-stream rather than a reset, so `readFramed` raises
+	// `FrameTruncationError` and this classifies `decode-error` — relevance decay, no contact
+	// strike. That is milder than this note first claimed (it predicted `unreachable`, and with
+	// it a strike against a peer that is alive and merely overloaded), but it is a teardown shape
+	// we do not own, so treat it as observed-not-guaranteed. Accepted rather than patched either
+	// way: FRET's own concurrency cannot approach any peer's inbound cap (see *Stream management*
+	// in docs/fret.md), so tripping it needs a peer flooding us or a consumer opening its own
+	// streams over the same connection. Do not add a heuristic for it.
 	if (isStreamLimitError(err)) return { kind: 'local-limit', error: toError(err) };
 	if (deadlineSignal.aborted === true || (err as { name?: unknown } | null)?.name === 'DeadlineExpiredError') {
 		return { kind: 'timeout' };
