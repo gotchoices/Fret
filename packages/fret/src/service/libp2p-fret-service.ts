@@ -164,7 +164,7 @@ export class Libp2pFretService implements Startable, FretService {
 	}
 
 	setMode(mode: FretMode): void {
-		this.ensure().setMode(mode);
+		return this.ensure().setMode(mode);
 	}
 
 	// Metadata pass-throughs for Arachnode adapter

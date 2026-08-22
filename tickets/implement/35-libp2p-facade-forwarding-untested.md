@@ -4,64 +4,69 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Sixth run stopped on BUDGET_WARNING, immediately after fixing a second failure. **Two fixes are
-already applied and must not be re-derived:**
+Seventh run stopped on BUDGET_WARNING, immediately after fixing a third failure. **Three fixes
+are already applied and must not be re-derived:**
 
-1. **Test file, `test/libp2p-facade-forwarding.spec.ts`**: added `mockCore.stop = () => {}` right
-   before `coreOf(svc).inner = mockCore` (inside the third `it`). This was needed because `stop`
-   is in `SKIP_LIST` (it does discovery-loop teardown around the core call, not a plain forward),
-   so `mockCore` never got a `stop` spy, and the test's own `finally` block calling `svc.stop()`
-   threw `TypeError: this.inner?.stop is not a function`. Fixed, confirmed by a mocha run this
-   session (see below for what that run then found next).
+1. **Test file, `test/libp2p-facade-forwarding.spec.ts`**: `mockCore.stop = () => {}` added right
+   before `coreOf(svc).inner = mockCore` (inside the third `it`). Needed because `stop` is
+   skip-listed (does discovery-loop teardown around the core call, not a plain forward), so
+   `mockCore` never got a `stop` spy and the test's own `finally` block calling `svc.stop()` threw.
+   Confirmed working — this part of the test file is done.
 
-2. **Production file, `src/service/libp2p-fret-service.ts`**, method `ready()` (~line 162): changed
+2. **Production file, `src/service/libp2p-fret-service.ts`**, method `ready()` (~line 162):
+   changed `await this.ensure().ready();` (no return) to `return this.ensure().ready();`. Real
+   forwarding-contract bug — every other facade method does `return this.ensure().foo(...)`, this
+   one silently dropped the resolved value. Not yet independently re-verified by a green test run
+   (see below), but the diagnosis is solid and unchanged from prior sessions.
+
+3. **Production file, same file**, method `setMode()` (~line 166): same bug, same fix. Was
    ```ts
-   async ready(): Promise<void> {
-   	await this.ensure().ready();
+   setMode(mode: FretMode): void {
+   	this.ensure().setMode(mode);
    }
    ```
-   to
+   now
    ```ts
-   async ready(): Promise<void> {
-   	return this.ensure().ready();
+   setMode(mode: FretMode): void {
+   	return this.ensure().setMode(mode);
    }
    ```
-   **This is a real bug, not a test artifact.** Every other facade method does
-   `return this.ensure().foo(...)`, forwarding the core's return value. `ready()` alone did
-   `await ...; ` with no `return`, so it always resolved `undefined` regardless of what the core's
-   `ready()` produced — it broke the "exact return identity" forwarding contract documented for
-   this facade (see `docs/fret.md`, "libp2p integration" section, the paragraph on
-   `Libp2pFretService` being tied to the core surface). In practice `FretService.ready()` is typed
-   `Promise<void>` so no real caller currently depends on the resolved value, but the facade's job
-   per this ticket is exact pass-through, and this was the one method silently not doing that — it
-   is exactly the class of bug ("swapped pair of numbers would go unnoticed") this ticket exists to
-   catch. This fix has **not yet been verified** — no test or tsc run happened after making it.
+   Found this session: after fix #2, a mocha run turned up `setMode return identity: expected
+   undefined to equal { __sentinel: 'setMode' }` — same missing-`return` pattern, different
+   method. `FretService.setMode` (core) is declared `void` and never returns anything in real
+   usage, so this has no behavioral effect in production; it matters purely for the exact-forward
+   contract this test suite enforces (mock core returns a sentinel object per call; facade must
+   pass it through unchanged). **This fix has NOT been verified by any test or tsc run — do that
+   first.**
 
 **What is still unverified — do this first, in order, before anything else:**
 ```
 cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000
 cd packages/fret && npx tsc --noEmit
 ```
-Expect 4/4 passing on the first command now that both fixes are in. If a *third* distinct failure
-surfaces, do not assume it is another one-line fix — diagnose fresh (the pattern so far has been:
-each fix reveals the next real gap, not a red herring), but do not spend more than one round doing
-so before asking a human if it recurs a third time.
+Expect 4/4 passing now that all three fixes are in. **If a fourth distinct failure surfaces**, the
+pattern across this ticket's whole history has been: each fix reveals the next real forwarding gap
+(`ready`, then `setMode`), always the same missing-`return` shape on a facade method. Given that
+repeat pattern, if a 4th one appears it is very likely the same fix again (`this.ensure().foo(...)`
+→ `return this.ensure().foo(...)`) — apply it directly rather than re-deriving from scratch, but do
+not spend more than one extra round chasing a 5th before asking a human.
 
-If `tsc --noEmit` fails, check `libp2p-fret-service.ts` (the `ready()` change and the `coreOf` cast
-helper in the test file are the only edits this ticket has made) — the rest of the package was
-type-clean before this ticket touched it.
+**Once both commands are green**, as a light sanity pass (not a full audit — do not turn this into
+a bigger investigation), skim the ~20 forwarding methods in `libp2p-fret-service.ts` for the same
+missing-`return` shape now that it's proven to be an easy-to-miss class, so the review stage isn't
+the first place a fourth instance surfaces. This is a quick read, not a re-run of the test loop.
 
-**Once both commands are green**: write the review/ handoff (see AGENTS.md implement-stage rules)
-summarizing the 4 test cases (skip-list-exists, exactly-20-forwarding-methods,
-forward-with-mock-identity-and-order, not-injected-throws). Call out **both** fixes in the handoff
-plainly: the test-file mock-completeness fix or the (skip-listed, untested-by-design) `stop`
-seam, and the production `ready()` forwarding bug this test suite caught for the first time
-because it is the only spec that exercises return-identity across every facade method. Note this
-is a new file (no pre-existing coverage to compare against). Do not re-derive the
-REJECTS/ASYNC_UNWRAP/ASYNC_GENERATOR classification or the skip list — both are already correct
-and unchanged; the skip-list and enumeration tests already proved this before this session ever
-touched the file, and the not-injected-throws property (which exercises every method's
-REJECTS/throw classification) also already passed.
+**Then write the review/ handoff** (see AGENTS.md implement-stage rules) summarizing the 4 test
+cases (skip-list-exists, exactly-20-forwarding-methods, forward-with-mock-identity-and-order,
+not-injected-throws). Call out **all three** fixes in the handoff plainly: the test-file
+mock-completeness fix (`stop` seam), and the two production forwarding bugs this test suite caught
+for the first time (`ready()` and `setMode()`) — it is the only spec that exercises return-identity
+across every facade method, which is exactly why two separate instances of the same one-line bug
+class turned up only once this suite existed. Note this is a new file (no pre-existing coverage to
+compare against). Do not re-derive the REJECTS/ASYNC_UNWRAP/ASYNC_GENERATOR classification or the
+skip list — both are already correct and unchanged; the skip-list and enumeration tests already
+proved this before any session touched the file, and the not-injected-throws property (which
+exercises every method's REJECTS/throw classification) also already passed.
 
 Then delete this ticket from implement/.
 
