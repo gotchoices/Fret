@@ -6,6 +6,7 @@ import { FretService } from '../src/service/fret-service.js'
 import { makeProtocols, registerRpcHandler } from '../src/rpc/protocols.js'
 import { hashPeerId } from '../src/ring/hash.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
+import { backoffOf } from './helpers/backoff.js'
 
 // What a **service** does with a `local-limit` outcome, driven by a real outbound stream-cap
 // refusal rather than by a hand-written outcome object.
@@ -122,8 +123,8 @@ describe('local stream-cap refusals at the service', function () {
 		await (svc as unknown as { probeMembership(id: string, s: AbortSignal | undefined): Promise<void> })
 			.probeMembership(peerId, undefined)
 
-	const backoffFor = (id: string): unknown =>
-		(svc as unknown as { backoffMap: { get(k: string): unknown } }).backoffMap.get(id)
+	const backoffFor = (id: string): number =>
+		backoffOf(svc).factor(id)
 
 	const entry = () => {
 		const e = store.getById(peerId)
@@ -172,7 +173,7 @@ describe('local stream-cap refusals at the service', function () {
 		expect(now.successCount, 'no success recorded either').to.equal(start.successCount)
 		expect(now.negotiateFailures, 'not membership evidence').to.equal(0)
 		expect(now.membership, 'label untouched').to.equal('member')
-		expect(backoffFor(peerId), 'no backoff — next tick probes fresh').to.equal(undefined)
+		expect(backoffFor(peerId), 'no backoff — next tick probes fresh').to.equal(0)
 
 		const d = svc.getDiagnostics()
 		expect(d.streamLimit - d0.streamLimit, 'one count per refusal').to.equal(REFUSALS)
@@ -203,7 +204,7 @@ describe('local stream-cap refusals at the service', function () {
 		expect(now.state, 'never marked dead').to.not.equal('dead')
 		expect(now.negotiateFailures, 'not membership evidence').to.equal(0)
 		expect(now.membership, 'label untouched').to.equal(start.membership)
-		expect(backoffFor(peerId), 'no backoff on this arm, unlike the failure arms').to.equal(undefined)
+		expect(backoffFor(peerId), 'no backoff on this arm, unlike the failure arms').to.equal(0)
 
 		const d = svc.getDiagnostics()
 		expect(d.streamLimit - d0.streamLimit, 'one count per refusal').to.equal(REFUSALS)

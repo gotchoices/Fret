@@ -14,6 +14,7 @@ import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
 import type { Connection, PeerId, Stream } from '@libp2p/interface'
 import type { RouteAndMaybeActV1, RouteProgress } from '../src/index.js'
+import { backoffOf } from './helpers/backoff.js'
 
 // A peer that repeatedly cannot be reached is marked `dead`; any proof that it is alive clears
 // the run and resurrects it. The distinction these tests pin down is *what counts as a failed
@@ -194,8 +195,8 @@ describe('dead state: liveness seam', () => {
 		expect(after?.failureCount, 'no failure recorded').to.equal(before.failureCount)
 		expect(after?.negotiateFailures, 'not membership evidence either').to.equal(0)
 		expect(after?.membership, 'label untouched').to.equal('member')
-		// No backoff: the map is only written by `recordBackoff`, which this path must not reach.
-		expect(((svc as any).backoffMap as { get(k: string): unknown }).get(id), 'no backoff').to.equal(undefined)
+		// No backoff: a local-limit outcome must not reach the backoff path.
+		expect(backoffOf(svc).factor(id), 'no backoff').to.equal(0)
 		// But it is visible — a ceiling that fires must not be silent.
 		expect(svc.getDiagnostics().streamLimit, 'counted once per refusal').to.equal(5)
 	})
@@ -854,7 +855,7 @@ describe('dead state: a run of answered-but-undecodable replies', () => {
 			// Stand in for the ≥500 ms spacing interval, and clear the forward path's backoff so the
 			// selector picks the same hop again.
 			store.update(hop, { lastContactFailureAt: 0 })
-			;(svc as unknown as { clearBackoff(id: string): void }).clearBackoff(hop)
+			backoffOf(svc).clear(hop)
 		}
 
 		// The counter increments just before the send, so it proves all three runs really took the
@@ -953,7 +954,7 @@ describe('cancellation is not evidence about a peer', () => {
 		expect(e?.negotiateFailures, `${label}: no membership evidence`).to.equal(0)
 		expect(e?.membership, `${label}: not demoted`).to.equal('member')
 		expect(e?.state, `${label}: not marked dead`).to.not.equal('dead')
-		expect((svc as any).backoffMap.get(id), `${label}: no backoff recorded`).to.equal(undefined)
+		expect(backoffOf(svc).factor(id), `${label}: no backoff recorded`).to.equal(0)
 	}
 
 	/** Count `dialProtocol` calls — the direct form of "no dial was issued". */
@@ -1026,7 +1027,7 @@ describe('cancellation is not evidence about a peer', () => {
 		await (svc as any).probeMembership(id, (svc as any).runSignal)
 
 		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
-		expect((svc as any).backoffMap.get(id), 'backoff recorded').to.not.equal(undefined)
+		expect(backoffOf(svc).factor(id), 'backoff recorded').to.not.equal(0)
 		expect(svc.getDiagnostics().pingsFail).to.equal(1)
 	})
 

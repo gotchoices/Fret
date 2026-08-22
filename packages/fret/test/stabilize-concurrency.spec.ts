@@ -4,6 +4,7 @@ import { buildMaintenanceRig, type MaintenanceRig, type PeerRig } from './helper
 import type { FretService as CoreFretService } from '../src/service/fret-service.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
 import { hashPeerId } from '../src/ring/hash.js'
+import { backoffOf } from './helpers/backoff.js'
 
 // One stabilization tick runs its outbound RPCs *pooled* — at most `maintenanceConcurrency` in
 // flight (Core 6 / Edge 2) — under one tick-wide budget (`STABILIZE_TICK_BUDGET_MS`), instead of
@@ -69,7 +70,7 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 			negotiateFailures: e.negotiateFailures,
 			membership: e.membership,
 			state: e.state,
-			backoff: (svc as any).backoffMap.get(id),
+			backoff: backoffOf(svc).factor(id),
 		}
 	}
 

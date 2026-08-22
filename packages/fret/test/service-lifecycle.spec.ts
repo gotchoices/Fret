@@ -10,6 +10,7 @@ import { FretService } from '../src/service/fret-service.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { hashPeerId } from '../src/ring/hash.js'
+import { backoffOf } from './helpers/backoff.js'
 
 const NETWORK = 'lifecycle-test'
 const delay = (ms: number) => new Promise((r) => setTimeout(r, ms))
@@ -487,8 +488,7 @@ describe('FretService start/stop lifecycle', function () {
 		expect(target?.contactFailures, 'no contact strike against a healthy peer').to.equal(0)
 		expect(target?.state, 'healthy peer not marked dead').to.not.equal('dead')
 		// stop() clears the backoff map *before* the tick resumes, so an entry here is the tick's doing.
-		const backoff = (svc as unknown as { backoffMap: { get: (id: string) => unknown } }).backoffMap
-		expect(backoff.get(targetId), 'no backoff recorded against a peer we never dialed').to.equal(undefined)
+		expect(backoffOf(svc).factor(targetId), 'no backoff recorded against a peer we never dialed').to.equal(0)
 	})
 
 	it('mints a fresh run signal per start and leaves the stopped run aborted', async () => {

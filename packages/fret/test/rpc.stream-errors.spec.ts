@@ -17,6 +17,7 @@ import { sendLeave } from '../src/rpc/leave.js'
 import { coordToBase64url, hashKey, hashPeerId } from '../src/ring/hash.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
 import type { NeighborSnapshotV1, RouteAndMaybeActV1 } from '../src/index.js'
+import { backoffOf } from './helpers/backoff.js'
 
 // What each outbound RPC returns when the reply fails *partway through*, and what the service
 // records about the peer as a result. The read primitive itself is covered elsewhere
@@ -675,7 +676,7 @@ describe('RPC stream failures', function () {
 		/** Stand in for the ≥500 ms spacing interval between independent contact observations. */
 		function unspace(id: string): void {
 			store.update(id, { lastContactFailureAt: 0 })
-			;(svc as unknown as { clearBackoff(id: string): void }).clearBackoff(id)
+			backoffOf(svc).clear(id)
 		}
 
 		it('books one contact strike — and no membership evidence — for a hop that resets mid-reply', async () => {
@@ -780,7 +781,7 @@ describe('RPC stream failures', function () {
 			expect(e.negotiateFailures, 'no membership evidence').to.equal(0)
 			expect(e.membership, 'not demoted').to.equal('member')
 			expect(e.state, 'not marked dead').to.not.equal('dead')
-			expect((svc as unknown as { backoffMap: Map<string, unknown> }).backoffMap.get(id), 'no backoff').to.equal(undefined)
+			expect(backoffOf(svc).factor(id), 'no backoff').to.equal(0)
 			expect(s.delivered, 'the cancel really landed mid-stream').to.equal(1)
 			expect(release(s), 'released once, by abort').to.deep.equal({ closes: 0, aborts: 1 })
 		})
