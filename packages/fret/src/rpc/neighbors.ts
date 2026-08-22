@@ -5,6 +5,7 @@ import {
 	decodeJson,
 	registerJsonHandler,
 } from './protocols.js';
+import type { StreamCaps } from './protocols.js';
 import { rpcRequest } from './request.js';
 import { makeSnapshotParser, parseOrThrow, MAX_NEIGHBORS_BYTES } from './validate.js';
 import type { Parser } from './validate.js';
@@ -38,7 +39,12 @@ export async function registerNeighbors(
 		predecessors: Number.POSITIVE_INFINITY,
 		sample: Number.POSITIVE_INFINITY,
 	}),
-	onMalformed?: (reason: 'decode' | 'parse') => void
+	onMalformed?: (reason: 'decode' | 'parse') => void,
+	// Trailing and optional for the same reason `snapshotParser` above is: TypeScript forbids a
+	// required parameter after an optional one, and an options-bag refactor of all four registrars
+	// is its own change. Forwarded verbatim to both protocols this function registers; omitting it
+	// leaves libp2p's own defaults (32 inbound / 64 outbound per protocol per connection).
+	streamCaps: StreamCaps = {}
 ): Promise<void> {
 	// The request carries no inbound `from`, but the connection's remote peer is
 	// transport-authenticated — and reaching this handler at all means the remote dialed
@@ -48,6 +54,7 @@ export async function registerNeighbors(
 	// bodies — including the close, which it performs under its own budget so a remote that stops
 	// reading cannot hold the handler open.
 	await registerJsonHandler(node, protocols.PROTOCOL_NEIGHBORS, {
+		...streamCaps,
 		serve: (connection) => {
 			onInbound?.(connection.remotePeer.toString());
 			return getSnapshot();
@@ -56,6 +63,7 @@ export async function registerNeighbors(
 
 	if (onAnnounce) {
 		await registerJsonHandler(node, protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
+			...streamCaps,
 			maxBytes,
 			parse: snapshotParser,
 			onMalformed,

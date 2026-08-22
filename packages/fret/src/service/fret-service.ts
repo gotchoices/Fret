@@ -1271,6 +1271,10 @@ export class FretService implements IFretService, Startable {
 
 	// RPC registration
 	private async registerRpcHandlers(): Promise<void> {
+		// Applied here rather than at construction because this runs on the `start()` path and
+		// `stop()` unhandles all five protocols: caps set once at construction would be silently
+		// dropped by a start -> stop -> start cycle.
+		const streamCaps = this.streamCaps();
 		try {
 			await Promise.all([
 				registerNeighbors(
@@ -1284,7 +1288,8 @@ export class FretService implements IFretService, Startable {
 					// The announce path's single cap enforcement point — `mergeAnnounceSnapshot`
 					// does not slice. Numbers come from `mergeSnapshotCaps()`; do not inline them.
 					makeSnapshotParser(this.mergeSnapshotCaps()),
-					() => { this.diag.rejected.malformed++; }
+					() => { this.diag.rejected.malformed++; },
+					streamCaps
 				),
 				// NOTE: maybeAct deliberately stays on `registerRpcHandler` while the other four
 				// protocols moved to the shared `registerJsonHandler` seam. That seam parses inside
@@ -1299,7 +1304,8 @@ export class FretService implements IFretService, Startable {
 					},
 					this.protocols.PROTOCOL_MAYBE_ACT,
 					this.maxBytesMaybeAct(),
-					() => { this.diag.rejected.malformed++; }
+					() => { this.diag.rejected.malformed++; },
+					streamCaps
 				),
 				// NOTE: leave is deliberately the one inbound handler with no `noteInboundRpc`
 				// hook (compare neighbors / maybeAct / ping above and below). That hook applies
@@ -1312,13 +1318,15 @@ export class FretService implements IFretService, Startable {
 					async (notice) => this.handleLeave(notice),
 					this.protocols.PROTOCOL_LEAVE,
 					() => { this.diag.rejected.identityMismatch++; },
-					() => { this.diag.rejected.malformed++; }
+					() => { this.diag.rejected.malformed++; },
+					streamCaps
 				),
 				registerPing(
 					this.node,
 					this.protocols.PROTOCOL_PING,
 					() => this.handlePingRequest(),
-					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(ping)')
+					(from) => this.detach(this.noteInboundRpc(from), 'noteInboundRpc(ping)'),
+					streamCaps
 				),
 			]);
 		} catch (err) {
@@ -2053,6 +2061,33 @@ export class FretService implements IFretService, Startable {
 		return this.cfg.profile === 'core'
 			? { successors: 16, predecessors: 16, sample: 8 }
 			: { successors: 8, predecessors: 8, sample: 6 };
+	}
+
+	/**
+	 * Per-connection, per-protocol stream caps handed to `node.handle` for all five FRET
+	 * protocols. libp2p counts both limits **per protocol per connection**, not per node, and
+	 * without them every protocol runs at libp2p's own defaults (32 inbound / 64 outbound) on both
+	 * profiles — so a Core node was provisioned at the Edge number and the two profiles were
+	 * identical where the design says they differ.
+	 *
+	 * NOTE: this is the single source of these four numbers — callers must not inline them. No
+	 * config knob, matching `mergeSnapshotCaps()` above: the profile branch returns literals, so a
+	 * cap of 0 or a negative number is not constructible. Tuning them is a follow-up with a
+	 * measurement behind it.
+	 *
+	 * These are **backstops, not operating limits.** FRET's own concurrency is per *node*
+	 * (`maintenanceConcurrency` Core 6 / Edge 2 across the whole tick pool; `announceFanout`
+	 * Core 8 / Edge 4 to *distinct* peers), so the streams FRET opens to one peer on one protocol
+	 * number ~1 — orders of magnitude under an outbound cap of 64 or 256. Inbound, the
+	 * `handleMaybeAct` inflight cap (Core 16 / Edge 4) sits far below the inbound stream cap
+	 * (Core 128 / Edge 32) and therefore binds first, answering `busy` politely. The stream cap is
+	 * the outer backstop that should essentially never fire against an honest peer — which is why
+	 * its firing is itself a signal.
+	 */
+	private streamCaps(): { maxInboundStreams: number; maxOutboundStreams: number } {
+		return this.cfg.profile === 'core'
+			? { maxInboundStreams: 128, maxOutboundStreams: 256 }
+			: { maxInboundStreams: 32, maxOutboundStreams: 64 };
 	}
 
 	/**

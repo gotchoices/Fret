@@ -3,6 +3,7 @@ import {
 	PROTOCOL_LEAVE,
 	registerJsonHandler,
 } from './protocols.js';
+import type { StreamCaps } from './protocols.js';
 import { rpcRequest } from './request.js';
 import { parseLeaveNotice } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
@@ -22,7 +23,10 @@ export async function registerLeave(
 	onLeave: (notice: LeaveNoticeV1) => Promise<void> | void,
 	protocol = PROTOCOL_LEAVE,
 	onIdentityMismatch?: (claimed: string, actual: string) => void,
-	onMalformed?: (reason: 'decode' | 'parse') => void
+	onMalformed?: (reason: 'decode' | 'parse') => void,
+	// Trailing and optional so existing positional callers keep compiling. Forwarded verbatim to
+	// `node.handle`; omitting it leaves libp2p's own per-connection defaults.
+	streamCaps: StreamCaps = {}
 ): Promise<void> {
 	// Decode, shape-check and stream release all belong to `registerJsonHandler` /
 	// `registerRpcHandler`, not this body — including the close, which the seam performs under its
@@ -30,6 +34,7 @@ export async function registerLeave(
 	// also performs the `replacements` sanitizing this body used to do inline, so `onLeave`
 	// receives an already-normalized notice.
 	await registerJsonHandler(node, protocol, {
+		...streamCaps,
 		maxBytes: 4096, // 12 replacements*64 + from 64 + timestamp 16 + punctuation ~64 ≈ 912 bytes; ~4.5x headroom kept
 		parse: parseLeaveNotice,
 		onMalformed,

@@ -7,6 +7,7 @@ import {
 	sendFramed,
 	registerRpcHandler,
 } from './protocols.js';
+import type { StreamCaps } from './protocols.js';
 import { createLogger } from '../logger.js';
 import { rpcRequest } from './request.js';
 import { parseMaybeActReply, parseOrThrow, MAX_ACTIVITY_BYTES, MAYBE_ACT_OVERHEAD_BYTES } from './validate.js';
@@ -20,7 +21,10 @@ export async function registerMaybeAct(
 	handle: (msg: RouteAndMaybeActV1, from: string) => Promise<NearAnchorV1 | BusyResponseV1 | { commitCertificate: string }>,
 	protocol = PROTOCOL_MAYBE_ACT,
 	maxBytes = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES,
-	onMalformed?: () => void
+	onMalformed?: () => void,
+	// Trailing and optional so existing positional callers keep compiling. Forwarded verbatim to
+	// `node.handle`; omitting it leaves libp2p's own per-connection defaults.
+	streamCaps: StreamCaps = {}
 ): Promise<void> {
 	// No inbound `from` on RouteAndMaybeAct, but thread the transport-authenticated
 	// sender id through to `handle` for future per-peer rate limiting / diagnostics.
@@ -51,7 +55,7 @@ export async function registerMaybeAct(
 		}
 		const res = await handle(msg, connection.remotePeer.toString());
 		sendFramed(stream, encodeJson(res));
-	});
+	}, { ...streamCaps });
 }
 
 /**

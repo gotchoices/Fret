@@ -4,6 +4,7 @@ import {
 	decodeJson,
 	registerJsonHandler,
 } from './protocols.js';
+import type { StreamCaps } from './protocols.js';
 import { rpcRequest } from './request.js';
 import { parseOrThrow, parsePingResponse } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
@@ -25,7 +26,10 @@ export async function registerPing(
 	node: Libp2p,
 	protocol = PROTOCOL_PING,
 	getSizeEstimate?: SizeEstimateProvider,
-	onInbound?: (from: string) => void
+	onInbound?: (from: string) => void,
+	// Trailing and optional so existing positional callers keep compiling. Forwarded verbatim to
+	// `node.handle`; omitting it leaves libp2p's own per-connection defaults.
+	streamCaps: StreamCaps = {}
 ): Promise<void> {
 	// Ping carries no `from`, but the connection's remote peer is transport-authenticated —
 	// and reaching this handler at all means the remote dialed *this network's* namespaced
@@ -34,6 +38,7 @@ export async function registerPing(
 	// `registerJsonHandler` — a decode step here would be pure ceremony. Encoding, errors and
 	// stream release (including the budgeted close) belong to the seam, not this body.
 	await registerJsonHandler(node, protocol, {
+		...streamCaps,
 		serve: (connection) => {
 			onInbound?.(connection.remotePeer.toString());
 			return pingReply(getSizeEstimate);

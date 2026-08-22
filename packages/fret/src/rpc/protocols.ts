@@ -114,11 +114,16 @@ export function isUnsupportedProtocolError(err: unknown): boolean {
  * `opts.closeBudgetMs` exists so a test need not spend the full default per case; there is no
  * production caller that overrides it.
  */
+export interface StreamCaps {
+	maxInboundStreams?: number;
+	maxOutboundStreams?: number;
+}
+
 export async function registerRpcHandler(
 	node: Libp2p,
 	protocol: string,
 	serve: (stream: Stream, connection: Connection) => Promise<void>,
-	opts: { closeBudgetMs?: number } = {}
+	opts: { closeBudgetMs?: number } & StreamCaps = {}
 ): Promise<void> {
 	const closeBudgetMs = opts.closeBudgetMs ?? RPC_TIMEOUT_MS;
 	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
@@ -146,7 +151,7 @@ export async function registerRpcHandler(
 				try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* best effort */ }
 			}
 		}
-	});
+	}, { maxInboundStreams: opts.maxInboundStreams, maxOutboundStreams: opts.maxOutboundStreams });
 }
 
 /**
@@ -163,12 +168,18 @@ export interface JsonRequestHandlerOpts<Req, Res> {
 	onMalformed?: (reason: 'decode' | 'parse') => void;
 	/** Test-only pass-through to {@link registerRpcHandler}; no production caller sets it. */
 	closeBudgetMs?: number;
+	/** Per-connection stream caps, forwarded verbatim to `node.handle`. See {@link StreamCaps}. */
+	maxInboundStreams?: number;
+	maxOutboundStreams?: number;
 }
 
 /** Options for a JSON protocol that reads no request body at all — it only answers. */
 export interface JsonReplyOnlyHandlerOpts<Res> {
 	serve: (connection: Connection) => Promise<Res> | Res;
 	closeBudgetMs?: number;
+	/** Per-connection stream caps, forwarded verbatim to `node.handle`. See {@link StreamCaps}. */
+	maxInboundStreams?: number;
+	maxOutboundStreams?: number;
 }
 
 /**
@@ -229,7 +240,11 @@ export function registerJsonHandler(
 		// Drop without replying; the seam still closes.
 		if (res === undefined) return;
 		sendFramed(stream, encodeJson(res));
-	}, { closeBudgetMs: opts.closeBudgetMs });
+	}, {
+		closeBudgetMs: opts.closeBudgetMs,
+		maxInboundStreams: opts.maxInboundStreams,
+		maxOutboundStreams: opts.maxOutboundStreams,
+	});
 }
 
 /**
