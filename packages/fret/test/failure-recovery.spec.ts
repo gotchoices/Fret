@@ -5,7 +5,8 @@ import { waitFor } from './helpers/wait-for.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { DigitreeStore } from '../src/store/digitree-store.js'
-import { ExpiringMap } from '../src/utils/expiring-map.js'
+import { ProbeBackoff } from '../src/service/probe-backoff.js'
+import { backoffOf, setBackoffOf } from './helpers/backoff.js'
 import { makeProtocols } from '../src/rpc/protocols.js'
 import { hashPeerId } from '../src/ring/hash.js'
 import type { Libp2p } from 'libp2p'
@@ -29,9 +30,10 @@ import type { NeighborSnapshotV1 } from '../src/index.js'
 // That split is the one `dead-state.spec.ts`'s own header asks for: by evidence source, not by test
 // count. Nothing here re-derives a seam-level fact.
 //
-// Two idioms recur, both borrowed rather than re-invented: rewind `lastContactFailureAt` instead of
-// sleeping out the strike-spacing window, and rewind a backoff entry's `until` instead of sleeping
-// out its window (`ring-membership.spec.ts`). Ticks are driven by hand — the observing service is
+// Two idioms recur: rewind `lastContactFailureAt` instead of sleeping out the strike-spacing
+// window, and advance a fake clock instead of sleeping out a backoff window. The service's
+// `backoff` is replaced in `beforeEach` with a `ProbeBackoff` reading that clock, so expiring a
+// window exercises the real window arithmetic rather than a hand-written `until` behind its back. Ticks are driven by hand — the observing service is
 // constructed and never started — so its own loop cannot race the assertions.
 
 describe('failure recovery: a real peer goes down, dies, and comes back', function () {
@@ -43,6 +45,8 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 	let svcB: CoreFretService
 	let store: DigitreeStore
 	let bId: string
+	/** Backing clock for the fake-clock `ProbeBackoff` installed in `beforeEach`. */
+	let clockMs = 0
 	const spareNodes: Libp2p[] = []
 	const spareSvcs: CoreFretService[] = []
 
@@ -71,13 +75,19 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		store.update(id, { lastContactFailureAt: 0, lastNegotiateFailureAt: 0 })
 	}
 
-	const backoffMap = (): ExpiringMap<{ until: number; factor: number }> =>
-		(svcA as any).backoffMap as ExpiringMap<{ until: number; factor: number }>
+	/** Escalation factor the installed backoff holds for a peer; 0 when nothing is retained. */
+	const factor = (id: string = bId): number => backoffOf(svcA).factor(id)
 
-	/** Expire a backoff window without sleeping it out, keeping the escalation factor intact. */
-	const expireBackoff = (id: string): void => {
-		const cur = backoffMap().get(id)
-		if (cur) backoffMap().set(id, { ...cur, until: Date.now() - 1 })
+	/**
+	 * Expire the open backoff window without sleeping it out, keeping the escalation factor intact.
+	 *
+	 * Advances one millisecond past the longest window an escalation here can open
+	 * (`baseMs * maxFactor` = 32 s) and no further: `retainMs` (300 s) must not elapse, or the
+	 * retained entry would be forgotten, the factor would silently reset to 1, and "window doubles
+	 * per confirmed failure" below would pass for the wrong reason.
+	 */
+	const expireBackoff = (): void => {
+		clockMs += ProbeBackoff.DEFAULT_BASE_MS * ProbeBackoff.DEFAULT_MAX_FACTOR + 1
 	}
 
 	const near = (): Promise<string[]> => (svcA as any).nearProbeTargets() as Promise<string[]>
@@ -116,6 +126,11 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		// below, and a live loop would probe B on its own schedule. The remote *is* started, so it
 		// registers this network's protocol handlers.
 		svcA = new CoreFretService(a, { profile: 'core', networkName: 'net-test' })
+		// Installed after construction and before the first tick, since a tick reads backoff state.
+		// The capacity matches what the Core profile derives for itself (the routing-table capacity),
+		// so this rig and `profile.behavior.spec.ts` agree on what a Core backoff map holds.
+		clockMs = Date.now()
+		setBackoffOf(svcA, new ProbeBackoff({ capacity: 2048, now: () => clockMs }))
 		svcB = new CoreFretService(b, { profile: 'core', networkName: 'net-test' })
 		await svcB.start()
 		store = svcA.getStore()
@@ -164,7 +179,7 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		// The assertion that pins the shipped staging: backoff belongs to the off-ring probe passes
 		// and to routing, never to the near pass, which is why a live member is re-verified every
 		// tick rather than dropping into a growing window after its first miss.
-		expect(backoffMap().get(bId), 'the near pass records no backoff').to.equal(undefined)
+		expect(factor(), 'the near pass records no backoff').to.equal(0)
 	})
 
 	it('keeps a softly-failing peer in every ring view and in the near list', async () => {
@@ -209,7 +224,7 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		// failed, and backed it off — so the immediately following tick skips it. A recovery test
 		// that runs one tick straight after a restart observes no change for exactly this reason.
 		expect(reprobe(), 'still inside the window the killing tick opened').to.not.include(bId)
-		expireBackoff(bId)
+		expireBackoff()
 		expect(reprobe(), 'the dead arm is the only pass that will ever touch it again').to.include(bId)
 	})
 
@@ -238,13 +253,13 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		await stopRemote()
 		await driveToDead()
 
-		expect(backoffMap().get(bId)?.factor, 'the killing tick backed it off at factor 1').to.equal(1)
+		expect(factor(), 'the killing tick backed it off at factor 1').to.equal(1)
 		expect(reprobe()).to.not.include(bId)
-		expireBackoff(bId)
+		expireBackoff()
 		expect(reprobe()).to.include(bId)
 
 		await tick() // the dead arm probes, fails again
-		expect(backoffMap().get(bId)?.factor, 'window doubles per confirmed failure').to.equal(2)
+		expect(factor(), 'window doubles per confirmed failure').to.equal(2)
 	})
 
 	it('strikes each of two unreachable near peers exactly once in one tick', async () => {
@@ -296,7 +311,7 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		await driveToDead()
 
 		await startRemote() // same peer id, same memory multiaddr
-		expireBackoff(bId)
+		expireBackoff()
 		const pingsBefore = svcA.getDiagnostics().pingsSent
 		await tick()
 
@@ -352,7 +367,7 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		await stopRemote()
 		await driveToDead()
 		await startRemote()
-		expireBackoff(bId)
+		expireBackoff()
 		await tick()
 
 		const after = entry()!
