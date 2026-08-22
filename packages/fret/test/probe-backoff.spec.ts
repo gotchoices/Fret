@@ -80,9 +80,11 @@ describe('ProbeBackoff', () => {
 			backoff.record('a')
 			expect(backoff.factor('a')).to.equal(2)
 
-			// The second call's later stamp pushed `until` out too: still backed off well past
-			// where the *first* call's window alone would have closed.
-			clock.advance(BASE_MS - 1)
+			// The second call's later stamp pushed `until` out too. `BASE_MS + 1`, not less: both
+			// records land at the same instant, so a second failure that had *not* escalated would
+			// leave `until` at that instant + BASE_MS and read as closed here. Anything inside the
+			// first window is true under either factor and would pin nothing.
+			clock.advance(BASE_MS + 1)
 			expect(backoff.isBackedOff('a')).to.equal(true)
 		})
 
