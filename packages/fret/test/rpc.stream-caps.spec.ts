@@ -135,6 +135,10 @@ describe(`inbound stream caps (${transport.name})`, function () {
 		// Every request either reached the handler (admitted, and now parked on the gate) or has
 		// already failed (refused). Polling that sum is what makes the split observable *while*
 		// the admitted streams are still open — the only window in which the cap is binding.
+		// NOTE: convergence wait, not a fixed sleep — but it is the one timing-shaped construct
+		// here, so it is where flake would appear on a loaded CI box. Hitting the 5 s ceiling does
+		// not silently pass: the `admitted + refused === CONCURRENT` assertion below fails loudly.
+		// If it ever does flake, raise the ceiling rather than replacing the poll with a sleep.
 		const until = Date.now() + 5000
 		while (entered + settled.length < CONCURRENT && Date.now() < until) await sleep(20)
 
