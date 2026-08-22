@@ -437,7 +437,7 @@ describe('Placement distributions', function () {
 				expect(own, 'clustered placement must expose its centers').to.exist
 				centers = own!
 			} else {
-				expect(given, 'uniform arm must be given the clustered arm's centers').to.exist
+				expect(given, 'uniform arm must be given the clustered centers').to.exist
 				centers = given!
 			}
 

@@ -30,6 +30,11 @@ describe('Churn scenario simulations', function () {
 		sim.scheduleBatchLeave(leaveCount, 3001)
 
 		// Continue simulation to t=8000 (5s recovery window)
+		// NOTE: this drain idiom pops an event and discards it when it lands past the bound,
+		// unlike test/simulation/pump.ts which peeks first and leaves it queued. Pre-existing and
+		// used at nine sites across this spec, sim-profiles.spec.ts and message-bus.spec.ts; every
+		// one of them is the last drain of its sim, so the dropped event changes no reading today.
+		// If a site ever drains to a bound and then keeps simulating, fold it onto `pump` instead.
 		while (sim.scheduler.pending() > 0) {
 			const evt = sim.scheduler.nextEvent()
 			if (!evt || evt.time > 12000) break
