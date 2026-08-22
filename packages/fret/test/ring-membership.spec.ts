@@ -654,6 +654,8 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		expect(store.getById('burst-peer')?.membership).to.equal('member', 'a burst must not demote a member')
 
 		// Spaced-out failures still accumulate and still demote — the run is delayed, not disabled.
+		// NOTE: the 600 ms sleep is sized against NEGOTIATE_FAILURE_MIN_SPACING_MS (500 ms); a late
+		// timer only widens the gap, so it cannot flake. Raise the sleep if that constant ever rises.
 		for (let i = 0; i < 2; i++) {
 			await new Promise((r) => setTimeout(r, 600))
 			signal.applyMembershipSignal('burst-peer', 'negotiate-failure')
