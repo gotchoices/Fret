@@ -508,6 +508,13 @@ export class FretService implements IFretService, Startable {
 	// the one hazard already met in practice is a test spreading `rejected` and aliasing the
 	// counters underneath (see `rpc.codec-properties.spec.ts`). If a consumer ever needs a
 	// stable snapshot, deep-freeze or deep-clone here rather than asking every caller to copy.
+	// NOTE: the live handle also makes one test idiom silently vacuous -- capturing the result as
+	// an object and subtracting a later read from it yields zero for every field, so the spec
+	// passes without asserting anything. Audited 2026-08-22 across every `getDiagnostics()` caller
+	// in `test/`: none does this (each either spreads a copy or reads scalars), so this is a
+	// tripwire, not a live defect. Revisit -- returning a frozen shallow copy, which makes the
+	// idiom unrepresentable at a per-call allocation -- if a spec is ever found taking a diff
+	// against an uncopied handle.
 	public getDiagnostics(): Readonly<typeof this.diag> {
 		return this.diag;
 	}
