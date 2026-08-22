@@ -431,5 +431,27 @@ describe('Profile behavior tests', function () {
 			await (svc as any).stabilizeOnce()
 			expect(backoff.size).to.equal(1)
 		})
+
+		it('stabilizeOnce drops backoff entries for peers no longer in the routing store', async () => {
+			const { svc } = await createService('core')
+
+			// Distinct from the expiry case above: this entry is well inside its retention window,
+			// so only the store-membership prune can remove it. The two halves of the sweep are
+			// orthogonal — no lifetime can see that a peer left the store.
+			const backoff = backoffOf(svc)
+			const absentId = 'peer-not-in-the-routing-store'
+			const selfId: string = (svc as any).selfIdStr
+			backoff.record(absentId)
+			backoff.record(selfId)
+			expect(backoff.size).to.equal(2)
+
+			await (svc as any).stabilizeOnce()
+
+			// Self is always in the store, so it pins the predicate rather than the prune: a prune
+			// handed an inverted or unconditional predicate fails on one of these two, not both.
+			expect(backoff.size).to.equal(1)
+			expect((svc as any).store.getById(absentId), 'precondition').to.equal(undefined)
+			expect(backoff.factor(selfId)).to.be.greaterThan(0)
+		})
 	})
 })
