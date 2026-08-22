@@ -120,3 +120,29 @@ either up inherits the capability and needs no rig change:
 - `debt-backoff-map-test-surface` — extracting the probe-backoff bookkeeping so its *arithmetic* is
   unit-testable. This ticket only asserts that a busy ping records *some* backoff, never what factor
   it lands on.
+
+<!-- resume-note -->
+## Resume note (run of 2026-08-22 — budget-cut before any code was written)
+
+**No source file was created or edited this run.** The tree is exactly as the previous run left it:
+the rig half is landed, `packages/fret/test/maintenance-nonok-replies.spec.ts` still does not exist,
+and `docs/fret.md` still forward-references it. The whole TODO above is untouched and stands as-is.
+
+Two things this run confirmed by reading, which the next run can take as given rather than re-deriving:
+
+- **`test/helpers/backoff.ts` exports two helpers, not one.** `backoffOf(svc)` is the reader this
+  ticket calls for; `setBackoffOf(svc, pb)` installs a fake-clock `ProbeBackoff` and is **not**
+  needed here — these arms assert only that a busy ping recorded *some* backoff (factor > 0) and
+  that the other arms recorded none (factor 0), never a window duration, so no clock control is
+  required and the real `ProbeBackoff` is fine.
+- **The rig's seeding and behavior knobs are sufficient as landed; no rig change is needed.**
+  `seedPeers(count, membership, patch)` forwards `patch` to `store.update`, so the pre-seeded
+  contact-failure run the ticket requires is `seedPeers(1, 'member', { contactFailures: 2 })`.
+  Per-arm behavior goes through `rig.setProtocolBehavior(id, rig.ping()|rig.neighbors(), b)` —
+  which is what the neighbors-`busy`-behind-an-`answers`-ping arm needs, since the per-peer
+  `rig.behavior` map cannot express two protocols differently. Note `'not-ok'` **rejects loudly**
+  if set against the neighbors protocol (by design), so that arm must use the ping protocol.
+
+Next run: start at the TODO list above. Read `fetchAndMergeSnapshot` (grep the symbol in
+`src/service/fret-service.ts`) first, since the fourth arm's assertions depend on what it actually
+does today, then write the spec, then `npx tsc --noEmit` and `yarn test` from `packages/fret`.
