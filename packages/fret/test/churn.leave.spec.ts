@@ -807,8 +807,10 @@ describe('Leave notice replacements (sender side)', function () {
 			rig = await makeSenderRig(15, COUNT, [WINDOW_RECEIVER, ...OUTSIDE_RECEIVERS], 'edge')
 			expect((rig.svc as any).cfg.m,
 				'premise: m = ceil(k / 2), so k of 15 gives an eight-wide window per side').to.equal(8)
-			// Read from the profile rather than written as a literal, so a profile retune fails
-			// the premise below instead of quietly making the case vacuous.
+			// The clamp's fan-out is a bare literal inside `sendLeaveToNeighbors` — it is not on
+			// `cfg`, and it is not `cfg.announceFanout` (Core 8 / Edge 4, a different bound) — so
+			// this is a hand-copy of the production expression and the assertion below, not the
+			// derivation, is what catches a retune.
 			fanOut = (rig.svc as any).cfg.profile === 'core' ? 4 : 2
 			expect(fanOut, 'premise: the edge profile caps the beyond-S/P fan-out at two').to.equal(2)
 			expect(OUTSIDE_RECEIVERS.length,
@@ -832,6 +834,10 @@ describe('Leave notice replacements (sender side)', function () {
 			// mid-flight as two and pass vacuously.
 			await waitFor(() => outsideTotal() >= fanOut, 5000, 10,
 				'the beyond-S/P arm reached `fanOut` of the three eligible peers')
+			// NOTE: fixed settle rather than a condition — every send is awaited inside `send()`,
+			// so this covers only handler delivery across the in-memory stream, not convergence.
+			// If it ever flakes, replace it with a condition (the receivers' notice counts holding
+			// still across two reads) rather than raising the number.
 			await delay(100)
 			// Deliberately not *which* of +9/+10/+11: selection order is `expandCohort`'s
 			// alternating cohort order, an implementation detail. The clamp is the contract. The

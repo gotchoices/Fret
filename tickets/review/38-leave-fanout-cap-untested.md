@@ -1,113 +1,100 @@
-description: A test was added to check that a departing peer's courtesy goodbye list is capped at a fixed number. Two reviewer runs have now been cut short by budget limits, so the remaining checks — running the test suite and confirming the project documentation still matches — still need doing.
+description: A test was added to check that a departing peer's courtesy goodbye list is capped at a fixed number. Three reviewer runs have now been cut short by budget limits; the only remaining work is running the whole test suite once and confirming the project documentation still matches.
 files: packages/fret/test/churn.leave.spec.ts, packages/fret/src/service/fret-service.ts, docs/fret.md
-difficulty: medium
+difficulty: easy
 ----
 
 <!-- resume-note -->
-**Two prior review runs were cut short by a token budget warning.** Run 1 read the implement diff
-and the production code under test. Run 2 re-read the diff with fresh eyes and cleared one
-checklist item (orphaned helpers). **Neither run changed any code** — `git status` is clean apart
-from the ticket board and `tickets/.in-progress`. Nothing is half-applied.
+**Three prior review runs were cut short by a token budget warning.** Run 1 read the implement diff
+and the production code. Run 2 re-read the diff with fresh eyes and cleared the orphaned-helper
+check. **Run 3 did the expensive verification and both inline fixes** — see *Done* below. `git
+status` now shows one real edit (`packages/fret/test/churn.leave.spec.ts`, comments only) plus the
+ticket board. Nothing is half-applied.
 
-Resume at the checklist at the bottom. **Budget note for the next run:** the two remaining
-expensive items are the test runs and the docs read. Do those *first*, before re-deriving any
-analysis already written down here — the two candidate findings below are the only open judgement
-calls and both are small.
+**Budget note for the next run: only two items remain, and one of them is the ~8 minute full test
+suite. Do it first, then the docs read, then write the `complete/` ticket. Do not re-derive any
+analysis below — the review is finished apart from those two checks.**
 
 ## What is under review
 
-Commit `5ea8321` (`ticket(implement): leave-fanout-cap-untested`). Test-only:
-`packages/fret/src/service/fret-service.ts` is byte-identical to HEAD. Three edits, all in
-`packages/fret/test/churn.leave.spec.ts`:
+Commit `5ea8321` (`ticket(implement): leave-fanout-cap-untested`). Test-only: `fret-service.ts` is
+byte-identical to HEAD. Three edits in `packages/fret/test/churn.leave.spec.ts`:
 
 - `makeSenderRig` gained an optional fourth parameter `profile: 'core' | 'edge' = 'core'`, threaded
-  to the single `new CoreFretService(departing, { profile, k })` line. Every existing caller is
+  to its single `new CoreFretService(departing, { profile, k })` line. Every existing caller is
   unchanged.
 - A new `describe` — *at the edge profile, with the fan-out pool wider than the cap* — with its own
-  `before`/`after` (`sendLeaveToNeighbors` is once-per-lifetime per service, so it cannot share the
+  `before` / `after` (a service sends leave notices once per lifetime, so it cannot share the
   neighbouring rig's departure). It marks two window peers `dead` so the live-member-scoped cohort
-  walk reaches further than the unfiltered S/P window walk, producing three eligible connected
-  peers outside the window against an edge `fanOut` of 2, then asserts the *sum* of notices across
-  those three equals `fanOut`.
+  walk reaches further than the unfiltered successor/predecessor window walk, producing three
+  eligible connected peers outside the window against an edge fan-out of 2, then asserts the *sum*
+  of notices across those three equals the fan-out.
 - Deletion of the misnamed `fan-out notifies peers beyond immediate S/P` star-topology test, whose
   own comment conceded it only asserted the survivors kept running.
 
 The clamp under test is the `.slice(0, fanOut)` on the `extra` list in `sendLeaveToNeighbors`
-(`src/service/fret-service.ts`, around line 1892).
+(`src/service/fret-service.ts:1892`).
 
-## What the interrupted runs established
+## Done (verified this run — do not redo)
 
-Read and confirmed by eye, not by running anything:
+- **Targeted spec passes**: `node --import ./register.mjs node_modules/mocha/bin/mocha.js
+  "test/churn.leave.spec.ts" --timeout 30000` → 22 passing, 10 s. Both new cases green.
+- **`npx tsc --noEmit` from `packages/fret` is clean** (exit 0), which also settles the
+  orphaned-import question run 2 counted by hand.
+- **Read `sendLeaveToNeighbors` in full** (`src/service/fret-service.ts:1860-1905`). It matches the
+  test's account: unfiltered `ringNeighborsBothSides` walk for `ids` / `spSet`,
+  `computeReplacements` off that set, serial notice loop with an `isDoomedDial` skip, then
+  `expandCohort(ids, selfCoord, fanOut, {self})`, `filter(!spSet.has(id) && isConnected(id))`,
+  `.slice(0, fanOut)`, second serial loop.
+- **Read `makeSenderRig` / `SenderRig` in full** (`test/churn.leave.spec.ts:530-607`) plus the
+  neighbouring `advertises the live members…` and `caps the replacement list at six ids` cases the
+  new block was modelled on. The `profile` thread-through touches exactly one line and every
+  existing caller keeps the `'core'` default.
+- **Finding 1 (the fan-out premise comment) resolved and fixed inline.** Checked whether the number
+  is exposed on the service: it is **not** — `fret-service.ts:1883` is a bare
+  `this.cfg.profile === 'core' ? 4 : 2` local, and the only `cfg`-level fan-out is
+  `announceFanout` (Core 8 / Edge 4, `fret-service.ts:500`), a *different* bound. So reading the
+  real number off the service is not available and the comment was the thing to fix; it now says
+  the derivation is a hand-copy and that the `expect(fanOut).to.equal(2)` below it is what catches
+  a retune.
+- **Finding 2 (the fixed `await delay(100)`) dispositioned as a tripwire, parked at the site.** It
+  is a handler-delivery settle, not a convergence guess (every send is awaited inside `send()`),
+  and no condition-shaped alternative exists that is not itself a settle. A `NOTE:` at the line
+  states that and names the replacement to reach for if it ever flakes. Not a ticket.
+- **Prior runs' cleared items**, restated so they are not re-derived: `(rig.svc as any).cfg` is
+  long-standing house precedent in this spec (14 other sites); `delay` is an existing local helper
+  already used by another case; the deletion orphaned no helper or constant.
 
-- The production `sendLeaveToNeighbors` body matches the ticket's description of it: unfiltered
-  `ringNeighborsBothSides` walk for `ids`/`spSet`, `computeReplacements` off that set, serial S/P
-  notice loop with an `isDoomedDial` skip, then `expandCohort(ids, selfCoord, fanOut, {self})`,
-  `filter(!spSet.has(id) && isConnected(id))`, `.slice(0, fanOut)`, second serial loop. So the
-  test's account of *why* the slice is otherwise a structural no-op is consistent with the code.
-- `(rig.svc as any).cfg` reaching into private service state is long-standing house precedent in
-  this spec (14 other sites), so the new case's use of it is not a new finding.
-- `delay` is a local one-line helper at the top of the file and is already used by an existing case
-  (`await delay(settleMs)`), so the new `await delay(100)` is not a new idiom in this file.
-- **The deletion orphaned nothing** (checklist item cleared by run 2). Occurrence counts in
-  `packages/fret/test/churn.leave.spec.ts` after the deletion: `buildMesh` 3, `Mesh` (the type
-  import plus the `let mesh` declaration), `waitFor` 7, `allConverged` 2, `anyProgressed` 2,
-  `alreadyStopped` 4, `CONVERGE_MS` 2, `PROGRESS_MS` 2 — every helper and constant the deleted
-  case used still has at least one other user, so no import or local went dead. (Two occurrences
-  of a name means the declaration plus one use.) `tsc --noEmit` is still the authority here and is
-  on the checklist anyway.
+## Remaining (all that is left)
 
-## Findings so far (not yet dispositioned)
+- **Run the full suite in the foreground with no redirection**, from `packages/fret`:
+  `yarn test` (~8 min). Must pass. There is no lint step in this repo — `yarn check` (typecheck +
+  build + test) is the gate, and `yarn format` must **not** be run (see `AGENTS.md`). Typecheck is
+  already green, so `yarn test` alone is sufficient.
+- **Read `docs/fret.md`'s *Leave* section and decide one thing**: the sender-side beyond-S/P
+  fan-out cap (Core 4 / Edge 2) does **not** appear to be stated anywhere in that section — step 3
+  says only "Notify any connected peers outside S/P before disconnecting", and the stated
+  "Per-leave outbound ceiling" bullet is about the *recipient's* cost and its `announceFanout`,
+  which is a different number. Confirm by reading, then either add one sentence naming the Core 4 /
+  Edge 2 cap under *Leave* (minor, fix inline in this pass) or record why it is already covered.
+  This is the one docs decision left; everything else the change touches is test-only.
+- Write the `complete/` ticket with a `## Review findings` section: what was checked, what was
+  found, what was done. Fold in the *Done* list above verbatim, the two dispositioned findings, the
+  docs decision, and the four gaps below. Say explicitly that no major finding was raised and why —
+  the change is test-only, the production clamp is unmodified, and the new case was shown
+  non-vacuous by the implementer's mutation check.
 
-Neither has been verified against a run; treat both as candidates, not conclusions.
+## Gaps the handoff declares openly — weigh and record, do not investigate
 
-- **The `fanOut` premise comment overstates what it does.** The new case computes
-  `fanOut = (rig.svc as any).cfg.profile === 'core' ? 4 : 2` and comments that it is "read from the
-  profile rather than written as a literal, so a profile retune fails the premise below instead of
-  quietly making the case vacuous". It reads the profile *name* and then re-derives the number with
-  a hand-copy of the production expression — so the fan-out magnitude now exists in two places with
-  nothing tying them together. The `expect(fanOut).to.equal(2)` immediately below does catch a
-  retune, but by the literal, not by the derivation the comment claims. Decide between: fixing the
-  comment to say what the line actually does; or reading the real number off the service the way
-  the line above it reads `cfg.m` (first check whether the fan-out is exposed on `cfg` at all — if
-  it is, that is the fix and it retires the whole finding). Likely minor — fix inline.
-- **The fixed `await delay(100)` settle**, which the implementer flagged themselves. It is not a
-  convergence guess (all sends are awaited inside `send()`), only a handler-delivery settle, but it
-  is a wall-clock guess in a file whose header is largely about having removed fixed sleeps. Judge
-  whether a condition-shaped alternative exists; if not, this is a tripwire (`NOTE:` at the site),
-  not a ticket.
+Each needs a disposition sentence in `## Review findings`, not new analysis:
 
-## Remaining checklist
-
-- **Run these first** (they are the budget risk), from `packages/fret`, and require passing:
-  `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/churn.leave.spec.ts" --timeout 30000`,
-  then `npx tsc --noEmit`, then the full `yarn test` (~8 min; run in the foreground with no
-  redirection so the runner's idle timer stays alive). There is no lint step in this repo —
-  `yarn check` (typecheck + build + test) is the gate, and `yarn format` must **not** be run
-  (see `AGENTS.md`).
-- Confirm `docs/fret.md` needs no change. The *Leave* section already states the fan-out and its
-  bound; the handoff says nothing in `docs/` referenced the deleted test. Verify by reading, not by
-  assuming — treat docs as out of date until read.
-- Read the whole new `describe` in context, plus the neighbouring `at the shipped k of 15` block
-  it was modelled on, and `makeSenderRig` / `SenderRig` (`noticesAt`, `idAt`, `send`) — neither
-  interrupted run saw them outside the diff. (Spec file is 853 lines; the sender-rig region starts
-  around line 555.)
-- Re-check the rig arithmetic independently (the handoff calls every number load-bearing): m = 8,
-  40 seeded peers, cohort ask of 18 alternating 9 per side, dead +2/+3 pulling the clockwise reach
-  to `{+1, +4..+11}`, +32 dropped as a ghost by `isConnected`. A wrong number here makes the case
-  pass vacuously.
-- Decide whether the anti-vacuity proof needs re-running. The handoff reports a mutation check
-  (removing `.slice(0, fanOut)` makes the new case fail `expected 3 to equal 2`) and that
-  `fret-service.ts` was restored afterwards — `git diff` against HEAD is clean, which corroborates
-  the restore but not the mutation result.
-- Weigh the four gaps the handoff declares openly, and record each as fixed / tripwire /
-  new ticket / accepted: the coupling to `expandCohort`'s alternating reach (a shortened reach
-  fails as "the clamp broke"); nothing asserting the edge profile changed only `fanOut`;
-  `replacements` deliberately unasserted in the new rig; and the interaction with
-  `plan/23-fret-service-decomposition`, whose second arm changes the target list `spSet` derives
-  from — whichever lands second must re-check the other's expectations.
-
-## Output
-
-A `complete/` ticket with a `## Review findings` section covering what was checked, what was found,
-and what was done — including the two candidate findings above, dispositioned. Empty categories are
-fine when stated with a reason.
+- The new case couples to `expandCohort`'s alternating reach: a future change that shortens that
+  reach fails the case as though the clamp broke. The case's own comment already says the count
+  fails loudly rather than vacuously in that direction, which is the mitigation.
+- Nothing asserts the edge profile changed *only* the fan-out; the rig trusts the profile split.
+- `replacements` is deliberately unasserted in the new rig — covered by the sibling cases.
+- `plan/23-fret-service-decomposition`'s second arm changes the target list `spSet` derives from;
+  whichever of the two lands second must re-check the other's expectations. Note it, do not act.
+- The implementer reports a mutation check (removing `.slice(0, fanOut)` fails the new case with
+  `expected 3 to equal 2`) and that the file was restored. `git diff` against HEAD shows
+  `fret-service.ts` unmodified, which corroborates the restore. Re-running the mutation is optional
+  and was judged not worth the budget.
