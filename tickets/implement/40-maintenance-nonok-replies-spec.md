@@ -122,27 +122,68 @@ either up inherits the capability and needs no rig change:
   it lands on.
 
 <!-- resume-note -->
-## Resume note (run of 2026-08-22 — budget-cut before any code was written)
+## Resume note (run of 2026-08-22, second run — budget-cut before any code was written)
 
-**No source file was created or edited this run.** The tree is exactly as the previous run left it:
-the rig half is landed, `packages/fret/test/maintenance-nonok-replies.spec.ts` still does not exist,
-and `docs/fret.md` still forward-references it. The whole TODO above is untouched and stands as-is.
+**No source file was created or edited this run either.** `packages/fret/test/maintenance-nonok-replies.spec.ts`
+still does not exist and `docs/fret.md` still forward-references it. The whole TODO above stands.
 
-Two things this run confirmed by reading, which the next run can take as given rather than re-deriving:
+This is the sixth consecutive run cut by the soft token budget, and the pattern is now the problem:
+each run spends its budget re-reading the same three files before writing a line. **The next run
+should write the spec first and read nothing but `fetchAndMergeSnapshot`.** Everything else it
+needs is transcribed below — treat it as given, do not re-derive it.
 
-- **`test/helpers/backoff.ts` exports two helpers, not one.** `backoffOf(svc)` is the reader this
-  ticket calls for; `setBackoffOf(svc, pb)` installs a fake-clock `ProbeBackoff` and is **not**
-  needed here — these arms assert only that a busy ping recorded *some* backoff (factor > 0) and
-  that the other arms recorded none (factor 0), never a window duration, so no clock control is
-  required and the real `ProbeBackoff` is fine.
-- **The rig's seeding and behavior knobs are sufficient as landed; no rig change is needed.**
-  `seedPeers(count, membership, patch)` forwards `patch` to `store.update`, so the pre-seeded
-  contact-failure run the ticket requires is `seedPeers(1, 'member', { contactFailures: 2 })`.
-  Per-arm behavior goes through `rig.setProtocolBehavior(id, rig.ping()|rig.neighbors(), b)` —
-  which is what the neighbors-`busy`-behind-an-`answers`-ping arm needs, since the per-peer
-  `rig.behavior` map cannot express two protocols differently. Note `'not-ok'` **rejects loudly**
-  if set against the neighbors protocol (by design), so that arm must use the ping protocol.
+### Given: the exact rig API (read from `test/helpers/maintenance-rig.ts` this run)
 
-Next run: start at the TODO list above. Read `fetchAndMergeSnapshot` (grep the symbol in
-`src/service/fret-service.ts`) first, since the fourth arm's assertions depend on what it actually
-does today, then write the spec, then `npx tsc --noEmit` and `yarn test` from `packages/fret`.
+```ts
+const r = await buildMaintenanceRig('core')          // also accepts a 2nd arg: Partial<FretConfig>
+r.svc, r.store, r.rig, r.node
+r.ping(), r.neighbors()                              // protocol strings
+r.concurrency()                                      // Core 6 / Edge 2
+r.setTickBudget(ms)                                  // restored by teardown()
+await r.seedPeers(count, 'member', { contactFailures: 2 })   // patch -> store.update
+r.rig.setProtocolBehavior(id, r.ping(), 'busy')      // per-(peer, protocol); beats r.rig.behavior
+r.rig.protocolsSeenBy(id)                            // string[], append-ordered
+await r.teardown()
+```
+
+`Behavior = 'answers' | 'hangs' | 'busy' | 'not-ok' | 'undecodable'`. `'not-ok'` **rejects loudly**
+against the neighbors protocol — ping only. `'busy'` and `'undecodable'` serve either protocol.
+The rig never starts the service, so drive `(svc as any).stabilizeOnce()` directly.
+
+### Given: the backoff helper
+
+`test/helpers/backoff.ts` exports `backoffOf(svc)` (the reader this spec wants) and
+`setBackoffOf(svc, pb)` (**not** needed — these arms assert only factor > 0 vs factor 0, never a
+window duration, so no clock control is required).
+
+### New this run: arm 4's answer is already written down, in a spec the ticket did not know about
+
+`packages/fret/test/fetch-snapshot-failure-arms.spec.ts` **exists on this branch** — the sibling
+ticket `debt-fetch-snapshot-failure-arms-untested` has evidently landed. It owns the fetch arms
+directly (`skipped`, `decode-error`, `ok`, `foreign-protocol`, `unreachable`, mid-stream stall)
+against its own hand-rolled connection stub rather than the rig.
+
+Its comment at line 132 states the answer arm 4 was told to go read `fetchAndMergeSnapshot` for:
+**`decode-error` and `busy` are both silent arms** — bookkeeping-identical to `skipped`, with
+`snapshotsFetched` not incremented and nothing scored. So arm 4 should assert exactly that:
+the entry is byte-for-byte unchanged by the fetch (relevance, `contactFailures`, membership,
+state), and `diag.snapshotsFetched` did not move — while the *ping* half of the same tick scored
+normally. Still open `fetchAndMergeSnapshot` to confirm before asserting, but expect to be pinning
+silence, not scoring.
+
+Two consequences for scope:
+
+- Arm 4 is a **rig-driven, whole-tick** case — ping scores, fetch stays silent, both observed
+  through one `stabilizeOnce`. That is genuinely not what the sibling spec covers (it calls
+  `fetchAndMergeSnapshot` directly, one arm at a time), so it is not duplicate coverage. Keep it.
+- If arm 4 turns out to be awkward to distinguish from the sibling spec's `decode-error` case,
+  the cheapest honest outcome is to keep arms 1–3 (the ping arms, which nothing else covers) and
+  say so in the handoff. Do **not** drop arms 1–3 to make room for arm 4.
+
+### Do this, in this order
+
+- Grep `fetchAndMergeSnapshot` in `src/service/fret-service.ts`, read that method only.
+- Write `packages/fret/test/maintenance-nonok-replies.spec.ts` — four arms, assertions as
+  specified above under *The four arms*. Do not re-read the rig or the backoff helper.
+- `cd packages/fret && npx tsc --noEmit`, then `yarn test` foreground, no redirection.
+- Re-check `docs/fret.md`'s two references to the spec path match the file landed.
