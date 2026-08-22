@@ -46,6 +46,7 @@ import { minDistance } from '../ring/distance.js';
 import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
 import { SizeObserver } from './size-observer.js';
+import { ProbeBackoff } from './probe-backoff.js';
 import type { LocalSizeEstimate } from './size-observer.js';
 import { ringNeighborsBothSides } from '../ring/ring-walk.js';
 import {
@@ -225,10 +226,11 @@ export class FretService implements IFretService, Startable {
 	/** Sized in the constructor, where the profile is known — see the sizing note there. */
 	private readonly dedupCache: DedupCache<NearAnchorV1 | { commitCertificate: string }>;
 	/**
-	 * Per-peer probe backoff. Sized and expired in the constructor — see the sizing note there
-	 * and {@link BACKOFF_RETAIN_MS} for why the retention lifetime is *not* the backoff window.
+	 * Per-peer probe backoff. Sized in the constructor — see the sizing note there, and
+	 * {@link ProbeBackoff.DEFAULT_RETAIN_MS} for why the retention lifetime is *not* the backoff
+	 * window.
 	 */
-	private readonly backoffMap: ExpiringMap<{ until: number; factor: number }>;
+	private readonly backoff: ProbeBackoff;
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
 	private readonly bucketAnnounce: TokenBucket;
@@ -242,30 +244,6 @@ export class FretService implements IFretService, Startable {
 	 */
 	private readonly departureDebounce: ExpiringMap<number>;
 	private static readonly DEPARTURE_DEBOUNCE_MS = 2000;
-	/**
-	 * First backoff window, doubled on each further failure up to {@link BACKOFF_MAX_FACTOR}.
-	 *
-	 * A named constant rather than a literal inside `recordBackoff` so the retention inequality
-	 * below can be asserted against the real value instead of a copy of it.
-	 */
-	private static readonly BACKOFF_BASE_MS = 1000;
-	/** Cap on the doubling factor: the longest window is `BACKOFF_BASE_MS × BACKOFF_MAX_FACTOR`. */
-	private static readonly BACKOFF_MAX_FACTOR = 32;
-	/**
-	 * How long a peer's backoff *escalation* is remembered after its last failure — deliberately
-	 * not the backoff window itself.
-	 *
-	 * `getBackoffPenalty` keeps an entry whose `until` has passed so the next `recordBackoff`
-	 * doubles `factor` instead of restarting at 1; that escalation is what tapers a genuinely
-	 * foreign or dead peer toward ~once/32 s. So retention means "forget a peer's escalation once
-	 * it has gone this long without failing again", and it must comfortably exceed the longest
-	 * backoff window (`BACKOFF_BASE_MS × BACKOFF_MAX_FACTOR` = 32 s) — otherwise a peer re-probed
-	 * at the slowest cadence would have its entry forgotten *between* probes and silently reset to
-	 * factor 1, which is exactly the escalation this constant exists to preserve. 5 min is ~9× the
-	 * longest window; `test/ring-membership.spec.ts` pins the inequality so tuning either side
-	 * fails loudly.
-	 */
-	private static readonly BACKOFF_RETAIN_MS = 300_000;
 	/**
 	 * Peer ids libp2p currently holds at least one multiaddr for — the backing set for
 	 * {@link hasAddresses}.
@@ -506,14 +484,13 @@ export class FretService implements IFretService, Startable {
 		// NOTE: these track the `bucketMaybeAct` rates above; raising those without raising
 		// these re-opens the eviction hole.
 		this.dedupCache = new DedupCache(DEDUP_TTL_MS, this.cfg.profile === 'core' ? 2048 : 512);
-		// An entry for a peer no longer in the store is dropped by `pruneBackoffMap` on the next
+		// An entry for a peer no longer in the store is dropped by `backoff.prune` on the next
 		// tick regardless, so the routing table's own capacity is the only ceiling that can ever
 		// bind here — Core takes it as-is, Edge trades that worst case for memory. A wrong eviction
 		// costs one earlier probe of the stalest-failing peer, since losing the entry only resets
 		// that peer's escalation to factor 1.
-		this.backoffMap = new ExpiringMap<{ until: number; factor: number }>({
+		this.backoff = new ProbeBackoff({
 			capacity: this.cfg.profile === 'core' ? this.cfg.capacity : Math.min(this.cfg.capacity, 512),
-			ttlMs: FretService.BACKOFF_RETAIN_MS,
 		});
 		// Live size is bounded by departures per DEPARTURE_DEBOUNCE_MS window, so Core's 512 leaves
 		// 256 departures/s of headroom before the cap can bind at all. A wrong eviction costs one
@@ -1220,7 +1197,7 @@ export class FretService implements IFretService, Startable {
 		// backoff escalation is per-run handshake history, exactly like `negotiateFailures`, which
 		// the store already refuses to carry across a restart. Cleared after the leave fan-out so
 		// that fan-out still sees the run's state. Mirrors `FretPeerDiscovery.stop()`.
-		this.backoffMap.clear();
+		this.backoff.clearAll();
 		this.departureDebounce.clear();
 		// Same rule for the size observations: peer-reported estimates are a run's view of the
 		// network, and carrying them into the next run would blend a stale ring's size into a
@@ -2472,7 +2449,7 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
 					this.noteAnsweredOnProtocol(id);
-					this.recordBackoff(id);
+					this.backoff.record(id);
 					return true;
 				case 'decode-error':
 					this.diag.pingsSent++;
@@ -2529,7 +2506,7 @@ export class FretService implements IFretService, Startable {
 			&& this.store.countByState('dead') === 0) return [];
 		// NOTE: the walk is captured once and `put` writes a *new* entry object rather than editing
 		// in place, so a store mutation made after this line is invisible to the arms that run
-		// after it. Sound today: all three arms are pure selection — they read `backoffMap`,
+		// after it. Sound today: all three arms are pure selection — they read the backoff state,
 		// connections and the address set, and write nothing — and the probing that does write
 		// happens later, in the pooled phase. If an arm ever writes to the store while selecting,
 		// re-walk per arm rather than leaving the later arms on a stale array.
@@ -2569,7 +2546,7 @@ export class FretService implements IFretService, Startable {
 		const budget = this.cfg.profile === 'core' ? 8 : 4;
 		const unknown = entries.filter(
 			(e) => e.id !== selfStr && e.membership === 'unknown' && e.state !== 'dead'
-				&& this.getBackoffPenalty(e.id) === 0
+				&& !this.backoff.isBackedOff(e.id)
 		);
 		if (unknown.length === 0) return [];
 		unknown.sort((a, b) => a.lastAccess - b.lastAccess);
@@ -2615,11 +2592,11 @@ export class FretService implements IFretService, Startable {
 		// dead arm alone, so no peer is probed twice in one tick. Recovering it there fixes both
 		// labels at once, since `applySuccess` promotes membership and resurrects together.
 		//
-		// NOTE: the arms share one `backoffMap`, so a peer that accumulated backoff while foreign
+		// NOTE: the arms share one `ProbeBackoff` instance, so a peer that accumulated backoff while foreign
 		// carries it into the dead arm. Intended today — it is the same "don't hammer this peer"
 		// budget, and the arms are disjoint so no peer is charged twice per tick. If the two ever
 		// need independent cadence (e.g. dead recovery made more eager than foreign re-probing),
-		// they need separate backoff maps, not just separate budgets.
+		// they need separate `ProbeBackoff` instances, not just separate budgets.
 		return [
 			...this.reprobeOffRingTargets(entries, (e) => e.membership === 'foreign' && e.state !== 'dead', budget),
 			...this.reprobeOffRingTargets(entries, (e) => e.state === 'dead', budget),
@@ -2641,7 +2618,7 @@ export class FretService implements IFretService, Startable {
 	private reprobeOffRingTargets(entries: PeerEntry[], isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
 		const selfStr = this.selfIdStr;
 		const candidates = entries.filter(
-			(e) => e.id !== selfStr && this.getBackoffPenalty(e.id) === 0 && isCandidate(e)
+			(e) => e.id !== selfStr && !this.backoff.isBackedOff(e.id) && isCandidate(e)
 		);
 		if (candidates.length === 0) return [];
 		// Only reachable peers are probeable; prefer connected over has-addresses.
@@ -2650,7 +2627,7 @@ export class FretService implements IFretService, Startable {
 		// (factor 0/1) — the one most likely to be recoverable — is serviced before a
 		// long-confirmed one (factor 32) rather than queueing behind it.
 		const byBackoffFactor = (a: PeerEntry, b: PeerEntry): number =>
-			(this.backoffMap.get(a.id)?.factor ?? 0) - (this.backoffMap.get(b.id)?.factor ?? 0);
+			this.backoff.factor(a.id) - this.backoff.factor(b.id);
 		const connected = candidates.filter((e) => this.isConnected(e.id)).sort(byBackoffFactor);
 		const reachable = candidates.filter((e) => !this.isConnected(e.id) && this.hasAddresses(e.id)).sort(byBackoffFactor);
 		return [...connected, ...reachable].slice(0, budget).map((e) => e.id);
@@ -2677,14 +2654,14 @@ export class FretService implements IFretService, Startable {
 					if (out.value.ok) {
 						await this.applySuccess(id, out.rttMs); // marks member, clears contact run
 						this.diag.pingsOk++;
-						this.clearBackoff(id);
+						this.backoff.clear(id);
 					} else {
 						// Negative pong: the reply is not usable, but it arrived on our namespaced
 						// protocol, so it settles membership and liveness all the same. Back off
 						// briefly — a peer answering `ok: false` has nothing to tell us yet.
 						this.diag.pingsFail++;
 						this.noteAnsweredOnProtocol(id);
-						this.recordBackoff(id);
+						this.backoff.record(id);
 					}
 					return;
 				case 'busy':
@@ -2695,7 +2672,7 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
 					this.noteAnsweredOnProtocol(id);
-					this.recordBackoff(id);
+					this.backoff.record(id);
 					return;
 				case 'foreign-protocol':
 				case 'unreachable':
@@ -2706,7 +2683,7 @@ export class FretService implements IFretService, Startable {
 					// tapers toward ~once/32s.
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out);
-					this.recordBackoff(id);
+					this.backoff.record(id);
 					return;
 				case 'local-limit':
 					// Our own ceiling refused the open — no evidence either way about this peer, so no
@@ -3074,11 +3051,11 @@ export class FretService implements IFretService, Startable {
 							// it would penalize a perfectly healthy adjacent hop for a long path
 							// behind it. Latency belongs to the ping paths, which measure one hop.
 							await this.applySuccess(next);
-							this.clearBackoff(next);
+							this.backoff.clear(next);
 							return out.value;
 						}
 						case 'busy':
-							this.recordBackoff(next);
+							this.backoff.record(next);
 							break;
 						case 'local-limit':
 							// Our own per-connection stream ceiling refused the open. Not evidence about
@@ -3103,7 +3080,7 @@ export class FretService implements IFretService, Startable {
 							// demotes, and only unreachable/timeout count toward the dead-state run.
 							log.error('forward maybeAct to %s: %s', next, out.kind);
 							await this.noteRpcFailure(next, out);
-							this.recordBackoff(next);
+							this.backoff.record(next);
 							break;
 					}
 				} catch (err) {
@@ -3147,7 +3124,7 @@ export class FretService implements IFretService, Startable {
 			nearRadius: computeNearRadius(sizeEstimate, this.cfg.k),
 			selfCoord,
 			confidence,
-			backoffPenalty: (id) => this.getBackoffPenalty(id),
+			backoffPenalty: (id) => this.backoff.penalty(id),
 		};
 	}
 
@@ -3157,40 +3134,6 @@ export class FretService implements IFretService, Startable {
 		const total = entry.successCount + entry.failureCount;
 		if (total === 0) return 0.5;
 		return entry.successCount / total;
-	}
-
-	private recordBackoff(id: string): void {
-		// Absent *or* retention-expired both read as `undefined` here, and both mean the same
-		// thing: this peer's escalation is forgotten, so the next window starts at factor 1.
-		const existing = this.backoffMap.get(id);
-		const factor = existing ? Math.min(existing.factor * 2, FretService.BACKOFF_MAX_FACTOR) : 1;
-		// The `set` also restarts the retention window, so retention is measured from the last
-		// failure rather than from the first — see BACKOFF_RETAIN_MS.
-		this.backoffMap.set(id, { until: Date.now() + FretService.BACKOFF_BASE_MS * factor, factor });
-	}
-
-	private clearBackoff(id: string): void {
-		this.backoffMap.delete(id);
-	}
-
-	private getBackoffPenalty(id: string): number {
-		const bo = this.backoffMap.get(id);
-		if (!bo) return 0;
-		if (bo.until < Date.now()) return 0; // window over, entry retained so factor grows on the next recordBackoff
-		return Math.min(1, bo.factor / FretService.BACKOFF_MAX_FACTOR);
-	}
-
-	/**
-	 * Drop backoff entries for peers that have left the store.
-	 *
-	 * **Orthogonal to expiry, not a duplicate of it**: a peer evicted from the routing table may
-	 * still be well inside its retention window, and no TTL can see that it is gone. Walks the
-	 * key *snapshot* `ExpiringMap.keys()` returns, so deleting while iterating is safe.
-	 */
-	private pruneBackoffMap(): void {
-		for (const id of this.backoffMap.keys()) {
-			if (!this.store.getById(id)) this.backoffMap.delete(id);
-		}
 	}
 
 	/**
@@ -3204,9 +3147,9 @@ export class FretService implements IFretService, Startable {
 	 * available to it).
 	 */
 	private sweepBoundedMaps(): void {
-		this.backoffMap.sweep();
+		this.backoff.sweep();
 		this.departureDebounce.sweep();
-		this.pruneBackoffMap();
+		this.backoff.prune((id) => this.store.getById(id) !== undefined);
 	}
 
 	report(_evt: ReportEvent): void {
@@ -3385,7 +3328,7 @@ export class FretService implements IFretService, Startable {
 				// so an immediate retry would meet the same empty token bucket. If the walk ever
 				// honours `retry_after_ms` with a real wait, keep busy responders out of
 				// `visited` so the wait can pay off.
-				this.recordBackoff(target);
+				this.backoff.record(target);
 				continue;
 			}
 			if (out.kind === 'cancelled' || out.kind === 'skipped') {
@@ -3413,7 +3356,7 @@ export class FretService implements IFretService, Startable {
 				// decode-error is proof of life — `noteRpcFailure` decays only, no contact strike.
 				log.error('iterativeLookup hop %d to %s: %s', hop, target, out.kind);
 				await this.noteRpcFailure(target, out);
-				this.recordBackoff(target);
+				this.backoff.record(target);
 				// No need to drop `target` from `bestAnchors` — it is in `visited`, which every
 				// candidate path filters against.
 				hop++;
@@ -3474,7 +3417,7 @@ export class FretService implements IFretService, Startable {
 						this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig }
 					);
 					if (actOut.kind === 'busy') {
-						this.recordBackoff(actTarget);
+						this.backoff.record(actTarget);
 					} else if (actOut.kind === 'cancelled' || actOut.kind === 'skipped') {
 						// Our own cancellation: score nothing and end the walk (`exhausted` below)
 						// rather than spend the remaining attempts on sends that cannot go out.
@@ -3484,7 +3427,7 @@ export class FretService implements IFretService, Startable {
 						// evidence; decode-error decays only, no contact strike.
 						log.error('activity send to anchor %s: %s', actTarget, actOut.kind);
 						await this.noteRpcFailure(actTarget, actOut);
-						this.recordBackoff(actTarget);
+						this.backoff.record(actTarget);
 					} else if ('commitCertificate' in actOut.value) {
 						yield { type: 'complete', hop: hop + 1, result: actOut.value, peerId: actTarget };
 						return;
