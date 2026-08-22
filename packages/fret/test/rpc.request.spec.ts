@@ -80,6 +80,17 @@ function unsupported(): Error {
 	return err
 }
 
+/**
+ * What libp2p throws out of `newStream` when *our own* per-connection stream cap is already full.
+ * The classes live in `@libp2p/interface` but are matched by `name`, so a hand-built error with
+ * the right name is exactly what the predicate sees.
+ */
+function streamLimit(name: 'TooManyOutboundProtocolStreamsError' | 'TooManyInboundProtocolStreamsError'): Error {
+	const err = new Error(name === 'TooManyOutboundProtocolStreamsError' ? 'Too many outbound protocol streams' : 'Too many inbound protocol streams')
+	err.name = name
+	return err
+}
+
 async function decodePing(bytes: Uint8Array): Promise<PingReply> {
 	return await decodeJson<PingReply>(bytes)
 }
@@ -454,6 +465,36 @@ describe('rpcRequest', function () {
 
 			expectKind(out, 'foreign-protocol')
 			expectRelease(s, { closes: 1, aborts: 0 })
+		})
+
+		it('a TooManyOutboundProtocolStreamsError at the open is local-limit, not unreachable', async () => {
+			// Our own ceiling refused the stream before anything reached the wire, so this is not
+			// evidence about the peer at all — the same class as a tick-budget expiry. Booking it
+			// as `unreachable` is what marked a perfectly healthy peer dead after three ticks.
+			const node = countingNode(undefined, {
+				open: async (): Promise<Stream> => { throw streamLimit('TooManyOutboundProtocolStreamsError') },
+			})
+
+			const out = await rpcRequest<PingReply>(node.node, peer, PROTOCOL, {
+				timeoutMs: TIMEOUT_MS, body: { ping: 1 }, decode: decodePing,
+			})
+
+			expectKind(out, 'local-limit')
+		})
+
+		it('the inbound stream-cap identity classifies local-limit too', async () => {
+			// Unreachable from a FRET sender (the remote raises that one and resets our stream, so
+			// the reason never travels — see the NOTE at `classify`), but the predicate matches both
+			// names, which covers a consumer opening a stream against its own inbound cap.
+			const node = countingNode(undefined, {
+				open: async (): Promise<Stream> => { throw streamLimit('TooManyInboundProtocolStreamsError') },
+			})
+
+			const out = await rpcRequest<PingReply>(node.node, peer, PROTOCOL, {
+				timeoutMs: TIMEOUT_MS, body: { ping: 1 }, decode: decodePing,
+			})
+
+			expectKind(out, 'local-limit')
 		})
 
 		it('a busy reply short-circuits before decode and carries retry_after_ms', async () => {

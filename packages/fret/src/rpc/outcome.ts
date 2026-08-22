@@ -54,4 +54,13 @@ export type RpcOutcome<T> =
 	 * The reply was a `BusyResponseV1`. `retryAfterMs` carries the message's `retry_after_ms`
 	 * when present. Proof of life — the peer answered, it just refused the work.
 	 */
-	| { kind: 'busy'; retryAfterMs?: number };
+	| { kind: 'busy'; retryAfterMs?: number }
+	/**
+	 * Our own per-connection stream cap refused to open the stream —
+	 * `TooMany{In,Out}boundProtocolStreamsError`, raised locally before anything reached the wire.
+	 * **Not evidence about the peer**: no contact strike, no relevance decay, no backoff — the same
+	 * class as a tick-budget expiry. Distinct from `skipped`, which means the dial *mode* forbade
+	 * dialing; this one means we were willing and our own ceiling refused, and that distinction is
+	 * the diagnostic.
+	 */
+	| { kind: 'local-limit'; error: Error };

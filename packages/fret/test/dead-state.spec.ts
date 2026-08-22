@@ -172,6 +172,34 @@ describe('dead state: liveness seam', () => {
 		expect(store.getById(id)?.membership).to.equal('foreign')
 	})
 
+	// Our own per-connection stream cap refused to open the stream — libp2p raised it out of
+	// `newStream`, i.e. out of FRET's own `openRpcStream`, before anything reached the wire. That
+	// says nothing whatever about the peer, exactly like a tick-budget expiry, so it must score
+	// nothing: no contact strike, no relevance decay, no backoff. Booking it as `unreachable` is
+	// what marked a healthy peer `dead` after three of them.
+	it('scores nothing at all for a local stream-cap refusal', async () => {
+		const id = seedPeer('peer-sl')
+		store.update(id, { relevance: 5, membership: 'member' })
+		const before = { ...store.getById(id) }
+
+		for (let i = 0; i < 5; i++) {
+			await (svc as any).noteRpcFailure(id, { kind: 'local-limit', error: new Error('Too many outbound protocol streams') })
+			unspace(id)
+		}
+
+		const after = store.getById(id)
+		expect(after?.contactFailures, 'no contact strike').to.equal(0)
+		expect(after?.state, 'never marked dead').to.not.equal('dead')
+		expect(after?.relevance, 'relevance untouched').to.equal(before.relevance)
+		expect(after?.failureCount, 'no failure recorded').to.equal(before.failureCount)
+		expect(after?.negotiateFailures, 'not membership evidence either').to.equal(0)
+		expect(after?.membership, 'label untouched').to.equal('member')
+		// No backoff: the map is only written by `recordBackoff`, which this path must not reach.
+		expect(((svc as any).backoffMap as { get(k: string): unknown }).get(id), 'no backoff').to.equal(undefined)
+		// But it is visible — a ceiling that fires must not be silent.
+		expect(svc.getDiagnostics().streamLimit, 'counted once per refusal').to.equal(5)
+	})
+
 	// A disconnect is not proof of life, and it is the event that *follows* a run of failed
 	// contacts — so if it cleared `dead` the seam would undo nearly every transition it makes,
 	// re-admitting the peer to every ring view with its counter still clamped at the threshold.

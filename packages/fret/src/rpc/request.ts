@@ -7,6 +7,7 @@ import {
 	encodeJson,
 	isFrameTruncationError,
 	isPayloadTooLargeError,
+	isStreamLimitError,
 	isUnsupportedProtocolError,
 	openRpcStream,
 	readFramed,
@@ -85,6 +86,15 @@ function classify(
 	if (isUnsupportedProtocolError(err)) return { kind: 'foreign-protocol', error: toError(err) };
 	if (isFrameTruncationError(err)) return { kind: 'decode-error', error: toError(err) };
 	if (isPayloadTooLargeError(err)) return { kind: 'decode-error', error: toError(err) };
+	// NOTE: this arm catches only *our own* ceiling. A **remote's** inbound-cap refusal is not
+	// distinguishable here: the remote's `onIncomingStream` throws
+	// `TooManyInboundProtocolStreamsError` and aborts the muxed stream, so what reaches us is a
+	// reset carrying at most a numeric code — the reason does not travel, and it reads as
+	// `unreachable`, booking a contact strike against a peer that is alive and merely overloaded.
+	// Accepted rather than patched: FRET's own concurrency cannot approach any peer's inbound cap
+	// (see *Stream management* in docs/fret.md), so tripping it needs a peer flooding us or a
+	// consumer opening its own streams over the same connection. Do not add a heuristic for it.
+	if (isStreamLimitError(err)) return { kind: 'local-limit', error: toError(err) };
 	if (deadlineSignal.aborted === true || (err as { name?: unknown } | null)?.name === 'DeadlineExpiredError') {
 		return { kind: 'timeout' };
 	}

@@ -354,6 +354,24 @@ export function isFrameTruncationError(err: unknown): boolean {
 }
 
 /**
+ * True for libp2p's own per-connection stream-cap refusals — `TooManyInboundProtocolStreamsError`
+ * and `TooManyOutboundProtocolStreamsError`, raised out of `newStream` (i.e. out of
+ * {@link openRpcStream}) *before anything reaches the wire*. Like `it-length-prefixed`'s error
+ * classes these are not importable, so this matches by `err.name`, the same shape as
+ * {@link isFrameTruncationError}.
+ *
+ * Both identities are matched, but only the outbound one is reachable from a FRET sender: the
+ * inbound error is constructed on the *remote's* side and its stream is aborted, so what arrives
+ * here is a muxer reset carrying no reason. Matching the inbound name costs nothing and covers a
+ * consumer that opens a stream against its own inbound cap over this node.
+ */
+export function isStreamLimitError(err: unknown): boolean {
+	if (err == null || typeof err !== 'object') return false;
+	const name = (err as { name?: unknown }).name;
+	return name === 'TooManyOutboundProtocolStreamsError' || name === 'TooManyInboundProtocolStreamsError';
+}
+
+/**
  * Race sentinel for the caller's abort signal. The abort arm **resolves** with this rather than
  * rejecting, so an abort that loses the race can never surface as an unhandled rejection; the
  * reader turns the sentinel into a throw itself.

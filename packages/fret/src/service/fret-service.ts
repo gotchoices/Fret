@@ -403,6 +403,14 @@ export class FretService implements IFretService, Startable {
 		pingsSent: 0,
 		pingsOk: 0,
 		pingsFail: 0,
+		/**
+		 * Outbound RPCs our own per-connection stream cap refused (`local-limit`) — libp2p's
+		 * `TooManyOutboundProtocolStreamsError` out of `openRpcStream`, before anything reached the
+		 * wire. Scores nothing against the peer; counted so a ceiling that fires is visible rather
+		 * than silent. Deliberately flat rather than under `rejected`, which counts *inbound*
+		 * messages we refused; this is an outbound refusal by our own stack.
+		 */
+		streamLimit: 0,
 		maybeActForwarded: 0,
 		evictions: 0,
 		/**
@@ -861,8 +869,8 @@ export class FretService implements IFretService, Startable {
 	 * the outcome variant: `foreign-protocol` proves the peer alive on another network and takes
 	 * the membership path; `unreachable` / `timeout` are failures to reach the peer at all and
 	 * take the contact-failure seam; `decode-error` is proof of life answering badly — relevance
-	 * decay only, never a strike. `ok` / `busy` / `cancelled` / `skipped` are the callers' to
-	 * handle.
+	 * decay only, never a strike; `local-limit` is our *own* stream ceiling refusing, so it is
+	 * counted and nothing else. `ok` / `busy` / `cancelled` / `skipped` are the callers' to handle.
 	 *
 	 * It deliberately records **no backoff**: each call site keeps whatever backoff behavior it
 	 * already had, so routing failures through here introduces none where there was none.
@@ -886,6 +894,12 @@ export class FretService implements IFretService, Startable {
 					// alike — never a strike.
 					this.noteAnsweredOnProtocol(id);
 					await this.applyFailure(id);
+					return;
+				case 'local-limit':
+					// Our own per-connection ceiling refused the stream before anything reached the
+					// wire — the same class as a tick-budget expiry, and no evidence about the peer.
+					// Counted only, so a ceiling that fires is visible; never scored.
+					this.diag.streamLimit++;
 					return;
 				default:
 					return; // ok / busy / cancelled / skipped are the callers' to handle
@@ -1664,6 +1678,10 @@ export class FretService implements IFretService, Startable {
 					case 'foreign-protocol': case 'unreachable': case 'timeout':
 						log.error('%s ping failed for %s - %s', label, id, out.kind);
 						return;
+					case 'local-limit':
+						// Our own stream ceiling, not the peer's fault — counted only, never scored.
+						await this.noteRpcFailure(id, out);
+						return;
 					case 'cancelled': case 'skipped':
 						return;
 				}
@@ -2404,6 +2422,13 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out);
 					return false;
+				case 'local-limit':
+					// Our own per-connection stream ceiling refused the open before anything reached the
+					// wire — the same class as a tick-budget expiry. No ping diagnostics (none was
+					// sent), no strike, no backoff. `false` because the peer did not answer, so the
+					// caller skips the snapshot fetch it could not have completed either.
+					await this.noteRpcFailure(id, out);
+					return false;
 				case 'cancelled':
 				case 'skipped':
 					return false; // our own cancellation / never attempted: record nothing
@@ -2620,6 +2645,11 @@ export class FretService implements IFretService, Startable {
 					await this.noteRpcFailure(id, out);
 					this.recordBackoff(id);
 					return;
+				case 'local-limit':
+					// Our own ceiling refused the open — no evidence either way about this peer, so no
+					// backoff for the same reason `cancelled` records none: next tick probes fresh.
+					await this.noteRpcFailure(id, out);
+					return;
 				case 'cancelled':
 				case 'skipped':
 					return; // no backoff — next tick probes fresh
@@ -2673,6 +2703,11 @@ export class FretService implements IFretService, Startable {
 			case 'decode-error':
 				// Answered badly / refused: alive. Today's empty-snapshot path scored nothing — preserved.
 				log.error('fetchNeighbors %s from %s', out.kind, id);
+				return announced;
+			case 'local-limit':
+				// Our own per-connection stream ceiling refused the open — not evidence about the peer,
+				// so it takes the counting-only arm of `noteRpcFailure` rather than a strike.
+				await this.noteRpcFailure(id, out);
 				return announced;
 			case 'foreign-protocol': // reaches this path for the first time — classification now works here
 			case 'unreachable':
@@ -2982,6 +3017,12 @@ export class FretService implements IFretService, Startable {
 						case 'busy':
 							this.recordBackoff(next);
 							break;
+						case 'local-limit':
+							// Our own per-connection stream ceiling refused the open. Not evidence about
+							// `next`: no strike, no backoff. Falls through to the NearAnchor below, the
+							// honest "did not forward" answer.
+							await this.noteRpcFailure(next, out);
+							break;
 						case 'cancelled':
 						case 'skipped':
 							// Our own cancellation is not evidence about `next` — score nothing and
@@ -3289,6 +3330,14 @@ export class FretService implements IFretService, Startable {
 				// remaining attempts would only meet the same aborted signal. (`skipped` is
 				// unreachable here — maybeAct dials — and scores the same nothing.)
 				break;
+			}
+			if (out.kind === 'local-limit') {
+				// Our own per-connection stream ceiling refused the open — not evidence about `target`,
+				// so no strike and no backoff. `target` is already in `visited`, so the walk moves on
+				// to the next candidate instead of retrying straight back into the same ceiling.
+				await this.noteRpcFailure(target, out);
+				hop++;
+				continue;
 			}
 			if (out.kind !== 'ok') {
 				// foreign-protocol / unreachable / timeout / decode-error: route the evidence.
