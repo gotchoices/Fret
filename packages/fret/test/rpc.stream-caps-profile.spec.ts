@@ -130,15 +130,18 @@ describe('RPC stream caps: profile split', function () {
 				const svc = new CoreFretService(node, { profile, networkName: NETWORK })
 				const { handled, unhandled } = spyHandlers(node)
 
-				await svc.start()
-				expectAllFiveAt(handled.splice(0), caps)
-
-				await svc.stop()
-				expect(unhandled.sort(), 'stop() unhandles all five').to.deep.equal([...ALL_PROTOCOLS].sort())
-				expect(handled, 'stop() registers nothing').to.deep.equal([])
-
-				await svc.start()
+				// Every assertion sits inside the try, so a failed one still stops the service:
+				// `start()` arms the stabilization loop, and a leaked timer fails the repo's
+				// mocha exit watchdog for the whole run rather than only this case.
 				try {
+					await svc.start()
+					expectAllFiveAt(handled.splice(0), caps)
+
+					await svc.stop()
+					expect(unhandled.sort(), 'stop() unhandles all five').to.deep.equal([...ALL_PROTOCOLS].sort())
+					expect(handled, 'stop() registers nothing').to.deep.equal([])
+
+					await svc.start()
 					expectAllFiveAt(handled.splice(0), caps)
 				} finally {
 					await svc.stop()
