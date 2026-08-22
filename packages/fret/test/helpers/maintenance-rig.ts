@@ -22,8 +22,34 @@ import type { FretConfig, NeighborSnapshotV1 } from '../../src/index.js'
 // iterator yielding one JSON chunk, plus `close`/`abort`. The service is never started: the pass
 // under test is driven directly so the loop cannot race the assertions, and `runSignal` is then
 // `undefined`, which every pass accepts.
+//
+// A peer's behavior is not only "answers or does not": the arms of `probeNeighborLatency` and
+// `fetchAndMergeSnapshot` that matter most are the ones where the peer answered *badly* — busy,
+// `ok: false`, or a well-framed reply whose bytes will not decode. Each of those is still an
+// answer on our namespaced protocol, so it confirms membership and clears a contact-failure run
+// while scoring differently from a good reply. `Behavior` therefore spans all five cases; see the
+// per-value notes on the type.
 
-export type Behavior = 'answers' | 'hangs'
+/**
+ * What one peer does when a maintenance pass opens a stream to it.
+ *
+ * - `'answers'` — ping replies `{ok: true, ts}`; a neighbors fetch replies with an empty
+ *   snapshot. The default at both lookup sites, so a spec that sets nothing is unchanged.
+ * - `'hangs'` — the stream open settles only when the caller's signal aborts.
+ * - `'busy'` — `{busy: true, retry_after_ms: 500}`, on **either** protocol. `rpcRequest`'s
+ *   `decodeReply` tests the busy shape on the parsed body before any reply validator runs, so one
+ *   busy body serves every sender.
+ * - `'not-ok'` — `{ok: false, ts}`. **Ping only** — a neighbors reply has no `ok` field, so
+ *   setting this against the neighbors protocol rejects loudly rather than degrading to something
+ *   that would pass vacuously.
+ * - `'undecodable'` — a *complete* frame whose body is not a JSON object, on either protocol.
+ *   Proof of life that classifies `decode-error`.
+ *
+ * `retry_after_ms` is a fixed 500 with no knob: no caller reads the hint today (`RpcOutcome`'s
+ * `busy` variant exposes it; nothing consumes it), so a configurable value would be an untested
+ * parameter. Add one when a consumer exists.
+ */
+export type Behavior = 'answers' | 'hangs' | 'busy' | 'not-ok' | 'undecodable'
 
 interface StreamOpts { signal?: AbortSignal }
 
@@ -115,21 +141,49 @@ export class PeerRig {
 		const settle = (): void => { this.inFlight-- }
 		const behavior = this.protocolBehavior.get(`${id}|${protocol}`) ?? this.behavior.get(id) ?? 'answers'
 		if (behavior === 'hangs') return hangsUntilAbort(opts, settle)
-		return this.reply(id, protocol).then(
+		return this.reply(id, protocol, behavior).then(
 			(bytes) => stubStream(bytes, this.holdMs, settle),
 			(err: unknown) => { settle(); throw err },
 		)
 	}
 
-	private async reply(id: string, protocol: string): Promise<Uint8Array> {
+	/**
+	 * The reply body for one (protocol, behavior) pair, framed. `behavior` is threaded down from
+	 * {@link open} rather than re-read here, so the per-(peer, protocol) override and the per-peer
+	 * default are resolved in exactly one place.
+	 */
+	private async reply(id: string, protocol: string, behavior: Behavior): Promise<Uint8Array> {
 		// Senders read replies with `readFramed`, so the stub must frame its body exactly like
 		// `sendFramed` does — raw JSON would have its first byte parsed as a varint length prefix.
-		if (protocol === this.pingProtocol) return lp.encode.single(await encodeJson({ ok: true, ts: Date.now() })).subarray()
-		if (protocol === this.neighborsProtocol) {
-			const snap: NeighborSnapshotV1 = { v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }
-			return lp.encode.single(await encodeJson(snap)).subarray()
+		// That holds for the `'undecodable'` body too: only its *content* is invalid, never its
+		// framing — a truncated frame would exercise `FrameTruncationError` instead (pinned by
+		// `test/rpc.stream-errors.spec.ts`), a different arm of the same `decode-error` class.
+		const known = protocol === this.pingProtocol || protocol === this.neighborsProtocol
+		if (!known) return Promise.reject(new Error(`unexpected protocol opened during a maintenance pass: ${protocol}`))
+
+		if (behavior === 'busy') return this.framed({ busy: true, retry_after_ms: 500 })
+		if (behavior === 'undecodable') {
+			// `'nope'` fails at `decodeJson` (not valid JSON at all). Deliberately *not* `'{}'`,
+			// which parses fine and then fails the reply *parser* instead — also `decode-error`,
+			// but by a different route. Do not "simplify" this into the other path.
+			return lp.encode.single(new TextEncoder().encode('nope')).subarray()
 		}
-		return Promise.reject(new Error(`unexpected protocol opened during a maintenance pass: ${protocol}`))
+		if (behavior === 'not-ok') {
+			// Ping-only: a neighbors reply has no `ok` field, so a mis-set behavior must fail the
+			// run loudly rather than pass vacuously by degrading into some other reply shape.
+			if (protocol !== this.pingProtocol) {
+				return Promise.reject(new Error(`the 'not-ok' behavior is ping-only; it was set against ${protocol}`))
+			}
+			return this.framed({ ok: false, ts: Date.now() })
+		}
+
+		if (protocol === this.pingProtocol) return this.framed({ ok: true, ts: Date.now() })
+		const snap: NeighborSnapshotV1 = { v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }
+		return this.framed(snap)
+	}
+
+	private framed(body: unknown): Uint8Array {
+		return lp.encode.single(encodeJson(body)).subarray()
 	}
 
 	protocolsSeenBy(id: string): string[] {
