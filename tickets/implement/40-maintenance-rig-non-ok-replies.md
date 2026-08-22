@@ -175,39 +175,79 @@ Neither was in `tickets/backlog/` at the top level when this was written; check 
 and `backlog/plan` sub-folders before concluding they are gone.
 
 <!-- resume-note -->
-## Resume note (run 2026-08-22)
+## Resume note (run 3, 2026-08-22)
 
-A prior run was cut by the runner's soft token budget **before making any code change**. The
-working tree is untouched by this ticket: no edits to `maintenance-rig.ts`, no new spec file, no
-`docs/fret.md` edit, and `tickets/backlog/debt-maintenance-rig-non-ok-replies.md` is still there.
-Every TODO above is still outstanding. There is no partial state to reconcile — start from the
-TODO list as written.
+**Still no code change.** Two consecutive runs have now been cut by the runner's soft token
+budget before touching a file — run 3 was warned at its *first* tool boundary, so the budget is
+being consumed by conversation context, not by this ticket's work. The working tree is untouched
+by this ticket: no edits to `maintenance-rig.ts`, no new spec file, no `docs/fret.md` edit, and
+`tickets/backlog/debt-maintenance-rig-non-ok-replies.md` is still present. Every TODO above is
+outstanding; there is no partial state to reconcile.
 
-What that run did establish, so the next agent need not re-read the same files:
+**Advice for the next run: make the edits first, read second.** The design section above is
+settled and the facts below are enough to write the rig change without re-reading anything.
+Write `maintenance-rig.ts` and the doc correction before opening `fret-service.ts`; only the
+neighbors-`busy` arm of the new spec actually needs the service read, and it can be written last.
 
-- `packages/fret/test/helpers/maintenance-rig.ts` is ~180 lines. The two lookup sites the design
-  section refers to are both on one line inside `PeerRig.open`:
-  `this.protocolBehavior.get(\`${id}|${protocol}\`) ?? this.behavior.get(id) ?? 'answers'`.
-  Widening `Behavior` therefore needs no change to that lookup — only to the type and to
-  `PeerRig.reply`.
-- `PeerRig.reply(id, protocol)` is the whole reply builder: two `if` arms (ping → `{ok: true, ts}`,
-  neighbors → empty `NeighborSnapshotV1`), then `Promise.reject(new Error('unexpected protocol
-  opened during a maintenance pass: ...'))`. That rejection is the "loud reject" shape the design
-  section says the ping-only `'not-ok'` behavior must reuse for the neighbors protocol.
-- `open()` already routes a rejected `reply()` correctly for the rig's accounting: it calls
-  `settle()` (decrementing `inFlight`) and rethrows, so a loudly-rejected behavior fails the run
-  without corrupting the high-water bookkeeping.
-- The stale file-header claim to correct is in the block comment at the top of the same file:
-  "Neither sender *writes* to the stream (they open and read)" is fine; the sentence that this
-  change falsifies is in `reply`'s neighbourhood and in the header's description of the stub —
-  re-read the header before editing rather than trusting this summary for the exact wording.
+### Facts confirmed by reading (runs 2 and 3) — do not re-derive
+
+`packages/fret/test/helpers/maintenance-rig.ts`, ~180 lines:
+
+- `export type Behavior = 'answers' | 'hangs'` sits directly under the file header block comment.
+- The single lookup site is one line inside `PeerRig.open`:
+  `const behavior = this.protocolBehavior.get(\`${id}|${protocol}\`) ?? this.behavior.get(id) ?? 'answers'`,
+  followed by `if (behavior === 'hangs') return hangsUntilAbort(opts, settle)` and then the
+  `this.reply(id, protocol).then(...)` call. Widening `Behavior` needs no change to that lookup —
+  only to the type and to `reply`.
+- `PeerRig.reply(id, protocol)` is the whole reply builder — three statements:
+  - ping → `lp.encode.single(await encodeJson({ ok: true, ts: Date.now() })).subarray()`
+  - neighbors → an empty `NeighborSnapshotV1`
+    (`{ v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }`),
+    same `lp.encode.single(...).subarray()` framing
+  - fallthrough → `Promise.reject(new Error(\`unexpected protocol opened during a maintenance pass: ${protocol}\`))`
+    — this is the "loud reject" shape the ping-only `'not-ok'` behavior must reuse when it is set
+    against the neighbors protocol.
+  `reply` takes only `(id, protocol)` today; the behavior is *not* passed in, so reworking it into
+  a per-(protocol, behavior) builder means threading `behavior` down from `open` as a third
+  argument.
+- The comment above the ping line is load-bearing and must survive: the stub has to frame its body
+  exactly like `sendFramed`, or the first raw-JSON byte is parsed as a varint length prefix. The
+  `'undecodable'` body must therefore still be `lp.encode.single(...)`-framed — only its *content*
+  is invalid.
+- `open()` routes a rejected `reply()` correctly for the rig's accounting: `(err) => { settle(); throw err }`,
+  so a loudly-rejected behavior decrements `inFlight` and fails the run without corrupting the
+  high-water bookkeeping.
+- **The exact header sentence to correct** (TODO item 3) is in the block comment at the top of the
+  file: "Neither sender *writes* to the stream (they open and read), so a stub stream needs only an
+  async iterator yielding one JSON chunk, plus `close`/`abort`." That sentence stays true. What the
+  header does **not** currently say is anything about `{ok: true}` — the "answers every ping
+  `{ok: true}`" claim the ticket quotes lives in **`docs/fret.md`**, not in the rig header. So TODO
+  item 3 is smaller than written: the header needs a sentence *added* describing the widened
+  behavior set, not a false claim removed. Re-read the header before editing and adjust the TODO
+  rather than hunting for wording that is not there.
+- `MaintenanceRig.seedPeers(count, membership, patch?)` already forwards `patch` to
+  `store.update(id, patch)`, so the pre-seeded `contactFailures: 2` case the design section
+  requires needs no rig change.
 - `test/helpers/backoff.ts` exports exactly `backoffOf(svc)` and `setBackoffOf(svc, pb)`, both
   casting through a `{ backoff: ProbeBackoff }` shape. The new spec needs only `backoffOf`.
-- Service call sites still to be read (not yet read in that run): `probeNeighborLatency`
-  (~`src/service/fret-service.ts:2428`), `probeAndFetch` (~2400), `fetchAndMergeSnapshot` (~2725),
-  `stabilizeOnce` (~2321), `nearProbeTargets` (~2383), `noteAnsweredOnProtocol` (~820),
-  `noteRpcFailure` (~858). The neighbors-`busy` arm's assertions must be written against what
-  `fetchAndMergeSnapshot` actually does, per the TODO above.
 
-No test or type-check command was run, so nothing is known about the tree's current green/red
-state beyond what `main` was at commit 8471214.
+### Service call sites — line numbers from `grep -n` (2026-08-22, commit c3468b7)
+
+Grep the named symbol rather than trusting these if the file has moved under you:
+
+- `noteAnsweredOnProtocol` — declared `src/service/fret-service.ts:820`; the doc comment above it
+  (from ~810) already names `fetchAndMergeSnapshot`'s answered-badly arm as one of the two passes
+  that deliberately score nothing.
+- `noteRpcFailure` — declared 858.
+- `stabilizeOnce` — 2321; `nearProbeTargets` 2383; `probeAndFetch` 2400; `phaseTwoTargets` 2503.
+- `probeNeighborLatency` — 2428. Its outcome arms call `noteAnsweredOnProtocol` at **2440** and
+  **2451**, and `noteRpcFailure` at **2457** (with an inline `// decay only` comment), **2463** and
+  **2470**. That is five arms; the two `noteAnsweredOnProtocol` sites are the answered-but-not-well
+  arms this ticket exists to reach.
+- `fetchAndMergeSnapshot` — 2725, with `noteRpcFailure` calls at **2750** (the comment there says
+  it "takes the counting-only arm of `noteRpcFailure` rather than a strike") and **2755**, and
+  `mergeDiscoveredId` at 2765 / 2769. **Read 2700–2780 before writing the neighbors-`busy` arm**
+  and assert what it actually does; the TODO above stands.
+
+No test or type-check command has been run across runs 2 or 3, so nothing is known about the
+tree's current green/red state.
