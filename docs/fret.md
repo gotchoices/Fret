@@ -964,6 +964,20 @@ After import, the normal stabilization loop probes restored peers to update conn
     the reasoning lives on `scoreMerge`. What is still degenerate is the store shape — unbounded stores plus a
     per-tick gossip merge of every neighbour's window leave each peer a large near-uniform slice
     of the ring, so eviction has nothing sparse to choose between.
+  - **Placement is guarded by two tests, and only a *bounded* store can measure the second**
+    (`test/message-bus.spec.ts`, *Placement distributions*). The first is geometric — clustered
+    placement packs more peers into one average-spacing arc than uniform does (measured 12–17 vs
+    1 at n=30, threshold 5). The second is behavioural — routing *between* clusters takes more
+    hops than routing the same two coordinates on a uniform ring (measured 4.8–7.1 vs 2.0–3.1
+    hops at n=300 / capacity 32, asserted with a 1.5-hop margin against a smallest observed
+    margin of 2.4). The second needs all three of: a store bound that actually bites, targets
+    aimed at real cluster centers, and convergence by pumping to a fixed time rather than
+    draining `durationMs`. Without the bound it measures nothing at all — every peer holds every
+    other peer, so the originator is already the target’s anchor in its own store and every
+    route completes in one hop under any placement, which is the same unbounded-store
+    degeneracy noted for the three routing cases above. And the bound is only reachable at a
+    larger n: `enforceCapacity` mirrors production, where protection outranks the cap, so any
+    capacity below 2m+1 = 17 is silently not enforced.
 - Benchmarks: Routing latency, memory usage, message overhead
 
 ### Open questions / next steps

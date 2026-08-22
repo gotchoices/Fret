@@ -3,8 +3,14 @@ import { expect } from 'chai'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
 import { SimMessageBus, type MessageBusConfig } from './simulation/message-bus.js'
 import { MetricsCollector } from './simulation/sim-metrics.js'
-import { FretSimulation } from './simulation/fret-sim.js'
-import { coordToBigInt, maxPeersInOneSpacingArc, PLACEMENT_SEEDS } from './simulation/placement-assertions.js'
+import { FretSimulation, type SimConfig } from './simulation/fret-sim.js'
+import {
+	coordToBigInt,
+	maxPeersInOneSpacingArc,
+	nearestAlivePeerTo,
+	PLACEMENT_SEEDS,
+} from './simulation/placement-assertions.js'
+import { toCoord } from './helpers/ring.js'
 
 describe('DeterministicRNG extensions', () => {
 	it('nextGaussian produces values with mean ~0 and stddev ~1', () => {
@@ -344,54 +350,143 @@ describe('Placement distributions', function () {
 		}
 	})
 
-	it('clustered placement: inter-cluster routing takes more hops', () => {
-		function avgHopsFor(placement?: 'clustered'): number {
-			const sim = new FretSimulation({
-				seed: 42,
-				n: 30,
+	it('clustered placement: inter-cluster routing takes more hops', function () {
+		this.timeout(300000)
+
+		// Three things have to be true at once for this to measure anything; the two earlier
+		// shapes of this test measured nothing at all (see the review ticket).
+		//
+		//  - The store must be *bounded*, or every peer holds every other peer and the
+		//    originator is already the target's anchor in its own store — a one-hop "route"
+		//    whatever the placement. `enforceCapacity` mirrors production, where protection
+		//    outranks the cap, so a capacity below 2m+1 = 17 is simply not enforced; that needs
+		//    an n far larger than the first test's 30. n=300 / capacity 32 is ~10.7% of the
+		//    population, the same bounded regime `simulation.routing.spec.ts` measures.
+		//  - Targets must be aimed at *real* cluster centers (`getClusterCenters`), and the
+		//    uniform arm must route between the same two coordinates under the same
+		//    sender-selection rule, or the arms differ by more than their placement.
+		//  - Convergence must use the routing spec's pump to CONVERGE_MS rather than draining
+		//    `durationMs`. That spec measured store contents flat from t=2000 to t=20000, and
+		//    draining 60s of stabilization ticks over 300 peers takes minutes per sim.
+		//
+		// Measured 2026-08-21 over PLACEMENT_SEEDS; every arm 10/10 successful at store size 32:
+		//
+		//   seed    clustered   uniform   margin
+		//   8008    4.90        2.30      2.60
+		//   8009    5.00        2.60      2.40
+		//   8010    7.10        2.00      5.10
+		//   4242    4.80        2.00      2.80
+		//   99      6.70        3.10      3.60
+		//
+		// Smallest observed margin 2.40 hops, so MIN_HOP_MARGIN of 1.5 sits 1.6x inside it and
+		// far above noise — the assertion is a measured separation rather than a coin flip. The
+		// store size and success count are asserted per run too, since a silently-unbounded
+		// store is exactly what made the earlier versions vacuous.
+		//
+		// What this does *not* discriminate: the sim's near radius is 4k/store.size() of the
+		// ring (see `nearRadiusFor` in fret-sim.ts), so at k=15 over a 32-entry store it clamps
+		// to half the ring and every candidate takes the selector's near branch. This measures
+		// the distance metric and the placement, not the cost function's slack constants.
+		// spreadBits stays at 32: `CoordPlacement.clusteredCoord` scales its Gaussian offset
+		// through a JS float, so it is only exact to ~52 bits.
+		const N = 300
+		const NUM_CLUSTERS = 3
+		const SPREAD_BITS = 32
+		const CAPACITY = 32
+		const CONVERGE_MS = 4000
+		const ROUTES = 10
+		const MIN_HOP_MARGIN = 1.5
+
+		/** Drive every event scheduled up to `uptoMs`, then park the clock there. */
+		function pump(sim: FretSimulation, uptoMs: number): void {
+			while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
+				sim.processEvent(sim.scheduler.nextEvent()!)
+			}
+			sim.scheduler.advanceTo(uptoMs)
+		}
+
+		function cfgFor(seed: number, placement: 'uniform' | 'clustered'): SimConfig {
+			return {
+				seed,
+				n: N,
 				k: 15,
 				m: 8,
 				churnRatePerSec: 0,
 				stabilizationIntervalMs: 500,
-				durationMs: 8000,
-				...(placement
-					? { placement, clusterConfig: { numClusters: 3, spreadBits: 32 } }
-					: {}),
-			})
-			sim.initialize()
-
-			for (const evt of sim.scheduler.advanceTo(5000)) {
-				sim.processEvent(evt)
+				durationMs: 60000,
+				placement,
+				clusterConfig: { numClusters: NUM_CLUSTERS, spreadBits: SPREAD_BITS },
+				capacity: CAPACITY,
 			}
-
-			const alivePeers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
-			for (let i = 0; i < 10; i++) {
-				const from = alivePeers[i % alivePeers.length]!
-				const target = new Uint8Array(32)
-				const seed = 42 + i * 13
-				for (let j = 0; j < 32; j++) target[j] = (seed * (j + 1) * 37) & 0xff
-				sim.scheduleRoute(from.id, target, 5001 + i)
-			}
-
-			while (sim.scheduler.pending() > 0) {
-				const evt = sim.scheduler.nextEvent()
-				if (!evt || evt.time > 8000) break
-				sim.processEvent(evt)
-			}
-
-			const metrics = sim.metrics.finalize()
-			expect(metrics.routingAttempts).to.equal(10)
-			console.log(
-				`  ${placement ?? 'uniform'}: avgRoutingHops ${metrics.avgRoutingHops}, ` +
-					`successfulRouteHops avg ` +
-					`${metrics.successfulRouteHops.length > 0 ? metrics.successfulRouteHops.reduce((a, b) => a + b, 0) / metrics.successfulRouteHops.length : 'n/a'}`
-			)
-			return metrics.avgRoutingHops
 		}
 
-		const clustered = avgHopsFor('clustered')
-		const uniform = avgHopsFor()
-		expect(clustered).to.be.greaterThan(uniform)
+		/**
+		 * Centers are drawn once from the clustered arm and reused by both arms, which is what
+		 * makes the uniform run a control: same coordinates, same selection rule, only the
+		 * placement differs.
+		 */
+		function centersFor(seed: number): readonly bigint[] {
+			const sim = new FretSimulation(cfgFor(seed, 'clustered'))
+			sim.initialize()
+			const centers = sim.getClusterCenters()
+			expect(centers, 'clustered placement must expose its centers').to.exist
+			return centers!
+		}
+
+		function measure(
+			seed: number,
+			placement: 'uniform' | 'clustered',
+			centers: readonly bigint[]
+		) {
+			const sim = new FretSimulation(cfgFor(seed, placement))
+			sim.initialize()
+			pump(sim, CONVERGE_MS)
+
+			const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+			let firstSender: string | undefined
+			for (let i = 0; i < ROUTES; i++) {
+				const from = nearestAlivePeerTo(alive, centers[i % centers.length]!)!
+				const to = centers[(i + 1) % centers.length]!
+				firstSender ??= from
+				sim.scheduleRoute(from, toCoord(to), CONVERGE_MS + 10 + i)
+			}
+			pump(sim, CONVERGE_MS + 10 + ROUTES)
+
+			const metrics = sim.metrics.finalize()
+			return {
+				hops: metrics.avgRoutingHops,
+				succeeded: metrics.successfulRouteHops.length,
+				attempts: metrics.routingAttempts,
+				storeSize: sim.getStores().get(firstSender!)?.size() ?? -1,
+			}
+		}
+
+		for (const seed of PLACEMENT_SEEDS) {
+			const centers = centersFor(seed)
+			const clustered = measure(seed, 'clustered', centers)
+			const uniform = measure(seed, 'uniform', centers)
+			console.log(
+				`  routing seed ${seed}: clustered ${clustered.hops.toFixed(2)} hops ` +
+					`(${clustered.succeeded}/${clustered.attempts}, store ${clustered.storeSize}), ` +
+					`uniform ${uniform.hops.toFixed(2)} hops ` +
+					`(${uniform.succeeded}/${uniform.attempts}, store ${uniform.storeSize})`
+			)
+
+			for (const [label, arm] of [
+				['clustered', clustered],
+				['uniform', uniform],
+			] as const) {
+				expect(arm.attempts, `${label} seed ${seed} attempts`).to.equal(ROUTES)
+				expect(arm.succeeded, `${label} seed ${seed} successes`).to.equal(ROUTES)
+				// Proof the bound actually bit: unbounded, the store holds all 300 peers and
+				// every route is one hop.
+				expect(arm.storeSize, `${label} seed ${seed} store size`).to.equal(CAPACITY)
+			}
+
+			expect(clustered.hops, `seed ${seed}: clustered vs uniform hops`).to.be.greaterThan(
+				uniform.hops + MIN_HOP_MARGIN
+			)
+		}
 	})
 
 	it('skewed placement: some regions are denser than others', () => {
