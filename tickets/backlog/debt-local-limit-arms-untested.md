@@ -52,3 +52,20 @@ class.
 
 The mirror case — a *remote* peer refusing our stream at its own inbound limit — is a stated
 and accepted residual, documented in `docs/fret.md` under *Stream management*. Not this ticket.
+
+## Coverage update (review of stream-caps-local-limit-scoring-test, 2026-08-21)
+
+Two new specs landed since this was filed, and they narrow the gap without closing it:
+
+- `packages/fret/test/rpc.stream-caps-outbound.spec.ts` proves a real outbound ceiling surfaces
+  as `local-limit` (memory transport and TCP + noise).
+- `packages/fret/test/rpc.stream-caps-local-limit-scoring.spec.ts` drives that real refusal
+  through two *actual call sites* of the failure-bookkeeping seam — the near-neighbour latency
+  probe and the off-ring membership probe — and asserts no strike, no decay, no backoff, and the
+  counter up by one per refusal. So the seam arm is now covered through real call sites rather
+  than only by handing it a synthetic outcome.
+
+Still unpinned: the warm-up ping pass, the iterative lookup walk, and the three write-only
+senders (one announce, two leave fan-outs) that reach the counter via `noteWriteOnlyOutcome`.
+The preference order above is unchanged — the generalized table test would absorb the two new
+specs as rows rather than replacing them.
