@@ -1,111 +1,95 @@
-description: A peer can reply "I am too busy" or send back an unreadable answer; new tests confirm the code treats those as real answers — the peer stays trusted and is never wrongly written off as unreachable.
-files: packages/fret/test/maintenance-nonok-replies.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, packages/fret/test/helpers/backoff.ts, packages/fret/src/service/fret-service.ts, docs/fret.md
+description: A test file was added that checks the network code handles peers replying "I'm busy" or with garbage; the review of that test file was cut short by a budget limit and needs finishing.
+files: packages/fret/test/maintenance-nonok-replies.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, packages/fret/test/helpers/backoff.ts, packages/fret/src/service/fret-service.ts, packages/fret/test/fetch-snapshot-failure-arms.spec.ts, docs/fret.md
 difficulty: medium
 ---
 
-## What landed
+<!-- resume-note -->
+A prior review run was cut off by `BUDGET_WARNING` before it could run validation or reach a
+disposition. No code was changed and no findings were filed. This ticket replaces the original
+review ticket; the implement-stage handoff it was reviewing is reproduced under *Handoff being
+reviewed* below so the next agent does not need to re-read the git history for it.
 
-One new file: `packages/fret/test/maintenance-nonok-replies.spec.ts`, four cases, all passing.
-No production code changed. No other test changed. The harness half (the `Behavior` widening on
-`test/helpers/maintenance-rig.ts`) had already landed on this branch in an earlier commit and was
-not touched.
+## What the prior run established
 
-The headline the spec exists to hold: **an answer that is not a good answer is still an answer.**
-It arrived over `/optimystic/<network>/fret/...`, a protocol only this network's peers serve, so it
-confirms membership and clears the contact-failure run — and it must never book a contact strike.
-Three strikes mark the peer `dead`, which silently drops it out of every ring view; a strike leaking
-into one of these arms is the regression the spec catches.
+**The diff under review is one commit, `1b85381`, and it is test-only.** It adds
+`packages/fret/test/maintenance-nonok-replies.spec.ts` (197 lines) and moves the ticket file.
+No production source changed. The `Behavior` widening on `test/helpers/maintenance-rig.ts`
+(`busy` / `not-ok` / `undecodable`, per-(peer, protocol) overrides) landed earlier on this branch
+in `9b7c410` under a different ticket and is **not** part of this diff — read it as context, not
+as work to review here.
 
-`docs/fret.md` line 79 forward-references this spec path twice. Both references were verified
-against the landed filename — the doc is true again, and renaming this file means editing that line.
+Both files were read in full. The rig's stub-connection approach, the framing of the
+`undecodable` body, and the ping-only guard on `not-ok` all check out on inspection.
 
-## The four cases, and what each proves
+## Observations recorded but NOT yet dispositioned
 
-All four seed **one** near peer as a live `member` at `contactFailures: 2`, then drive exactly one
-`stabilizeOnce` directly (the rig never starts the service, so a live loop cannot race the
-assertions). Core profile; one peer is well inside the near budget of 4 and the pool cap of 6, so
-nothing can be truncated out of the tick and misread as "scored nothing". Phase 2 still runs but
-selects nothing — no `unknown` / `foreign` / `dead` entry is seeded — so every recorded contact
-belongs to the near pass.
+These are candidate findings from a read of the spec alone. None was verified against the
+production code, so each still needs the "is this real" pass before it is fixed, filed, or
+dropped. Do not treat the list as a verdict.
 
-- **ping `busy`** — backoff factor > 0, relevance *exactly* unchanged, `successCount` and
-  `failureCount` both unchanged (this arm scores nothing at all), `pingsSent` +1, `pingsFail` +1,
-  `pingsOk` +0.
-- **ping `not-ok`** (`ok: false`) — `failureCount` +1, `successCount` unchanged, backoff factor 0,
-  `pingsSent` +1, `pingsFail` +1.
-- **ping `undecodable`** — same shape as `not-ok`: `failureCount` +1, backoff 0. This is
-  `noteRpcFailure`'s decay-only arm, reached via `decode-error`.
-- **neighbors `busy` behind an `answers` ping** — the ping half is credited (`successCount` +1,
-  relevance strictly up, `pingsOk` +1) while `fetchAndMergeSnapshot`'s busy arm stays completely
-  silent: `snapshotsFetched` +0 and `failureCount` unchanged.
+- **`expectAnsweredNotStruck` asserts `membership === 'member'` against a peer seeded as
+  `member`.** That assertion can only ever catch a *demotion*, never confirm the promotion the
+  spec's headline claims ("an answer on our protocol confirms membership"). Seeding `unknown` on
+  at least one arm would make it load-bearing. Check whether an `unknown` peer would still be
+  selected by the near pass at all — the near list is live-member-gated, so it very likely would
+  not, in which case the assertion is as strong as this rig can make it and the comment overstates
+  what it proves. Decide which, and either strengthen the arm or soften the comment.
+- **Case 3 (`undecodable`) drops the `pingsOk` delta assertion** that cases 1 and 2 both carry.
+  Almost certainly an oversight rather than a decision; one line to restore symmetry.
+- **`backoffOf` (`test/helpers/backoff.ts`) was never read.** Its `factor()` semantics are assumed
+  by three arms (`> 0` on busy, `=== 0` on the two decay arms). Confirm `factor()` returns 0 rather
+  than `undefined`/throwing for a peer with no backoff entry, or the two `=== 0` assertions may be
+  passing on a coincidence.
+- **Overlap with `fetch-snapshot-failure-arms.spec.ts` is asserted by the implementer, not
+  verified.** The handoff itself invites deleting case 4 if a reviewer disagrees it is distinct.
+  Read that spec and make the call.
+- **Every assertion is untested against the production arms.** `probeNeighborLatency`,
+  `noteRpcFailure`, `probeAndFetch` and `fetchAndMergeSnapshot` were not opened. The spec's claims
+  about which arm moves which counter are plausible and internally consistent, but a review that
+  never read the code under test has verified nothing.
 
-Every case additionally asserts, through one shared helper (`expectAnsweredNotStruck`):
-`contactFailures` driven from the pre-seeded 2 to **0**, `membership === 'member'`,
-`state !== 'dead'`, and that the neighbors protocol was opened **after** the ping for that peer —
-proving the near pass did the contacting and that `probeAndFetch` did not skip the fetch.
+## The one finding the implementer deliberately escalated
 
-Arm 4 was checked against `fetchAndMergeSnapshot` before being written, as the source ticket
-required: `busy` and `decode-error` share one silent arm that returns before `snapshotsFetched++`
-and scores nothing. Confirmed at `packages/fret/src/service/fret-service.ts:2725`.
+`getDiagnostics()` returns the live `diag` object rather than a copy
+(`packages/fret/src/service/fret-service.ts:511`), so **any** spec that captures it as an object
+and diffs later reads zero deltas and passes vacuously. This spec avoids the trap by reading
+scalars. The implementer left the class-level question for the reviewer and did not audit other
+specs.
 
-## Two measurement traps this spec hit, and how to re-hit them
+Two things are still owed here, and neither was done:
 
-Both were written the wrong way first and passed vacuously or failed loudly; both are now
-documented in the spec's file header. A reviewer changing these assertions should know why they
-are shaped as they are.
+- **The audit.** Grep the other specs for the object-snapshot pattern. If any spec has the hole, it
+  is passing vacuously today and that is a real defect, not a tripwire.
+- **The disposition.** Returning a frozen shallow copy would make the bad pattern unrepresentable,
+  but it is a production change with a per-call allocation cost. Climb *Architecture first* before
+  filing anything: this is a types/representation fix if it is worth doing at all. If it is
+  declined, it needs an accepted-tradeoff `NOTE:` at the `getDiagnostics` site so the next reviewer
+  does not re-discover it — the trap is currently documented only in the header of one spec, which
+  is the wrong home for a class-level concern.
 
-- **`getDiagnostics()` returns the service's live `diag` object, not a copy.** A "before" reference
-  and an "after" reference are therefore the same object, and every delta computes as 0 — an
-  assertion that silently passes in exactly the direction it was written to catch. The spec reads
-  the counters as scalars through a small `pings()` helper. **This trap is not local to this
-  spec** — any spec taking an object snapshot of diagnostics has the same hole. Worth a grep during
-  review; see *Not done* below.
-- **A freshly seeded entry sits at `relevance: 0`, and `applyFailure` recomputes `base · S(x)` from
-  the counters rather than multiplying the stored value down.** So the *first* scoring call raises
-  relevance whatever the arm, and "relevance strictly decreased" — which the source ticket asked
-  for on arms 2 and 3 — is not assertable against a seeded baseline. The decay arms are asserted on
-  `failureCount` instead, which is the input that actually distinguishes decay from credit.
-  Relevance is still asserted where unambiguous: exactly unchanged on the busy ping, strictly up on
-  arm 4's credited ping.
+## Validation still owed
 
-## Validation run
+Nothing was run. All of it remains:
 
-- `cd packages/fret && npx tsc --noEmit` — clean.
-- `cd packages/fret && yarn test` — **1264 passing, 0 failing** (8m). Foreground, no redirection.
-- No `.pre-existing-error.md` written; nothing failed.
-- The rig's `teardown` restores `STABILIZE_TICK_BUDGET_MS` and `getConnections`. This spec never
-  calls `setTickBudget`, so it leaks no static into later specs in the same mocha process.
+- `cd packages/fret && npx tsc --noEmit`
+- `cd packages/fret && yarn test` (~8 min; foreground, no redirection — see the runner rules)
 
-## Known gaps — treat the tests above as a floor
+There is no lint step in this repo; `yarn check` (typecheck + build + test) is the gate, and
+`yarn format` / `yarn format:check` must **not** be run (see AGENTS.md).
 
-- **The backoff assertion is coarse by design.** Arm 1 asserts only `factor(id) > 0`, never which
-  factor it lands on or how long the window is. Pinning the arithmetic is
-  `debt-backoff-map-test-surface`'s scope and needs a fake clock this spec deliberately does not
-  install.
-- **Core only.** The arms are profile-independent but were run on core alone. An edge run would
-  exercise the tighter `maintenanceConcurrency` (2) and near budget, though with one seeded peer
-  neither can bind. Cheap to add if a reviewer wants it; not obviously worth the runtime.
-- **One peer per case.** Multi-peer interaction — several near peers answering badly in the same
-  tick, or a bad answerer sharing a tick with a hung peer — is untested here. `opened` is
-  append-ordered per peer so per-peer ordering stays safe, but no case asserts across peers.
-- **`not-ok` is ping-only.** The rig rejects loudly against the neighbors protocol, so there is no
-  negative-pong arm on the fetch side and there cannot be one — a neighbors reply has no `ok`
-  field.
-- **The relevance question is dodged, not answered.** Nothing here proves that a bad answer scores
-  *lower than* a good one; it proves only which counter each arm moves. A comparative case (bad-arm
-  relevance vs good-arm relevance on identically-seeded peers) would close that and was not
-  written.
-- **Arm 4 overlaps `fetch-snapshot-failure-arms.spec.ts` in subject but not in method** — that spec
-  calls `fetchAndMergeSnapshot` directly, one arm at a time, against its own stub. Arm 4 is the
-  whole-tick composition (ping scores, fetch silent, one `stabilizeOnce`). A reviewer who disagrees
-  that this is distinct enough should delete arm 4 and keep arms 1–3, which nothing else covers.
+## Docs
 
-## Not done — worth a reviewer's judgement
+`docs/fret.md` line 79 forward-references `test/maintenance-nonok-replies.spec.ts` twice. The
+implementer says both were verified against the landed filename; that was not re-checked. Confirm
+it, and check whether any *other* doc claim the spec touches (the `busy`-records-backoff arm, the
+`fetchAndMergeSnapshot` silent arm) is now stated in the document but unpinned or misstated.
 
-The live-`diag`-object trap above is a **class**, not an instance: `getDiagnostics()` returns
-`this.diag` directly (`packages/fret/src/service/fret-service.ts:511`), so any spec that captures it
-as an object and diffs later reads zero deltas and passes vacuously. This spec is now safe; other
-specs were not audited for it. The architectural fix is at the source — returning a frozen shallow
-copy would make the bad pattern impossible rather than merely documented — but that is a production
-change outside this ticket's scope and it has a real cost (an allocation per call). Deliberately
-left as a finding for the reviewer to weigh rather than filed as a ticket or fixed inline.
+## Handoff being reviewed
+
+The implement-stage handoff claimed: four cases, all passing; `tsc --noEmit` clean; `yarn test`
+1264 passing / 0 failing; no `.pre-existing-error.md` written. It was honest about its gaps —
+coarse backoff assertion (factor `> 0` only, arithmetic left to `debt-backoff-map-test-surface`),
+core profile only, one peer per case, no negative-pong arm on the fetch side (the rig rejects it
+loudly and a neighbors reply has no `ok` field), and no comparative case proving a bad answer
+scores *lower* than a good one. Treat those as the floor the review should push on, not as
+settled scope.
