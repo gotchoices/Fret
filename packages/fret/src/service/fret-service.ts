@@ -899,7 +899,7 @@ export class FretService implements IFretService, Startable {
 					// Our own per-connection ceiling refused the stream before anything reached the
 					// wire — the same class as a tick-budget expiry, and no evidence about the peer.
 					// Counted only, so a ceiling that fires is visible; never scored.
-					this.diag.streamLimit++;
+					this.countStreamLimit(outcome);
 					return;
 				default:
 					return; // ok / busy / cancelled / skipped are the callers' to handle
@@ -907,6 +907,32 @@ export class FretService implements IFretService, Startable {
 		} catch (e) {
 			log.error('noteRpcFailure bookkeeping failed for %s - %e', id, e);
 		}
+	}
+
+	/**
+	 * The **only** trace a `local-limit` outcome leaves. Our own per-connection stream ceiling
+	 * refused the open before anything reached the wire, so it is evidence about this node, not
+	 * about the peer: no contact strike, no relevance decay, no backoff — the counter is all there
+	 * is. Every site that observes an outcome must therefore reach *this*, including the two
+	 * write-only senders (announce, leave notices), which must never reach {@link noteRpcFailure}:
+	 * that seam would turn their `unreachable` / `timeout` outcomes into contact strikes, which
+	 * those passes deliberately do not record. A single owner of the increment is what keeps the
+	 * counter's meaning — "our ceiling fired" — one fact rather than per-call-site policy.
+	 */
+	private countStreamLimit(outcome: RpcOutcome<unknown>): void {
+		if (outcome.kind === 'local-limit') this.diag.streamLimit++;
+	}
+
+	/**
+	 * Outcome bookkeeping for the write-only senders (announce, leave notices): count a
+	 * `local-limit` (see {@link countStreamLimit}) and log anything that is neither `ok` nor our
+	 * own cancellation. Nothing else is recorded — for a write-only request `ok` means "reached
+	 * the transport", not "received" (see the write-only note on `rpcRequest`), so none of these
+	 * outcomes is evidence about the peer worth scoring.
+	 */
+	private noteWriteOnlyOutcome(id: string, outcome: RpcOutcome<undefined>, what: string): void {
+		this.countStreamLimit(outcome);
+		if (outcome.kind !== 'ok' && outcome.kind !== 'cancelled') log.error('%s to %s: %s', what, id, outcome.kind);
 	}
 
 	/**
@@ -1595,7 +1621,7 @@ export class FretService implements IFretService, Startable {
 					dial: true, signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
 				});
 				if (out.kind === 'ok') this.diag.announcementsSent++;
-				else if (out.kind !== 'cancelled') log.error('announce to %s failed: %s', id, out.kind);
+				this.noteWriteOnlyOutcome(id, out, 'announce');
 			} catch (err) {
 				// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
 				log.error('announce failed to %s - %e', id, err);
@@ -1680,7 +1706,9 @@ export class FretService implements IFretService, Startable {
 						return;
 					case 'local-limit':
 						// Our own stream ceiling, not the peer's fault — counted only, never scored.
-						await this.noteRpcFailure(id, out);
+						// Straight to the counter rather than through `noteRpcFailure`: this pass
+						// scores nothing at all, so it has no business reaching the scoring seam.
+						this.countStreamLimit(out);
 						return;
 					case 'cancelled': case 'skipped':
 						return;
@@ -1840,7 +1868,7 @@ export class FretService implements IFretService, Startable {
 				// during shutdown.
 				try {
 					const out = await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts);
-					if (out.kind !== 'ok' && out.kind !== 'cancelled') log.error('sendLeave to %s: %s', id, out.kind);
+					this.noteWriteOnlyOutcome(id, out, 'sendLeave');
 				} catch (err) { log.error('sendLeave failed for %s - %e', id, err) }
 			}
 			// Bounded fan-out beyond S/P (connected peers only)
@@ -1858,7 +1886,7 @@ export class FretService implements IFretService, Startable {
 				if (budget.signal.aborted) break;
 				try {
 					const out = await sendLeave(this.node, id, notice, this.protocols.PROTOCOL_LEAVE, sendOpts);
-					if (out.kind !== 'ok' && out.kind !== 'cancelled') log.error('sendLeave fan-out to %s: %s', id, out.kind);
+					this.noteWriteOnlyOutcome(id, out, 'sendLeave fan-out');
 				} catch (err) { log.error('sendLeave fan-out failed for %s - %e', id, err) }
 			}
 		} catch (err) {
@@ -3335,7 +3363,13 @@ export class FretService implements IFretService, Startable {
 				// Our own per-connection stream ceiling refused the open — not evidence about `target`,
 				// so no strike and no backoff. `target` is already in `visited`, so the walk moves on
 				// to the next candidate instead of retrying straight back into the same ceiling.
-				await this.noteRpcFailure(target, out);
+				//
+				// NOTE: `hop++` spends a hop of the `ttl - hop` budget later messages carry even
+				// though nothing left this node. Harmless today — the walk is bounded by
+				// `maxAttempts` regardless, and over-spending is the conservative direction — but
+				// if our ceiling ever fires often enough to shorten real routes, leave `hop` alone
+				// here, since no message was sent.
+				this.countStreamLimit(out);
 				hop++;
 				continue;
 			}
