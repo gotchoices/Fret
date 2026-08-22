@@ -81,7 +81,10 @@ describe('maintenance: replies that are answers but not good answers', () => {
 	function expectAnsweredNotStruck(id: string): void {
 		const after = r.store.getById(id)!;
 		expect(after.contactFailures ?? 0, 'an answer clears the contact-failure run and books no strike').to.equal(0);
-		expect(after.membership, 'an answer on our protocol confirms membership').to.equal('member');
+		// Not a *promotion* assertion: the near pass draws its targets from the live-member-gated
+		// ring view, so a peer seeded `unknown` is never selected and this arm cannot exercise
+		// `unknown -> member`. What it holds is that an answer does not demote a confirmed member.
+		expect(after.membership, 'an answer does not demote a confirmed member').to.equal('member');
 		expect(after.state, 'no strike, so no escalation to dead').to.not.equal('dead');
 
 		// Per-peer ordering only: `opened` is append-ordered per peer, and pool overlap can reorder
@@ -163,6 +166,7 @@ describe('maintenance: replies that are answers but not good answers', () => {
 		const p = pings();
 		expect(p.sent - p0.sent, 'the ping was sent').to.equal(1);
 		expect(p.fail - p0.fail, 'a decode error counts as a failed ping').to.equal(1);
+		expect(p.ok - p0.ok, 'a decode error is not a good ping').to.equal(0);
 	});
 
 	it('a busy neighbors fetch behind an answering ping is silent: the ping scores, the fetch does not', async () => {
