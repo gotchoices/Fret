@@ -22,6 +22,12 @@ export interface ProbeBackoffOptions {
 	/**
 	 * Cap on the doubling factor; longest window is `baseMs * maxFactor`.
 	 * Default {@link ProbeBackoff.DEFAULT_MAX_FACTOR}.
+	 *
+	 * NOTE: a `maxFactor` of 0 makes {@link ProbeBackoff.penalty} return `NaN` from the second
+	 * failure onward (`Math.min(1, 0 / 0)`), which would poison the routing cost sum silently.
+	 * Unreachable today — the only production caller passes the static default and no config knob
+	 * reaches here — so it is left unguarded rather than validated in the constructor, matching the
+	 * retention-inequality decision below. Revisit if this ever becomes caller- or config-supplied.
 	 */
 	maxFactor?: number;
 	/**
