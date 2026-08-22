@@ -173,3 +173,41 @@ other — whoever picks either up should land the harness change once and then s
 
 Neither was in `tickets/backlog/` at the top level when this was written; check the `backlog/impl`
 and `backlog/plan` sub-folders before concluding they are gone.
+
+<!-- resume-note -->
+## Resume note (run 2026-08-22)
+
+A prior run was cut by the runner's soft token budget **before making any code change**. The
+working tree is untouched by this ticket: no edits to `maintenance-rig.ts`, no new spec file, no
+`docs/fret.md` edit, and `tickets/backlog/debt-maintenance-rig-non-ok-replies.md` is still there.
+Every TODO above is still outstanding. There is no partial state to reconcile — start from the
+TODO list as written.
+
+What that run did establish, so the next agent need not re-read the same files:
+
+- `packages/fret/test/helpers/maintenance-rig.ts` is ~180 lines. The two lookup sites the design
+  section refers to are both on one line inside `PeerRig.open`:
+  `this.protocolBehavior.get(\`${id}|${protocol}\`) ?? this.behavior.get(id) ?? 'answers'`.
+  Widening `Behavior` therefore needs no change to that lookup — only to the type and to
+  `PeerRig.reply`.
+- `PeerRig.reply(id, protocol)` is the whole reply builder: two `if` arms (ping → `{ok: true, ts}`,
+  neighbors → empty `NeighborSnapshotV1`), then `Promise.reject(new Error('unexpected protocol
+  opened during a maintenance pass: ...'))`. That rejection is the "loud reject" shape the design
+  section says the ping-only `'not-ok'` behavior must reuse for the neighbors protocol.
+- `open()` already routes a rejected `reply()` correctly for the rig's accounting: it calls
+  `settle()` (decrementing `inFlight`) and rethrows, so a loudly-rejected behavior fails the run
+  without corrupting the high-water bookkeeping.
+- The stale file-header claim to correct is in the block comment at the top of the same file:
+  "Neither sender *writes* to the stream (they open and read)" is fine; the sentence that this
+  change falsifies is in `reply`'s neighbourhood and in the header's description of the stub —
+  re-read the header before editing rather than trusting this summary for the exact wording.
+- `test/helpers/backoff.ts` exports exactly `backoffOf(svc)` and `setBackoffOf(svc, pb)`, both
+  casting through a `{ backoff: ProbeBackoff }` shape. The new spec needs only `backoffOf`.
+- Service call sites still to be read (not yet read in that run): `probeNeighborLatency`
+  (~`src/service/fret-service.ts:2428`), `probeAndFetch` (~2400), `fetchAndMergeSnapshot` (~2725),
+  `stabilizeOnce` (~2321), `nearProbeTargets` (~2383), `noteAnsweredOnProtocol` (~820),
+  `noteRpcFailure` (~858). The neighbors-`busy` arm's assertions must be written against what
+  `fetchAndMergeSnapshot` actually does, per the TODO above.
+
+No test or type-check command was run, so nothing is known about the tree's current green/red
+state beyond what `main` was at commit 8471214.
