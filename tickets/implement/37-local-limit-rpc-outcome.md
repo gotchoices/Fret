@@ -105,3 +105,50 @@ over the same connection. Record it as a `NOTE:` at the `classify` site and as a
 - `docs/fret.md`: one sentence stating the non-distinguishable-reset residual, in
   *Stream management* beside the stream-cap bullet the sibling ticket rewrites.
 - Run `cd packages/fret && npx tsc --noEmit` and `yarn test` before handing off.
+
+<!-- resume-note -->
+## Resume note — discovery done, no code written yet
+
+A prior run read the relevant sites and hit its token budget before editing. Nothing in the
+working tree was changed. Exact sites, so the next run does not re-discover them:
+
+**Predicate goes here.** `packages/fret/src/rpc/protocols.ts:338-353` — `isPayloadTooLargeError`
+and `isFrameTruncationError` sit adjacent, both matching on `err.name` with an
+`err == null || typeof err !== 'object'` guard first. Match that shape exactly; the libp2p error
+classes are not importable, same as the note on `isFrameTruncationError`.
+
+**`classify` arm goes here.** `packages/fret/src/rpc/request.ts` — `classify(err, callerSignal,
+deadlineSignal)`, roughly lines 86-96. Current order: caller-signal → `foreign-protocol` →
+truncation → payload-too-large → deadline/`DeadlineExpiredError` → `unreachable` fallback. Put the
+stream-limit check with the other identity checks (before the deadline check is fine — identities
+are disjoint), and definitely before the `unreachable` fallback. Note `classify` returns
+`RpcOutcome<never>`, so the new variant must be constructible there.
+
+**`noteRpcFailure`.** `packages/fret/src/service/fret-service.ts:873-896`. Its `default` arm is at
+line ~890 with the comment `// ok / busy / cancelled / skipped are the callers' to handle` — that
+is the comment the TODO says to extend with `local-limit`, and the variant is inert there by
+construction.
+
+**Diagnostics.** The `diag` object literal is at `fret-service.ts:398` (flat counters
+`pingsSent` / `pingsOk` / `pingsFail`, then a nested `rejected` sub-object). `streamLimit` belongs
+beside `pingsFail` as a flat counter, not under `rejected` — `rejected` counts *inbound* messages
+we refused, and this is an outbound refusal by our own stack. `getDiagnostics()` at line ~526
+returns `Readonly<typeof this.diag>`, so adding a field needs no other change.
+
+**Switch sites that must gain an arm.** Adding a variant will break every exhaustive `switch` over
+`RpcOutcome['kind']`. Candidates found by grep (line numbers approximate, grep the surrounding
+symbol):
+- `fret-service.ts:1661-1668` — pooled warm-up ping fan-out (`pingWarmupTargets`)
+- `fret-service.ts:2374-2409` — `probeNeighborLatency`
+- `fret-service.ts:2587-2625` — `probeMembership`
+- `fret-service.ts:2669-2685` — `fetchAndMergeSnapshot`
+- `fret-service.ts:2972-2996` — the maybeAct forward path
+- `fret-service.ts:3278`, `3287`, `3358`, `3360` — `iterativeLookup`, `if`-based rather than
+  `switch`, so these will *not* fail to compile; check each reads `local-limit` sanely (it should
+  fall through to "no progress from this peer", not to a strike).
+
+Run `cd packages/fret && npx tsc --noEmit` immediately after adding the variant — the compile
+errors are the authoritative list of sites, more reliable than the grep above. Several of those
+switches have a `default`, so the compiler will not flag them; read each one that grep names.
+
+The design, tests and remaining TODO list above are unchanged and still correct.
