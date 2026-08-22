@@ -1,13 +1,18 @@
-description: A test was added to check that a departing peer's courtesy goodbye list is capped at a fixed number. A reviewer started checking that test but ran out of budget before finishing, so the checks that remain — running the test suite, and confirming the project documentation still matches — still need doing.
+description: A test was added to check that a departing peer's courtesy goodbye list is capped at a fixed number. Two reviewer runs have now been cut short by budget limits, so the remaining checks — running the test suite and confirming the project documentation still matches — still need doing.
 files: packages/fret/test/churn.leave.spec.ts, packages/fret/src/service/fret-service.ts, docs/fret.md
 difficulty: medium
 ----
 
 <!-- resume-note -->
-**A prior review run was cut short by a token budget warning.** It had read the implement diff and
-the production code under test, but had not run the tests, not read the whole spec file, and not
-checked `docs/`. No code was changed by that run — `git status` was clean apart from the ticket
-board. Nothing is half-applied; resume from the checklist at the bottom.
+**Two prior review runs were cut short by a token budget warning.** Run 1 read the implement diff
+and the production code under test. Run 2 re-read the diff with fresh eyes and cleared one
+checklist item (orphaned helpers). **Neither run changed any code** — `git status` is clean apart
+from the ticket board and `tickets/.in-progress`. Nothing is half-applied.
+
+Resume at the checklist at the bottom. **Budget note for the next run:** the two remaining
+expensive items are the test runs and the docs read. Do those *first*, before re-deriving any
+analysis already written down here — the two candidate findings below are the only open judgement
+calls and both are small.
 
 ## What is under review
 
@@ -30,7 +35,7 @@ Commit `5ea8321` (`ticket(implement): leave-fanout-cap-untested`). Test-only:
 The clamp under test is the `.slice(0, fanOut)` on the `extra` list in `sendLeaveToNeighbors`
 (`src/service/fret-service.ts`, around line 1892).
 
-## What the interrupted run had established
+## What the interrupted runs established
 
 Read and confirmed by eye, not by running anything:
 
@@ -43,6 +48,13 @@ Read and confirmed by eye, not by running anything:
   this spec (14 other sites), so the new case's use of it is not a new finding.
 - `delay` is a local one-line helper at the top of the file and is already used by an existing case
   (`await delay(settleMs)`), so the new `await delay(100)` is not a new idiom in this file.
+- **The deletion orphaned nothing** (checklist item cleared by run 2). Occurrence counts in
+  `packages/fret/test/churn.leave.spec.ts` after the deletion: `buildMesh` 3, `Mesh` (the type
+  import plus the `let mesh` declaration), `waitFor` 7, `allConverged` 2, `anyProgressed` 2,
+  `alreadyStopped` 4, `CONVERGE_MS` 2, `PROGRESS_MS` 2 — every helper and constant the deleted
+  case used still has at least one other user, so no import or local went dead. (Two occurrences
+  of a name means the declaration plus one use.) `tsc --noEmit` is still the authority here and is
+  on the checklist anyway.
 
 ## Findings so far (not yet dispositioned)
 
@@ -55,8 +67,9 @@ Neither has been verified against a run; treat both as candidates, not conclusio
   a hand-copy of the production expression — so the fan-out magnitude now exists in two places with
   nothing tying them together. The `expect(fanOut).to.equal(2)` immediately below does catch a
   retune, but by the literal, not by the derivation the comment claims. Decide between: fixing the
-  comment to say what the line actually does; or exporting the fan-out from the service so the test
-  reads the real number. Likely minor — fix inline.
+  comment to say what the line actually does; or reading the real number off the service the way
+  the line above it reads `cfg.m` (first check whether the fan-out is exposed on `cfg` at all — if
+  it is, that is the fix and it retires the whole finding). Likely minor — fix inline.
 - **The fixed `await delay(100)` settle**, which the implementer flagged themselves. It is not a
   convergence guess (all sends are awaited inside `send()`), only a handler-delivery settle, but it
   is a wall-clock guess in a file whose header is largely about having removed fixed sleeps. Judge
@@ -65,21 +78,7 @@ Neither has been verified against a run; treat both as candidates, not conclusio
 
 ## Remaining checklist
 
-- Read the whole new `describe` in context, plus the neighbouring `at the shipped k of 15` block
-  it was modelled on, and `makeSenderRig` / `SenderRig` (`noticesAt`, `idAt`, `send`) — the
-  interrupted run only saw them through the diff.
-- Verify the deletion orphaned no imports or helpers (`buildMesh`, `Mesh`, `waitFor`,
-  `allConverged`, `anyProgressed`, `alreadyStopped`) — the handoff claims all still have users;
-  confirm rather than trust.
-- Re-check the rig arithmetic independently (the handoff calls every number load-bearing): m = 8,
-  40 seeded peers, cohort ask of 18 alternating 9 per side, dead +2/+3 pulling the clockwise reach
-  to `{+1, +4..+11}`, +32 dropped as a ghost by `isConnected`. A wrong number here makes the case
-  pass vacuously.
-- Decide whether the anti-vacuity proof needs re-running. The handoff reports a mutation check
-  (removing `.slice(0, fanOut)` makes the new case fail `expected 3 to equal 2`) and that
-  `fret-service.ts` was restored afterwards — `git diff` against HEAD is clean, which corroborates
-  the restore but not the mutation result.
-- Run, from `packages/fret`, and require passing:
+- **Run these first** (they are the budget risk), from `packages/fret`, and require passing:
   `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/churn.leave.spec.ts" --timeout 30000`,
   then `npx tsc --noEmit`, then the full `yarn test` (~8 min; run in the foreground with no
   redirection so the runner's idle timer stays alive). There is no lint step in this repo —
@@ -88,6 +87,18 @@ Neither has been verified against a run; treat both as candidates, not conclusio
 - Confirm `docs/fret.md` needs no change. The *Leave* section already states the fan-out and its
   bound; the handoff says nothing in `docs/` referenced the deleted test. Verify by reading, not by
   assuming — treat docs as out of date until read.
+- Read the whole new `describe` in context, plus the neighbouring `at the shipped k of 15` block
+  it was modelled on, and `makeSenderRig` / `SenderRig` (`noticesAt`, `idAt`, `send`) — neither
+  interrupted run saw them outside the diff. (Spec file is 853 lines; the sender-rig region starts
+  around line 555.)
+- Re-check the rig arithmetic independently (the handoff calls every number load-bearing): m = 8,
+  40 seeded peers, cohort ask of 18 alternating 9 per side, dead +2/+3 pulling the clockwise reach
+  to `{+1, +4..+11}`, +32 dropped as a ghost by `isConnected`. A wrong number here makes the case
+  pass vacuously.
+- Decide whether the anti-vacuity proof needs re-running. The handoff reports a mutation check
+  (removing `.slice(0, fanOut)` makes the new case fail `expected 3 to equal 2`) and that
+  `fret-service.ts` was restored afterwards — `git diff` against HEAD is clean, which corroborates
+  the restore but not the mutation result.
 - Weigh the four gaps the handoff declares openly, and record each as fixed / tripwire /
   new ticket / accepted: the coupling to `expandCohort`'s alternating reach (a shortened reach
   fails as "the clamp broke"); nothing asserting the edge profile changed only `fanOut`;
