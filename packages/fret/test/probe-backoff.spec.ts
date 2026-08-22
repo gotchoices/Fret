@@ -71,6 +71,21 @@ describe('ProbeBackoff', () => {
 			expect(seen).to.deep.equal([1, 2, 4, 8, 16, 32])
 		})
 
+		it('two failures inside one still-open window both escalate', () => {
+			const { backoff, clock } = makeBackoff()
+			backoff.record('a')
+			expect(backoff.factor('a')).to.equal(1)
+
+			// No clock.advance — second failure lands inside the first window.
+			backoff.record('a')
+			expect(backoff.factor('a')).to.equal(2)
+
+			// The second call's later stamp pushed `until` out too: still backed off well past
+			// where the *first* call's window alone would have closed.
+			clock.advance(BASE_MS - 1)
+			expect(backoff.isBackedOff('a')).to.equal(true)
+		})
+
 		it('caps at maxFactor and stays there across further records', () => {
 			const { backoff, clock } = makeBackoff()
 
@@ -193,6 +208,11 @@ describe('ProbeBackoff', () => {
 			expect(backoff.isBackedOff('a')).to.equal(false)
 			expect(backoff.factor('b')).to.equal(1)
 			expect(backoff.isBackedOff('b')).to.equal(true)
+
+			// The follow-up: clear() left 'a' forgotten, not merely retained at 0 — the next
+			// failure must restart at factor 1, same shape as the retention-expiry case above.
+			backoff.record('a')
+			expect(backoff.factor('a')).to.equal(1)
 		})
 
 		it('clearAll forgets every peer', () => {
