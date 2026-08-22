@@ -15,6 +15,16 @@ import { registerRpcHandler } from '../src/index.js'
 // state without standing up ten connections), and the enforcement spec proves the value means
 // something once it arrives (which a spy cannot see at all).
 //
+// NOTE: neither spec asserts the *shipped* 128/256 and 32/64 are enforced end to end - this one
+// proves they are requested, the sibling proves a cap of 2 is enforced. Closing that would need
+// 33+ concurrent streams on one connection, which is why it was not attempted; revisit only if a
+// cap is ever suspected of being requested-but-ignored at its real magnitude.
+//
+// NOTE: the external-caller case below drives `registerRpcHandler` only. `registerJsonHandler`'s
+// two option interfaces declare the same cap fields optional and `tsc --noEmit` is the whole
+// compile-time claim, so no case drives them with the fields omitted; add one if that seam ever
+// grows a runtime default rather than forwarding `undefined`.
+//
 // Counting real `node.handle` calls, rather than reading the caps back off `FretService`, is what
 // pins the split: `streamCaps()` is private and its return value is only meaningful if it is
 // forwarded, and the forwarding is five separate spreads through four registrar functions.
