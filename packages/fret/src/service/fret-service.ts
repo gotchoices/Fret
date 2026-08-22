@@ -902,6 +902,14 @@ export class FretService implements IFretService, Startable {
 	 * that seam would turn their `unreachable` / `timeout` outcomes into contact strikes, which
 	 * those passes deliberately do not record. A single owner of the increment is what keeps the
 	 * counter's meaning — "our ceiling fired" — one fact rather than per-call-site policy.
+	 *
+	 * NOTE: accepted tradeoff — counting inside `classify` (`src/rpc/request.ts`) instead, so that
+	 * no call site could forget the counter at all, was weighed and **declined**. It trades 4
+	 * direct callers of this method for the convention having to hold at ~12 `rpcRequest` call
+	 * sites, and `classify` is a module-level function with no service to count against: the sink
+	 * would have to be a module global, which is wrong for a process hosting more than one FRET
+	 * service — the two services' ceilings would add into one number and neither could report its
+	 * own. Revisit if `rpcRequest` ever gains a per-service context object to carry the sink.
 	 */
 	private countStreamLimit(outcome: RpcOutcome<unknown>): void {
 		if (outcome.kind === 'local-limit') this.diag.streamLimit++;
