@@ -51,3 +51,31 @@ export const PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]
  * rather than measured once at authoring time.
  */
 export const MAX_PEERS_IN_ONE_SPACING_ARC = 7
+
+/**
+ * The alive peer whose coordinate is nearest `target` by ring distance — `min(cw, ccw)` over
+ * the 2^256 ring, matching `src/ring/distance.ts`'s metric — with the ring's own lexicographic
+ * peer-id tie-break, since ring distance is not unique per coordinate (one peer clockwise and
+ * one counter-clockwise can sit at the same arc length).
+ *
+ * Exists so a placement measurement and the spec that ships its threshold select their route
+ * origins by one implementation rather than two.
+ */
+export function nearestAlivePeerTo(
+	peers: Iterable<{ id: string; coord: Uint8Array; alive: boolean }>,
+	target: bigint,
+): string | undefined {
+	const ringSize = 1n << 256n
+	let bestId: string | undefined
+	let bestDist = 0n
+	for (const peer of peers) {
+		if (!peer.alive) continue
+		const cw = (coordToBigInt(peer.coord) - target + ringSize) % ringSize
+		const dist = cw <= ringSize - cw ? cw : ringSize - cw
+		if (bestId === undefined || dist < bestDist || (dist === bestDist && peer.id < bestId)) {
+			bestId = peer.id
+			bestDist = dist
+		}
+	}
+	return bestId
+}
