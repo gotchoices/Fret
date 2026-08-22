@@ -129,3 +129,37 @@ already exists.
   `sendLeaveToNeighbors` and checking the case fails; restore it.
 - `docs/fret.md` needs no change — this is test-only and the *Leave* section already states the
   fan-out and its bound. If the deleted test is referenced anywhere in docs, fix that reference.
+
+---
+
+## Progress (run interrupted by budget warning — no code changed)
+
+**Working tree is untouched.** No edits were made to any source or test file; the run ended
+during the read pass. Nothing to unwind, nothing half-applied.
+
+What the read pass established, so the next agent does not repeat it:
+
+- `test/churn.leave.spec.ts` is 794 lines. The ticket's description of it is accurate — all three
+  target sites were confirmed by reading, not inferred.
+- `makeSenderRig` is at ~line 620. The hardcoded profile is the line
+  `const svc = new CoreFretService(departing, { profile: 'core', k })` inside it. That is the one
+  line the optional profile argument has to reach; the rest of the helper is profile-agnostic.
+- The misnamed star test `fan-out notifies peers beyond immediate S/P` occupies roughly lines
+  102–130 (from the `it(` line through its closing `})`).
+- **Deleting it orphans no imports.** This was the one TODO bullet that needed checking and the
+  answer is "nothing to remove": `buildMesh` / `Mesh` are still used by
+  `a graceful stop sends leave notices to its neighbors without throwing` (`buildMesh(4)`) and by
+  `oversized replacements array is truncated` (`buildMesh(3)`); `waitFor`, `expect`, the
+  `allConverged` / `anyProgressed` helpers and the `alreadyStopped` array all still have a user in
+  the first of those tests. So the deletion is a plain excision of the `it(...)` block plus its
+  leading comment — no import list edit, no helper removal.
+- The existing `describe('at the shipped k of 15', ...)` starts at ~line 709 and ends at the file's
+  end. The new edge-profile `describe` goes beside it, inside the same
+  `Leave notice replacements (sender side)` parent, with its own `before` / `after` (the parent
+  block's `before` already spends the shared rig's once-per-lifetime `sendLeaveToNeighbors`).
+- That existing block already carries a `NOTE:` at `OUTSIDE_RECEIVER = 9` conceding it *assumes*
+  `expandCohort`'s reach rather than asserting it. The new case must not repeat that shape — its
+  premise assertions are what keep it from going vacuous, per the spec above.
+
+Everything under **The spec to add**, **Edge cases & interactions** and **TODO** above still stands
+unchanged and is the work remaining. Start at `makeSenderRig`.
