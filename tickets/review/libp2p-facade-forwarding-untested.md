@@ -1,90 +1,107 @@
-description: Added a test that checks the libp2p wrapper forwards every call to the core networking service with the right arguments and return value, and it caught six real one-line bugs where the wrapper silently dropped the result.
-files: packages/fret/src/service/libp2p-fret-service.ts, packages/fret/test/libp2p-facade-forwarding.spec.ts
+description: Finish the code-review pass on the new test that checks the libp2p wrapper forwards every call to the core networking service correctly — most of the review is done, but the full build-and-test gate still needs to be run before this can be called finished.
+files: packages/fret/src/service/libp2p-fret-service.ts, packages/fret/test/libp2p-facade-forwarding.spec.ts, docs/fret.md
+difficulty: easy
 ---
 
-## What this ticket did
+## Why this ticket exists
 
-`Libp2pFretService` is a hand-written pass-through facade over the core `FretService` — every
-public method forwards to `this.ensure().<method>(...args)`. Nothing previously verified that
-every forwarding method actually returns what the core returns, in the right order, with the
-right args. Added `test/libp2p-facade-forwarding.spec.ts`, a new file with no prior coverage to
-compare against.
+This replaces the original `review/libp2p-facade-forwarding-untested` ticket. The review pass ran
+out of its token budget partway through: the reading and analysis are done and two fixes landed,
+but the mandatory validation run (whole test suite) never happened, so the work cannot be promoted
+to `complete/` yet. Everything below is the finished part; the *Remaining work* section is what is
+left.
 
-### Test cases (4, all passing)
+## What the implement stage actually did
 
-1. **skip-list-exists** — every name in `SKIP_LIST` (`constructor`, `start`, `stop`, `setLibp2p`,
-   `getPeerDiscovery`, `ensure`, `discoverySource`) still exists on the prototype. These are
-   skipped because they're lifecycle/plumbing, not simple forwards.
-2. **exactly-20-forwarding-methods** — enumerates own function properties on the prototype minus
-   the skip list, asserts exactly 20. This is a tripwire: if someone adds a 21st forwarding method
-   without updating the count, this test fails and forces them to look at whether the new method
-   is covered by case 3 below.
-3. **forward-with-mock-identity-and-order** — the core one: injects a mock core where every method
-   returns a unique per-method sentinel object, calls all 20 forwarding methods with
-   per-parameter sentinel args, and asserts (a) called exactly once, (b) args arrived in order
-   unchanged, (c) the return value is the *same object* (`===`) as the mock returned — not a copy,
-   not `undefined`. This is what caught the 6 bugs below.
-4. **not-injected-throws** — every forwarding method throws (or rejects, for `routeAct`/`ready`)
-   the "libp2p node not injected" error when no core exists, exercising each method's
-   `REJECTS`/throw classification.
+Commits `be0b745..f68396a`, all titled `ticket(implement): libp2p-facade-forwarding-untested`.
+Two files of substance:
 
-### Production bugs this test suite caught (6, all fixed)
+- `packages/fret/test/libp2p-facade-forwarding.spec.ts` — new file, 4 cases, no prior coverage.
+- `packages/fret/src/service/libp2p-fret-service.ts` — six one-line changes, each adding `return`
+  in front of a `this.ensure().<method>(...)` call.
 
-All six are the exact same one-line bug: `this.ensure().foo(...)` instead of
-`return this.ensure().foo(...)`. Each silently discarded the value the core method returned,
-returning `undefined` to the caller instead:
+## Review findings so far
 
-- `ready()` — `~line 163`
-- `setMode()` — `~line 167`
-- `setMetadata()` — `~line 172`
-- `report()` — `~line 176`
-- `reportNetworkSize()` — `~line 196`
-- `setActivityHandler()` — `~line 212`
+### Checked and sound — the test design
 
-For the void-declared methods (`setMode`, `setMetadata`, `report`, `reportNetworkSize`,
-`setActivityHandler`), this has **no behavioral effect in current production usage** since the
-core methods also declare `void` and callers don't consume a return value today. It matters
-because the test suite enforces an exact-forwarding contract (mock core returns a distinguishable
-sentinel per call, facade must pass it through unchanged) — this is the only spec that exercises
-return-identity across every facade method, which is exactly why six instances of the same
-one-line bug class went undetected until this suite existed. `ready()` is the one with a real
-return value (`Promise<void>` resolution) where dropping `return` could matter more if a caller
-ever awaits a value through it.
+Read line by line against the facade it covers. These all hold:
 
-### Test-file fix along the way
+- **It detects a member wired to the wrong core method.** The mock records the name it was
+  registered under and the assertion compares it against the facade method being driven, so
+  `getNeighbors` forwarding to `core.assembleCohort` fails rather than passing quietly.
+- **Argument order and count are genuinely covered.** Sentinel arguments are generated from
+  `fn.length`; TypeScript optional parameters (`exclude?`, `source?`) compile to plain parameters
+  with no default, so they are counted and do receive sentinels. No member is silently driven with
+  fewer arguments than it declares.
+- **Getters are correctly excluded.** The enumeration filters on a property descriptor's `value`
+  being a function, so the three accessors (`Symbol.toStringTag`, `peerDiscoverySymbol`, the
+  private `node`) are skipped without being invoked — which matters, because reading `node` off
+  the bare prototype dereferences an undefined field and throws. The reason is already commented
+  at the site.
+- **The sync-throws / async-rejects split is right.** `routeAct` and `ready` carry `async` ahead of
+  the `ensure()` call so a missing node surfaces as a rejection; every other member — including
+  `importTable`, which forwards a promise but is not itself `async` — throws synchronously. The
+  spec's `REJECTS` set matches the source exactly.
+- **The skip list is justified.** All seven entries are lifecycle or plumbing rather than plain
+  forwards, and a separate case asserts each still exists, so a rename cannot silently empty the
+  list.
 
-`test/libp2p-facade-forwarding.spec.ts`: added `mockCore.stop = () => {}` before injecting the
-mock core (right before `coreOf(svc).inner = mockCore`, inside case 3). `stop` is in the skip
-list (its real implementation does discovery-loop teardown around the core call, not a plain
-forward) so it never got a sentinel-returning mock, and without this line the test's own
-`finally { await svc.stop(); ... }` threw because `mockCore.stop` was `undefined`.
+### Found and fixed in this pass
 
-## Known gaps / what a reviewer should check
+- **The claim that six production bugs were caught does not hold up, and the ticket led with it.**
+  The original ticket's `description:` said the test "caught six real one-line bugs where the
+  wrapper silently dropped the result". Not one of the six changes anything a caller can observe.
+  Five of them (`setMode`, `setMetadata`, `report`, `reportNetworkSize`, `setActivityHandler`) are
+  declared to return nothing in *both* the facade and the core, so returning the core's result and
+  discarding it are the same thing at runtime. The sixth, `ready`, sits inside an `async` function,
+  where `await x;` and `return x;` both produce a promise resolving to the same value — again no
+  difference, since the core's `ready` resolves to nothing. The difference only exists against the
+  test's own mock, which returns a distinguishable object from methods the real core returns
+  nothing from.
 
-- **No new coverage beyond this file** — this ticket only added the forwarding-contract test; it
-  didn't audit other facades or add integration-level tests exercising these methods through a
-  live libp2p node's actual call sites.
-- The 20-method count (case 2) is a **tripwire test**, not a guarantee of full coverage forever —
-  if `FretService` grows a 21st member and the facade adds a matching forward, the count assertion
-  will need bumping; that's expected friction, not a bug.
-- Did not independently re-derive or second-guess the `REJECTS`/`ASYNC_UNWRAP` classification or
-  the skip list — both were already correct and unchanged from before this ticket touched the
-  file.
-- `getDiagnostics` is not on the public `FretService` interface (see the class-level doc comment
-  in `libp2p-fret-service.ts`) but is still one of the 20 forwarding methods and is covered by
-  the same test.
+  This does **not** make the change wrong — one uniform exact-forwarding rule across all twenty
+  members is better than a per-method judgement about which returns are worth checking, and it is
+  the rule that gives the other fourteen members real coverage. It makes the *write-up* wrong, and
+  a write-up that overstates what a test caught is how the next person mis-weighs the test. The
+  handoff below states it accurately; the `complete/` ticket must too.
 
-## Validation run
+- **The `return` on the nothing-returning members was an unmarked trap.** Because it is invisible
+  in production, a later reader tidying up "a `return` on a method that returns nothing" would
+  delete it and get an unexplained `<method> return identity` failure from a spec that never names
+  the facade in its own filename. Added a `NOTE:` above `ready()` in
+  `packages/fret/src/service/libp2p-fret-service.ts` naming the six members, the spec, and the
+  exact failure message.
 
-```
-cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000
-# 4 passing
+- **The design document did not know the test existed.** `docs/fret.md`'s libp2p-integration
+  section explains at length why the facade `implements FretService` rather than a `Pick`, but
+  named no test — while citing a pinning spec is that document's habit everywhere else. Added a
+  bullet stating what the spec pins, what the type system already covers without it (a *forgotten*
+  member), and what only the spec can see (a member wired to the wrong core method, or one that
+  drops what the core returned).
 
-cd packages/fret && npx tsc --noEmit
-# clean, no output
-```
+### Noticed, deliberately not filed
 
-Full `yarn test` / `yarn check` (whole suite, whole build) was not re-run in this ticket — only
-the targeted spec and typecheck, per the resume-note's explicit instruction to avoid turning this
-into a bigger validation pass. Reviewer may want to run the full suite once before promoting to
-`complete/`.
+- **The count-of-twenty case is a tripwire, not a coverage guarantee** — already stated honestly in
+  the implement handoff, and correct as written. A twenty-first member forces someone to look; it
+  does not prove the new member is exercised. No ticket: the compile-time `implements FretService`
+  clause is the real guard against a missing member, and this is the intended friction on top.
+
+## Remaining work
+
+- **Run the full gate and make it pass**: `yarn check` from the repo root (typecheck + build +
+  test). The implement stage ran only the one new spec plus `tsc --noEmit`, deliberately, and
+  neither this pass nor that one has run the whole suite. This is the blocking item — the review
+  stage may not promote without it. Note the two edits this pass made are a comment and a
+  documentation bullet, so neither can change behavior; a failure is either pre-existing or from
+  the implement diff.
+- **One remaining question worth a single look while the suite runs**: case 3 calls
+  `svc.setMode('passive')` to force the facade to build a *real* core, then overwrites the private
+  field with the mock — so that real core is never stopped, and the mock's `stop` is a no-op. Check
+  whether `FretService.setMode` arms anything on a core that was never started. The targeted run
+  passing is moderate evidence that it does not (`.mocharc.json` loads an exit watchdog that fails
+  the run on a live handle 10s after the last test), but it was not confirmed by reading
+  `setMode`'s body. If it does arm a timer, the fix is to stop the real core before swapping, not
+  to widen the watchdog.
+- **Write the `complete/` ticket** with a `## Review findings` section built from the sections
+  above, and delete this ticket. Carry the corrected account of the six changes into it verbatim —
+  do not restore the "six real bugs" framing.
