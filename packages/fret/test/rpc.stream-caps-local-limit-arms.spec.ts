@@ -336,8 +336,8 @@ describe('local stream-cap refusals at every outcome-observing arm', function ()
 		 *
 		 * Same `REFUSALS` (4) drives with the spacing rewind between them as the table rows use, so
 		 * a booked strike would provably have reached `dead` rather than merely have moved a
-		 * counter. `rewindSpacing()` writes `lastContactFailureAt` on the capped remote, so the
-		 * rewind is done against whichever peer the row actually drives.
+		 * counter. The module-level `rewindSpacing()` writes `lastContactFailureAt` on the capped
+		 * remote only, so this helper rewinds against whichever peer the row actually drives.
 		 */
 		const expectCountsNothing = async (id: string, drive: () => Promise<void>) => {
 			const read = () => {
