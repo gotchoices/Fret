@@ -1,75 +1,93 @@
-description: A test file was added that checks the network code handles peers replying "I'm busy" or with garbage; the review of that test file was cut short by a budget limit and needs finishing.
-files: packages/fret/test/maintenance-nonok-replies.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, packages/fret/test/helpers/backoff.ts, packages/fret/src/service/fret-service.ts, packages/fret/test/fetch-snapshot-failure-arms.spec.ts, docs/fret.md
+description: A test file was added that checks the network code handles peers replying "I'm busy" or with garbage; the review of that test file has been cut short by a budget limit twice and still needs finishing.
+files: packages/fret/test/maintenance-nonok-replies.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, packages/fret/test/helpers/backoff.ts, packages/fret/src/service/fret-service.ts, packages/fret/src/service/probe-backoff.ts, packages/fret/test/fetch-snapshot-failure-arms.spec.ts, docs/fret.md
 difficulty: medium
 ---
 
 <!-- resume-note -->
-A prior review run was cut off by `BUDGET_WARNING` before it could run validation or reach a
-disposition. No code was changed and no findings were filed. This ticket replaces the original
-review ticket; the implement-stage handoff it was reviewing is reproduced under *Handoff being
-reviewed* below so the next agent does not need to re-read the git history for it.
+Two prior review runs were cut off by `BUDGET_WARNING`. **No code has been changed, no findings
+filed, and no validation run.** The whole review is still owed. Read *Budget discipline* below
+before doing anything else — the cheap-first ordering there is what the two lost runs got wrong.
 
-## What the prior run established
+## The diff under review
 
-**The diff under review is one commit, `1b85381`, and it is test-only.** It adds
-`packages/fret/test/maintenance-nonok-replies.spec.ts` (197 lines) and moves the ticket file.
-No production source changed. The `Behavior` widening on `test/helpers/maintenance-rig.ts`
-(`busy` / `not-ok` / `undecodable`, per-(peer, protocol) overrides) landed earlier on this branch
-in `9b7c410` under a different ticket and is **not** part of this diff — read it as context, not
-as work to review here.
+One commit, `1b85381`, **test-only**: it adds `packages/fret/test/maintenance-nonok-replies.spec.ts`
+(197 lines) and moves the ticket file. No production source changed. The `Behavior` widening in
+`test/helpers/maintenance-rig.ts` (`busy` / `not-ok` / `undecodable`, per-(peer, protocol)
+overrides) landed earlier on this branch in `9b7c410` under a different ticket — context, not work
+to review here. Do not re-read the git history; that is all of it.
 
-Both files were read in full. The rig's stub-connection approach, the framing of the
-`undecodable` body, and the ping-only guard on `not-ok` all check out on inspection.
+## Budget discipline (why two runs died)
 
-## Observations recorded but NOT yet dispositioned
+Both lost runs spent their budget on reading. Order the work so a third cut-off still leaves
+something banked:
 
-These are candidate findings from a read of the spec alone. None was verified against the
-production code, so each still needs the "is this real" pass before it is fixed, filed, or
-dropped. Do not treat the list as a verdict.
+- Run `npx tsc --noEmit` and `yarn test` **first** — they cost wall-clock, not context, and a green
+  gate is the one deliverable that cannot be inferred later.
+- Then read only the line ranges named below. They were located by grep in run two and are
+  accurate as of `1b85381`; grep the symbol if a range looks off rather than reading around it.
+- The `Bash` tool's working directory **persists between calls**. After one `cd packages/fret`, a
+  later `cd packages/fret` fails with "No such file or directory". Use absolute paths.
 
-- **`expectAnsweredNotStruck` asserts `membership === 'member'` against a peer seeded as
-  `member`.** That assertion can only ever catch a *demotion*, never confirm the promotion the
-  spec's headline claims ("an answer on our protocol confirms membership"). Seeding `unknown` on
-  at least one arm would make it load-bearing. Check whether an `unknown` peer would still be
-  selected by the near pass at all — the near list is live-member-gated, so it very likely would
-  not, in which case the assertion is as strong as this rig can make it and the comment overstates
-  what it proves. Decide which, and either strengthen the arm or soften the comment.
+## Where the production arms live (`packages/fret/src/service/fret-service.ts`)
+
+Located already — do not re-discover:
+
+| Symbol | Lines |
+|---|---|
+| `noteAnsweredOnProtocol` | ~816–830 |
+| `noteRpcFailure` | ~858–900 |
+| `nearProbeTargets` | ~2383–2400 |
+| `probeAndFetch` | ~2400–2412 |
+| `probeNeighborLatency` | ~2428–2480 |
+| `fetchAndMergeSnapshot` | ~2725–2770 |
+
+`ProbeBackoff` is its own module: `packages/fret/src/service/probe-backoff.ts`.
+
+## Observations recorded but NOT dispositioned
+
+Candidate findings from reading the spec and the rig alone. **None has been checked against the
+production code.** Not a verdict — each still needs the "is this real" pass before it is fixed,
+filed, or dropped.
+
+- **`expectAnsweredNotStruck` asserts `membership === 'member'` against a peer seeded as `member`.**
+  That can only ever catch a *demotion*; it never confirms the promotion the spec's headline claims
+  ("an answer on our protocol confirms membership"). Seeding `unknown` on one arm would make it
+  load-bearing — but the near list is live-member-gated (`nearProbeTargets`), so an `unknown` peer
+  very likely is not selected by the near pass at all, in which case the assertion is as strong as
+  this rig can make it and the *comment* overstates what it proves. Read `nearProbeTargets`, decide
+  which, and either strengthen the arm or soften the comment.
 - **Case 3 (`undecodable`) drops the `pingsOk` delta assertion** that cases 1 and 2 both carry.
-  Almost certainly an oversight rather than a decision; one line to restore symmetry.
-- **`backoffOf` (`test/helpers/backoff.ts`) was never read.** Its `factor()` semantics are assumed
-  by three arms (`> 0` on busy, `=== 0` on the two decay arms). Confirm `factor()` returns 0 rather
-  than `undefined`/throwing for a peer with no backoff entry, or the two `=== 0` assertions may be
-  passing on a coincidence.
+  Almost certainly an oversight; one line restores symmetry.
+- **`backoffOf(...).factor(id)` semantics are assumed, not confirmed.** Three arms depend on them
+  (`> 0` on busy, `=== 0` on the two decay arms). `test/helpers/backoff.ts` was read in run two and
+  is a thin private-field accessor — it settles nothing. Confirm in `probe-backoff.ts` that
+  `factor()` returns `0` (not `undefined`, not a throw) for a peer with **no** backoff entry, or
+  the two `=== 0` assertions may be passing by coincidence.
 - **Overlap with `fetch-snapshot-failure-arms.spec.ts` is asserted by the implementer, not
-  verified.** The handoff itself invites deleting case 4 if a reviewer disagrees it is distinct.
-  Read that spec and make the call.
-- **Every assertion is untested against the production arms.** `probeNeighborLatency`,
-  `noteRpcFailure`, `probeAndFetch` and `fetchAndMergeSnapshot` were not opened. The spec's claims
-  about which arm moves which counter are plausible and internally consistent, but a review that
-  never read the code under test has verified nothing.
+  verified.** The handoff invites deleting case 4 if a reviewer disagrees it is distinct. Read that
+  spec and make the call.
+- **Every assertion is untested against the production arms.** The spec's claims about which arm
+  moves which counter are plausible and internally consistent, but a review that never read the
+  code under test has verified nothing. This is the core of the remaining work.
 
-## The one finding the implementer deliberately escalated
+## The finding the implementer deliberately escalated
 
 `getDiagnostics()` returns the live `diag` object rather than a copy
-(`packages/fret/src/service/fret-service.ts:511`), so **any** spec that captures it as an object
-and diffs later reads zero deltas and passes vacuously. This spec avoids the trap by reading
-scalars. The implementer left the class-level question for the reviewer and did not audit other
-specs.
+(`packages/fret/src/service/fret-service.ts:511`), so **any** spec that captures it as an object and
+diffs later reads zero deltas and passes vacuously. This spec avoids the trap by reading scalars.
+Two things are owed, neither done:
 
-Two things are still owed here, and neither was done:
-
-- **The audit.** Grep the other specs for the object-snapshot pattern. If any spec has the hole, it
-  is passing vacuously today and that is a real defect, not a tripwire.
-- **The disposition.** Returning a frozen shallow copy would make the bad pattern unrepresentable,
-  but it is a production change with a per-call allocation cost. Climb *Architecture first* before
-  filing anything: this is a types/representation fix if it is worth doing at all. If it is
-  declined, it needs an accepted-tradeoff `NOTE:` at the `getDiagnostics` site so the next reviewer
-  does not re-discover it — the trap is currently documented only in the header of one spec, which
-  is the wrong home for a class-level concern.
+- **The audit.** Grep the other specs for the object-snapshot pattern. A spec with the hole is
+  passing vacuously *today* — a real defect, not a tripwire.
+- **The disposition.** A frozen shallow copy would make the bad pattern unrepresentable, at a
+  per-call allocation cost, and it is a production change. Climb *Architecture first* before filing
+  anything: this is a types/representation fix if it is worth doing at all. If declined, it needs an
+  accepted-tradeoff `NOTE:` at the `getDiagnostics` site — the trap is currently documented only in
+  one spec's header, which is the wrong home for a class-level concern.
 
 ## Validation still owed
 
-Nothing was run. All of it remains:
+Nothing has been run.
 
 - `cd packages/fret && npx tsc --noEmit`
 - `cd packages/fret && yarn test` (~8 min; foreground, no redirection — see the runner rules)
@@ -80,9 +98,9 @@ There is no lint step in this repo; `yarn check` (typecheck + build + test) is t
 ## Docs
 
 `docs/fret.md` line 79 forward-references `test/maintenance-nonok-replies.spec.ts` twice. The
-implementer says both were verified against the landed filename; that was not re-checked. Confirm
-it, and check whether any *other* doc claim the spec touches (the `busy`-records-backoff arm, the
-`fetchAndMergeSnapshot` silent arm) is now stated in the document but unpinned or misstated.
+implementer says both were verified against the landed filename; not re-checked. Confirm it, and
+check whether any *other* doc claim the spec touches (the `busy`-records-backoff arm, the
+`fetchAndMergeSnapshot` silent arm) is stated in the document but unpinned or misstated.
 
 ## Handoff being reviewed
 
@@ -91,5 +109,5 @@ The implement-stage handoff claimed: four cases, all passing; `tsc --noEmit` cle
 coarse backoff assertion (factor `> 0` only, arithmetic left to `debt-backoff-map-test-surface`),
 core profile only, one peer per case, no negative-pong arm on the fetch side (the rig rejects it
 loudly and a neighbors reply has no `ok` field), and no comparative case proving a bad answer
-scores *lower* than a good one. Treat those as the floor the review should push on, not as
-settled scope.
+scores *lower* than a good one. Treat those as the floor the review should push on, not as settled
+scope.
