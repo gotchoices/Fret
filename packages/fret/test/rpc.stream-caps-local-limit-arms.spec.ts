@@ -6,6 +6,7 @@ import { FretService } from '../src/service/fret-service.js'
 import { makeProtocols, registerRpcHandler } from '../src/rpc/protocols.js'
 import { sendPing } from '../src/rpc/ping.js'
 import { sendLeave } from '../src/rpc/leave.js'
+import { rpcRequest } from '../src/rpc/request.js'
 import { hashPeerId } from '../src/ring/hash.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
 import { backoffOf } from './helpers/backoff.js'
@@ -288,5 +289,118 @@ describe('local stream-cap refusals at every outcome-observing arm', function ()
 				expect(a.streamLimit - b.streamLimit, 'one count per refusal').to.equal(REFUSALS)
 			})
 		}
+	})
+
+	// ── The two outcomes that must NOT count ─────────────────────────────────────────────────
+	//
+	// `local-limit` counts because *our own* ceiling refused a stream we were willing to open. Two
+	// lookalikes must stay distinguishable from it and count nothing: `cancelled` — we are shutting
+	// down mid-request — and `skipped` — the dial *mode* forbade dialing, so no stream was ever
+	// attempted. A naive "count it wherever we see a stream error" implementation over-counts
+	// exactly here, which is what makes these two rows worth their weight.
+	//
+	// They sit **outside** the `arms` table on purpose: every table row is driven twice (control
+	// pass, then capped pass) and neither of these wants either — no cap is involved, so there is
+	// nothing to control against. The block is placed after the capped block so it cannot perturb
+	// that table's diagnostics deltas, and each row reads `getDiagnostics()` immediately before its
+	// own loop. Both rows are cap-independent even though the caps are installed by now: the
+	// `cancelled` row returns at `rpcRequest`'s entry check before any stream is opened, and the
+	// `skipped` row has no connection to open one on.
+	//
+	// Neither row goes through a service pass. Both drive the sender directly and hand the returned
+	// `RpcOutcome` to the observing site — the same shape the "shared noteRpcFailure seam" row
+	// above already uses — so they need no new private surface and no widening of the `priv()` cast.
+	describe('non-counting — an outcome that is not our own ceiling counts nothing', () => {
+		let third: Libp2p
+		let thirdId: string
+
+		before(async () => {
+			// A third node, deliberately never dialed. `dial: 'never'` maps to
+			// `requireExisting: true`, so `openRpcStream` yields no stream only when there is no
+			// open connection — and the rig's own `before` dials the *remote*, so a 'never'
+			// request against that peer would find a live connection and succeed. This node needs
+			// no address either, since nothing ever dials it.
+			third = await createMemNode()
+			await third.start()
+			thirdId = third.peerId.toString()
+			store.upsert(thirdId, await hashPeerId(third.peerId))
+			store.setMembership(thirdId, 'member')
+		})
+
+		after(async () => { await stopAll([third]) })
+
+		/**
+		 * Deliberately **not** shared with the counting rows above. A helper both kinds could use
+		 * would have to weaken the counter assertion to "did not decrease", which would make every
+		 * counting row vacuous. Here the delta is a strict equality against the pre-loop reading.
+		 *
+		 * Same `REFUSALS` (4) drives with the spacing rewind between them as the table rows use, so
+		 * a booked strike would provably have reached `dead` rather than merely have moved a
+		 * counter. `rewindSpacing()` writes `lastContactFailureAt` on the capped remote, so the
+		 * rewind is done against whichever peer the row actually drives.
+		 */
+		const expectCountsNothing = async (id: string, drive: () => Promise<void>) => {
+			const read = () => {
+				const e = store.getById(id)
+				expect(e, 'the peer is in the routing table').to.not.equal(undefined)
+				return e!
+			}
+			const start = { ...read() }
+			const b = { ...svc.getDiagnostics() }
+
+			for (let i = 0; i < REFUSALS; i++) {
+				await drive()
+				store.update(id, { lastContactFailureAt: 0 })
+			}
+
+			const now = read()
+			expect(now.contactFailures, 'no contact strike').to.equal(0)
+			expect(now.state, 'never marked dead').to.not.equal('dead')
+			expect(now.membership, 'membership label untouched').to.equal(start.membership)
+			expect(now.relevance, 'relevance untouched').to.equal(start.relevance)
+			expect(now.failureCount, 'no failure recorded').to.equal(start.failureCount)
+			expect(now.successCount, 'no success recorded either').to.equal(start.successCount)
+			expect(now.negotiateFailures, 'not membership evidence').to.equal(0)
+			expect(backoffOf(svc).factor(id), 'no backoff — the next pass probes fresh').to.equal(0)
+
+			const a = svc.getDiagnostics()
+			// The delta that makes the row non-counting: strict equality against the pre-loop
+			// reading, never a "did not decrease".
+			expect(a.streamLimit - b.streamLimit, 'not our ceiling — nothing to count').to.equal(0)
+		}
+
+		it('cancelled — a refusal landing during stop() is not our ceiling', async () => {
+			// `classify` tests the caller's signal first, so a refusal arriving while the caller is
+			// aborting classifies `cancelled` rather than whatever the wire did. This row does not
+			// drive that narrow window: an already-aborted controller takes `rpcRequest`'s **entry**
+			// exit (`if (opts.signal?.aborted === true) return { kind: 'cancelled' }`, inside the
+			// `try` right after the deadline is armed), so no stream is opened at all.
+			//
+			// Residual, stated rather than papered over: what the row pins is that the *outcome*
+			// `cancelled` counts nothing at `noteRpcFailure` — the arm a naive "count it wherever we
+			// see a stream error" gets wrong. *Which* error was suppressed is deliberately not
+			// pinned: the `classify` exit (a real refusal reclassified `cancelled` because the
+			// caller's signal fired first) is driven by no row in this spec.
+			await expectCountsNothing(peerId, async () => {
+				const ac = new AbortController()
+				ac.abort()
+				const out = await sendPing(local, peerId, P.PROTOCOL_PING, { timeoutMs: 2000, signal: ac.signal })
+				expect(out.kind, 'the caller signal wins over every network outcome').to.equal('cancelled')
+				await priv().noteRpcFailure(peerId, out)
+			})
+		})
+
+		it('skipped — the dial mode forbade dialing, so no stream was ever attempted', async () => {
+			await expectCountsNothing(thirdId, async () => {
+				// `sendPing` exposes no dial mode, so this drives `rpcRequest` directly. Its
+				// write-only overload never comes into play: `openRpcStream` returns `undefined`
+				// before any write, because 'never' forbids the dial and no connection to this
+				// node was ever opened. A *broken* dial would be `unreachable`, which is a
+				// different row's outcome entirely.
+				const out = await rpcRequest(local, thirdId, P.PROTOCOL_PING, { dial: 'never', timeoutMs: 2000 })
+				expect(out.kind, 'no stream opened, hence no outcome about the peer').to.equal('skipped')
+				await priv().noteRpcFailure(thirdId, out)
+			})
+		})
 	})
 })
