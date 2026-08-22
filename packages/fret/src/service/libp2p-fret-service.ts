@@ -169,11 +169,11 @@ export class Libp2pFretService implements Startable, FretService {
 
 	// Metadata pass-throughs for Arachnode adapter
 	setMetadata(metadata: Record<string, unknown>): void {
-		this.ensure().setMetadata(metadata);
+		return this.ensure().setMetadata(metadata);
 	}
 
 	report(evt: ReportEvent): void {
-		this.ensure().report(evt);
+		return this.ensure().report(evt);
 	}
 
 	getMetadata(peerId: string): Record<string, unknown> | undefined {
@@ -193,7 +193,7 @@ export class Libp2pFretService implements Startable, FretService {
 	}
 
 	reportNetworkSize(estimate: number, confidence: number, source?: string): void {
-		this.ensure().reportNetworkSize(estimate, confidence, source);
+		return this.ensure().reportNetworkSize(estimate, confidence, source);
 	}
 
 	getNetworkSizeEstimate(): { size_estimate: number; confidence: number; sources: number } {
@@ -209,7 +209,7 @@ export class Libp2pFretService implements Startable, FretService {
 	}
 
 	setActivityHandler(handler: ActivityHandler): void {
-		this.ensure().setActivityHandler(handler);
+		return this.ensure().setActivityHandler(handler);
 	}
 
 	iterativeLookup(key: Uint8Array, options: LookupOptions): AsyncGenerator<RouteProgress> {
