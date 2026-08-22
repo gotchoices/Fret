@@ -5,6 +5,7 @@ import { percentileSummary } from './simulation/sim-metrics.js'
 import { DeterministicRNG } from './simulation/deterministic-rng.js'
 import { chooseNextHop } from '../src/selector/next-hop.js'
 import { refMinDistance, toCoord } from './helpers/ring.js'
+import { pump } from './simulation/pump.js'
 
 /**
  * Does ring routing actually work?
@@ -81,14 +82,6 @@ import { refMinDistance, toCoord } from './helpers/ring.js'
  * fails the other way: it keeps most routes alive (83–90%) but drags them the long way round the
  * ring. So the p90 upper bound catches clockwise-only, and the success floor catches XOR.
  */
-
-/** Drive every event scheduled up to `uptoMs`, one at a time, then park the clock there. */
-function pump(sim: FretSimulation, uptoMs: number): void {
-	while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
-		sim.processEvent(sim.scheduler.nextEvent()!)
-	}
-	sim.scheduler.advanceTo(uptoMs)
-}
 
 function baseConfig(overrides: Partial<SimConfig> = {}): SimConfig {
 	return {

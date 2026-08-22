@@ -1,32 +1,35 @@
-description: A simulation test that checks whether grouping peers into clusters makes messages travel farther now takes so long it trips the test framework's five-minute limit and reports as failing, even though every measurement it makes is correct. The test needs to be made faster, and a few smaller clean-ups from the same review still need doing.
-files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation.routing.spec.ts, packages/fret/test/simulation/fret-sim.ts, docs/fret.md
+description: A simulation test that checks whether grouping peers into clusters makes messages travel farther now takes so long it trips the test framework's five-minute limit and reports as failing, even though every measurement it makes is correct. Most of the speed-up work is now written but has not yet been run, so the next step is to check it compiles, time it, and finish a few smaller clean-ups.
+files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/pump.ts, packages/fret/test/simulation.routing.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/churn-scenarios.spec.ts, docs/fret.md
 difficulty: medium
 ---
 
-Fourth review run for `sim-placement-guards-no-control`. Runs 1 and 2 hit the soft token budget
-before validating anything. Run 3 ran the validation and found the blocking failure recorded below.
-Run 4 (this one) re-read the two specs and **confirmed the two code-level facts the fix depends on**,
-then hit the budget warning with no edits landed. Nothing below needs re-reading ticket history.
-**No source file has been modified by any review run except the committed comment fix at a619d51;
-the working tree is clean of review edits.**
+Fifth review run for `sim-placement-guards-no-control`. Runs 1, 2 and 4 hit the soft token budget
+before landing anything. Run 3 ran the validation and found the blocking failure recorded below.
+**Run 5 (the previous one) landed real edits and then hit the budget warning before it could run
+anything.** Nothing below needs re-reading ticket history.
 
-## Validated (do not repeat)
+## Working tree state — read this first
 
-- `npx tsc --noEmit` from `packages/fret/` — **clean**. `FretSimulation.getStores()`,
-  `scheduler.peek()`, `scheduler.advanceTo()` and `SimConfig.capacity` all exist as the new test
-  uses them.
-- `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 300000`
-  from `packages/fret/` — **28 passing, 1 failing, 7 minutes wall clock.**
-- **Confirmed by reading (run 4):** `pump` is byte-identical in
-  `test/simulation.routing.spec.ts:86-91` and `test/message-bus.spec.ts:401-406` — same three-line
-  body, same doc-comment intent.
-- **Confirmed by reading (run 4):** in `test/message-bus.spec.ts`, `centersFor(seed)` builds and
-  `initialize()`s a full 300-peer clustered sim purely to call `sim.getClusterCenters()`, and then
-  `measure(seed, 'clustered', centers)` builds a *second* sim from the identical
-  `cfgFor(seed, 'clustered')`. Over `PLACEMENT_SEEDS` (5 seeds) that is 5 redundant 300-peer
-  initializations out of 15 sims built.
+Run 5 modified three files. **They are unvalidated: no type-check and no test run has touched
+them.** Start by type-checking, then re-time.
 
-## The blocking failure
+- **`packages/fret/test/simulation/pump.ts` — new file.** Exports the shared
+  `pump(sim, uptoMs)`, doc sentence preserved verbatim: "Drive every event scheduled up to
+  `uptoMs`, then park the clock there."
+- **`packages/fret/test/simulation.routing.spec.ts`** — local `pump` deleted, now imports the
+  shared one.
+- **`packages/fret/test/message-bus.spec.ts`** — local `pump` deleted, now imports the shared one.
+  `centersFor` deleted entirely; `measure(seed, placement, given?)` now derives the centers on the
+  clustered arm (keeping the `expect(..., 'clustered placement must expose its centers').to.exist`)
+  and *requires* the caller-supplied ones on the uniform arm, returning `centers` in its result.
+  The sweep loop runs clustered first, then `measure(seed, 'uniform', clustered.centers)`. Also
+  added two decision comments (see *Findings decided in run 5* below).
+
+The one thing to double-check by eye, since nothing has compiled it: `FretSimulation` is still
+*used* (not merely imported) in both specs after the pump deletions — confirm neither import went
+unused, since `verbatimModuleSyntax` is on.
+
+## The blocking failure (unchanged — this is what must now be re-timed)
 
 ```
 1) Placement distributions
@@ -47,83 +50,83 @@ seed   99: clustered 6.70 uniform 3.10      (comment: 6.70 / 3.10)
 
 All arms 10/10 successful, store size 32 on every arm, every assertion passes. The test body is
 synchronous, so mocha's timer fires only once the body returns: the failure is elapsed wall time and
-nothing else. Not a wrong threshold, not a flaky measurement — the runtime tax the implement stage
-estimated at ~130 s is actually over 300 s. Caused by this ticket's own diff, so it must be fixed
-here; it is **not** a pre-existing failure and must not be reported as one.
+nothing else. Not a wrong threshold, not a flaky measurement. Caused by this ticket's own diff, so
+it must be fixed here; it is **not** a pre-existing failure and must not be reported as one.
 
 **Do not fix it by raising the timeout.** A single test over five minutes is past agent-runnable.
 
-## The fix, in the order to try it
+## Remaining work, in order
 
-**Step 1 — drop the redundant `centersFor` sim.** Costs nothing in coverage. Change `measure` so the
-clustered arm returns the centers it already has, and drive the uniform arm afterwards with them:
+**Step A — type-check.** `cd packages/fret && npx tsc --noEmit`. Fix whatever the run-5 edits broke.
+
+**Step B — re-time.** Run 5's edit removes 5 of the 15 300-peer sim initializations the sweep built
+(one per seed), so expect roughly 300 s -> ~200 s. **That may not be enough on its own.**
 
 ```
-function measure(seed, placement, centers?) -> { hops, succeeded, attempts, storeSize, centers }
+node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 300000
 ```
 
-For `placement === 'clustered'`, take `centers` from `sim.getClusterCenters()` after `initialize()`
-(keeping the existing `expect(centers, 'clustered placement must expose its centers').to.exist`);
-for `'uniform'`, require the caller-supplied `centers`. The loop body then runs clustered first,
-uniform second. Delete `centersFor` entirely.
+Run it in the foreground with no redirection (or `| tee tickets/.logs/30-sim-placement.test.log`
+if you need to grep it). Gate: 29 passing, 0 failing, comfortably inside the timeout.
 
-**Do not** let the uniform arm derive its own centers — both arms must route between identical
-coordinates or the control is destroyed. This removes a third of the sims the sweep builds, so
-expect roughly 300 s -> ~200 s. **That may not be enough on its own; re-time before stopping.**
-
-**Step 2 — only if step 1 is not enough, cut `ROUTES` (currently 10), not the seed count.** The
+**Step C — only if step B is still too slow, cut `ROUTES` (currently 10), not the seed count.** The
 implementer kept five seeds deliberately: the whole point of the rewrite was to stop asserting on one
 seed. If seeds are cut anyway, the measured table in the test's comment must be **re-taken**, not
 trimmed — a table listing seeds the test no longer runs is a false claim about what was measured.
-The same applies to the numbers in `docs/fret.md` (see below).
+The same applies to the numbers in `docs/fret.md` (see step E).
 
-Gate: re-run the two-spec command above and confirm green.
-
-## Confirmed hygiene finding — fix inline
-
-Extract the duplicated `pump(sim, uptoMs)` into a small shared module, e.g.
-`test/simulation/pump.ts` (`placement-assertions.ts` is placement-specific, so not there), and have
-both specs import it. Keep the existing doc sentence: "Drive every event scheduled up to `uptoMs`,
-then park the clock there."
-
-**Scope correction — a prior run mis-scoped this.** There is a *second*, different pump idiom
+**Step D — park the second pump idiom as a tripwire.** There is a *second*, different pump idiom
 (`while (pending > 0) { const evt = nextEvent(); if (!evt || evt.time > bound) break; ... }`, which
 pops an event and then discards it when it lands past the bound). It is **pre-existing and
 widespread** — `churn-scenarios.spec.ts` at six sites, `sim-profiles.spec.ts` at two,
-`message-bus.spec.ts:318` — and this ticket's diff did not introduce it. Do **not** fold it into the
-inline fix. Park the dropped-event behavior as a `NOTE:` tripwire at one of those sites, or file a
-`debt-` ticket if it turns out to change any reading.
+`message-bus.spec.ts` at one — and this ticket's diff did not introduce it. Do **not** fold it into
+the shared `pump`. Add one `NOTE:` tripwire at a single one of those sites recording the
+dropped-event behavior, or file a `debt-` ticket if it turns out to change any reading.
+
+**Step E — verify `docs/fret.md`.** The *Testing strategy -> Simulation* bullet beginning
+"**Placement is guarded by two tests**". Never diffed against the final shipped test body. Confirm
+the numbers it quotes (n=300 / capacity 32, 4.8-7.1 versus 2.0-3.1 hops, 1.5-hop margin, 2m+1 = 17)
+still match. If `ROUTES` or the seed set changed in step C, this bullet changes with it.
+
+## Findings decided in run 5 — carry these verdicts into the `complete/` ticket
+
+- **`storeSize` sampled from the first sender only** — **accepted as shipped.** One sample proves
+  the store bound bit, which is the assertion's stated purpose, and every peer in the sweep is
+  enforced against the same capacity. Recorded as a `NOTE:` at the sample site in `measure`.
+- **`cfgFor` passes `clusterConfig` on the uniform arm too**, where it is unused — **accepted as
+  shipped, and arguably right**: it keeps the two configs identical but for `placement`, which is
+  the point of the control. Recorded as a comment at that field.
 
 ## Findings still needing a judgement call
 
-None is believed to be a correctness defect. The output `complete/` ticket must state a decision for
-each — explicitly, with a reason, not silently.
-
-- **`storeSize` is sampled from the first sender only** (`firstSender ??= from`). One sample proves
-  the store bound actually bit, which is the assertion's stated purpose, so this is very likely fine
-  as shipped. Say so rather than leaving it unremarked.
-- **`cfgFor` passes `clusterConfig` on the uniform arm too**, where it is unused. Harmless and
-  arguably right: it keeps the two configs identical but for `placement`, which is the point of the
-  control. Decide and state it.
 - **The ~90-line comment block** above the second test. Judge whether it reads better as shorter
   prose plus named constants, per the source-hygiene rule preferring naming and composition over
-  comment blocks.
+  comment blocks. Run 5 did not touch it (it only added the two short decision comments above).
+  Weigh carefully before trimming: the block carries a *measured* seed table that is load-bearing
+  evidence for the thresholds, so shorten the prose, not the tables.
 
 ## Aspect angles still unexamined
 
-- **Source file size — measured, needs a judgement.** `wc -l packages/fret/test/message-bus.spec.ts`
-  reports **585 lines**; other touched files: `simulation/fret-sim.ts` 923,
-  `simulation/placement.ts` 135, `simulation/placement-assertions.ts` 81. Decide whether 585 lines
-  warrants a split (the `Placement distributions` describe block is the natural seam) or is
-  acceptable, and say which.
-- **`docs/fret.md`'s *Testing strategy -> Simulation* bullet** — the paragraph beginning "**Placement
-  is guarded by two tests**". It was read in the AGENTS.md context and looked accurate, but has never
-  been diffed against the final shipped test body. Confirm the numbers it quotes (n=300 / capacity
-  32, 4.8-7.1 versus 2.0-3.1 hops, 1.5-hop margin, 2m+1 = 17) still match after the runtime fix. If
-  `ROUTES` or the seed set changes, this bullet changes with it.
+- **Source file size — measured, needs a judgement.** Before run 5's edits
+  `wc -l packages/fret/test/message-bus.spec.ts` reported **585 lines** (run 5's net change is
+  roughly -10). Other touched files: `simulation/fret-sim.ts` 923, `simulation/placement.ts` 135,
+  `simulation/placement-assertions.ts` 81, the new `simulation/pump.ts` ~9. Re-measure with `wc -l`
+  and decide whether it warrants a split (the `Placement distributions` describe block is the
+  natural seam) or is acceptable, and say which.
 - **Resource cleanup.** Sims are local and dropped; confirm nothing arms a timer the mocha exit
-  watchdog would catch. The run above exited cleanly with the watchdog armed — suggestive, but that
+  watchdog would catch. Run 3's run exited cleanly with the watchdog armed — suggestive, but that
   was not what was being tested.
+
+## Validated (do not repeat)
+
+- `npx tsc --noEmit` from `packages/fret/` — clean **at run 3's tree**, i.e. *before* run 5's edits.
+  `FretSimulation.getStores()`, `scheduler.peek()`, `scheduler.advanceTo()` and `SimConfig.capacity`
+  all exist as the test uses them. This does **not** cover run 5's edits — see step A.
+- The two-spec command above at run 3's tree — **28 passing, 1 failing, 7 minutes wall clock.**
+- **Confirmed by reading (run 4):** `pump` was byte-identical in both specs. Resolved by run 5.
+- **Confirmed by reading (run 4):** `centersFor` built and `initialize()`d a full 300-peer clustered
+  sim purely to read `getClusterCenters()`, i.e. 5 redundant initializations of 15. Resolved by
+  run 5.
 
 ## Tripwires already parked at their code sites — do not re-file
 
@@ -137,4 +140,5 @@ each — explicitly, with a reason, not silently.
 
 The `complete/` ticket must carry a `## Review findings` section listing what was checked, what was
 found, and what was done — empty categories stated explicitly with a reason, not omitted. The
-"Validated" section above can be carried into it verbatim as the "what was checked" half.
+"Validated" section above and the run-5 verdicts can be carried into it as the "what was checked"
+and "what was decided" halves.

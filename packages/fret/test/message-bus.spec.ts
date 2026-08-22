@@ -11,6 +11,7 @@ import {
 	PLACEMENT_SEEDS,
 } from './simulation/placement-assertions.js'
 import { toCoord } from './helpers/ring.js'
+import { pump } from './simulation/pump.js'
 
 describe('DeterministicRNG extensions', () => {
 	it('nextGaussian produces values with mean ~0 and stddev ~1', () => {
@@ -397,14 +398,6 @@ describe('Placement distributions', function () {
 		const ROUTES = 10
 		const MIN_HOP_MARGIN = 1.5
 
-		/** Drive every event scheduled up to `uptoMs`, then park the clock there. */
-		function pump(sim: FretSimulation, uptoMs: number): void {
-			while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
-				sim.processEvent(sim.scheduler.nextEvent()!)
-			}
-			sim.scheduler.advanceTo(uptoMs)
-		}
-
 		function cfgFor(seed: number, placement: 'uniform' | 'clustered'): SimConfig {
 			return {
 				seed,
@@ -415,31 +408,39 @@ describe('Placement distributions', function () {
 				stabilizationIntervalMs: 500,
 				durationMs: 60000,
 				placement,
+				// Passed on the uniform arm too, where it is unused: the two configs then differ
+				// by `placement` alone, which is the point of the control.
 				clusterConfig: { numClusters: NUM_CLUSTERS, spreadBits: SPREAD_BITS },
 				capacity: CAPACITY,
 			}
 		}
 
 		/**
-		 * Centers are drawn once from the clustered arm and reused by both arms, which is what
-		 * makes the uniform run a control: same coordinates, same selection rule, only the
-		 * placement differs.
+		 * The clustered arm reports the centers it placed itself; the uniform arm must be handed
+		 * those same centers rather than deriving its own. That is what makes the uniform run a
+		 * control: identical coordinates and identical origin-selection rule, only the placement
+		 * differs. Letting the uniform arm pick its own centers would destroy the control — and
+		 * building a throwaway clustered sim purely to read the centers off costs a third of the
+		 * sweep's 300-peer initializations for nothing.
 		 */
-		function centersFor(seed: number): readonly bigint[] {
-			const sim = new FretSimulation(cfgFor(seed, 'clustered'))
-			sim.initialize()
-			const centers = sim.getClusterCenters()
-			expect(centers, 'clustered placement must expose its centers').to.exist
-			return centers!
-		}
-
 		function measure(
 			seed: number,
 			placement: 'uniform' | 'clustered',
-			centers: readonly bigint[]
+			given?: readonly bigint[]
 		) {
 			const sim = new FretSimulation(cfgFor(seed, placement))
 			sim.initialize()
+
+			let centers: readonly bigint[]
+			if (placement === 'clustered') {
+				const own = sim.getClusterCenters()
+				expect(own, 'clustered placement must expose its centers').to.exist
+				centers = own!
+			} else {
+				expect(given, 'uniform arm must be given the clustered arm's centers').to.exist
+				centers = given!
+			}
+
 			pump(sim, CONVERGE_MS)
 
 			const alive = Array.from(sim.getPeers().values()).filter((p) => p.alive)
@@ -457,14 +458,17 @@ describe('Placement distributions', function () {
 				hops: metrics.avgRoutingHops,
 				succeeded: metrics.successfulRouteHops.length,
 				attempts: metrics.routingAttempts,
+				// NOTE: sampled from the first sender only. One sample is enough for what the
+				// assertion claims — that the store bound actually bit — and every peer in the
+				// sweep is enforced against the same capacity.
 				storeSize: sim.getStores().get(firstSender!)?.size() ?? -1,
+				centers,
 			}
 		}
 
 		for (const seed of PLACEMENT_SEEDS) {
-			const centers = centersFor(seed)
-			const clustered = measure(seed, 'clustered', centers)
-			const uniform = measure(seed, 'uniform', centers)
+			const clustered = measure(seed, 'clustered')
+			const uniform = measure(seed, 'uniform', clustered.centers)
 			console.log(
 				`  routing seed ${seed}: clustered ${clustered.hops.toFixed(2)} hops ` +
 					`(${clustered.succeeded}/${clustered.attempts}, store ${clustered.storeSize}), ` +
