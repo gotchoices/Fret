@@ -1,154 +1,94 @@
-description: Two simulation tests now check that grouping peers into clusters really does change the network's shape and slow down message routing; the second one used to pass no matter what the answer was, and has been rewritten around a measurement that finally shows a difference.
-files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/churn-scenarios.spec.ts, docs/fret.md
+description: A review pass over two simulation tests that check whether grouping peers into clusters really changes how messages travel was cut short by a budget limit; the code was read and notes taken, but the tests still need to be run and a few small clean-ups applied.
+files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/placement.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/churn-scenarios.spec.ts, docs/fret.md
 difficulty: medium
 ---
 
-Thirteen prior runs went into this; the last three produced no source edits, only measurement. What
-finally landed is below, along with the three findings that explain why the earlier shapes of the
-second test were abandoned — read those before questioning the design, because each one was
-re-derived more than once.
+Continuation of the review stage for `sim-placement-guards-no-control`. The prior review run read
+the whole implement-stage diff (`git diff 4584078..HEAD -- packages/fret/test/message-bus.spec.ts
+packages/fret/test/churn-scenarios.spec.ts packages/fret/test/simulation/`) and hit the runner's
+soft token budget before running anything. Nothing below needs re-reading the ticket history — the
+findings are stated in full.
 
-## What shipped
+## Already done this run
 
-Two tests in `test/message-bus.spec.ts`, under `describe('Placement distributions')`, plus a
-supporting module and two small harness additions.
+- Read the cumulative diff for all five touched files with fresh eyes.
+- **Fixed inline**: the doc comment on `MAX_PEERS_IN_ONE_SPACING_ARC` in
+  `test/simulation/placement-assertions.ts` still said its two arms "are asserted below". They are
+  not below — the constant moved out of `churn-scenarios.spec.ts` into this module and the
+  assertions stayed behind. Comment now names the spec file. **This edit is uncommitted and
+  unverified** (no typecheck run after it); it is a comment body only, so the risk is a long line,
+  not a compile error.
 
-**Test 1 — `clustered placement: peers cluster around centers`** (unchanged this run; finished
-earlier). Geometric: counts the most peers falling inside any one average-spacing arc of the ring.
-Threshold `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC = 5`, asserted in **both** directions over all
-five `PLACEMENT_SEEDS`, so the threshold's separating power is re-proved every run rather than
-measured once. Latest run: clustered 13/12/15/17/12, uniform 1/1/1/1/1.
+## Must still be done before this ticket can move to complete/
 
-**Test 2 — `clustered placement: inter-cluster routing takes more hops`** (rewritten this run).
-Behavioural: routes between real cluster centers and compares average hop count against a uniform
-control routing between the *same two coordinates* under the *same* sender-selection rule. Measured
-2026-08-21, all five seeds, every arm 10/10 successful with store size exactly 32:
-
-| seed | clustered | uniform | margin |
-|---|---|---|---|
-| 8008 | 4.90 | 2.30 | 2.60 |
-| 8009 | 5.00 | 2.60 | 2.40 |
-| 8010 | 7.10 | 2.00 | 5.10 |
-| 4242 | 4.80 | 2.00 | 2.80 |
-| 99   | 6.70 | 3.10 | 3.60 |
-
-Asserted per seed: `clustered > uniform + 1.5`, plus `attempts == 10`, `successes == 10`, and
-`storeSize == 32` on **both** arms. Smallest observed margin is 2.40, so 1.5 sits 1.6x inside it.
-
-The store-size assertion is not decoration — it is the guard against the exact failure this ticket
-existed to fix (Finding A). If the bound stops biting, the test fails loudly instead of quietly
-measuring one hop in both arms and passing.
-
-Supporting code (all landed in earlier runs, all now consumed):
-`test/simulation/placement-assertions.ts` exports `coordToBigInt`, `maxPeersInOneSpacingArc`,
-`nearestAlivePeerTo`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
-`MAX_PEERS_IN_ONE_SPACING_ARC = 7`; `CoordPlacement.centers` and
-`FretSimulation.getClusterCenters()` expose the cluster centers. `nearestAlivePeerTo` and
-`getClusterCenters` had no consumer until this run — test 2 is now it, so nothing in that set is
-dead code any more.
-
-`test/churn-scenarios.spec.ts` consumes `MAX_PEERS_IN_ONE_SPACING_ARC` for its own two placement
-guards (batch-burst and steady-trickle joiners); unchanged this run, passing.
-
-`docs/fret.md` gained a bullet under *Testing strategy -> Simulation* recording both guards, their
-measured numbers, and the bounded-store precondition.
-
-## Why the old test measured nothing — the three findings
-
-These are the reviewer's context for why the obvious simpler designs were tried and abandoned.
-
-**Finding A — the unbounded store made every route one hop.** `FretSimulation.handleRoute`
-(`test/simulation/fret-sim.ts` L785-793) declares a route successful the moment the peer holding
-the message is the target coordinate's anchor *in its own store*. At n=30 with `capacity` unset,
-5 s of stabilization leaves every peer holding every other peer, so the originator's own store
-already names the globally-nearest peer to any target: it delivers in one hop and that peer is the
-anchor. The old test measured 0.9-1.0 average hops in *both* arms on *every* seed with 10/10
-successes, and asserted `clustered > uniform` with no margin on a single hardcoded seed — it would
-have passed or failed on floating-point noise. No target-generation scheme can fix this; the store
-has to be bounded. `docs/fret.md` records the same degeneracy for the three unbounded routing cases
-in `simulation.routing.spec.ts`.
-
-**Finding B — a store bound is unreachable at n=30, which is why n is 300.**
-`FretSimulation.enforceCapacity` (`fret-sim.ts` L701-721) mirrors production: eviction skips a
-protection set and **protection outranks the cap**, so with `capacity < 2m + 1` the evictable set
-runs out and the store simply stays over capacity. At m = 8 that floor is 17 — far above any
-"small fraction of 30". So test 2 does not share test 1's n. At n = 300, `capacity: 32` is ~10.7%
-of the population and is comfortably above the floor; it is also the same bounded regime
-`simulation.routing.spec.ts` already measures (cap 32 at n=1000 -> 100% success, p90 7-8 hops).
-
-**Finding C — the sweep that "timed out" was draining a config field nothing simulates.** An
-earlier run's sweep pumped the scheduler all the way to `durationMs` (30 s, i.e. 60 stabilization
-ticks over 300 peers) and blew its budget, which nearly got the whole test deleted as unmeasurable.
-`simulation.routing.spec.ts` never does that: it pumps only to a fixed convergence time and its
-doc-block records why — store contents measured flat from t=2000 through t=20000. Using that pump
-(`pump(sim, uptoMs)`, inlined in the test) each sim costs ~11 s instead of minutes, and the whole
-10-sim sweep runs in ~2 minutes. The "delete it because measuring is unaffordable" outcome is
-therefore withdrawn; it was affordable all along.
-
-## Validation
-
-Both from `packages/fret/`:
+**Validation — nothing was run.** Both from `packages/fret/`:
 
 ```
 node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 300000
 npx tsc --noEmit
 ```
 
-**29 passing (3m), typecheck clean.** No pre-existing failures surfaced. Full `yarn test` was NOT
-run this run — see gaps.
+Budget permitting, also `yarn test` — the implement handoff never ran the full suite either, and
+its stated blast-radius argument ("only a spec and a docs file changed") is reasoning, not a green
+run. There is no lint step in this repo (`yarn check` = typecheck + build + test; `yarn format` is
+forbidden, see AGENTS.md).
 
-Console output is deliberately verbose (one line per seed per test) so a future reader who has to
-re-tune a threshold can read the current numbers straight off a CI log rather than re-deriving
-them.
+**Verify the API surface the new test leans on actually exists** — read, don't assume:
+`FretSimulation.getStores()`, `scheduler.peek()`, `scheduler.advanceTo()`, and a `capacity` field
+on `SimConfig` (`test/simulation/fret-sim.ts`). The typecheck above covers this, so running it is
+the cheap proof.
 
-## Use cases for the reviewer to poke at
+## Findings recorded but not yet dispositioned
 
-- **Does the second test actually bite?** Set `capacity: undefined` in `cfgFor` — the store-size
-  assertion should fail at 300, and if you also drop that assertion the hop counts should collapse
-  to ~1.0 in both arms and the margin assertion should fail. That is the Finding A regression.
-- **Is the control a real control?** The centers are drawn once from a `clustered` sim and reused
-  by the `uniform` arm (`centersFor`), so both arms route between identical coordinates. Check that
-  reuse survived the rewrite — deriving centers separately per arm would silently make the arms
-  differ by more than placement.
-- **Is 1.5 the right margin?** Smallest observed margin is 2.40. Argue it up or down; the numbers
-  to argue against are in the table above and in the test's comment.
-- **Runtime.** Test 2 takes ~121 s. It sets its own `this.timeout(300000)`, overriding the
-  describe's 60 s. That is roughly 2.5x headroom on the measured time, on this machine.
+Each needs a judgement call the prior run did not get to make. None is believed to be a correctness
+defect; they are hygiene and cost.
 
-## Known gaps — flagged, not papered over
+- **Two different pump idioms inside one `describe`.** The second test defines a local `pump(sim,
+  uptoMs)` helper (peek/nextEvent/advanceTo). The first test's `reading()` hand-rolls a different
+  loop that calls `nextEvent()` and then *discards* the popped event when its time exceeds the
+  bound. Same intent, two implementations, and the first silently drops one event. Candidate for a
+  shared helper in `test/simulation/` (the routing spec has a third copy of this idiom — check
+  `test/simulation.routing.spec.ts` before writing a fourth). Disposition: probably a minor
+  inline fix; if it grows past the two call sites, it is a `debt-` ticket.
+- **`centersFor(seed)` builds and initializes an extra 300-peer simulation per seed purely to read
+  the cluster centers**, then `measure()` builds another for the clustered arm with the same
+  config. That is 5 wasted `initialize()` calls at n=300 across the sweep. Given the test already
+  costs ~121 s, this is worth checking: if `measure()` can return the centers from the clustered
+  arm it already builds and the uniform arm can be driven afterwards, the sweep loses a third of
+  its sims. Do **not** restructure so the uniform arm derives centers separately — that would
+  destroy the control (both arms must route between identical coordinates).
+- **`storeSize` is sampled from the first sender only** (`firstSender ??= from`). One sample is
+  enough to prove the bound bit, which is the assertion's stated purpose, so this is likely fine as
+  is — but say so explicitly in the findings rather than leaving it unremarked.
+- **`cfgFor` passes `clusterConfig` on the uniform arm too**, where it is unused. Harmless and
+  arguably keeps the two configs identical-but-for-placement, which is the point of the control.
+  Decide and state, don't silently leave it.
+- **The runtime tax is the implement stage's own flagged gap** and is a judgement call for this
+  review: `test/message-bus.spec.ts` went from a few seconds to ~130 s, all of it the second test
+  (five seeds x two arms x ~12 s). Levers are fewer seeds or a smaller `ROUTES`. The implementer
+  kept five seeds deliberately because the rewrite's whole point was to stop asserting on one seed.
+  Either endorse that or cut it — but if cut, the measured table in the test's comment must be
+  re-taken, not just trimmed.
 
-- **Runtime is the main cost of this change.** `test/message-bus.spec.ts` went from a few seconds
-  to ~130 s. That is a real tax on every full test run and a reviewer may reasonably want it cut —
-  the honest levers are fewer seeds (say 3 of 5, halving the time and the evidence) or a smaller
-  `ROUTES`. It was left at five seeds because the whole point of the rewrite was to stop asserting
-  on one seed. Not filed as a ticket: it is a judgement call for the reviewer, not a defect.
-- **Only the two spec files this ticket touches were run.** The full suite was not run this run
-  (budget). The changed files are one test spec and a docs file, so the blast radius is that spec —
-  but that is reasoning, not a green run.
-- **`spreadBits` is pinned at 32 and the wider-cluster case was never measured.** The prior plan
-  listed widening to ~224 as the fallback if 32 did not separate. It separated, so 224 was never
-  run. Note `CoordPlacement.clusteredCoord` scales its Gaussian offset through a JS float, so it is
-  exact only to ~52 bits — raising `spreadBits` past 52 in a shipped test needs that scaling moved
-  into BigInt first. This is recorded at the code site already.
-- **The test does not discriminate the cost function's slack constants**, and says so in its
-  comment. The sim's near radius is `4k/store.size()` of maximum ring distance, so at k=15 over a
-  32-entry store the fraction is 60/32 > 1 and clamps to half the ring, putting every candidate in
-  the selector's *near* branch. What is discriminated is the distance metric and the placement.
-  A reviewer should check the comment does not over-claim beyond that.
-- **No property/generalized test was added**, only two point measurements over five fixed seeds.
-  A generator over (n, capacity, numClusters, spreadBits) asserting the ordering would be the
-  stronger guard. Not filed — the class has exactly two instances today and both are now covered;
-  file it if a third placement guard appears.
+## Aspect angles not yet covered
 
-## Tripwires
+The prior run read for correctness and comment accuracy only. Still unexamined: source-file size
+(`test/message-bus.spec.ts` is now large — measure it with a line count and state the number),
+whether the second test's ~90-line comment block would be better as shorter prose plus a named
+constant, resource cleanup (the sims are local and dropped, but confirm nothing arms a timer the
+mocha exit watchdog would catch), and whether `docs/fret.md`'s new *Testing strategy -> Simulation*
+bullet matches what the shipped test actually asserts (it was read in the AGENTS.md context and
+looked accurate, but was not diffed against the final test body).
 
-None recorded this run. The two conditional concerns that would have qualified — the `spreadBits`
-~52-bit precision limit and the near-radius clamp — already have comments at their code sites
-(`CoordPlacement.clusteredCoord`, `nearRadiusFor` in `fret-sim.ts`) from earlier runs, and are
-restated in the test's own comment where a future reader will meet them.
+## Tripwires already parked at their code sites (do not re-file)
 
-## Hygiene
+- `spreadBits` is exact only to ~52 bits because `CoordPlacement.clusteredCoord` scales its Gaussian
+  offset through a JS float — noted at that site.
+- The sim's near radius clamps to half the ring at a 32-entry store, so every candidate takes the
+  selector's near branch — noted at `nearRadiusFor` in `test/simulation/fret-sim.ts` and restated in
+  the test's comment.
 
-Scratch sweep script (`test/simulation/seed-check.tmp.ts`) was written and deleted this run; not in
-the tree. No logs written. Working tree at handoff holds only `packages/fret/test/message-bus.spec.ts`
-and `docs/fret.md`.
+## Output
+
+The `complete/` ticket must carry a `## Review findings` section listing what was checked, what was
+found, and what was done — with empty categories stated explicitly and with a reason, not omitted.

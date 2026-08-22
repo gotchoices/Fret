@@ -47,7 +47,7 @@ export const PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]
  *
  * Worst fixed reading 4, best buggy reading 11, nothing in between — so 7 sits 1.75x above
  * everything the fixed placement produced and 1.57x below everything the bug produced. Both
- * arms are asserted below, so the threshold's separating power is re-proved on every run
+ * arms are asserted by the placement cases in `test/churn-scenarios.spec.ts`, so the threshold's separating power is re-proved on every run
  * rather than measured once at authoring time.
  */
 export const MAX_PEERS_IN_ONE_SPACING_ARC = 7
