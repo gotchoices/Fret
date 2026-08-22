@@ -1,50 +1,193 @@
-description: A simulation test claims that grouping peers into clusters makes message routing take more steps, but it would pass whether or not that were true; the measurement needed to fix or delete it has now been shown to be too slow to run at the size previously proposed.
+description: A simulation test claims that grouping peers into clusters makes message routing take more steps, but it would pass whether or not that were true; the measurement needed to fix or delete it has now been shown to be affordable, and a first run of it produced multi-hop routes for the first time.
 files: packages/fret/test/message-bus.spec.ts, packages/fret/test/simulation/placement-assertions.ts, packages/fret/test/simulation/fret-sim.ts, packages/fret/test/simulation.routing.spec.ts, docs/fret.md
 difficulty: medium
 tradeoffs: n/a (implement ticket)
 ---
 
-Twelfth run. **One real edit landed this run** (see below) and the sweep script was written and
-run — it timed out, which is the new finding. Everything under the "Finding A" and "Finding B"
-headings is carried forward unchanged and is still correct; do not re-derive it.
+Thirteenth run. **No source edits landed this run.** What landed is the measurement: Finding C
+(the twelfth run's blocker) is **resolved**, and one sim was timed and produced the first
+multi-hop reading this ticket has ever seen. Findings A and B are carried forward unchanged and
+are still correct; do not re-derive them.
 
-## What landed this run — do not redo
+Stopped on a `BUDGET_WARNING` immediately after that timing run, before the sweep. The sweep is
+the only thing left before the test can be written or deleted.
 
-`nearestAlivePeerTo` is now exported from `test/simulation/placement-assertions.ts` (appended at
-the end of the file, beside `maxPeersInOneSpacingArc`). Signature as the eleventh run specified;
-ring distance `min(cw, ccw)` over 2^256, lexicographic id tie-break. `npx tsc --noEmit` passes
-with it. It is an **uncommitted working-tree edit** — the runner commits it with this ticket, so
-by the time you read this it should be at HEAD. Nothing consumes it yet.
+## Finding C is resolved — the cost was never the population, it was the drain
 
-The scratch sweep script was written, run, and deleted. Its contents are reproduced verbatim
-below so you do not have to re-derive it.
+The twelfth run's sweep drained the scheduler to `durationMs` (30000 ms), i.e. 60 stabilization
+ticks over 300 peers. `test/simulation.routing.spec.ts` **never does that**. Its `durationMs:
+60000` is a config field that is never simulated: `measureRouting` pumps only to `CONVERGE_MS`
+(4000 ms), fires its routes at 4010..4110, and pumps to 4110. Its doc-block records why 4000 is
+enough — store contents measured flat from t=2000 through t=20000 at a 500 ms tick.
 
-## Finding C (new, and it is the blocker): the sweep as specified is not agent-runnable
+Its pump, which the sweep script below now uses:
 
-At `n: 300, k: 15, m: 8, stabilizationIntervalMs: 500, durationMs: 30000`, **one**
-(draw-centers + clustered run + uniform run) triple did not complete in 115 seconds — the run
-was killed at the 2-minute tool timeout having printed only its header line. The eleventh run's
-plan was 5 seeds x 2 placements x 2 capacities x 2 spreads, i.e. 40 sims plus 10 center draws.
-At the observed rate that is well over an hour, so it cannot be run inside a ticket at all.
+```ts
+function pump(sim: FretSimulation, uptoMs: number): void {
+	while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
+		sim.processEvent(sim.scheduler.nextEvent()!)
+	}
+	sim.scheduler.advanceTo(uptoMs)
+}
+```
 
-**First thing to do next run — this is cheap and probably resolves it.** Read the `SimConfig`
-literals in `test/simulation.routing.spec.ts`. That spec already runs a **1000**-peer case
-inside a mocha timeout, so whatever `durationMs` / `stabilizationIntervalMs` it uses is known to
-be affordable at more than 3x the population used above. The 30000 ms / 500 ms pair used this
-run was invented here, not copied from that spec, and 30000/500 = 60 stabilize ticks x 300 peers
-of gossip merging is the obvious suspect. Copy the routing spec's numbers rather than guessing
-new ones.
+With that change, one timed sim at `n: 300, k: 15, m: 8, capacity: 32,
+stabilizationIntervalMs: 500, clustered, clusterConfig: { numClusters: 3, spreadBits: 32 }`,
+converging to 4000 ms and firing 10 routes between real cluster centers via `nearestAlivePeerTo`:
 
-Then **time exactly one sim** — not a triple, not a sweep — and only widen once you know the
-per-sim cost. Budget the sweep against a 10-minute ceiling: at cost `c` seconds per sim, you can
-afford roughly `600/c` sims. If that is fewer than 40, cut variants in this order (cheapest
-information lost first): drop the `capacity: undefined` sanity control to a single seed, then
-drop one `spreadBits` value, then reduce to 3 seeds for exploration and re-run all 5 only for
-the configuration you intend to ship.
+```
+one sim: centers 8ms, run 11856ms { hops: 4.9, ok: 10, attempts: 10, storeSize: 32 }
+```
 
-## Finding A (confirmed at the code site): every route is one hop, and why
+**~12 s per sim.** Against a 10-minute ceiling that is ~50 sims, so the eleventh run's 40-sim
+sweep now fits — but see the trimming note below, because most of it is no longer worth buying.
 
-The second test measured 0.9-1.0 average hops in *both* arms on *every* seed with 10/10
+## What that one run already tells you — read before sweeping
+
+- **`storeSize: 32`.** The bound bit. Finding B's floor (`2m + 1` = 17) is cleared and the store
+  is genuinely capped, which is the regime the whole test needed to reach.
+- **`hops: 4.9` with 10/10 successes.** Finding A's "every route is one hop" is gone. There is a
+  real multi-hop measurement to compare arms with.
+- The `uniform` control arm was **not** run — that was a single-sim timing probe, not a triple.
+  So there is no separation number yet, only proof that the clustered arm is no longer pinned at
+  1.0 and therefore *can* separate.
+
+## What to do next — sweep, trimmed
+
+Write the script below back to `test/simulation/seed-check.tmp.ts` (relative imports work from
+there), run from `packages/fret/`, and **delete it before handoff**. It is the twelfth run's
+script with the pump fix and env-var variant selection already in it.
+
+Start with the configuration already known to produce multi-hop routes, all five seeds, both
+arms — 10 sims, roughly 2 minutes:
+
+```
+SWEEP_SPREADS=32 SWEEP_CAPS=32 node --import ./register.mjs test/simulation/seed-check.tmp.ts
+```
+
+Only if that does not separate cleanly, spend more:
+
+- `SWEEP_SPREADS=224` next (widening the clusters is the eleventh run's stated "legitimate thing
+  to try" — mind the ~52-bit precision caveat below).
+- `SWEEP_CAPS=none` on a **single** seed last, as a sanity control showing the bound is what
+  produced the multi-hop regime. Not worth five seeds.
+
+Budget against 10 minutes at ~12 s per sim (~50 sims). Do not run all four combinations at five
+seeds without reason — that is 40 sims and most of it buys nothing once the first block
+separates.
+
+## The sweep script, verbatim (pump fix included)
+
+```ts
+import { FretSimulation, type SimConfig } from './fret-sim.js'
+import { PLACEMENT_SEEDS, nearestAlivePeerTo } from './placement-assertions.js'
+import { toCoord } from '../helpers/ring.js'
+
+const N = Number(process.env.SWEEP_N ?? 300)
+const NUM_CLUSTERS = 3
+const CONVERGE_MS = 4000
+const ROUTES = 10
+
+/** Drive every event scheduled up to `uptoMs`, then park the clock there. (routing spec's pump) */
+function pump(sim: FretSimulation, uptoMs: number): void {
+	while ((sim.scheduler.peek()?.time ?? Infinity) <= uptoMs) {
+		sim.processEvent(sim.scheduler.nextEvent()!)
+	}
+	sim.scheduler.advanceTo(uptoMs)
+}
+
+function baseCfg(
+	seed: number,
+	placement: 'uniform' | 'clustered',
+	spreadBits: number,
+	capacity?: number,
+): SimConfig {
+	return {
+		seed, n: N, k: 15, m: 8,
+		churnRatePerSec: 0,
+		stabilizationIntervalMs: 500,
+		durationMs: 60000,
+		placement,
+		clusterConfig: { numClusters: NUM_CLUSTERS, spreadBits },
+		capacity,
+	}
+}
+
+function measure(cfg: SimConfig, centers: readonly bigint[]) {
+	const sim = new FretSimulation(cfg)
+	sim.initialize()
+	pump(sim, CONVERGE_MS)
+	const peers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
+	let firstSender: string | undefined
+	for (let i = 0; i < ROUTES; i++) {
+		const a = centers[i % centers.length]!
+		const b = centers[(i + 1) % centers.length]!
+		const from = nearestAlivePeerTo(peers, a)!
+		firstSender ??= from
+		sim.scheduleRoute(from, toCoord(b), CONVERGE_MS + 10 + i)
+	}
+	pump(sim, CONVERGE_MS + 10 + ROUTES)
+	const m = sim.metrics.finalize()
+	return {
+		hops: m.avgRoutingHops,
+		ok: m.successfulRouteHops.length,
+		attempts: m.routingAttempts,
+		storeSize: sim.getStores().get(firstSender!)?.size() ?? -1,
+	}
+}
+
+function centersFor(seed: number, spreadBits: number): readonly bigint[] {
+	const sim = new FretSimulation(baseCfg(seed, 'clustered', spreadBits))
+	sim.initialize()
+	const c = sim.getClusterCenters()
+	if (!c) throw new Error('no centers')
+	return c
+}
+
+if (process.env.SWEEP_ONE) {
+	const t0 = Date.now()
+	const centers = centersFor(8008, 32)
+	const tc = Date.now()
+	const r = measure(baseCfg(8008, 'clustered', 32, 32), centers)
+	console.log(`one sim: centers ${tc - t0}ms, run ${Date.now() - tc}ms`, r)
+	process.exit(0)
+}
+
+console.log(`n=${N} numClusters=${NUM_CLUSTERS} converge=${CONVERGE_MS}ms`)
+console.log('spread cap    seed  clustered(hops/ok/store)  uniform(hops/ok/store)')
+const SPREADS = (process.env.SWEEP_SPREADS ?? '32,224').split(',').map(Number)
+const CAPS = (process.env.SWEEP_CAPS ?? '32,none')
+	.split(',')
+	.map((s) => (s === 'none' ? undefined : Number(s)))
+const SEEDS = process.env.SWEEP_SEEDS
+	? process.env.SWEEP_SEEDS.split(',').map(Number)
+	: PLACEMENT_SEEDS
+for (const spreadBits of SPREADS) {
+	for (const capacity of CAPS) {
+		for (const seed of SEEDS) {
+			const t0 = Date.now()
+			const centers = centersFor(seed, spreadBits)
+			const cl = measure(baseCfg(seed, 'clustered', spreadBits, capacity), centers)
+			const un = measure(baseCfg(seed, 'uniform', spreadBits, capacity), centers)
+			const capLabel = capacity === undefined ? 'none' : String(capacity)
+			console.log(
+				`${String(spreadBits).padStart(6)} ${capLabel.padStart(4)} ${String(seed).padStart(5)}  ` +
+					`${cl.hops.toFixed(2)}/${cl.ok}/${cl.storeSize}`.padEnd(25) +
+					` ${un.hops.toFixed(2)}/${un.ok}/${un.storeSize}`.padEnd(24) +
+					` (${Date.now() - t0}ms)`,
+			)
+		}
+	}
+}
+```
+
+Drawing `centers` once from a `clustered` run per (seed, spreadBits) and reusing them for that
+seed's `uniform` arm is what makes the control a control. Ship a numeric margin only if
+separation is clean and consistent across all five seeds; 1-vs-0.9 is noise.
+
+## Finding A (confirmed at the code site): why the old test measured one hop
+
+The old second test measured 0.9-1.0 average hops in *both* arms on *every* seed with 10/10
 successes. Not "the targets landed in the wrong place" — "there is nowhere to route to".
 
 `FretSimulation.handleRoute` (`test/simulation/fret-sim.ts` L785-793) declares a route successful
@@ -57,10 +200,10 @@ contains the destination's neighbours. This matches `docs/fret.md` under *Testin
 ("unbounded stores plus a per-tick gossip merge ... arrive in one or two hops under any
 roughly-monotone metric").
 
-So the root cause is the unbounded store, and aiming targets at real cluster centers is
-necessary but not sufficient.
+So the root cause is the unbounded store, and aiming targets at real cluster centers is necessary
+but not sufficient. The `storeSize: 32` / `hops: 4.9` reading above is this finding being cleared.
 
-## Finding B: a store bound is unreachable at n=30 — you must raise n
+## Finding B: a store bound is unreachable at n=30 — that is why n is raised
 
 `FretSimulation.enforceCapacity` (`test/simulation/fret-sim.ts` L701-721) mirrors production:
 eviction skips a protection set, and **protection outranks the cap** — with `capacity < 2m + 1`
@@ -69,7 +212,8 @@ Any capacity that is a "small fraction" of n = 30 (about 3-4) is far below 17, s
 changes nothing: `store.size()` stays at the full population and the test still measures one hop.
 
 Consequence: the second test needs its own, larger `n` — it does not have to share n=30 with the
-first test. `capacity: 32` is comfortably above the 2m+1 = 17 floor.
+first test. `capacity: 32` is comfortably above the 2m+1 = 17 floor, and at `n: 300` it is ~10.7%
+of the population.
 
 Note the interaction already recorded at `nearRadiusFor` (`fret-sim.ts` ~L860): the near radius is
 `4k/store.size()` of maximum ring distance, so at k=15 and a 32-entry store the fraction is
@@ -88,7 +232,8 @@ letting a future reader over-claim.
   L369-395 asserts both arms).
 - **`test/simulation/placement-assertions.ts` is finished** — exports `coordToBigInt`,
   `maxPeersInOneSpacingArc`, `nearestAlivePeerTo`, `PLACEMENT_SEEDS = [8008, 8009, 8010, 4242, 99]`,
-  `MAX_PEERS_IN_ONE_SPACING_ARC = 7`.
+  `MAX_PEERS_IN_ONE_SPACING_ARC = 7`. `nearestAlivePeerTo` landed in the twelfth run and is
+  committed; nothing consumes it yet.
 - **`CoordPlacement.centers` and `FretSimulation.getClusterCenters()` exist and are committed.**
   Nothing consumes them yet.
 
@@ -107,9 +252,9 @@ takes more hops` (`test/message-bus.spec.ts` L347-395).
   deadAfterFailures?, deadReprobePerTick?, messageBus?, profileMix? }
 ```
 
-Members: `sim.initialize()`, `sim.scheduler.advanceTo(ms)` (generator of events),
-`sim.processEvent(evt)`, `sim.scheduler.pending()`, `sim.scheduler.nextEvent()`,
-`sim.scheduleRoute(fromPeerId: string, targetCoord: Uint8Array, atMs: number)`,
+Members: `sim.initialize()`, `sim.scheduler.peek()`, `sim.scheduler.nextEvent()`,
+`sim.scheduler.advanceTo(ms)` (generator of events), `sim.scheduler.pending()`,
+`sim.processEvent(evt)`, `sim.scheduleRoute(fromPeerId: string, targetCoord: Uint8Array, atMs: number)`,
 `sim.getPeers(): ReadonlyMap<string, SimPeer>` (`SimPeer` carries `id`, `coord: Uint8Array`,
 `alive: boolean`), `sim.getStores(): ReadonlyMap<string, DigitreeStore>`,
 `sim.getClusterCenters(): readonly bigint[] | undefined`, `sim.aliveCount()`,
@@ -136,12 +281,11 @@ That spec's doc-block records, at `n: 1000`, all-edge, 100 routes, seed 4242, sh
 | 32 | 3.2% | 100% | 8 |
 
 Confirmed across seeds 1 / 4242 / 99 / 20260820 at cap 32: 100% success, p90 7-8. So a bounded
-store at roughly 3% of population is a **known-good multi-hop configuration** — that is the
-regime the second test has to reach.
+store at roughly 3% of population is a **known-good multi-hop configuration**.
 
 ## What the fixed test needs
 
-Both arms together — either alone still measures nothing:
+All three together — any one alone still measures nothing:
 
 - **Bound the store, which means raising `n`** (Finding B). Report `store.size()` for one sender
   per run; it is the number that says at a glance whether the bound actually bit.
@@ -151,6 +295,9 @@ Both arms together — either alone still measures nothing:
   **both** arms route from `nearestAlivePeerTo(peers, A)` to coordinate `B`. Same two
   coordinates in both runs, same selection rule, so the only difference is where the placement
   put the peers.
+- **Converge with the routing spec's pump, not a drain to `durationMs`** — that is what made the
+  measurement affordable, and a mocha test that drains 60 s of ticks over 300 peers will time out
+  exactly as the twelfth run's sweep did.
 
 ## The outcome that is allowed to be "no"
 
@@ -160,131 +307,42 @@ made of three points may simply not produce longer paths than a uniform one howe
 bounded, because there is nothing between the clusters to route through. Widening `spreadBits`
 (say 200-240 — mind the ~52-bit precision note) is a legitimate thing to try before concluding.
 
-If, after raising `n`, bounding `capacity`, aiming at real centers **and** trying a wider spread,
-the two arms still do not separate cleanly across all five `PLACEMENT_SEEDS`, the honest
-resolution is to **delete the second test**, not to loosen it. It currently asserts
+If, after the sweep, the two arms still do not separate cleanly across all five `PLACEMENT_SEEDS`,
+the honest resolution is to **delete the second test**, not to loosen it. It currently asserts
 `clustered > uniform` with no margin on a single hardcoded seed and would pass on noise; a
 deleted vacuous test is strictly better than a retained one. The first test already covers
 clustered placement's real, measured effect. Deleting is a result to report plainly in the
 handoff, with the numbers behind it — not a failure.
 
-**A third permitted outcome, given Finding C:** if the measurement cannot be made affordable
-(one sim still costs minutes after copying the routing spec's parameters), delete the second
-test on *that* basis and say so. A test whose claim cannot be measured within a tractable budget
-is not one to keep asserting on a hardcoded seed.
-
-## The sweep script, verbatim
-
-Write it back to `test/simulation/seed-check.tmp.ts` (relative imports work from there), run with
-`node --import ./register.mjs test/simulation/seed-check.tmp.ts` from `packages/fret/`, and
-**delete it before handoff** — `git status` on that directory must be clean. Adjust `N`,
-`durationMs`, `stabilizationIntervalMs` and the variant loops per Finding C before running it.
-
-```ts
-import { FretSimulation, type SimConfig } from './fret-sim.js'
-import { PLACEMENT_SEEDS, nearestAlivePeerTo } from './placement-assertions.js'
-import { toCoord } from '../helpers/ring.js'
-
-const N = Number(process.env.SWEEP_N ?? 300)
-const NUM_CLUSTERS = 3
-
-function baseCfg(seed: number, placement: 'uniform' | 'clustered', spreadBits: number, capacity?: number): SimConfig {
-	return {
-		seed, n: N, k: 15, m: 8,
-		churnRatePerSec: 0,
-		stabilizationIntervalMs: 500,   // <- suspect; copy simulation.routing.spec.ts instead
-		durationMs: 30000,              // <- suspect; copy simulation.routing.spec.ts instead
-		placement,
-		clusterConfig: { numClusters: NUM_CLUSTERS, spreadBits },
-		capacity,
-	}
-}
-
-function measure(cfg: SimConfig, centers: readonly bigint[]) {
-	const sim = new FretSimulation(cfg)
-	sim.initialize()
-	for (const evt of sim.scheduler.advanceTo(5000)) sim.processEvent(evt)
-	const peers = Array.from(sim.getPeers().values()).filter((p) => p.alive)
-	let firstSender: string | undefined
-	for (let i = 0; i < 10; i++) {
-		const a = centers[i % centers.length]!
-		const b = centers[(i + 1) % centers.length]!
-		const from = nearestAlivePeerTo(peers, a)!
-		firstSender ??= from
-		sim.scheduleRoute(from, toCoord(b), 5001 + i)
-	}
-	while (sim.scheduler.pending() > 0) {
-		const evt = sim.scheduler.nextEvent()
-		if (!evt || evt.time > cfg.durationMs) break
-		sim.processEvent(evt)
-	}
-	const m = sim.metrics.finalize()
-	return {
-		hops: m.avgRoutingHops,
-		ok: m.successfulRouteHops.length,
-		attempts: m.routingAttempts,
-		storeSize: sim.getStores().get(firstSender!)?.size() ?? -1,
-	}
-}
-
-function centersFor(seed: number, spreadBits: number): readonly bigint[] {
-	const sim = new FretSimulation(baseCfg(seed, 'clustered', spreadBits))
-	sim.initialize()
-	const c = sim.getClusterCenters()
-	if (!c) throw new Error('no centers')
-	return c
-}
-
-console.log(`n=${N} numClusters=${NUM_CLUSTERS}`)
-console.log('spread cap    seed  clustered(hops/ok/store)  uniform(hops/ok/store)')
-for (const spreadBits of [32, 224]) {
-	for (const capacity of [32, undefined]) {
-		for (const seed of PLACEMENT_SEEDS) {
-			const t0 = Date.now()
-			const centers = centersFor(seed, spreadBits)
-			const cl = measure(baseCfg(seed, 'clustered', spreadBits, capacity), centers)
-			const un = measure(baseCfg(seed, 'uniform', spreadBits, capacity), centers)
-			const capLabel = capacity === undefined ? 'none' : String(capacity)
-			console.log(
-				`${String(spreadBits).padStart(6)} ${capLabel.padStart(4)} ${String(seed).padStart(5)}  ` +
-					`${cl.hops.toFixed(2)}/${cl.ok}/${cl.storeSize}`.padEnd(25) +
-					` ${un.hops.toFixed(2)}/${un.ok}/${un.storeSize}`.padEnd(24) +
-					` (${Date.now() - t0}ms)`,
-			)
-		}
-	}
-}
-```
-
-Drawing `centers` once from a `clustered` run per (seed, spreadBits) and reusing them for that
-seed's `uniform` arm is what makes the control a control. Ship a numeric margin only if
-separation is clean and consistent across all five seeds; 1-vs-0.9 is noise.
+The twelfth run's third permitted outcome — "delete it because the measurement is unaffordable" —
+is **withdrawn**. It is affordable: ~12 s per sim.
 
 TODO:
-- Read the `SimConfig` literals in `test/simulation.routing.spec.ts` and adopt its
-  `durationMs` / `stabilizationIntervalMs`. Time **one** sim before sweeping anything.
-- Run the sweep, trimmed to fit a 10-minute ceiling per Finding C; record the table.
-- If it separates: rewrite `test/message-bus.spec.ts` L347-395 to use `nearestAlivePeerTo` plus
-  the raised `n` and the store bound, assert both `clustered > uniform` **and** a measured
-  numeric margin over all 5 `PLACEMENT_SEEDS`, with the measured table in a comment — mirroring
-  the `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` pattern the first test already uses.
-- If it does not separate (or cannot be measured affordably): delete that test, and delete
-  `nearestAlivePeerTo`, `CoordPlacement.centers` and `FretSimulation.getClusterCenters()` if
-  nothing else consumes them. All are committed, so that is a real edit to three files.
+- Run the trimmed sweep (`SWEEP_SPREADS=32 SWEEP_CAPS=32`, all five seeds, ~2 min); record the
+  table. Widen only if it does not separate.
+- If it separates: rewrite `test/message-bus.spec.ts` L347-395 to use `nearestAlivePeerTo`, the
+  raised `n`, the store bound and the pump-to-converge pattern; assert both `clustered > uniform`
+  **and** a measured numeric margin over all 5 `PLACEMENT_SEEDS`, with the measured table in a
+  comment — mirroring the `CLUSTERED_MAX_PEERS_IN_ONE_SPACING_ARC` pattern the first test uses.
+  Mind the mocha timeout: 10 sims at ~12 s is ~2 min, so raise `this.timeout` on that describe
+  block (currently 60000) or cut the seed count and say which in the comment.
+- If it does not separate: delete that test, and delete `nearestAlivePeerTo`,
+  `CoordPlacement.centers` and `FretSimulation.getClusterCenters()` if nothing else consumes
+  them. All are committed, so that is a real edit to three files.
 - Delete the scratch script either way.
 - Gate, both from `packages/fret/`:
   ```
-  node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 60000
+  node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/message-bus.spec.ts" "test/churn-scenarios.spec.ts" --timeout 300000
   npx tsc --noEmit
   ```
 - Write the `review/` ticket (slug `sim-placement-guards-no-control`): the first test's measured
   threshold, what happened to the second test (fixed with numbers, or deleted with the numbers
   that justified deleting), and Findings A, B and C so the reviewer understands why the earlier
-  target-generation and small-capacity plans were abandoned and why the sweep was trimmed.
-  Delete this file once the review ticket is written.
+  target-generation and small-capacity plans were abandoned and why the twelfth run's sweep timed
+  out. Delete this file once the review ticket is written.
 
 ## Hygiene
 
 The working tree at handoff should hold whatever this ticket's work changes and nothing else. No
-scratch files, no logs. `test/simulation/placement.ts` and `test/simulation/fret-sim.ts` are
-clean at HEAD — if they show as modified at your handoff, that is your own edit.
+scratch files, no logs. `test/simulation/placement.ts` and `test/simulation/fret-sim.ts` are clean
+at HEAD — if they show as modified at your handoff, that is your own edit.
