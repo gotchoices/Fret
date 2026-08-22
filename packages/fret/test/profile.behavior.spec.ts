@@ -6,6 +6,8 @@ import { useCleanup, type Cleanup } from './helpers/cleanup.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { TokenBucket } from '../src/utils/token-bucket.js'
 import { ExpiringMap } from '../src/utils/expiring-map.js'
+import { ProbeBackoff } from '../src/service/probe-backoff.js'
+import { backoffOf, setBackoffOf } from './helpers/backoff.js'
 import { MAX_NEIGHBORS_BYTES } from '../src/rpc/validate.js'
 import { peerDiscoverySymbol } from '@libp2p/interface'
 import { Libp2pFretService } from '../src/service/libp2p-fret-service.js'
@@ -342,17 +344,17 @@ describe('Profile behavior tests', function () {
 		})
 	})
 
-	// ----- Bounded internal map capacities (backoffMap, departureDebounce, discovery debounce) -----
+	// ----- Bounded internal map capacities (probe backoff, departureDebounce, discovery debounce) -----
 
 	describe('Bounded internal map capacities', () => {
-		it('Core backoffMap capacity defaults to routing-table capacity (2048)', async () => {
+		it('Core probe-backoff capacity defaults to routing-table capacity (2048)', async () => {
 			const { svc } = await createService('core')
-			expect((svc as any).backoffMap.capacity).to.equal(2048)
+			expect(backoffOf(svc).capacity).to.equal(2048)
 		})
 
-		it('Edge backoffMap capacity is capped at 512', async () => {
+		it('Edge probe-backoff capacity is capped at 512', async () => {
 			const { svc } = await createService('edge')
-			expect((svc as any).backoffMap.capacity).to.equal(512)
+			expect(backoffOf(svc).capacity).to.equal(512)
 		})
 
 		it('Core departureDebounce capacity defaults to 512', async () => {
@@ -383,25 +385,29 @@ describe('Profile behavior tests', function () {
 			expect(disc.emitted.capacity).to.equal(77)
 		})
 
-		it('stabilizeOnce sweeps expired entries from backoffMap and departureDebounce', async () => {
+		it('stabilizeOnce sweeps expired entries from the probe backoff and departureDebounce', async () => {
 			const { svc } = await createService('core')
 
 			let clockNow = Date.now()
 			const now = () => clockNow
 			const advance = (ms: number) => { clockNow += ms }
 
-			const backoffTtl = (CoreFretService as any).BACKOFF_RETAIN_MS
+			// Both lifetimes come from their owners' own constants, not from a copy: the backoff
+			// retention now lives on `ProbeBackoff` (the service no longer declares it), and
+			// reading it off `CoreFretService` yielded `undefined`, which silently disabled the
+			// TTL half of this case.
+			const backoffTtl = ProbeBackoff.DEFAULT_RETAIN_MS
 			const departureTtl = (CoreFretService as any).DEPARTURE_DEBOUNCE_MS
-			;(svc as any).backoffMap = new ExpiringMap({ capacity: 8, ttlMs: backoffTtl, now })
+			setBackoffOf(svc, new ProbeBackoff({ capacity: 8, retainMs: backoffTtl, now }))
 			;(svc as any).departureDebounce = new ExpiringMap({ capacity: 8, ttlMs: departureTtl, now })
-			const backoff = (svc as any).backoffMap as ExpiringMap<{ until: number, factor: number }>
+			const backoff = backoffOf(svc)
 			const departure = (svc as any).departureDebounce as ExpiringMap<number>
 
-			// The backoff entry uses the service's own id because `pruneBackoffMap` runs inside the
+			// The backoff entry uses the service's own id because `backoff.prune` runs inside the
 			// same `sweepBoundedMaps` call and drops entries for peers absent from the routing store.
 			// Self is always in the store, so the sweep is the only thing that can remove it.
 			const selfId: string = (svc as any).selfIdStr
-			backoff.set(selfId, { until: clockNow, factor: 1 })
+			backoff.record(selfId)
 			departure.set('departure-expired-peer', clockNow)
 
 			// Past *both* lifetimes: the two differ by two orders of magnitude (5 min vs 2 s), so a
@@ -413,14 +419,15 @@ describe('Profile behavior tests', function () {
 
 			await (svc as any).stabilizeOnce()
 
-			// `size` counts *retained* entries. `has` / `get` / `keys` all filter expired entries
-			// lazily, so an assertion through them passes whether or not the sweep ever ran.
+			// `size` counts *retained* entries. `factor` / `isBackedOff` / `penalty` all filter
+			// expired entries lazily, so an assertion through them passes whether or not the sweep
+			// ever ran.
 			expect(backoff.size).to.equal(0)
 			expect(departure.size).to.equal(1)
 			expect(departure.has('departure-live-peer')).to.equal(true)
 
-			// The other half for backoffMap, which has no survivor above: a live entry is kept.
-			backoff.set(selfId, { until: clockNow, factor: 1 })
+			// The other half for the backoff map, which has no survivor above: a live entry is kept.
+			backoff.record(selfId)
 			await (svc as any).stabilizeOnce()
 			expect(backoff.size).to.equal(1)
 		})
