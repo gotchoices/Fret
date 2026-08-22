@@ -218,7 +218,7 @@ describe('ExpiringMap', () => {
 			for (let i = 0; i < 8; i++) map.set(`k${i}`, i)
 			const keys = map.keys()
 			expect(keys).to.have.length(8)
-			// The `pruneBackoffMap` pattern: walk the snapshot, delete a subset of the live map.
+			// The `ProbeBackoff.prune` pattern: walk the snapshot, delete a subset of the live map.
 			for (const k of keys) {
 				if (Number(k.slice(1)) % 2 === 0) map.delete(k)
 			}

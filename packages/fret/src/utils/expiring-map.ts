@@ -94,7 +94,7 @@ export class ExpiringMap<V> {
 	 * Snapshot of the live (non-expired) keys.
 	 *
 	 * An array rather than an iterator so a caller can delete from the map while walking the
-	 * result — which `pruneBackoffMap` in `FretService` does — without relying on `Map`'s
+	 * result — which `ProbeBackoff.prune` does — without relying on `Map`'s
 	 * delete-during-iteration semantics being what it wanted.
 	 */
 	keys(): string[] {

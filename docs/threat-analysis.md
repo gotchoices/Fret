@@ -97,7 +97,7 @@ An attacker node accepts forwarded `RouteAndMaybeAct` messages but silently drop
 
 - **Preconditions**: Attacker node on the routing path.
 - **Impact**: Lookup failures, activity timeouts. The requesting `iterativeLookup` generator retries with different candidates but may keep selecting attacker nodes.
-- **Current mitigations**: `iterativeLookup` retries up to `maxAttempts`. `recordBackoff` penalizes unresponsive peers. Backoff penalty is included in cost function. But there's no reputation propagation — only the direct requester learns about the blackhole.
+- **Current mitigations**: `iterativeLookup` retries up to `maxAttempts`. `ProbeBackoff.record` penalizes unresponsive peers. Backoff penalty is included in cost function. But there's no reputation propagation — only the direct requester learns about the blackhole.
 
 #### 2.4 Network Size Estimate Manipulation
 **Severity: High**
@@ -124,11 +124,11 @@ A deflated estimate increases `nearRadius` (from `computeNearRadius`), causing t
 #### 2.5 Backoff Exploitation
 **Severity: Medium**
 
-The backoff mechanism (`recordBackoff`/`getBackoffPenalty`, `fret-service.ts:1033-1052`) exponentially penalizes peers that return busy or fail. An attacker who can trigger busy responses from honest peers (e.g., by consuming their rate limit tokens with spam) effectively removes them from routing consideration.
+The backoff mechanism (`ProbeBackoff.record` / `ProbeBackoff.penalty`, `src/service/probe-backoff.ts`) exponentially penalizes peers that return busy or fail. An attacker who can trigger busy responses from honest peers (e.g., by consuming their rate limit tokens with spam) effectively removes them from routing consideration.
 
 - **Preconditions**: Ability to cause target peers to return `BusyResponseV1`.
 - **Impact**: Good peers penalized in routing decisions, traffic shifted to attacker-controlled nodes.
-- **Current mitigations**: Backoff has a max factor of 32. `clearBackoff` resets on success. But the penalty persists until the next successful interaction.
+- **Current mitigations**: Backoff has a max factor of 32. `ProbeBackoff.clear` resets on success. But the penalty persists until the next successful interaction.
 
 ---
 
@@ -272,7 +272,7 @@ When this was written, each `handleLeave` invocation triggered store removal of 
 
 Several internal maps have no hard capacity limits:
 
-- `backoffMap: Map<string, {until, factor}>` — grows with every peer that returns busy or fails, but is bounded by the routing-table capacity (C=2048): `pruneBackoffMap` runs each stabilization tick and drops any entry whose peer is no longer in the store, and `clearBackoff` removes an entry on first success. Entries are deliberately retained past expiry (`getBackoffPenalty` no longer deletes on expiry, so the per-peer factor can grow across windows), but the per-entry payload is fixed-size, so the map cannot exceed the store's eviction-bounded size. An attacker spamming from many peer IDs therefore cannot grow it past that bound.
+- `ProbeBackoff` (`src/service/probe-backoff.ts`, keyed by peer id, holding `{until, factor}`) — grows with every peer that returns busy or fails, but is bounded by the routing-table capacity (C=2048): `ProbeBackoff.prune` runs each stabilization tick and drops any entry whose peer is no longer in the store, and `ProbeBackoff.clear` removes an entry on first success. Entries are deliberately retained past expiry (`ProbeBackoff.penalty` does not delete on expiry, so the per-peer factor can grow across windows), but the per-entry payload is fixed-size, so the map cannot exceed the store's eviction-bounded size. An attacker spamming from many peer IDs therefore cannot grow it past that bound.
 - `announcedIds: Map<string, number>` — pruned at 4096 entries, but only when emitting new discoveries. Between prunes, can grow unbounded.
 - `departureDebounce: Map<string, number>` — pruned at 256, but only on departure events.
 - `networkObservations: Array` — capped at 100 entries. Adequately bounded.
@@ -715,7 +715,7 @@ The 100ms idle timeout after first data (in the pre-framing `readAllBounded`) wa
 **Phase 3 — Medium Priority (hardens operations)**
 10. Implement the dead state transition (consecutive failure tracking per design doc).
 11. Add stabilization jitter to prevent thundering-herd patterns.
-12. Bound all internal maps (`backoffMap`, etc.) with explicit capacity limits and periodic sweeps.
+12. Bound all internal maps (the probe-backoff map, etc.) with explicit capacity limits and periodic sweeps.
 13. Sanitize metadata keys to prevent prototype pollution. Consider `Object.create(null)` for metadata storage and size limits.
 14. Add diversity requirements to cohort assembly (IP range, AS number diversity).
 15. Cap `handleLeave` outbound work (share tokens with outbound budgets to limit amplification factor).
