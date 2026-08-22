@@ -99,36 +99,6 @@ describe('Churn leave handling', function () {
 	// own S/P window, so the pool is empty and the notice ships `replacements: undefined`. See
 	// `Leave notice replacements (sender side)` at the bottom of this file.
 
-	it('fan-out notifies peers beyond immediate S/P', async () => {
-		mesh = await buildMesh(8)
-		await mesh.addServices((_i, m) => ({ profile: 'core', k: 7, bootstraps: [m.ids[0]!] }))
-		await mesh.connect('star')
-		await waitFor(allConverged(mesh.services, mesh.ids),
-			CONVERGE_MS, 25, 'star of 8 converges before the leave')
-
-		const diagsBefore = mesh.services.map(s => ({ ...s.getDiagnostics() }))
-
-		// Stop node 3 (middle-ish) — with core profile, fan-out = 4.
-		// NOTE: what this rig can observe is the departure being survived, not the fan-out itself.
-		// The extra (beyond-S/P) leave targets are `isConnected`-only, and the S/P targets are
-		// `isDoomedDial`-filtered; a memory-transport node runs no `identify`, so a peer learned
-		// only through gossip has no peerStore address and is undialable (`docs/fret.md`,
-		// *Dialability*). In a star, node 3 is connected to node 0 alone, so the notice reaches
-		// node 0 and nobody else. Observing a real beyond-S/P fan-out needs `createIdentifyNode`
-		// plus a topology where the departing node holds several connections.
-		await mesh.services[3]!.stop()
-		await mesh.nodes[3]!.stop()
-		alreadyStopped.push(3)
-		await waitFor(anyProgressed(mesh.services, diagsBefore, 3),
-			PROGRESS_MS, 25, 'a survivor stabilizes after the leave')
-
-		// All remaining services should still be running
-		for (let i = 0; i < mesh.services.length; i++) {
-			if (i === 3) continue
-			expect(mesh.services[i]!.getDiagnostics()).to.have.property('pingsSent')
-		}
-	})
-
 	it('oversized replacements array is truncated', async () => {
 		mesh = await buildMesh(3)
 		await mesh.connect('star')
@@ -590,7 +560,8 @@ describe('Leave notice replacements (sender side)', function () {
 	async function makeSenderRig(
 		k: number,
 		count: number,
-		realOffsets: number[] = [RECEIVER_OFFSET]
+		realOffsets: number[] = [RECEIVER_OFFSET],
+		profile: 'core' | 'edge' = 'core'
 	): Promise<SenderRig> {
 		const nodes: Libp2p[] = []
 		const departing = await createMemNode(); await departing.start(); nodes.push(departing)
@@ -611,7 +582,7 @@ describe('Leave notice replacements (sender side)', function () {
 		}
 		const primary = received.get(realOffsets[0]!)!
 
-		const svc = new CoreFretService(departing, { profile: 'core', k })
+		const svc = new CoreFretService(departing, { profile, k })
 		const selfCoord = await hashPeerId(departing.peerId)
 		const store = svc.getStore()
 		const byOffset = new Map<number, string>()
@@ -789,6 +760,94 @@ describe('Leave notice replacements (sender side)', function () {
 			for (const offset of [SUCC_RECEIVER, PRED_RECEIVER, OUTSIDE_RECEIVER]) {
 				expect(rig!.noticesAt(offset).length, `+${offset} got exactly one notice`).to.equal(1)
 			}
+		})
+	})
+
+	/**
+	 * The `.slice(0, fanOut)` clamp on the beyond-S/P fan-out.
+	 *
+	 * Every other rig in this file has exactly `fanOut` eligible extras or fewer, so the slice has
+	 * never removed anything — and seeding a bigger ring does not change that. `ids` is the S/P
+	 * window from an *unfiltered* ring walk, while `expandCohort` asks the *live-member-scoped*
+	 * `assembleCohort` for `ids.length + fanOut` peers; when every seeded peer is a live member
+	 * the two walks reach the same distance, so the expansion is the window plus exactly `fanOut`
+	 * more ids and the slice is structurally a no-op at any k, count or profile.
+	 *
+	 * The lever is the asymmetry between those two walks: a window peer that is `dead` occupies a
+	 * slot in `ids` but is skipped by the cohort walk, which therefore reaches further out and
+	 * surfaces more non-`spSet` ids than `fanOut`. Marking window peers dead is what makes the
+	 * slice bite.
+	 *
+	 * Runs the **edge** profile (fanOut 2 rather than core's 4) so it needs one fewer real node to
+	 * outrun the cap, and so needs its own rig — `sendLeaveToNeighbors` is once-per-lifetime.
+	 */
+	describe('at the edge profile, with the fan-out pool wider than the cap', function () {
+		const COUNT = 40
+		/** A window peer, so it is notified by the S/P loop rather than by the fan-out arm. */
+		const WINDOW_RECEIVER = 1
+		/**
+		 * Outside the window `{+1..+8}` and inside the widened cohort reach. The ask is
+		 * `ids.length + fanOut` = 16 + 2 = 18, alternating 9 per side; skipping the dead +2 and +3
+		 * pulls the clockwise reach to `{+1, +4..+11}`, so the non-`spSet` extras are +9, +10, +11
+		 * clockwise and +32 counter-clockwise. +32 is a ghost, so `isConnected` drops it — three
+		 * eligible connected extras against a cap of two.
+		 */
+		const OUTSIDE_RECEIVERS = [9, 10, 11]
+		/** Ghosts, so marking them dead loses no notice — it only shortens the cohort walk. */
+		const DEAD_WINDOW = [2, 3]
+
+		let rig: SenderRig | undefined
+		let fanOut: number
+
+		before(async function () {
+			this.timeout(30000)
+			// `WINDOW_RECEIVER` is first, so it is the offset `send()` waits on: it is reached by
+			// the S/P loop, which every outcome of the clamp still runs. Waiting on one of the
+			// capped extras instead would wait on the very thing under test.
+			rig = await makeSenderRig(15, COUNT, [WINDOW_RECEIVER, ...OUTSIDE_RECEIVERS], 'edge')
+			expect((rig.svc as any).cfg.m,
+				'premise: m = ceil(k / 2), so k of 15 gives an eight-wide window per side').to.equal(8)
+			// Read from the profile rather than written as a literal, so a profile retune fails
+			// the premise below instead of quietly making the case vacuous.
+			fanOut = (rig.svc as any).cfg.profile === 'core' ? 4 : 2
+			expect(fanOut, 'premise: the edge profile caps the beyond-S/P fan-out at two').to.equal(2)
+			expect(OUTSIDE_RECEIVERS.length,
+				'premise: more real, connected peers outside the window than the cap admits')
+				.to.be.greaterThan(fanOut)
+
+			const store = rig.svc.getStore()
+			for (const offset of DEAD_WINDOW) store.setState(rig.idAt(offset), 'dead')
+
+			await rig.send()
+		})
+		after(async () => { await rig?.stop(); rig = undefined })
+
+		const outsideTotal = () =>
+			OUTSIDE_RECEIVERS.reduce((n, o) => n + rig!.noticesAt(o).length, 0)
+
+		it('sends the beyond-S/P arm exactly `fanOut` notices, not one per eligible peer', async () => {
+			// The sends are all awaited inside `send()`, but the receivers' handlers run on the
+			// far side of the in-memory stream, so wait for the expected count and then settle
+			// before asserting equality — otherwise a missing clamp (three notices) could be read
+			// mid-flight as two and pass vacuously.
+			await waitFor(() => outsideTotal() >= fanOut, 5000, 10,
+				'the beyond-S/P arm reached `fanOut` of the three eligible peers')
+			await delay(100)
+			// Deliberately not *which* of +9/+10/+11: selection order is `expandCohort`'s
+			// alternating cohort order, an implementation detail. The clamp is the contract. The
+			// count also fails loudly (below `fanOut`) if a future change shortens the cohort
+			// reach, rather than passing vacuously.
+			expect(outsideTotal(), 'the `.slice(0, fanOut)` clamp, with three peers eligible')
+				.to.equal(fanOut)
+			for (const offset of OUTSIDE_RECEIVERS) {
+				expect(rig!.noticesAt(offset).length, `+${offset} was notified at most once`)
+					.to.be.at.most(1)
+			}
+		})
+
+		it('does not notify a window peer twice by widening the extras', () => {
+			expect(rig!.noticesAt(WINDOW_RECEIVER).length,
+				'reached by the S/P loop, and excluded from the fan-out arm by `spSet`').to.equal(1)
 		})
 	})
 })
