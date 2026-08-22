@@ -160,7 +160,7 @@ export class Libp2pFretService implements Startable, FretService {
 	}
 
 	async ready(): Promise<void> {
-		await this.ensure().ready();
+		return this.ensure().ready();
 	}
 
 	setMode(mode: FretMode): void {

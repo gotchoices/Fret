@@ -4,59 +4,66 @@ difficulty: easy
 ---
 
 <!-- resume-note -->
-Fifth run stopped on BUDGET_WARNING, immediately after running mocha and diagnosing the one
-failure. **Do not re-read `libp2p-fret-service.ts` or re-derive anything — the fix is known and
-below.** `tsc --noEmit` has still never been run against the new file.
+Sixth run stopped on BUDGET_WARNING, immediately after fixing a second failure. **Two fixes are
+already applied and must not be re-derived:**
 
-**File `test/libp2p-facade-forwarding.spec.ts` exists and 3 of 4 tests pass.** The 4th
-("forwards every non-skipped method to the core with exact args, order, and return identity")
-fails with:
+1. **Test file, `test/libp2p-facade-forwarding.spec.ts`**: added `mockCore.stop = () => {}` right
+   before `coreOf(svc).inner = mockCore` (inside the third `it`). This was needed because `stop`
+   is in `SKIP_LIST` (it does discovery-loop teardown around the core call, not a plain forward),
+   so `mockCore` never got a `stop` spy, and the test's own `finally` block calling `svc.stop()`
+   threw `TypeError: this.inner?.stop is not a function`. Fixed, confirmed by a mocha run this
+   session (see below for what that run then found next).
 
-```
-TypeError: this.inner?.stop is not a function
- at Libp2pFretService.stop (file:///C:/projects/Fret/packages/fret/src/service/libp2p-fret-service.ts:124:27)
- at async Context.<anonymous> (test\libp2p-facade-forwarding.spec.ts:93:4)
-```
+2. **Production file, `src/service/libp2p-fret-service.ts`**, method `ready()` (~line 162): changed
+   ```ts
+   async ready(): Promise<void> {
+   	await this.ensure().ready();
+   }
+   ```
+   to
+   ```ts
+   async ready(): Promise<void> {
+   	return this.ensure().ready();
+   }
+   ```
+   **This is a real bug, not a test artifact.** Every other facade method does
+   `return this.ensure().foo(...)`, forwarding the core's return value. `ready()` alone did
+   `await ...; ` with no `return`, so it always resolved `undefined` regardless of what the core's
+   `ready()` produced — it broke the "exact return identity" forwarding contract documented for
+   this facade (see `docs/fret.md`, "libp2p integration" section, the paragraph on
+   `Libp2pFretService` being tied to the core surface). In practice `FretService.ready()` is typed
+   `Promise<void>` so no real caller currently depends on the resolved value, but the facade's job
+   per this ticket is exact pass-through, and this was the one method silently not doing that — it
+   is exactly the class of bug ("swapped pair of numbers would go unnoticed") this ticket exists to
+   catch. This fix has **not yet been verified** — no test or tsc run happened after making it.
 
-**Root cause**: the test builds `mockCore` only for the enumerated (non-skip-listed) forwarding
-methods — `stop` is in `SKIP_LIST` on purpose (it does discovery-loop teardown around the core
-call, not a plain forward), so `mockCore` never gets a `stop` spy. The test's `finally` block then
-calls `await svc.stop()`, and the real `Libp2pFretService.stop()` body does
-`this.inner?.stop()` — `inner` is the mock object (truthy, so `?.` does not guard), and calling a
-property that doesn't exist on it throws. This is a test-file bug, not a bug in
-`libp2p-fret-service.ts` — the facade's `stop()` is correct; the mock is just incomplete.
-
-**Fix (one line, in the test file only)**: add a no-op `stop` spy to `mockCore` before installing
-it, e.g. right after the `for (const name of methods) { ... }` loop that populates `mockCore` and
-before `coreOf(svc).inner = mockCore`:
-```ts
-mockCore.stop = () => {}
-```
-`stop` is deliberately not part of the `AnyFn`-returns-sentinel loop (it's skip-listed, has no
-sentinel-return assertion), so a plain no-op is correct — nothing asserts on it, it only needs to
-exist so the real facade's `stop()` can call it without throwing during the test's own cleanup.
-
-**Verification commands (run both, in order, after applying the one-line fix)**:
+**What is still unverified — do this first, in order, before anything else:**
 ```
 cd packages/fret && node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/libp2p-facade-forwarding.spec.ts" --timeout 30000
 cd packages/fret && npx tsc --noEmit
 ```
-Expect 4/4 passing on the first command. If `tsc --noEmit` fails, check the new file's `coreOf`
-cast helper — the rest of the package was type-clean before this ticket touched it.
+Expect 4/4 passing on the first command now that both fixes are in. If a *third* distinct failure
+surfaces, do not assume it is another one-line fix — diagnose fresh (the pattern so far has been:
+each fix reveals the next real gap, not a red herring), but do not spend more than one round doing
+so before asking a human if it recurs a third time.
 
-If mocha still fails after the one-line fix, re-check whether `Libp2pFretService.stop()` also
-calls anything else on `inner` beyond `.stop()` (read only that one method, not the whole file)
-and give `mockCore` whatever else it needs the same way (a bare no-op, not a sentinel-asserting
-spy, since `stop` is skip-listed and untested-by-design here).
+If `tsc --noEmit` fails, check `libp2p-fret-service.ts` (the `ready()` change and the `coreOf` cast
+helper in the test file are the only edits this ticket has made) — the rest of the package was
+type-clean before this ticket touched it.
 
 **Once both commands are green**: write the review/ handoff (see AGENTS.md implement-stage rules)
 summarizing the 4 test cases (skip-list-exists, exactly-20-forwarding-methods,
-forward-with-mock-identity-and-order, not-injected-throws), note this is a new file (no
-pre-existing coverage to compare against), and delete this ticket from implement/. Do not
-re-derive the REJECTS/ASYNC_UNWRAP/ASYNC_GENERATOR classification or the skip list — both are
-already correct and unchanged (3 of 4 tests already prove this: skip-list and enumeration tests
-pass, and the not-injected-throws property — which exercises every method's REJECTS/throw
-classification — also passes).
+forward-with-mock-identity-and-order, not-injected-throws). Call out **both** fixes in the handoff
+plainly: the test-file mock-completeness fix or the (skip-listed, untested-by-design) `stop`
+seam, and the production `ready()` forwarding bug this test suite caught for the first time
+because it is the only spec that exercises return-identity across every facade method. Note this
+is a new file (no pre-existing coverage to compare against). Do not re-derive the
+REJECTS/ASYNC_UNWRAP/ASYNC_GENERATOR classification or the skip list — both are already correct
+and unchanged; the skip-list and enumeration tests already proved this before this session ever
+touched the file, and the not-injected-throws property (which exercises every method's
+REJECTS/throw classification) also already passed.
+
+Then delete this ticket from implement/.
 
 ## End
 Work ticket as described above.

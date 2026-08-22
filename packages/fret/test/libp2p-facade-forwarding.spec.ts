@@ -77,6 +77,7 @@ describe('Libp2pFretService — forwarding', function () {
 					return ASYNC_UNWRAP.has(name) ? Promise.resolve(sentinel) : sentinel
 				}
 			}
+			mockCore.stop = () => {}
 			coreOf(svc).inner = mockCore
 
 			for (const name of methods) {
