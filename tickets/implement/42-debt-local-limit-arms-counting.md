@@ -2,6 +2,29 @@ description: When our own node runs out of network stream slots, several places 
 files: packages/fret/src/service/fret-service.ts, packages/fret/src/rpc/request.ts, packages/fret/test/rpc.stream-caps-local-limit-scoring.spec.ts, packages/fret/test/rpc.stream-caps-outbound.spec.ts
 difficulty: medium
 
+## Run history — read this first
+
+**Two runs have now ended on the runner's soft token budget before writing any code.** The first
+(`debt-local-limit-arms-untested`) split into this ticket and `debt-local-limit-arms-noncounting`.
+The second (this ticket) spent its budget on orientation alone — reading `docs/fret.md` via
+`AGENTS.md`, then the two template specs, then grepping the arms — and was cut off at the first
+tool call after that.
+
+The lesson is about **order of work**, not about scope: the scope here is a single new test file.
+Splitting again would make it worse, since every run pays the same large fixed preamble.
+
+So, next run:
+
+- **Do not re-read `docs/fret.md`, and do not re-grep `fret-service.ts` for the arms.** Everything
+  those steps produced is recorded under *Verified at HEAD* below, checked at f03d061 and unchanged.
+- **Do not re-read `test/rpc.stream-caps-outbound.spec.ts`** — its only contribution is the rig
+  recipe, reproduced below.
+- **Read `test/rpc.stream-caps-local-limit-scoring.spec.ts` once** (it is the file to copy the shape
+  of) and then **write the new spec immediately**, before any other exploration.
+- Validate last: `npx tsc --noEmit`, then the `rpc.stream-caps*` specs, then `yarn test`.
+- If budget runs out again mid-file, hand off the partial file and say which rows are missing —
+  a partial spec that compiles is worth more than another empty run.
+
 ## Background
 
 An outbound request can fail because *our own* node hit its per-connection limit on open
@@ -13,10 +36,9 @@ The shipped fix routes every outcome-observing site through one owner,
 `FretService.countStreamLimit`, which bumps `diag.streamLimit` and scores nothing. Only one arm
 is pinned by a test today.
 
-This ticket is the first of two halves split from `debt-local-limit-arms-untested` when that run
-hit its token budget before writing any code. It builds the new spec file and the rows that
-**do** count. The companion `debt-local-limit-arms-noncounting` adds the rows that must **not**
-count, plus the source `NOTE:` and the design-doc update.
+This ticket builds the new spec file and the rows that **do** count. The companion
+`debt-local-limit-arms-noncounting` (already filed, sequence 42.5) adds the rows that must **not**
+count, plus the source `NOTE:` and the design-doc update, extending this same file.
 
 ## The design call, resolved (carried forward — do not re-litigate)
 
@@ -37,25 +59,11 @@ Rejected on evidence gathered during planning:
 
 So the helper stays and the test becomes the guarantee.
 
-## What to build
+## Verified at HEAD (f03d061) — do not re-derive
 
-One table-driven spec, `packages/fret/test/rpc.stream-caps-local-limit-arms.spec.ts`, with a row
-per outcome-observing arm. Each row forces a **real** stream-limit refusal at that arm's own call
-site and asserts the same four things:
-
-- the peer's failure counters (`contactFailures`, `failureCount`) are unchanged
-- the peer's `relevance`, `membership` and `state` are unchanged
-- no backoff was recorded for the peer (`ProbeBackoff`)
-- `diag.streamLimit` went up by exactly one per refusal
-
-Adding an eighth arm later means adding a row, not copying a test.
-
-### The arms — line numbers **verified by grep at HEAD** (f03d061)
-
-`grep -n "countStreamLimit\|noteWriteOnlyOutcome\|noteRpcFailure\|local-limit" src/service/fret-service.ts`
-produced these; grep the named symbol rather than trusting a number after any edit.
-
-`countStreamLimit` is defined at **906** and has four direct callers:
+**The arms.** `grep -n "countStreamLimit\|noteWriteOnlyOutcome\|noteRpcFailure\|local-limit"
+src/service/fret-service.ts` was re-run this session; every line number the plan recorded still
+matches. `countStreamLimit` is defined at **906** and has four direct callers:
 
 | # | Call site | Line | Covered today? |
 |---|---|---|---|
@@ -68,38 +76,95 @@ produced these; grep the named symbol rather than trusting a number after any ed
 `sendLeave` fan-out **1881**.
 
 Sites that route a `local-limit` outcome *into* `noteRpcFailure` rather than counting for
-themselves — verified at **2472/2477**, **2695/2698**, **2754/2757**, **3067/3071**, plus the
-activity-resend arm at **3436**. These inherit arm 1 and are not separate arms — but include
-them as rows anyway, so a future edit that gives one of them its own `switch` arm is caught by
-an existing row rather than by nobody.
+themselves — **2472/2477**, **2695/2698**, **2754/2757**, **3067/3071**, plus the activity-resend
+arm at **3436**. These inherit arm 1 and are not separate arms — but include them as rows anyway,
+so a future edit that gives one of them its own `switch` arm is caught by an existing row rather
+than by nobody.
+
+**Protocol export names — all five now confirmed by reading `src/rpc/protocols.ts:29–49`**, which
+closes the open question the plan left ("only `PROTOCOL_PING` has been confirmed"). `makeProtocols(networkName)`
+returns an object with exactly these keys:
+
+```
+PROTOCOL_NEIGHBORS           //  `/optimystic/${networkName}/fret/1.0.0/neighbors`
+PROTOCOL_NEIGHBORS_ANNOUNCE  //  .../neighbors/announce
+PROTOCOL_MAYBE_ACT           //  .../maybeAct
+PROTOCOL_LEAVE               //  .../leave
+PROTOCOL_PING                //  .../ping
+```
+
+Note announce is its **own** protocol, distinct from the neighbors request protocol — so a row
+capping "neighbors" for the announce arm must cap `PROTOCOL_NEIGHBORS_ANNOUNCE`, and one for the
+snapshot fetch must cap `PROTOCOL_NEIGHBORS`. Capping the wrong one of that pair is the most
+likely way to write a vacuously-passing row.
+
+**Private methods the template already reaches through `svc as unknown as { … }`**, with their
+signatures as used:
+
+```
+probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<boolean>
+probeMembership(id: string, signal: AbortSignal | undefined): Promise<void>
+cfg: { deadAfterFailures: number }
+```
+
+The remaining arms need their own cast; grep the method name in `fret-service.ts` at the line
+numbers above for its exact parameter list rather than guessing.
+
+**Known-good imports** (all used by the template spec):
+`createMemNode` / `stopAll` from `./helpers/libp2p.js`, `backoffOf` from `./helpers/backoff.js`,
+`makeProtocols` / `registerRpcHandler` from `../src/rpc/protocols.js`, `hashPeerId` from
+`../src/ring/hash.js`, `FretService` from `../src/service/fret-service.js`, `DigitreeStore` (type)
+from `../src/store/digitree-store.js`.
+
+## What to build
+
+One table-driven spec, `packages/fret/test/rpc.stream-caps-local-limit-arms.spec.ts`, with a row
+per outcome-observing arm. Each row forces a **real** stream-limit refusal at that arm's own call
+site and asserts the same four things:
+
+- the peer's failure counters (`contactFailures`, `failureCount`) are unchanged
+- the peer's `relevance`, `membership` and `state` are unchanged
+- no backoff was recorded for the peer (`ProbeBackoff`, read via the `backoffOf` helper)
+- `diag.streamLimit` went up by exactly one per refusal
+
+Adding an eighth arm later means adding a row, not copying a test.
 
 ### The rig recipe (already proven — reuse it, do not re-derive)
 
-`test/rpc.stream-caps-local-limit-scoring.spec.ts` is the template; read it first. On the
-**dialing** node, register the protocol handler directly with `{ maxOutboundStreams: 0 }` —
-libp2p reads the outbound cap off the dialer's own registrar entry
-(`findOutgoingStreamLimit`, `libp2p/dist/src/connection.js`), and `newStream` counts the stream
-it is opening before comparing, so a cap of 0 refuses the first stream with no concurrency
-needed. The registered handler is never entered; it exists purely to declare the cap.
-
-Imports that spec already uses, so they are known-good:
-`createMemNode` / `stopAll` from `./helpers/libp2p.js`, `backoffOf` from `./helpers/backoff.js`,
-`makeProtocols` / `registerRpcHandler` from `../src/rpc/protocols.js`, `hashPeerId` from
-`../src/ring/hash.js`. Grep `makeProtocols` in `src/rpc/protocols.ts` for the exact
-per-protocol export names before writing the per-protocol cap installer — only
-`PROTOCOL_PING` has been confirmed by reading.
+On the **dialing** node, register the protocol handler directly with `{ maxOutboundStreams: 0 }`
+via `registerRpcHandler`. libp2p reads the outbound cap off the dialer's own registrar entry
+(`findOutgoingStreamLimit`, `libp2p/dist/src/connection.js`), and `newStream` counts the stream it
+is opening before comparing, so a cap of 0 refuses the first stream with no concurrency needed. The
+registered handler is never entered; it exists purely to declare the cap.
 
 Carry these rig details across or the assertions go vacuous:
 
 - Do **not** `start()` the local service — no live stabilization loop, so diagnostics stay
-  deterministic; drive each pass explicitly by casting through `svc as unknown as { … }`.
-- Rewind `lastContactFailureAt` to 0 between refusals. Without it the 500 ms contact-failure
-  spacing guard lets a broken implementation pass.
+  deterministic; drive each pass explicitly by casting through `svc as unknown as { … }`. Because
+  the local service is never started it has registered none of the five protocols, which is what
+  leaves the spec free to register them itself at a cap of 0.
+- The remote service **is** started, so the control call has a real handler to answer.
+- Give the local node an address for the remote by dialing its multiaddr once, then seed the
+  routing-table entry with `store.upsert(peerId, await hashPeerId(remote.peerId))` and
+  `store.setMembership(peerId, 'member')` — FRET itself dials by bare peer id.
+- Rewind `lastContactFailureAt` to 0 between refusals (`store.update(peerId, { lastContactFailureAt: 0 })`).
+  Without it the 500 ms contact-failure spacing guard lets a broken implementation pass.
 - Keep a **control** case per arm proving the same call answers over the same connection before
   the cap is installed.
 - Install the cap **per protocol**. Arms 2–4 span ping (warm-up), maybeAct (lookup) and
-  neighbors/leave (write-only), so a cap on ping alone pins nothing for arms 3 and 4.
-- The remote service **is** started, so the control call has a real handler to answer.
+  neighbors-announce / leave (write-only), so a cap on ping alone pins nothing for arms 3 and 4.
+
+## TODO
+
+- Write `packages/fret/test/rpc.stream-caps-local-limit-arms.spec.ts` as a table over the arms
+  above, reusing the `maxOutboundStreams: 0` rig.
+- Cover arms 2, 3 and all three `noteWriteOnlyOutcome` callers; add rows for arm 1 and for the
+  five inherit-arm-1 sites.
+- Leave the `cancelled` / `skipped` non-counting rows, the source `NOTE:` and the `docs/fret.md`
+  paragraph to `debt-local-limit-arms-noncounting` — that ticket extends this same file.
+- Run `cd packages/fret && npx tsc --noEmit` and
+  `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/rpc.stream-caps*.spec.ts" --timeout 30000`,
+  then the full `yarn test` before handing off.
 
 ## Edge cases & interactions
 
@@ -122,16 +187,3 @@ Carry these rig details across or the assertions go vacuous:
   TCP+noise) and `rpc.stream-caps-local-limit-scoring.spec.ts` (arm 1 through two real call sites)
   both stay where they are; the new table adds the uncovered arms and re-covers arm 1 as a row for
   uniformity.
-
-## TODO
-
-- Write `packages/fret/test/rpc.stream-caps-local-limit-arms.spec.ts` as a table over the arms
-  above, reusing the `maxOutboundStreams: 0` rig from
-  `rpc.stream-caps-local-limit-scoring.spec.ts`.
-- Cover arms 2, 3 and all three `noteWriteOnlyOutcome` callers; add rows for arm 1 and for the
-  five inherit-arm-1 sites.
-- Leave the `cancelled` / `skipped` non-counting rows, the source `NOTE:` and the `docs/fret.md`
-  paragraph to `debt-local-limit-arms-noncounting` — that ticket extends this same file.
-- Run `cd packages/fret && npx tsc --noEmit` and
-  `node --import ./register.mjs node_modules/mocha/bin/mocha.js "test/rpc.stream-caps*.spec.ts" --timeout 30000`,
-  then the full `yarn test` before handing off.
