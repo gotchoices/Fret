@@ -153,55 +153,75 @@ function assertCoordWidth(coord: Uint8Array): void {
 type EntryPath = Path<string, PeerEntry>;
 
 /**
- * Tree keys, cached against the *entry object* that produced them.
+ * Tree keys, cached against the *coordinate array* an entry carries.
  *
  * `digitree` derives an entry's key on demand rather than storing it, and calls the extractor
  * once per binary-search probe inside a leaf node — measured 5 calls per `find`, 6 per seek.
- * Every one of those calls ran `coordToHex` (a 32-iteration loop building a 64-character
- * string) plus a concatenation, which measured ~83% of a `find` (20 000 `find` calls over a
- * 2048-entry store: 39.0 ms rebuilding vs 4.4 ms cached). `find` is not a rare call —
- * `getById`, `remove`, `update`, `put`, and the seek that starts every ring walk each perform
- * one.
+ * Uncached, every one of those calls runs `coordToHex` (a 32-iteration loop building a
+ * 64-character string) plus a concatenation, which measured ~83% of a `find` (20 000 `find`
+ * calls over a 2048-entry store: 39.0 ms rebuilding vs 4.4 ms cached). `find` is not a rare
+ * call — `remove`, `put`, and the seek that starts every ring walk each perform one.
  *
- * Keyed on **object identity**, and deliberately not a field on `PeerEntry`. Every write path
- * builds its new entry by spreading the old one (`{ ...prev, coord, lastAccess }` in `upsert`,
- * `{ ...cur, ...patch }` in `update`), so a key field would carry the previous entry's key
- * across a coordinate change and be silently stale — the re-key case this store's write seam
- * exists to handle. A re-keyed entry is a *different object*, so it simply misses the cache:
- * staleness is unrepresentable rather than merely unlikely. It would also widen an exported
- * public interface, and a non-enumerable symbol property that dodged the spread would cost a
- * `defineProperty` per write plus a shape transition on the hottest object in the package.
- * Entries are dropped from the cache by the garbage collector when the store drops them, so
- * there is no eviction path to maintain and no ceiling to state.
+ * The cache key is the **coordinate array's object identity**, guarded by the entry's id, and
+ * that choice is the whole point rather than an implementation detail. Keying on the *entry*
+ * object instead covers only the read side: every write path hands `put` a freshly spread
+ * entry (`{ ...prev, coord, lastAccess }` in `upsert`, `{ ...cur, ...patch }` in `update`), so
+ * a write was a guaranteed miss — it rebuilt the hex, allocated the key, and inserted a fresh
+ * weak-table record that was garbage before the next write. That cost is not the rebuild; it
+ * is the weak table. Measured on the 300-peer bounded-store simulation in
+ * `test/message-bus.spec.ts` (3.4M writes, 66M extractor calls): 25–35 s per run keyed on the
+ * entry, 9 s with the cache removed outright, and 3.3–4.3 s keyed on the coordinate — an
+ * entry-keyed cache was several times *worse* than no cache at all, because the misses it
+ * could not avoid each left a record behind for the collector to walk.
+ *
+ * A coordinate array, by contrast, is stable across writes wherever one exists: `upsert` reuses
+ * the caller's array (a peer's ring coordinate, hashed once), and `update` spreads the current
+ * entry, so an entry whose coordinate did not change carries the same array through. So the
+ * ordinary write is a hit, and the table holds one record per live coordinate rather than one
+ * per write.
+ *
+ * The id guard is what keeps that sound: two entries may legitimately share a coordinate array
+ * (the same bytes handed to two ids), and the key embeds the id. A mismatch simply rebuilds,
+ * which is the uncached cost and never a wrong key. A genuine re-key hands in a different
+ * array and misses the same way.
+ *
+ * Deliberately not a field on `PeerEntry`: a key field would be carried across a coordinate
+ * change by the spread and be silently stale — the re-key case this store's write seam exists
+ * to handle — it would widen an exported public interface, and a non-enumerable symbol
+ * property that dodged the spread would cost a `defineProperty` per write plus a shape
+ * transition on the hottest object in the package. Arrays leave the cache with the garbage
+ * collector, so there is no eviction path to maintain and no ceiling to state.
  *
  * NOTE: the cache rests on one invariant, and that invariant is already load-bearing at HEAD:
- * an entry's `id` and `coord` are never mutated in place while it sits in the tree. Because
- * `digitree` re-derives keys from entries on demand, in-place mutation already scrambles tree
- * order *without* the cache — so the cache is exactly as safe as the status quo, no safer and
- * no less. Verified by grep across `src/` and `test/` at the time of writing: every write path
- * replaces the entry object. `test/digitree.neighbors.spec.ts` pins the re-key path so the two
- * cannot drift.
+ * an entry's `id`, and the bytes of the `coord` it holds, are never mutated in place while it
+ * sits in the tree. Because `digitree` re-derives keys from entries on demand, in-place
+ * mutation already scrambles tree order *without* the cache — so the cache is exactly as safe
+ * as the status quo, no safer and no less. Verified by grep across `src/` and `test/` at the
+ * time of writing: every write path replaces the entry object and every coordinate is built
+ * fresh by a decoder or a hash. `test/digitree.neighbors.spec.ts` pins the re-key path and
+ * `test/digitree.invariants.spec.ts` asserts tree order against the coordinates the entries
+ * actually carry, so a stale key fails there.
  */
-const keyCache = new WeakMap<PeerEntry, string>();
+const keyCache = new WeakMap<Uint8Array, { id: string; key: string }>();
 
 function makeKey(entry: PeerEntry): string {
-	const cached = keyCache.get(entry);
-	if (cached !== undefined) return cached;
+	const cached = keyCache.get(entry.coord);
+	if (cached !== undefined && cached.id === entry.id) return cached.key;
 	const key = `${coordToHex(entry.coord)}|${entry.id}`;
-	keyCache.set(entry, key);
+	keyCache.set(entry.coord, { id: entry.id, key });
 	return key;
 }
 
 /**
  * The routing table: an ordered B+Tree of peer entries plus an index from peer id to that
- * entry's tree key.
+ * entry.
  *
  * The tree key embeds the ring coordinate (`hex(coord)|id`), so **changing a peer's
  * coordinate changes its tree key** — an update is a re-key, not an in-place edit. Every
  * read above this class rests on one invariant:
  *
- * > Exactly one tree entry exists per peer id, and `byId` maps that id to that entry's
- * > current key.
+ * > Exactly one tree entry exists per peer id, and `byId` maps that id to that very entry
+ * > object.
  *
  * Nothing outside this class may write to either structure. All mutation funnels through
  * the private {@link DigitreeStore.put} seam (and its delete half, {@link
@@ -211,7 +231,18 @@ function makeKey(entry: PeerEntry): string {
  */
 export class DigitreeStore {
 	private readonly byKey: BTree<string, PeerEntry>;
-	private readonly byId: Map<string, string>; // id -> key
+	/**
+	 * id -> the *entry object* the tree holds for that id, rather than its tree key.
+	 *
+	 * Holding the entry is what makes `getById` free. A key has to be turned back into an
+	 * entry by a tree `find`, and `find` is this store's dominant cost: `digitree` derives a
+	 * key from an entry on demand and calls the extractor once per binary-search probe, so
+	 * every id-keyed read — and every write, which resolves the previous entry before
+	 * replacing it — paid a full descent to learn something this map already held. Nothing is
+	 * lost by dropping the key: it is recoverable from the entry through {@link makeKey},
+	 * whose cache is warm for any entry the tree already holds.
+	 */
+	private readonly byId: Map<string, PeerEntry>;
 	// O(1) per-label tallies over the entries currently in the store, maintained only at the
 	// write seam (`put`) and the delete seam (`remove`) below. A tally over a field the store
 	// already owns is bookkeeping, not policy — the store still never branches on `membership`
@@ -263,17 +294,21 @@ export class DigitreeStore {
 	private put(entry: PeerEntry): PeerEntry {
 		assertCoordWidth(entry.coord);
 		const key = makeKey(entry);
-		const prevKey = this.byId.get(entry.id);
-		const prevEntry = this.getById(entry.id);
-		if (prevKey !== undefined && prevKey !== key) {
-			const prev = this.byKey.find(prevKey);
-			if (prev.on) this.byKey.deleteAt(prev);
+		const prevEntry = this.byId.get(entry.id);
+		if (prevEntry !== undefined) {
+			// `makeKey` over an entry the tree already holds is a cache hit, so recovering the
+			// previous key costs nothing and the tree is touched only on a genuine re-key.
+			const prevKey = makeKey(prevEntry);
+			if (prevKey !== key) {
+				const prev = this.byKey.find(prevKey);
+				if (prev.on) this.byKey.deleteAt(prev);
+			}
 		}
 		// insert-or-replace at `key`: unlike `insert` it has no conflict outcome to discard,
 		// and unlike `updateAt` it needs no caller-held path — it takes its own `find` after
 		// the delete above, so nothing here can act on a path the tree already invalidated.
 		this.byKey.upsert(entry);
-		this.byId.set(entry.id, key);
+		this.byId.set(entry.id, entry);
 		if (prevEntry) this.tally(prevEntry, -1);
 		this.tally(entry, 1);
 		return entry;
@@ -313,16 +348,13 @@ export class DigitreeStore {
 	}
 
 	getById(id: string): PeerEntry | undefined {
-		const key = this.byId.get(id);
-		if (!key) return undefined;
-		const p = this.byKey.find(key);
-		return p.on ? this.byKey.at(p) : undefined;
+		return this.byId.get(id);
 	}
 
 	remove(id: string): void {
-		const key = this.byId.get(id);
-		if (!key) return;
-		const p = this.byKey.find(key);
+		const prev = this.byId.get(id);
+		if (!prev) return;
+		const p = this.byKey.find(makeKey(prev));
 		if (p.on) {
 			this.tally(this.byKey.at(p)!, -1);
 			this.byKey.deleteAt(p);

@@ -457,9 +457,15 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
   - Ready gate for early queries; allow zero-peers override for single-node dev.
 - Routing store (Digitree) & indices (A2)
   - Ordered B+Tree keyed by ring coordinate; secondary relevance index.
-  - **One entry per peer id, and the id index points at its current key.** The store keeps two
-    views of the same population: the ordered tree (every ring walk, `list`, `exportEntries`)
-    and a map from peer id to that entry's tree key (`getById`, `remove`, `update`, `size`).
+  - **One entry per peer id, and the id index points at that very entry object.** The store keeps
+    two views of the same population: the ordered tree (every ring walk, `list`, `exportEntries`)
+    and a map from peer id to the entry the tree holds for it (`getById`, `remove`, `update`,
+    `size`). The map holds the *entry*, not its tree key: a key has to be turned back into an
+    entry by a tree `find`, and `find` is the store's dominant cost (see the key-cache bullet
+    below), so an id index storing keys made every id-keyed read — and every write, which
+    resolves the previous entry before replacing it — pay a full descent to learn something the
+    map already held. Nothing is lost by dropping the key; it is recoverable from the entry
+    through the cached key builder.
     The tree key embeds the coordinate (`hex(coord)|id`), so **changing a peer's coordinate is a
     re-key, not an in-place edit** — the old entry must be dropped as the new one is placed.
     All mutation therefore funnels through a single private write seam inside `DigitreeStore`
@@ -493,24 +499,38 @@ See [threat-analysis.md](threat-analysis.md) for comprehensive threat modeling a
     caller skip a full-table walk outright — which is what the stabilization tick's
     phase-2 target selection does (see the *Two phases* bullet under *Stabilization and
     churn handling*).
-  - **A tree key is built once per entry object, not once per tree probe.** `digitree` derives
+  - **A tree key is built once per ring coordinate, not once per tree probe.** `digitree` derives
     keys from entries on demand rather than storing them, and calls the extractor once per
     binary-search probe inside a leaf — measured 5 calls per `find`, 6 per seek — so every
-    `getById` / `remove` / `update` / `put` and the seek that starts every ring walk rebuilt a
-    64-character hex string five or six times over. Measured at ~83% of a `find` (20 000 `find`s
-    over a 2048-entry store: 39.0 ms rebuilding, 4.4 ms cached). The cache is a module-level
-    `WeakMap` keyed on **entry object identity**, populated inside the key builder itself.
-    Identity rather than peer id is the whole point: every write path builds its new entry by
-    spreading the old one, so a key stored *on* the entry would be carried across a coordinate
-    change and be silently stale — the exact re-key case the write seam exists to handle — while
-    a re-keyed entry is a different object and simply misses the cache. Staleness is therefore
-    unrepresentable rather than merely unlikely, entries leave the cache with the garbage
-    collector, and there is no eviction path or ceiling to state. It rests on one invariant that
-    is **already load-bearing at HEAD**: an entry's `id` and `coord` are never mutated in place
-    while it sits in the tree. Because keys are re-derived on demand, in-place mutation already
-    scrambles tree order without the cache, so the cache is exactly as safe as the status quo.
-    `test/digitree.invariants.spec.ts` now asserts tree order agrees with the coordinates the
-    entries carry, which is the assertion a stale key fails.
+    `remove` / `put` and the seek that starts every ring walk rebuilt a 64-character hex string
+    five or six times over. Measured at ~83% of a `find` (20 000 `find`s over a 2048-entry store:
+    39.0 ms rebuilding, 4.4 ms cached). The cache is a module-level `WeakMap` keyed on the
+    **coordinate array's object identity**, guarded by the entry's id, and populated inside the
+    key builder itself.
+    - **Keying it on the coordinate rather than on the entry object is the load-bearing part,
+      and it is what makes the cache a win at all.** Every write path builds its new entry by
+      spreading the old one, so an entry-keyed cache was a guaranteed *miss* on every write: it
+      rebuilt the hex, allocated the key, and inserted a fresh weak-table record that was
+      garbage before the next write. The cost of that is not the rebuild, it is the weak table —
+      measured on the 300-peer bounded-store case in `test/message-bus.spec.ts` (3.4M writes,
+      66M extractor calls), an entry-keyed cache ran the sweep in 25–35 s, *no cache at all* ran
+      it in 9 s, and the coordinate-keyed cache runs it in 3.3–4.3 s. A coordinate array is
+      stable across writes wherever one exists (`upsert` reuses the caller's array, `update`
+      spreads the current entry), so the ordinary write is a hit and the table holds one record
+      per live coordinate rather than one per write.
+    - The **id guard** keeps that sound: the key embeds the id, and two entries may share a
+      coordinate array, so a record whose id does not match simply rebuilds — the uncached cost,
+      never a wrong key. A genuine re-key hands in a different array and misses the same way.
+    - Keeping the key *on* the entry instead is still wrong for the original reason: the spread
+      would carry it across a coordinate change and it would be silently stale, which is the
+      exact re-key case the write seam exists to handle.
+    - It rests on one invariant that is **already load-bearing at HEAD**: an entry's `id`, and the
+      bytes of the `coord` it holds, are never mutated in place while it sits in the tree. Because
+      keys are re-derived on demand, in-place mutation already scrambles tree order without the
+      cache, so the cache is exactly as safe as the status quo. Arrays leave the cache with the
+      garbage collector, so there is no eviction path or ceiling to state.
+      `test/digitree.invariants.spec.ts` asserts tree order agrees with the coordinates the
+      entries carry, which is the assertion a stale key fails.
   - **A ring walk exits on the first repeated id, because a repeat proves it lapped.**
     `neighborsRight` / `neighborsLeft` collect straight into a `Set` and return the moment they
     see an id already in it. Unfiltered, `maxScan` is `Infinity`, so before this a walk on a ring
