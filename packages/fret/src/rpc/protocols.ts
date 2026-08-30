@@ -764,8 +764,9 @@ export async function openRpcStream(
  * not: `close()` on a stream whose remote has stalled is itself unbounded, so the *cleanup*
  * of a timed-out read would hang after the read's own deadline had already fired. `abort()`
  * is synchronous and releases the stream at once — which matters because outbound stream caps
- * are finite (libp2p's default 64 per protocol per connection; FRET passes no override), so a
- * leaked stream is a real ceiling rather than mere waste.
+ * are finite (per protocol per connection: libp2p defaults to 64, and FRET's own registrations
+ * override it through `FretService.streamCaps()` — Core 256, Edge 64), so a leaked stream is a
+ * real ceiling rather than mere waste.
  *
  * The close on the un-aborted path is itself bounded by `signal`. `Stream.close()` resolves only
  * once pending data has reached the transport, so a peer that accepts a stream and then stops
