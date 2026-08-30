@@ -3,8 +3,16 @@ import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
 import { tcp } from '@libp2p/tcp'
 import { identify } from '@libp2p/identify'
+// NOTE: `@libp2p/circuit-relay-v2` is pinned to an exact version in package.json rather than to a
+// range, and this is its only consumer. 4.1.3 is the newest release whose whole transitive
+// `@libp2p/*` set matches what libp2p 3.1.3 already pulls, so it dedupes completely; a newer one
+// drags in a second `@libp2p/interface` (3.3.0 adds a required `Stream.readableEnded`, which the
+// installed libp2p's streams do not have). Nothing in the repo moves the pin for you — if you bump
+// the libp2p stack, bump this too; a stale pin surfaces as a `tsc --noEmit` type error, loudly, but
+// only at that point.
 import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import type { Connection } from '@libp2p/interface'
+import { stopAll } from './libp2p.js'
 
 /**
  * A three-node circuit-relay topology: a publicly reachable relay, a `listener` that is only
@@ -69,11 +77,25 @@ async function waitFor(what: string, predicate: () => boolean, timeoutMs = 15_00
  * this helper.
  */
 export async function createRelayTopology(): Promise<RelayTopology> {
-	const relay = await createRelayNode()
-	const listener = await createRelayedNode(true)
-	const dialer = await createRelayedNode(false)
-	const all = [relay, listener, dialer]
+	const all: Libp2p[] = []
+	try {
+		const relay = await createRelayNode(); all.push(relay)
+		const listener = await createRelayedNode(true); all.push(listener)
+		const dialer = await createRelayedNode(false); all.push(dialer)
+		await connectThroughRelay(relay, listener, dialer)
+		return { relay, listener, dialer, all }
+	} catch (err) {
+		// Setup runs across three nodes, a reservation and two dials, and any of them can throw.
+		// The nodes already standing must be stopped here: the spec's `after` hook has no topology
+		// to hand `stopAll`, so they would stay live and the mocha exit watchdog would fail the run
+		// on the open handles — burying the setup error that actually caused it.
+		await stopAll(all)
+		throw err
+	}
+}
 
+/** Reserve a slot on the relay for `listener`, then dial it from `dialer` over that circuit. */
+async function connectThroughRelay(relay: Libp2p, listener: Libp2p, dialer: Libp2p): Promise<void> {
 	const relayAddr = relay.getMultiaddrs()[0]
 	if (relayAddr == null) throw new Error('relay is not listening')
 
@@ -98,8 +120,6 @@ export async function createRelayTopology(): Promise<RelayTopology> {
 	// on the listener, reading the listener's connection object.
 	await waitFor('both ends of the circuit to report an open connection', () =>
 		connectionTo(dialer, listener) != null && connectionTo(listener, dialer) != null)
-
-	return { relay, listener, dialer, all }
 }
 
 /** The open connection from `from` to `to`, or `undefined`. */

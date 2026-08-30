@@ -135,6 +135,6 @@ describe('registration seam is the only place that calls node.handle', function 
 		// `registerRpcHandler` (or `registerJsonHandler`) instead of widening this list.
 		expect(sites, 'every protocol registers through registerRpcHandler').to.have.lengthOf(1)
 		expect(sites[0], 'the one call site is the seam').to.match(
-			new RegExp(`^${SEAM_FILE.split(sep).join('/').replace('.', '\\.')}:\\d+$`))
+			new RegExp(`^${SEAM_FILE.split(sep).join('/').replaceAll('.', '\\.')}:\\d+$`))
 	})
 })

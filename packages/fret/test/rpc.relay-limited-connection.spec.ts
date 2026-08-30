@@ -25,17 +25,18 @@ import { rpcRequest } from '../src/rpc/request.js'
 //      gate tests — and throws if the connection turned out to be direct;
 //   2. the bare control must be refused, which can only happen when the gate is engaged.
 //
-// Mutation results (run by hand during implementation, recorded here because a mutation nobody
-// ran proves nothing):
-//   - flipping `runOnLimitedConnection` to `false` in `handleOptions` reddens the positive case;
+// Mutation results (run by hand, recorded here because a mutation nobody ran proves nothing):
+//   - flipping `runOnLimitedConnection` to `false` in `handleOptions` reddens the positive case
+//     (`decode-error`); the control stays green;
 //   - adding `runOnLimitedConnection: true` to the bare control's `node.handle` reddens the
-//     control.
-// Each mutation reddens exactly the arm it should and leaves the other green.
+//     control; the positive case stays green;
+//   - flipping `runOnLimitedConnection` to `false` in `openRpcStream` — the *sender* half —
+//     reddens the positive case too (`unreachable`), since libp2p refuses at the dial.
 //
-// One thing this rig deliberately does not do: exercise FRET's *sender* opt-in. Both arms dial
-// through `openRpcStream`, which already sets `runOnLimitedConnection: true` — so the dial-side
-// check passes for both protocols, and every difference between the two arms is attributable to
-// the listener's stored handler options. That is the point; the sender side was never broken.
+// So both ends' opt-ins are covered, but only *jointly*: the positive case fails if either side
+// loses its opt-in, and its `kind` is what tells them apart (`unreachable` = the dialer refused
+// locally, `decode-error` = the listener tore the stream down). The two arms differ only in the
+// listener's stored handler options, which is what attributes a green control to the receive side.
 
 const NETWORK = 'relay-limited-test'
 /** Registered through the seam under test — opts in for relayed traffic as a constant. */
