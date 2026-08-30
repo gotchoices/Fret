@@ -33,7 +33,11 @@ import { registerRpcHandler } from '../src/index.js'
 interface HandleOpts {
 	maxInboundStreams?: number
 	maxOutboundStreams?: number
+	runOnLimitedConnection?: boolean
 }
+
+/** Just the two caps — the relay opt-in is a constant, so it is never a per-profile expectation. */
+type Caps = Required<Pick<HandleOpts, 'maxInboundStreams' | 'maxOutboundStreams'>>
 
 interface Registration {
 	protocol: string
@@ -79,7 +83,7 @@ const ALL_PROTOCOLS = [
 // Pinned as literals rather than read back out of `FretService.streamCaps()`, so the expectation
 // is not derived from the thing under test. These are the numbers `docs/fret.md` states under
 // *Stream management*; a change to either must be a change here too.
-const profiles: Array<{ profile: 'core' | 'edge'; caps: Required<HandleOpts> }> = [
+const profiles: Array<{ profile: 'core' | 'edge'; caps: Caps }> = [
 	{ profile: 'core', caps: { maxInboundStreams: 128, maxOutboundStreams: 256 } },
 	{ profile: 'edge', caps: { maxInboundStreams: 32, maxOutboundStreams: 64 } },
 ]
@@ -104,7 +108,7 @@ describe('RPC stream caps: profile split', function () {
 	 * supplied. `FretService` always supplies one, so all five must appear — and if that ever
 	 * stops being true, this is what catches it rather than a count that a duplicate could satisfy.
 	 */
-	function expectAllFiveAt(handled: Registration[], caps: Required<HandleOpts>): void {
+	function expectAllFiveAt(handled: Registration[], caps: Caps): void {
 		expect(handled.map((r) => r.protocol).sort(), 'all five protocols, once each').to.deep.equal(
 			[...ALL_PROTOCOLS].sort()
 		)
@@ -114,6 +118,14 @@ describe('RPC stream caps: profile split', function () {
 				{ maxInboundStreams: r.opts!.maxInboundStreams, maxOutboundStreams: r.opts!.maxOutboundStreams },
 				`${r.protocol}: stream caps`
 			).to.deep.equal(caps)
+			// The relay opt-in rides the same registration. Asserted here, inside the per-profile
+			// and start -> stop -> start cases, because both are edge cases for it too: it must not
+			// become profile-conditional while travelling through the caps plumbing, and a cycle
+			// that re-registers the protocols must re-apply it. `registerRpcHandler` bakes it in as
+			// a constant, so this is confirming the constant survives the four registrar
+			// signatures rather than testing a value any caller chose.
+			expect(r.opts!.runOnLimitedConnection, `${r.protocol}: opted in to limited connections`)
+				.to.equal(true)
 		}
 	}
 
@@ -160,13 +172,20 @@ describe('RPC stream caps: profile split', function () {
 		})
 	}
 
-	it('leaves the caps absent when a caller omits them, so an external caller still compiles', async () => {
-		// The "also confirm while you are here" arm. The new stream-cap fields are optional on the
+	it('omits the cap keys entirely when a caller supplies none, so an external caller still compiles', async () => {
+		// The "also confirm while you are here" arm. The stream-cap fields are optional on the
 		// root-exported inbound seam, so a consumer registering its own protocol over the same node
 		// — the case `test/package-exports.spec.ts` guards the reachability of — needs no cap at all.
-		// Optionality is a *compile-time* claim, so the value of this case is that it type-checks
-		// with no cap fields present; the runtime assertion below is the second half, that omitting
-		// them forwards `undefined` rather than fabricating a default.
+		// Optionality is a *compile-time* claim, so half the value of this case is that it
+		// type-checks with no cap fields present.
+		//
+		// The runtime half is stronger than "the values are undefined": the keys must be **absent**.
+		// libp2p's registrar stores `{ maxInboundStreams: 32, maxOutboundStreams: 64, ...opts }`, so
+		// a key present with an `undefined` value spreads over the default and replaces it, leaving
+		// the handler with no cap at all. `hasOwnProperty` is the only assertion that can tell those
+		// two apart — `opts.maxInboundStreams === undefined` is satisfied by both. What the
+		// registrar then stores is `test/rpc.handler-registration.spec.ts`'s subject; this is the
+		// spy-side half.
 		const { handled } = spyHandlers(node)
 
 		await registerRpcHandler(
@@ -177,7 +196,9 @@ describe('RPC stream caps: profile split', function () {
 		)
 
 		expect(handled.length, 'one registration').to.equal(1)
-		expect(handled[0]!.opts?.maxInboundStreams, 'no inbound cap requested').to.equal(undefined)
-		expect(handled[0]!.opts?.maxOutboundStreams, 'no outbound cap requested').to.equal(undefined)
+		const opts = handled[0]!.opts as Record<string, unknown> | undefined
+		expect(Object.hasOwn(opts ?? {}, 'maxInboundStreams'), 'no inbound cap key present').to.equal(false)
+		expect(Object.hasOwn(opts ?? {}, 'maxOutboundStreams'), 'no outbound cap key present').to.equal(false)
+		expect(opts?.runOnLimitedConnection, 'the relay opt-in is still there').to.equal(true)
 	})
 })

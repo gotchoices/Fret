@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Connection, NewStreamOptions, PeerId, Stream } from '@libp2p/interface';
+import type { Connection, NewStreamOptions, PeerId, Stream, StreamHandlerOptions } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import { byteStream } from '@libp2p/utils';
 import { decode as decodeVarint } from 'uint8-varint';
@@ -119,6 +119,38 @@ export interface StreamCaps {
 	maxOutboundStreams?: number;
 }
 
+/**
+ * Build the options object handed to `node.handle`.
+ *
+ * **`runOnLimitedConnection` is a constant here, not a parameter.** libp2p refuses to run a
+ * protocol over a *limited* (circuit-relay) connection unless **both** ends opted in for that
+ * protocol, and the two ends are separate options objects: the dialer's `NewStreamOptions` (which
+ * {@link openRpcStream} sets) and the listener's stored handler options, which `Connection`'s
+ * inbound path reads back before invoking the handler. FRET opted in only when calling out, so a
+ * peer reachable only through a relay — a phone, a browser, a laptop behind a home router — could
+ * call every FRET protocol and answer none of them: it looked connected and was effectively
+ * unroutable, because the ring-maintenance and lookup RPCs are how a peer is *found*.
+ *
+ * Baked in rather than threaded through a parameter so a protocol added later inherits relay
+ * support without its author knowing the setting exists. There is no case where FRET wants to
+ * refuse relayed traffic for one protocol and accept it for another — all five register through
+ * this one seam, which is also why a single missing property disabled inbound RPC for the whole
+ * protocol set at once.
+ *
+ * **Absent caps are omitted, never passed as `undefined`.** libp2p's registrar stores
+ * `{ maxInboundStreams: 32, maxOutboundStreams: 64, ...opts }`, so a key present with an
+ * `undefined` value spreads *over* those defaults and replaces them with `undefined` rather than
+ * leaving them in place. Dormant for FRET's own registrations (`FretService.streamCaps()` always
+ * returns real numbers on both profiles) but not for outside callers: this function is public API
+ * and its `opts` parameter defaults to `{}`.
+ */
+function handleOptions(caps: StreamCaps): StreamHandlerOptions {
+	const options: StreamHandlerOptions = { runOnLimitedConnection: true };
+	if (caps.maxInboundStreams !== undefined) options.maxInboundStreams = caps.maxInboundStreams;
+	if (caps.maxOutboundStreams !== undefined) options.maxOutboundStreams = caps.maxOutboundStreams;
+	return options;
+}
+
 export async function registerRpcHandler(
 	node: Libp2p,
 	protocol: string,
@@ -151,7 +183,7 @@ export async function registerRpcHandler(
 				try { stream.abort(err instanceof Error ? err : new Error(String(err))); } catch { /* best effort */ }
 			}
 		}
-	}, { maxInboundStreams: opts.maxInboundStreams, maxOutboundStreams: opts.maxOutboundStreams });
+	}, handleOptions(opts));
 }
 
 /**
