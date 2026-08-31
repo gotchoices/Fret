@@ -321,6 +321,7 @@ Notes:
 - During routing and stabilization, we bias discovery/merges toward logarithmically spaced intervals around targets rather than exact keys.
 - Combined with sparsity-weighted relevance, this seeds routing-relevant peers without explicit finger tables.
 - The cache thus self-organizes into a distance-balanced spine that accelerates future lookups, while remaining purely cache/relevance-driven.
+- **NOTE: accepted tradeoff — an explicit long-range finger set was proposed and declined.** Maintaining a separate set of logarithmically-spaced finger peers, probabilistically refreshed each stabilization cycle, would duplicate what the sparsity bonus already produces: the KDE over normalized log-distance up-ranks peers in under-represented distance bands, which is finger maintenance by another name, paid for out of scoring rather than out of probe budget. A second mechanism would need its own probe budget and its own eviction protection, and would compete with the sparsity model for the same routing-table slots. Revisit only if a hop-count measurement shows a deficit the sparsity model is not closing — `test/simulation.routing.spec.ts` is where that would show up, and at present it does not (p90 of 2 hops on the dense cases, 7–8 on the bounded-store 1000-peer case).
 
 ### Small vs large networks
 - Small (n << k): successor walk yields min(n, k). Deterministic and fast (one hop likely sufficient).

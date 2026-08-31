@@ -1,4 +1,3 @@
-----
 description: FRET tells peers about each other by identity only, never by address — so a peer behind a NAT can be known to the whole ring while nobody except its relay can actually reach it. Carry dialable address hints in the neighbor exchange.
 files: packages/fret/src/index.ts, packages/fret/src/service/fret-service.ts, packages/fret/src/service/peer-discovery.ts, packages/fret/src/store/digitree-store.ts, packages/fret/src/rpc/neighbors.ts
 tradeoffs: Real security surface (unsigned address hints are an eclipse/traffic-redirection vector, so hints must be self-signed peer records, which grows message size and adds verification cost) and partial duplication of libp2p identify — a maintainer may prefer fixing propagation one layer up (in the embedder, e.g. Optimystic's cluster records) and leaving FRET address-free by design.

@@ -1,8 +1,7 @@
----
 description: The real networking code that finds a peer and delivers work to it is only ever exercised with three nodes; there is no test that runs a few dozen real instances talking to each other, so bugs that only appear at that size would ship unnoticed.
 files: packages/fret/test/helpers/libp2p.ts, packages/fret/test/route.maybeact.integration.spec.ts, packages/fret/test/fret.mesh.spec.ts, packages/fret/test/iterative-lookup.spec.ts, packages/fret/src/service/fret-service.ts
 tradeoffs: A few dozen real libp2p nodes per test case is slow and prone to timing flakiness, and the deterministic simulator already covers ring maintenance — a maintainer could reasonably say the three-node integration tests plus the simulator are enough and spend the budget elsewhere.
----
+----
 
 Split out while planning `15.5-sim-router-realism`, which makes the deterministic simulator route
 through the shipped next-hop selector. That closes the "the simulator cannot detect a broken

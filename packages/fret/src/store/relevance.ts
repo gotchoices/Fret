@@ -89,6 +89,14 @@ function frequencyScore(entry: PeerEntry): number {
  * success) rather than a term that also grows with volume; volume lives in `frequencyScore`
  * instead. Putting volume in both would double-count it and force every weight to be re-tuned.
  * Revisit if the frequency term is ever removed or re-weighted to near zero.
+ *
+ * NOTE: accepted tradeoff — latency enters relevance *only* as this bounded penalty, and a
+ * further "nearness bonus" ranking peers against the population's RTT distribution (a z-score or
+ * percentile over an EMA mean and variance) was proposed and declined. It would pull the routing
+ * table toward topologically near peers, working directly against the sparsity model whose whole
+ * purpose is a distance-balanced spine — the two terms would fight, and the sparsity model is the
+ * one the routing design depends on. Revisit only if hop counts are measured to suffer from
+ * latency-blind next-hop choice, which the routing guard spec does not currently show.
  */
 export function healthScore(entry: PeerEntry): number {
 	const total = entry.successCount + entry.failureCount;
