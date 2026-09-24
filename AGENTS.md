@@ -67,8 +67,8 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 
 `yarn release` (from root) runs full flow: preflight prompt →
 `yarn bump` (bumpp: pick version, commit, tag `v<version>`, push) →
-`yarn pub` (clean, build, `yarn npm publish`) → `yarn gh-release`
-(GitHub release for new tag).
+`yarn pub` (clean, build, `yarn npm publish`) → `yarn await-published`
+(wait until npm serves it) → `yarn gh-release` (GitHub release for new tag).
 
 - **Preflight** (`scripts/release-preflight.js`) does **not** run
   `yarn check` — it asks whether you already did, the same gate
@@ -80,6 +80,19 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 - **Release notes**: drop untracked `.release-notes.pending.md` at repo
   root for release body; else GitHub auto-generates. Pending file
   consumed (deleted) on success.
+- **Wait for npm** (`scripts/await-published.js`): npm serves a new
+  version some time after `yarn pub` returns, and a downstream upgrade
+  run in that gap resolves the old one. The wait reads which packages
+  `pub` publishes from the root `package.json` (`pub` → `pub:*` →
+  `publish-package.js <dir>`), asks `npm view <name>@<version>` for each
+  every 5 s, and ends with `all N packages published and visible on npm
+  at <version>`. **Upgrade downstream repos only after that line.** After
+  10 min (`FRET_PUBLISH_WAIT_SECONDS` overrides) it names each missing
+  package and exits non-zero, so no GitHub release is cut. npm already
+  accepted the publish then: **don't re-run `yarn release`** (it would
+  bump again); re-run `yarn await-published`, then `yarn gh-release`.
+  Pure logic in `scripts/published-visibility.js`, tested by
+  `yarn test:scripts` (part of `yarn test`; no network).
 - **Publish only** (no bump / GitHub release): `yarn pub`.
 - **Prereqs**: authenticated `gh` CLI + npm publish rights for `p2p-fret`.
 

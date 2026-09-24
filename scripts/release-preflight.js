@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Release preflight — the reminder gate in front of `yarn bump && yarn pub && yarn gh-release`.
+ * Release preflight — the reminder gate in front of `yarn bump && yarn pub && yarn await-published && yarn gh-release`.
  *
  * `yarn pub` publishes to npm: irreversible for a given version number. This script does NOT
  * run the checks itself (a release should not silently spend minutes rebuilding and re-testing
@@ -47,7 +47,7 @@ function report() {
 	stdout.write('Run `yarn check` first if you have not already. It covers:\n');
 	stdout.write('  • yarn typecheck   tsc --noEmit over packages/fret\n');
 	stdout.write('  • yarn build       the package compiles\n');
-	stdout.write('  • yarn test        mocha suites (with the exit watchdog)\n\n');
+	stdout.write('  • yarn test        release-script tests, then mocha suites (with the exit watchdog)\n\n');
 
 	if (facts.ok) {
 		stdout.write(`Working tree: ${facts.dirty ? 'DIRTY — uncommitted changes present' : 'clean'}\n`);
