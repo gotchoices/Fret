@@ -35,6 +35,7 @@ import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
 import type { RpcOutcome } from '../rpc/outcome.js';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
+import { equals as u8Equals } from 'uint8arrays/equals';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
@@ -2940,6 +2941,10 @@ export class FretService implements IFretService, Startable {
 	private adoptPeerRecord(id: string, envelope: Uint8Array): void {
 		const entry = this.store.getById(id);
 		if (!entry) return;
+		// The common `peer:update` is one that re-fires with the record we already hold — our own
+		// `consumePeerRecord` echo, or any unrelated peerStore change for that peer (tags,
+		// protocols) — so answer that by byte equality before spending two protobuf parses on it.
+		if (entry.addressRecord && u8Equals(entry.addressRecord.envelope, envelope)) return;
 		const peeked = peekPeerRecord(envelope);
 		if (!peeked || peeked.signer !== id || peeked.peerId !== id) {
 			log.error('peerStore record for %s is not a self-signed record for that peer - not adopting', id);

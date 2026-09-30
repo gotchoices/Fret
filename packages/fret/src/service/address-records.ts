@@ -139,6 +139,13 @@ export class SelfAddressRecord {
 	private sealedFor = '';
 	private cached: string | undefined;
 	private lastSeq = 0n;
+	/**
+	 * Bumped at the start of every seal. A seal that finds it changed after its signature
+	 * returns was overtaken by a seal for a *newer* address list, so it must not commit: two
+	 * snapshot builds straddling a reservation landing would otherwise let the earlier (lower
+	 * sequence number) record land in the cache last and ride the next snapshot.
+	 */
+	private generation = 0;
 	/** A seal in progress, so two concurrent snapshot builds share one signature. */
 	private inflight: { key: string; promise: Promise<string | undefined> } | null = null;
 
@@ -162,6 +169,7 @@ export class SelfAddressRecord {
 	}
 
 	private async seal(node: Libp2p, privateKey: PrivateKey, addrs: Multiaddr[], key: string): Promise<string | undefined> {
+		const generation = ++this.generation;
 		if (addrs.length === 0) {
 			// Nothing dialable to state — no record, rather than a signed empty list that would
 			// only make receivers discard the addresses they hold for us.
@@ -180,6 +188,9 @@ export class SelfAddressRecord {
 		this.lastSeq = seq;
 		const record = new PeerRecord({ peerId: node.peerId, multiaddrs: addrs, seqNumber: seq });
 		const envelope = await RecordEnvelope.seal(record, privateKey);
+		// Overtaken while signing: the newer seal owns the cache. Hand back whatever it produces
+		// (or already produced) rather than this record, which describes a list we no longer have.
+		if (generation !== this.generation) return this.inflight?.promise ?? this.cached;
 		const encoded = encodeAddressRecord(envelope.marshal());
 		this.sealedFor = key;
 		if (encoded.length > MAX_ADDRESS_RECORD_CHARS) {

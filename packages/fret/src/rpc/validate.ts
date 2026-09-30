@@ -145,8 +145,8 @@ export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
 /**
  * Cap on one base64url-encoded address record in a snapshot's `hints`, in characters (one byte
  * each — base64url is ASCII). An Ed25519 envelope over a handful of addresses encodes to roughly
- * 300–700 characters; 2048 leaves room for an RSA key and the {@link MAX_SELF_RECORD_ADDRS}
- * addresses a self record may carry. Applied on both sides: the parser drops a longer record, and
+ * 300–700 characters; 2048 leaves room for an RSA key and the eight addresses a self record may
+ * carry (`MAX_SELF_RECORD_ADDRS` in `service/address-records.ts`). Applied on both sides: the parser drops a longer record, and
  * `SelfAddressRecord` omits its own record rather than emit one the receiver would drop.
  */
 export const MAX_ADDRESS_RECORD_CHARS = 2048;
