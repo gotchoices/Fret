@@ -3762,7 +3762,8 @@ export class FretService implements IFretService, Startable {
 	 * `consumePeerRecord`. `true` → the addresses are in the peerStore, so mark them known. A throw
 	 * is a bad signature on a record whose structure was fine — the file was altered — so that
 	 * record is stripped and counted, and the rest of the table stands. `false` → the peerStore
-	 * already holds an equal-or-newer record; the entry keeps its copy.
+	 * already holds an equal-or-newer record, so the entry adopts that one instead of keeping the
+	 * file's — see {@link adoptStoredPeerRecord}.
 	 */
 	private async consumeImportedAddressRecords(ids: Iterable<string>): Promise<void> {
 		// NOTE: one signature verify plus one peerStore write per persisted record, awaited in
@@ -3782,6 +3783,24 @@ export class FretService implements IFretService, Startable {
 				continue;
 			}
 			if (accepted) this.setAddressKnown(id, true);
+			else await this.adoptStoredPeerRecord(id);
+		}
+	}
+
+	/**
+	 * The peerStore turned down an imported record because it already holds an equal-or-newer one
+	 * for `id` — an import after `start()` replacing a live entry, or a peerStore that persists
+	 * across restarts. Import replaced the entry with the file's copy, so adopt the stored record
+	 * back onto it; otherwise the entry would forward the older record until the next
+	 * `peer:update` for that peer, which may never come.
+	 */
+	private async adoptStoredPeerRecord(id: string): Promise<void> {
+		try {
+			const peer = await this.node.peerStore.get(peerIdFromString(id));
+			this.setAddressKnown(id, peer.addresses.length > 0);
+			if (peer.peerRecordEnvelope) this.adoptPeerRecord(id, peer.peerRecordEnvelope);
+		} catch (err) {
+			log.error('adopting the peerStore record for imported %s failed - %e', id, err);
 		}
 	}
 }

@@ -187,6 +187,13 @@ describe('FretService routing-table import — address records', function () {
 		}
 	}
 
+	/** base64url envelope over a record *about* `subject`, signed by `signer` — sequence number 1,
+	 *  so older than any record libp2p's identify seals. */
+	async function sealed(signer: PrivateKey, subject: PeerId): Promise<string> {
+		const record = new PeerRecord({ peerId: subject, multiaddrs: [multiaddr('/ip4/127.0.0.1/tcp/4001')], seqNumber: 1n })
+		return u8ToString((await RecordEnvelope.seal(record, signer)).marshal(), 'base64url')
+	}
+
 	async function waitFor(what: string, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
 		const deadline = Date.now() + timeoutMs
 		while (!predicate()) {
@@ -233,6 +240,29 @@ describe('FretService routing-table import — address records', function () {
 		}
 	})
 
+	// An import after `start()` replaces a live entry with the file's copy; when libp2p already
+	// holds a newer record the entry must come back to that one, not keep forwarding the file's.
+	it('an entry whose imported record is older than the peerStore one adopts the peerStore one', async () => {
+		const keyB = await generateKeyPair('Ed25519')
+		const a = await createIdentifyMemNode()
+		const b = await createIdentifyMemNode(keyB)
+		try {
+			const svcA = new FretService(a, { networkName: NETWORK })
+			await svcA.start()
+			const idB = b.peerId.toString()
+			await a.dial(b.getMultiaddrs()[0]!)
+			await waitFor('B\'s record on A\'s entry', () => svcA.getStore().getById(idB)?.addressRecord !== undefined)
+			const live = svcA.getStore().getById(idB)!.addressRecord!.envelope
+
+			await svcA.importTable(tableOf([serializedPeer(idB, 20, { addressRecord: { envelope: await sealed(keyB, b.peerId), confirmedAt: Date.now() } })]))
+
+			expect(u8ToString(svcA.getStore().getById(idB)!.addressRecord!.envelope, 'base64url')).to.equal(u8ToString(live, 'base64url'))
+			await svcA.stop()
+		} finally {
+			await stopAll([a, b])
+		}
+	})
+
 	describe('a damaged, altered or stale record', () => {
 		let keyG: PrivateKey
 		let keyB: PrivateKey
@@ -247,12 +277,6 @@ describe('FretService routing-table import — address records', function () {
 			pidB = peerIdFromPrivateKey(keyB)
 			pidC = peerIdFromPrivateKey(keyC)
 		})
-
-		/** base64url envelope over a record *about* `subject`, signed by `signer`. */
-		async function sealed(signer: PrivateKey, subject: PeerId): Promise<string> {
-			const record = new PeerRecord({ peerId: subject, multiaddrs: [multiaddr('/ip4/127.0.0.1/tcp/4001')], seqNumber: 1n })
-			return u8ToString((await RecordEnvelope.seal(record, signer)).marshal(), 'base64url')
-		}
 
 		/** The signature is the envelope's last protobuf field: flipping the last byte leaves the
 		 *  structure — and so the import pre-pass — intact, and fails only the verification. */
