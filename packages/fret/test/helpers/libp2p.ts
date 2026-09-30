@@ -5,6 +5,7 @@ import { tcp } from '@libp2p/tcp'
 import { memory } from '@libp2p/memory'
 import { plaintext } from '@libp2p/plaintext'
 import { identify, identifyPush } from '@libp2p/identify'
+import type { PrivateKey } from '@libp2p/interface'
 
 let memAddrCounter = 0
 
@@ -27,6 +28,22 @@ export async function createMemNode(addr?: string): Promise<Libp2p> {
 		streamMuxers: [yamux()]
 	})
 	return node
+}
+
+/**
+ * {@link createMemNode} plus libp2p's `identify`, so connecting two of these stores each side's
+ * verified signed peer record — which FRET mirrors onto the routing-table entry. `privateKey` lets
+ * a spec restart a node under the same identity with a fresh peerStore.
+ */
+export async function createIdentifyMemNode(privateKey?: PrivateKey): Promise<Libp2p> {
+	return await createLibp2p({
+		...(privateKey ? { privateKey } : {}),
+		addresses: { listen: [`/memory/identify-node-${++memAddrCounter}-${Date.now()}`] },
+		transports: [memory()],
+		connectionEncrypters: [plaintext()],
+		streamMuxers: [yamux()],
+		services: { identify: identify() }
+	})
 }
 
 /**

@@ -1,4 +1,6 @@
 import { BTree, type Path } from 'digitree';
+import { fromString as u8FromString } from 'uint8arrays/from-string';
+import { toString as u8ToString } from 'uint8arrays/to-string';
 import { COORD_BYTES, coordToBase64url, coordToHex, base64urlToCoord } from '../ring/hash.js';
 
 export type PeerState = 'connected' | 'disconnected' | 'dead';
@@ -89,10 +91,17 @@ export interface PeerEntry {
 	 * (the same rule as `membership`). The service forwards the record to other peers while the
 	 * peer is connected or `confirmedAt` is recent, and orders records by the envelope's own
 	 * sequence number — never by `confirmedAt`, which is our clock, not the signer's. Preserved
-	 * across `upsert` like every other mutable field; written only through `update`. Not
-	 * serialized yet — the persisted-table ticket adds that.
+	 * across `upsert` like every other mutable field; written only through `update`, and restored
+	 * by `importEntries` from the {@link SerializedAddressRecord} `exportEntries` writes.
 	 */
-	addressRecord?: { envelope: Uint8Array; confirmedAt: number };
+	addressRecord?: PeerAddressRecord;
+}
+
+/** A verified signed address record as a routing-table entry holds it — see {@link PeerEntry.addressRecord}. */
+export interface PeerAddressRecord {
+	envelope: Uint8Array;
+	/** Unix ms on the local clock when the record was accepted (or, after an export, last confirmed). */
+	confirmedAt: number;
 }
 
 /**
@@ -141,6 +150,35 @@ export interface SerializedPeerEntry {
 	failureCount: number;
 	avgLatencyMs: number | null; // null = never measured; absent in pre-nullable snapshots → null
 	metadata?: Record<string, unknown>;
+	addressRecord?: SerializedAddressRecord; // optional; absent in tables predating address hints
+}
+
+/** {@link PeerAddressRecord} as a persisted table carries it. */
+export interface SerializedAddressRecord {
+	/** base64url of the marshaled envelope — the same encoding a wire address hint uses. */
+	envelope: string;
+	/** Unix ms on the *exporter's* clock. */
+	confirmedAt: number;
+}
+
+export function serializeAddressRecord(r: PeerAddressRecord): SerializedAddressRecord {
+	return { envelope: u8ToString(r.envelope, 'base64url'), confirmedAt: r.confirmedAt };
+}
+
+/**
+ * Inverse of {@link serializeAddressRecord}. Throws on a record the table cannot have written: an
+ * envelope that is not a base64url string, or a `confirmedAt` that is not a finite number (a `NaN`
+ * would compare false against every age limit, so the record would never go stale).
+ *
+ * Structural only — the envelope bytes are not parsed; whether they are a signed record for the
+ * right peer is the service's question, not the store's.
+ */
+export function deserializeAddressRecord(s: SerializedAddressRecord): PeerAddressRecord {
+	if (typeof s.envelope !== 'string') throw new Error('address record envelope is not a string');
+	if (typeof s.confirmedAt !== 'number' || !Number.isFinite(s.confirmedAt)) {
+		throw new Error(`address record confirmedAt is not a finite number: ${JSON.stringify(s.confirmedAt)}`);
+	}
+	return { envelope: u8FromString(s.envelope, 'base64url'), confirmedAt: s.confirmedAt };
 }
 
 export interface SerializedTable {
@@ -593,6 +631,7 @@ export class DigitreeStore {
 			failureCount: e.failureCount,
 			avgLatencyMs: e.avgLatencyMs,
 			...(e.metadata ? { metadata: e.metadata } : {}),
+			...(e.addressRecord ? { addressRecord: serializeAddressRecord(e.addressRecord) } : {}),
 		}));
 	}
 
@@ -601,18 +640,22 @@ export class DigitreeStore {
 	 * store wins, including a coordinate move (the snapshot is the more recent view of that
 	 * peer, and a stale duplicate would otherwise linger in the tree unreachable by id).
 	 *
-	 * A record whose coordinate is malformed rejects the whole snapshot, and does so *before*
-	 * any entry is written: a corrupted persisted table is better refused loudly than admitted
-	 * as ring state, but a mid-loop throw would leave a half-imported table behind (and skip
-	 * the caller's capacity enforcement, which runs after the call returns).
+	 * A record whose coordinate or address record is malformed rejects the whole snapshot, and
+	 * does so *before* any entry is written: a corrupted persisted table is better refused loudly
+	 * than admitted as ring state, but a mid-loop throw would leave a half-imported table behind
+	 * (and skip the caller's capacity enforcement, which runs after the call returns).
 	 *
 	 * @returns the number of *distinct ids stored* — not the number of input records, so a
 	 * snapshot carrying an id twice reports 1.
 	 */
 	importEntries(entries: SerializedPeerEntry[]): number {
-		const decoded = entries.map((s) => ({ s, coord: base64urlToCoord(s.coord) }));
+		const decoded = entries.map((s) => ({
+			s,
+			coord: base64urlToCoord(s.coord),
+			addressRecord: s.addressRecord ? deserializeAddressRecord(s.addressRecord) : undefined,
+		}));
 		const stored = new Set<string>();
-		for (const { s, coord } of decoded) {
+		for (const { s, coord, addressRecord } of decoded) {
 			const entry: PeerEntry = {
 				id: s.id,
 				coord,
@@ -646,6 +689,7 @@ export class DigitreeStore {
 				// a coercion would instead discard real 0 ms measurements.
 				avgLatencyMs: s.avgLatencyMs ?? null,
 				...(s.metadata ? { metadata: s.metadata } : {}),
+				...(addressRecord ? { addressRecord } : {}),
 			};
 			this.put(entry);
 			stored.add(entry.id);

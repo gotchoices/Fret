@@ -209,7 +209,7 @@ function withOptionals<T extends object>(
 const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata', 'hints'] as const
 const MAYBE_ACT_OPTIONALS = ['wants', 'digest', 'activity', 'breadcrumbs'] as const
 const LEAVE_OPTIONALS = ['replacements'] as const
-const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'metadata'] as const
+const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'metadata', 'addressRecord'] as const
 
 const arbNeighborSnapshot: fc.Arbitrary<NeighborSnapshotV1> = withOptionals(fc.record(
 	{
@@ -282,6 +282,12 @@ const arbSerializedPeerEntry: fc.Arbitrary<SerializedPeerEntry> = withOptionals(
 		// and not by vanishing. See the *bucketless sparsity model* note in `docs/fret.md`.
 		avgLatencyMs: fc.option(arbJsonNumber, { nil: null }),
 		metadata: arbMetadata,
+		// The store never parses the envelope, so any bytes will do; canonical base64url because
+		// that is the only form its own export writes.
+		addressRecord: fc.record({
+			envelope: fc.uint8Array({ maxLength: 96 }).map((b) => u8ToString(b, 'base64url')),
+			confirmedAt: arbJsonNumber,
+		}),
 	}
 ), [...PEER_ENTRY_OPTIONALS])
 
@@ -346,8 +352,8 @@ describe('RPC codec properties', function () {
 			await assertRoundTrips(arbLeaveNotice, ['replacements'])
 		})
 
-		it('round-trips SerializedTable, including a null avgLatencyMs', async () => {
-			const region = { nullLatency: 0, numericLatency: 0, absentMembership: 0 }
+		it('round-trips SerializedTable, including a null avgLatencyMs and an address record', async () => {
+			const region = { nullLatency: 0, numericLatency: 0, absentMembership: 0, addressRecord: 0 }
 
 			await fc.assert(
 				fc.asyncProperty(arbSerializedTable, async (table) => {
@@ -355,6 +361,7 @@ describe('RPC codec properties', function () {
 						if (e.avgLatencyMs === null) region.nullLatency++
 						else region.numericLatency++
 						if (e.membership === undefined) region.absentMembership++
+						if (e.addressRecord) region.addressRecord++
 					}
 					expect(await decodeJson(await encodeJson(table))).to.deep.equal(table)
 				}),
@@ -364,6 +371,7 @@ describe('RPC codec properties', function () {
 			expect(region.nullLatency, 'no null avgLatencyMs was generated').to.be.greaterThan(0)
 			expect(region.numericLatency, 'no measured avgLatencyMs was generated').to.be.greaterThan(0)
 			expect(region.absentMembership, 'no pre-membership-style entry was generated').to.be.greaterThan(0)
+			expect(region.addressRecord, 'no entry carrying an address record was generated').to.be.greaterThan(0)
 		})
 	})
 

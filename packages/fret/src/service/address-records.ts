@@ -7,6 +7,7 @@ import type { PrivateKey } from '@libp2p/interface';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { toString as u8ToString } from 'uint8arrays/to-string';
 import { MAX_ADDRESS_RECORD_CHARS } from '../rpc/validate.js';
+import { deserializeAddressRecord, type SerializedPeerEntry } from '../store/digitree-store.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('service:address-records');
@@ -36,6 +37,72 @@ export const MAX_SELF_RECORD_ADDRS = 8;
  * keeps circulating only while some node is connected to its subject or the subject re-seals.
  */
 export const ADDRESS_HINT_FORWARD_MAX_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * How long a peer's record survives in an exported routing table, measured from when we last
+ * confirmed it (a peer connected at export time counts as confirmed at that moment). Older
+ * records are left out of the export and dropped on import.
+ *
+ * Far longer than the forwarding window, because the two answer different questions: forwarding
+ * vouches for a record to *other* peers, while a persisted record only seeds *our own* first
+ * dials after a restart — the case where nothing else knows the address at all (gotchoices/sereus#18).
+ * The cost of keeping one too long is a dead address, and a failed relayed dial costs seconds
+ * (Sereus measured up to 14 s at a 3 s link round trip), so every stale record slows a restart;
+ * 14 days still covers a node switched off for a holiday. No separate count cap: at most one
+ * record rides on each routing-table entry, so the table's capacity already bounds them.
+ */
+export const ADDRESS_RECORD_PERSIST_MAX_AGE_MS = 14 * 24 * 60 * 60 * 1000;
+
+/**
+ * The export half of the persist-age rule, for one entry the store serialized: a peer connected
+ * at export time is confirmed *now* (a live connection is the confirmation), and a record last
+ * confirmed more than {@link ADDRESS_RECORD_PERSIST_MAX_AGE_MS} ago is left out.
+ */
+export function freshenExportedAddressRecord(entry: SerializedPeerEntry, now: number, isConnected: (id: string) => boolean): SerializedPeerEntry {
+	const record = entry.addressRecord;
+	if (!record) return entry;
+	if (isConnected(entry.id)) return { ...entry, addressRecord: { ...record, confirmedAt: now } };
+	return now - record.confirmedAt > ADDRESS_RECORD_PERSIST_MAX_AGE_MS ? withoutAddressRecord(entry) : entry;
+}
+
+/**
+ * The import-time check of one persisted entry's address record — structural, no signature
+ * check, run over the whole table before anything is written. The signature is verified once,
+ * later, inside `consumePeerRecord`.
+ *
+ * - **Corrupt** → throws, so the caller refuses the whole table: an envelope that is not base64url
+ *   or does not decode as a signed peer record, a `confirmedAt` that is not a finite number, or a
+ *   signer or payload peer id that is not the entry's own id. Our own export cannot produce any of
+ *   these, so the file was damaged.
+ * - **Stale** (last confirmed more than {@link ADDRESS_RECORD_PERSIST_MAX_AGE_MS} ago) → the record
+ *   is dropped and the entry kept. Age is not damage.
+ * - A `confirmedAt` later than `now` is clamped to `now`: our clock went backwards since the
+ *   export, or the file was edited — and an edited file is the table-signing work's concern
+ *   (`tickets/backlog/23-debt-routing-table-export-signing.md`), not something an age check can see.
+ */
+export function vetPersistedAddressRecord(entry: SerializedPeerEntry, now: number): SerializedPeerEntry {
+	const record = entry.addressRecord;
+	if (!record) return entry;
+	let envelope: Uint8Array;
+	try {
+		({ envelope } = deserializeAddressRecord(record));
+	} catch (err) {
+		throw new Error(`persisted address record for ${entry.id} is malformed: ${(err as Error).message}`, { cause: err });
+	}
+	const peeked = peekPeerRecord(envelope);
+	if (!peeked) throw new Error(`persisted address record for ${entry.id} does not decode as a signed peer record`);
+	if (peeked.signer !== entry.id || peeked.peerId !== entry.id) {
+		throw new Error(`persisted address record for ${entry.id} is signed by ${peeked.signer} and describes ${peeked.peerId}`);
+	}
+	const confirmedAt = Math.min(record.confirmedAt, now);
+	if (now - confirmedAt > ADDRESS_RECORD_PERSIST_MAX_AGE_MS) return withoutAddressRecord(entry);
+	return confirmedAt === record.confirmedAt ? entry : { ...entry, addressRecord: { ...record, confirmedAt } };
+}
+
+function withoutAddressRecord(entry: SerializedPeerEntry): SerializedPeerEntry {
+	const { addressRecord: _dropped, ...rest } = entry;
+	return rest;
+}
 
 /** The base64url string a record travels as on the wire. */
 export function encodeAddressRecord(envelope: Uint8Array): string {

@@ -1,9 +1,17 @@
-import { describe, it, beforeEach, afterEach } from 'mocha'
+import { describe, it, before, beforeEach, afterEach } from 'mocha'
 import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
-import { createMemNode } from './helpers/libp2p.js'
+import type { PeerId, PrivateKey } from '@libp2p/interface'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import { PeerRecord, RecordEnvelope } from '@libp2p/peer-record'
+import { multiaddr } from '@multiformats/multiaddr'
+import { fromString as u8FromString } from 'uint8arrays/from-string'
+import { toString as u8ToString } from 'uint8arrays/to-string'
+import { createIdentifyMemNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService } from '../src/service/fret-service.js'
-import type { SerializedPeerEntry } from '../src/store/digitree-store.js'
+import { ADDRESS_RECORD_PERSIST_MAX_AGE_MS } from '../src/service/address-records.js'
+import type { SerializedAddressRecord, SerializedPeerEntry, SerializedTable } from '../src/store/digitree-store.js'
 import { coordToBase64url } from '../src/ring/hash.js'
 import { serializedPeer, tableOf } from './helpers/serialized-table.js'
 
@@ -149,5 +157,158 @@ describe('FretService routing-table import before start()', function () {
 		const survivors = svc.exportTable().entries.map((e) => e.id)
 		const alwaysKept = Array.from({ length: CAPACITY - 2 * M }, (_, i) => `peer-${OVERSIZED - 1 - i}`)
 		for (const id of alwaysKept) expect(survivors, `${id} kept on relevance`).to.include(id)
+	})
+})
+
+// The table also carries each peer's signed address record, so a restarted node's first dials
+// already have addresses (gotchoices/sereus#18). The store serializes the field mechanically — its
+// structural rows are in `digitree.persistence.spec.ts`, its round trip in
+// `rpc.codec-properties.spec.ts` — and this pins what the service adds on top: the records reach
+// libp2p's peerStore on import, and what a damaged, altered or stale record costs.
+describe('FretService routing-table import — address records', function () {
+	this.timeout(30000)
+
+	/** Addresses a node's peerStore holds for `peer`; `[]` when it has never heard of it. */
+	async function addressesOf(node: Libp2p, peer: PeerId): Promise<string[]> {
+		try {
+			return (await node.peerStore.get(peer)).addresses.map((a) => a.multiaddr.toString())
+		} catch (err) {
+			if ((err as { name?: string }).name === 'NotFoundError') return []
+			throw err
+		}
+	}
+
+	async function dialError(node: Libp2p, peer: PeerId): Promise<Error | undefined> {
+		try {
+			await node.dial(peer)
+			return undefined
+		} catch (err) {
+			return err as Error
+		}
+	}
+
+	async function waitFor(what: string, predicate: () => boolean, timeoutMs = 10_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs
+		while (!predicate()) {
+			if (Date.now() > deadline) throw new Error(`timed out after ${timeoutMs}ms waiting for ${what}`)
+			await new Promise<void>((resolve) => setTimeout(resolve, 20))
+		}
+	}
+
+	it('a restarted node dials a peer it knew only from its saved table, with no exchange first', async () => {
+		const keyA = await generateKeyPair('Ed25519')
+		const a = await createIdentifyMemNode(keyA)
+		const b = await createIdentifyMemNode()
+		const nodes: Libp2p[] = [a, b]
+		try {
+			const svcA = new FretService(a, { networkName: NETWORK })
+			await svcA.start()
+			const idB = b.peerId.toString()
+			await a.dial(b.getMultiaddrs()[0]!)
+			// identify stores B's signed record in A's peerStore; FRET mirrors it onto B's entry.
+			await waitFor('B\'s record on A\'s entry', () => svcA.getStore().getById(idB)?.addressRecord !== undefined)
+			// Through JSON, as a caller persisting the table would.
+			const saved = JSON.parse(JSON.stringify(svcA.exportTable())) as SerializedTable
+			expect(saved.entries.find((e) => e.id === idB)?.addressRecord, 'B exported with its record').to.not.equal(undefined)
+			await svcA.stop()
+			await a.stop()
+
+			// Same identity, fresh peerStore, and a FRET service that never starts — so nothing but
+			// the imported table can have told this node where B is.
+			const restarted = await createIdentifyMemNode(keyA)
+			nodes.push(restarted)
+			const svcRestarted = new FretService(restarted, { networkName: NETWORK })
+
+			// Negative control: the same table without the record restores B's entry and leaves B
+			// undialable — the record is the only thing that differs between the two imports.
+			const stripped: SerializedTable = { ...saved, entries: saved.entries.map(({ addressRecord: _r, ...rest }) => rest) }
+			await svcRestarted.importTable(stripped)
+			expect(svcRestarted.getStore().getById(idB), 'B restored').to.not.equal(undefined)
+			expect((await dialError(restarted, b.peerId))?.name, 'no address for B').to.equal('NoValidAddressesError')
+
+			await svcRestarted.importTable(saved)
+			expect(await dialError(restarted, b.peerId), 'dials B from the restored record').to.equal(undefined)
+		} finally {
+			await stopAll(nodes)
+		}
+	})
+
+	describe('a damaged, altered or stale record', () => {
+		let keyG: PrivateKey
+		let keyB: PrivateKey
+		let keyC: PrivateKey
+		let pidG: PeerId
+		let pidB: PeerId
+		let pidC: PeerId
+
+		before(async () => {
+			[keyG, keyB, keyC] = await Promise.all([generateKeyPair('Ed25519'), generateKeyPair('Ed25519'), generateKeyPair('Ed25519')])
+			pidG = peerIdFromPrivateKey(keyG)
+			pidB = peerIdFromPrivateKey(keyB)
+			pidC = peerIdFromPrivateKey(keyC)
+		})
+
+		/** base64url envelope over a record *about* `subject`, signed by `signer`. */
+		async function sealed(signer: PrivateKey, subject: PeerId): Promise<string> {
+			const record = new PeerRecord({ peerId: subject, multiaddrs: [multiaddr('/ip4/127.0.0.1/tcp/4001')], seqNumber: 1n })
+			return u8ToString((await RecordEnvelope.seal(record, signer)).marshal(), 'base64url')
+		}
+
+		/** The signature is the envelope's last protobuf field: flipping the last byte leaves the
+		 *  structure — and so the import pre-pass — intact, and fails only the verification. */
+		function tampered(envelope: string): string {
+			const bytes = u8FromString(envelope, 'base64url')
+			bytes[bytes.length - 1]! ^= 0xff
+			return u8ToString(bytes, 'base64url')
+		}
+
+		type Outcome = 'refused' | 'stripped' | 'dropped'
+
+		it('refuses the table for a corrupt record, strips a forged signature, drops a stale record', async () => {
+			const now = Date.now()
+			const genuineB = await sealed(keyB, pidB)
+			const rows: Array<[string, SerializedAddressRecord, Outcome]> = [
+				['an envelope that is not a signed peer record', { envelope: u8ToString(new Uint8Array([1, 2, 3]), 'base64url'), confirmedAt: now }, 'refused'],
+				['a record about B signed by C', { envelope: await sealed(keyC, pidB), confirmedAt: now }, 'refused'],
+				['a genuine record for C, labelled B', { envelope: await sealed(keyC, pidC), confirmedAt: now }, 'refused'],
+				['a record whose signature does not verify', { envelope: tampered(genuineB), confirmedAt: now }, 'stripped'],
+				['a record past the persist age', { envelope: genuineB, confirmedAt: now - ADDRESS_RECORD_PERSIST_MAX_AGE_MS - 60_000 }, 'dropped'],
+			]
+			const good = serializedPeer(pidG.toString(), 10, { addressRecord: { envelope: await sealed(keyG, pidG), confirmedAt: now } })
+
+			for (const [what, addressRecord, outcome] of rows) {
+				// A fresh node per row: every import that is not refused puts the good record in the
+				// peerStore, and a refused row has to show it did not.
+				const node = await createMemNode()
+				try {
+					const svc = new FretService(node, { networkName: NETWORK })
+					const sizeBefore = svc.getStore().size()
+					const rejectedBefore = svc.getDiagnostics().rejected.addressHint
+
+					let err: unknown
+					try {
+						await svc.importTable(tableOf([good, serializedPeer(pidB.toString(), 20, { addressRecord })]))
+					} catch (e) {
+						err = e
+					}
+
+					if (outcome === 'refused') {
+						expect(err, `${what}: import refused`).to.be.instanceOf(Error)
+						expect(svc.getStore().size(), `${what}: nothing written`).to.equal(sizeBefore)
+						expect(await addressesOf(node, pidG), `${what}: not even the good record consumed`).to.deep.equal([])
+						continue
+					}
+					expect(err, `${what}: import stands`).to.equal(undefined)
+					expect(svc.getStore().getById(pidB.toString()), `${what}: B restored`).to.not.equal(undefined)
+					expect(svc.getStore().getById(pidB.toString())?.addressRecord, `${what}: B without its record`).to.equal(undefined)
+					expect(await addressesOf(node, pidB), `${what}: nothing about B reached the peerStore`).to.deep.equal([])
+					expect(await addressesOf(node, pidG), `${what}: the rest of the table consumed`).to.deep.equal(['/ip4/127.0.0.1/tcp/4001'])
+					expect(svc.getDiagnostics().rejected.addressHint - rejectedBefore, `${what}: counted only when altered`)
+						.to.equal(outcome === 'stripped' ? 1 : 0)
+				} finally {
+					await stopAll([node])
+				}
+			}
+		})
 	})
 })

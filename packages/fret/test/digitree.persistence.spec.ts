@@ -167,7 +167,7 @@ describe('DigitreeStore persistence', () => {
 		expect(store.size()).to.equal(0)
 	})
 
-	it('a malformed coordinate rejects the whole snapshot without importing part of it', () => {
+	it('a malformed record rejects the whole snapshot without importing part of it', () => {
 		const good: SerializedPeerEntry = {
 			id: 'good',
 			coord: coordToBase64url(randomCoord()),
@@ -179,13 +179,23 @@ describe('DigitreeStore persistence', () => {
 			failureCount: 0,
 			avgLatencyMs: 0,
 		}
-		const bad: SerializedPeerEntry = { ...good, id: 'bad', coord: coordToBase64url(randomCoord(31)) }
+		const record = { envelope: 'AAEC', confirmedAt: 1 }
+		// Every way a record can be structurally unrepresentable in the store. The service adds
+		// its own rows (an envelope that is not a signed record for that peer) on top of these —
+		// `service.table-persistence.spec.ts`.
+		const corruptions: Array<[string, Partial<SerializedPeerEntry>]> = [
+			['a wrong-width coordinate', { coord: coordToBase64url(randomCoord(31)) }],
+			['an address-record envelope that is not base64url', { addressRecord: { ...record, envelope: 'not/base64url!' } }],
+			['an address-record confirmedAt that is not a finite number', { addressRecord: { ...record, confirmedAt: Number.NaN } }],
+		]
 
-		const store = new DigitreeStore()
-		// `good` sorts first, so a per-record throw would leave it behind.
-		expect(() => store.importEntries([good, bad])).to.throw()
-		expect(store.size()).to.equal(0)
-		expect(store.getById('good')).to.equal(undefined)
+		for (const [what, patch] of corruptions) {
+			const store = new DigitreeStore()
+			// `good` sorts first, so a per-record throw would leave it behind.
+			expect(() => store.importEntries([good, { ...good, id: 'bad', ...patch }]), what).to.throw()
+			expect(store.size(), what).to.equal(0)
+			expect(store.getById('good'), what).to.equal(undefined)
+		}
 	})
 
 	// `avgLatencyMs: null` means "never measured". Round-tripping it as 0 would hand the

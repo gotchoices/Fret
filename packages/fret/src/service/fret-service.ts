@@ -47,7 +47,9 @@ import {
 	SelfAddressRecord,
 	decodeAddressRecord,
 	encodeAddressRecord,
+	freshenExportedAddressRecord,
 	peekPeerRecord,
+	vetPersistedAddressRecord,
 } from './address-records.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
@@ -453,8 +455,10 @@ export class FretService implements IFretService, Startable {
 			/**
 			 * Address hints refused by `ingestAddressHints`: an undecodable envelope, a signer or
 			 * payload peer id that is not the id the hint was labelled with, or a signature that
-			 * failed to verify. A hint that is merely stale (not newer than the record already held)
-			 * is not a rejection and is not counted.
+			 * failed to verify — plus a record in an imported routing table whose signature failed
+			 * to verify (`importTable`; a *structurally* corrupt one refuses the whole import
+			 * instead). A hint that is merely stale (not newer than the record already held), or a
+			 * persisted record past its age limit, is not a rejection and is not counted.
 			 */
 			addressHint: 0,
 		},
@@ -2883,6 +2887,7 @@ export class FretService implements IFretService, Startable {
 	 * and identical bytes make the second a no-op, so no lock is needed.
 	 */
 	private async ingestAddressHints(snap: NeighborSnapshotV1): Promise<void> {
+		const source = `snapshot from ${snap.from}`;
 		for (const hint of snap.hints ?? []) {
 			if (hint.id === this.selfIdStr) continue;
 			const entry = this.store.getById(hint.id);
@@ -2893,13 +2898,13 @@ export class FretService implements IFretService, Startable {
 			} catch (err) {
 				// The parser already vetted the encoding on both inbound paths; this guards a
 				// caller that hands the merge an unparsed snapshot.
-				this.rejectAddressHint(snap.from, hint.id, 'record is not base64url', err);
+				this.rejectAddressRecord(source, hint.id, 'record is not base64url', err);
 				continue;
 			}
 			const peeked = peekPeerRecord(bytes);
-			if (!peeked) { this.rejectAddressHint(snap.from, hint.id, 'record does not decode as a signed peer record'); continue; }
+			if (!peeked) { this.rejectAddressRecord(source, hint.id, 'record does not decode as a signed peer record'); continue; }
 			if (peeked.signer !== hint.id || peeked.peerId !== hint.id) {
-				this.rejectAddressHint(snap.from, hint.id, `record is signed by ${peeked.signer} and describes ${peeked.peerId}`);
+				this.rejectAddressRecord(source, hint.id, `record is signed by ${peeked.signer} and describes ${peeked.peerId}`);
 				continue;
 			}
 			// NOTE: re-decodes the held envelope (two protobuf parses, no crypto) on every resend,
@@ -2911,7 +2916,7 @@ export class FretService implements IFretService, Startable {
 			try {
 				accepted = await this.node.peerStore.consumePeerRecord(bytes, { expectedPeer: peerIdFromString(hint.id) });
 			} catch (err) {
-				this.rejectAddressHint(snap.from, hint.id, 'signature did not verify', err);
+				this.rejectAddressRecord(source, hint.id, 'signature did not verify', err);
 				continue;
 			}
 			if (!accepted) continue;
@@ -2920,13 +2925,17 @@ export class FretService implements IFretService, Startable {
 		}
 	}
 
-	/** Count and report one refused address hint — see `diag.rejected.addressHint`. */
-	private rejectAddressHint(from: string, id: string, why: string, err?: unknown): void {
+	/**
+	 * Count and report one refused address record — see `diag.rejected.addressHint`. `source` names
+	 * where it came from (a snapshot's sender, or an imported table) for the log line.
+	 */
+	private rejectAddressRecord(source: string, id: string, why: string, err?: unknown): void {
 		this.diag.rejected.addressHint++;
 		// NOTE: debug-gated (@libp2p/logger emits only under DEBUG), and bounded per message by the
-		// parser's named set; rate-limit if this is ever routed to an always-on sink.
-		if (err === undefined) log.error('snapshot from %s: rejecting address hint for %s - %s', from, id, why);
-		else log.error('snapshot from %s: rejecting address hint for %s - %s - %e', from, id, why, err);
+		// parser's named set (per import, by the table's capacity); rate-limit if this is ever
+		// routed to an always-on sink.
+		if (err === undefined) log.error('%s: rejecting address record for %s - %s', source, id, why);
+		else log.error('%s: rejecting address record for %s - %s - %e', source, id, why, err);
 	}
 
 	/**
@@ -3711,11 +3720,14 @@ export class FretService implements IFretService, Startable {
 	}
 
 	exportTable(): SerializedTable {
+		const now = Date.now();
 		return {
 			v: 1,
 			peerId: this.selfIdStr,
-			timestamp: Date.now(),
-			entries: this.store.exportEntries(),
+			timestamp: now,
+			// The store serializes address records mechanically; how fresh one is — confirmed by a
+			// live connection, or too old to be worth a dial after a restart — is ours to judge.
+			entries: this.store.exportEntries().map((e) => freshenExportedAddressRecord(e, now, (id) => this.isConnected(id))),
 		};
 	}
 
@@ -3729,9 +3741,48 @@ export class FretService implements IFretService, Startable {
 		// rule instead of two repairs — and the local entry is better information regardless.
 		// The count therefore reports ids actually stored, self excluded.
 		const selfStr = this.selfIdStr;
-		const count = this.store.importEntries(table.entries.filter((e) => e.id !== selfStr));
+		// Vetted over the whole table before the store sees any of it, so a corrupt address record
+		// refuses the import with nothing written — the same rule as a malformed coordinate.
+		const now = Date.now();
+		const entries = table.entries.filter((e) => e.id !== selfStr).map((e) => vetPersistedAddressRecord(e, now));
+		const count = this.store.importEntries(entries);
 		await this.enforceCapacity();
+		await this.consumeImportedAddressRecords(new Set(entries.filter((e) => e.addressRecord).map((e) => e.id)));
 		return count;
+	}
+
+	/**
+	 * Hand the address records a restored table carries to libp2p, so the first dials after a
+	 * restart already have addresses — without this a peer reachable only through a relay comes
+	 * back as an id nobody can dial (gotchoices/sereus#18). Runs after capacity enforcement, so a
+	 * record whose entry was just evicted is never consumed; the peerStore is not Startable, so it
+	 * works before `start()` as well as after.
+	 *
+	 * The import pre-pass was structural; the signature is verified here, once, inside
+	 * `consumePeerRecord`. `true` → the addresses are in the peerStore, so mark them known. A throw
+	 * is a bad signature on a record whose structure was fine — the file was altered — so that
+	 * record is stripped and counted, and the rest of the table stands. `false` → the peerStore
+	 * already holds an equal-or-newer record; the entry keeps its copy.
+	 */
+	private async consumeImportedAddressRecords(ids: Iterable<string>): Promise<void> {
+		// NOTE: one signature verify plus one peerStore write per persisted record, awaited in
+		// turn, so a full table delays `importTable`'s return by that much. If Edge start-up ever
+		// shows it, consume only the ring window around self here and detach the rest.
+		for (const id of ids) {
+			const record = this.store.getById(id)?.addressRecord;
+			if (!record) continue;
+			let accepted: boolean;
+			try {
+				accepted = await this.node.peerStore.consumePeerRecord(record.envelope, { expectedPeer: peerIdFromString(id) });
+			} catch (err) {
+				this.rejectAddressRecord('imported table', id, 'signature did not verify', err);
+				// Only the record that failed: one a hint delivered while this verify was in flight
+				// was verified on its own and stands.
+				if (this.store.getById(id)?.addressRecord === record) this.store.update(id, { addressRecord: undefined });
+				continue;
+			}
+			if (accepted) this.setAddressKnown(id, true);
+		}
 	}
 }
 

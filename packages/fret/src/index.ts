@@ -1,6 +1,6 @@
 import type { Libp2p } from 'libp2p';
 import type { PrivateKey } from '@libp2p/interface';
-import type { SerializedPeerEntry, SerializedTable } from './store/digitree-store.js';
+import type { SerializedAddressRecord, SerializedPeerEntry, SerializedTable } from './store/digitree-store.js';
 import { FretService as FretServiceClass } from './service/fret-service.js';
 
 export type FretMode = 'active' | 'passive';
@@ -159,7 +159,7 @@ export interface FretService {
 	importTable(table: SerializedTable): Promise<number>;
 }
 
-export type { SerializedPeerEntry, SerializedTable };
+export type { SerializedAddressRecord, SerializedPeerEntry, SerializedTable };
 export { FretServiceClass as FretServiceImpl };
 export { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryInput, type FretPeerDiscoveryConfig } from './service/peer-discovery.js';
 export { Libp2pFretService, fretService } from './service/libp2p-fret-service.js';
@@ -167,7 +167,7 @@ export { hashKey, hashPeerId } from './ring/hash.js';
 export type { RingCoord } from './ring/hash.js';
 export { clockwiseDistance, minDistance, lexLess } from './ring/distance.js';
 export { DigitreeStore } from './store/digitree-store.js';
-export type { PeerEntry, PeerPatch, PeerState, MembershipState, RingCursor, RingWalkPage } from './store/digitree-store.js';
+export type { PeerEntry, PeerAddressRecord, PeerPatch, PeerState, MembershipState, RingCursor, RingWalkPage } from './store/digitree-store.js';
 export { estimateSizeAndConfidence } from './estimate/size-estimator.js';
 export type { SizeEstimate, SizeEstimateOptions } from './estimate/size-estimator.js';
 export { assembleCohort } from './service/cohort.js';
