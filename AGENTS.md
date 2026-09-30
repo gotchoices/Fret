@@ -6,8 +6,9 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 ├── packages/fret/                 # Only package — workspace name: "p2p-fret"
 │   ├── register.mjs              # ESM loader hook for running TS directly
 │   ├── src/
-│   │   ├── service/fret-service.ts  # Main service (~2960 lines)
+│   │   ├── service/fret-service.ts  # Main service (~3600 lines)
 │   │   ├── service/libp2p-fret-service.ts
+│   │   ├── service/address-records.ts  # Signed peer records: peek, self-seal, forwarding window
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
 │   │   ├── store/{digitree-store,relevance}.ts
 │   │   ├── ring/{distance,hash,ring-walk}.ts

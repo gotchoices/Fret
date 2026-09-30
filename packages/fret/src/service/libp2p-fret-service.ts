@@ -1,11 +1,17 @@
-import type { PeerDiscovery, Startable } from '@libp2p/interface';
+import type { PeerDiscovery, PrivateKey, Startable } from '@libp2p/interface';
 import { peerDiscoverySymbol } from '@libp2p/interface';
 import type { Libp2p } from 'libp2p';
 import type { FretConfig, FretMode, FretService, RouteAndMaybeActV1, NearAnchorV1, ReportEvent, SerializedTable, ActivityHandler, LookupOptions, RouteProgress } from '../index.js';
 import { FretService as CoreFretService } from './fret-service.js';
 import { FretPeerDiscovery, type DiscoverySnapshotSource, type FretPeerDiscoveryConfig } from './peer-discovery.js';
 
-type Components = { libp2p?: Libp2p };
+/**
+ * What this facade reads off the components libp2p hands every service. `privateKey` is the
+ * node's own key (libp2p always supplies it), which the core needs to seal this node's signed
+ * address record; taking it from here is what lets the ordinary
+ * `libp2p({ services: { fret: fretService() } })` registration sign with no extra wiring.
+ */
+type Components = { libp2p?: Libp2p; privateKey?: PrivateKey };
 
 /**
  * A libp2p-hosted FRET service: a thin facade whose every method below is a hand-written
@@ -89,7 +95,9 @@ export class Libp2pFretService implements Startable, FretService {
 			if (!node) {
 				throw new Error('Libp2pFretService: libp2p node not injected');
 			}
-			this.inner = new CoreFretService(node, this.cfg);
+			// An explicit config key wins over the component, matching how the node source resolves.
+			const privateKey = this.cfg?.privateKey ?? this.components.privateKey;
+			this.inner = new CoreFretService(node, { ...this.cfg, ...(privateKey ? { privateKey } : {}) });
 		}
 		return this.inner;
 	}

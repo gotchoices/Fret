@@ -103,43 +103,63 @@ export const MAYBE_ACT_OVERHEAD_BYTES = 16 * 1024;
  * Per-message byte cap for both neighbors protocols (request/reply and announce). **One number
  * for both profiles**, because this is an *acceptance* limit: it bounds the largest message a
  * *peer* may send us, and Edge and Core peers talk to each other, so it has to cover the largest
- * snapshot any profile can legitimately emit. Sizing it per-profile — as it was, Core 16 KiB /
+ * snapshot any profile can legitimately emit. Sizing it per-profile — as it once was, Core 16 KiB /
  * Edge 8 KiB — made a legal Core snapshot unreadable by every Edge peer.
  *
  * Derived, not picked. The Core worst legal emission, measured by encoding the shape
  * `FretService.snapshot` produces (53-char peer ids, a 32-byte base64url coordinate per sample
  * entry, `metadata` grown until `JSON.stringify(metadata)` hits
- * {@link MAX_SNAPSHOT_METADATA_BYTES_CORE} exactly, and 256 bytes reserved for the still-empty
- * `sig` field):
+ * {@link MAX_SNAPSHOT_METADATA_BYTES_CORE} exactly, 256 bytes reserved for the still-empty `sig`
+ * field, and a `hints` array packed to {@link MAX_SNAPSHOT_HINT_BYTES_CORE}):
  *
  *   16 successors + 16 predecessors + 8 sample entries (the *merge* caps, which are wider than
  *   today's emission caps of 12/12/8)  ....................................  3,371 bytes
  *   + 8 KiB metadata (including the `,"metadata":` key)  ..................  8,204 bytes
- *   = 11,575 bytes
+ *   = 11,575 bytes of fixed fields
+ *   + 48 KiB of hints (the whole array, plus its `,"hints":[]` framing)  ....  49,163 bytes
+ *   = 60,738 bytes
  *
- * 16 KiB leaves ~4.8 KiB of headroom over that. The 256-byte `sig` reservation is already inside
- * the number, so landing message signatures does not disturb it.
+ * 64 KiB leaves ~4.7 KiB of headroom over that. Sereus used the same 64 KiB for the same payload.
  *
  * The invariant this constant carries, pinned by `test/rpc.codec-properties.spec.ts`: **the
- * largest legal emission of *any* profile encodes under this cap.** Re-splitting it per profile
- * breaks that and fails there.
+ * largest legal emission of *any* profile — fixed fields, metadata allowance and hint budget
+ * together — encodes under this cap.** Re-splitting it per profile breaks that and fails there.
  */
-export const MAX_NEIGHBORS_BYTES = 16 * 1024;
+export const MAX_NEIGHBORS_BYTES = 64 * 1024;
 
 /** Cap on the encoded size of the caller-supplied `metadata` a Core node attaches to its
  *  outgoing snapshot. This is an **emission budget** — the Core profile's own choice of how much
  *  application metadata it will carry — not an acceptance limit; acceptance is
- *  {@link MAX_NEIGHBORS_BYTES}, one network-wide number. The invariant the two budgets must keep
- *  is `largest emission of any profile <= MAX_NEIGHBORS_BYTES`: at the merge caps the Core fixed
- *  fields cost 3,371 bytes, so this allowance plus them lands at 11,575, comfortably under.
- *  Over-cap metadata is omitted from the snapshot rather than truncated — see
- *  `FretService.snapshot`. */
+ *  {@link MAX_NEIGHBORS_BYTES}, one network-wide number. The invariant the emission budgets must
+ *  keep is `largest emission of any profile <= MAX_NEIGHBORS_BYTES`: at the merge caps the Core
+ *  fixed fields cost 3,371 bytes, so this allowance plus them lands at 11,575, and the hint budget
+ *  ({@link MAX_SNAPSHOT_HINT_BYTES_CORE}) on top of that at 60,738 — under. Over-cap metadata is
+ *  omitted from the snapshot rather than truncated — see `FretService.snapshot`. */
 export const MAX_SNAPSHOT_METADATA_BYTES_CORE = 8 * 1024;
 /** Same, Edge profile: an emission budget, half of Core's because an edge node carries less.
- *  Its worst legal emission is 6,301 bytes, also under {@link MAX_NEIGHBORS_BYTES} — which is the
- *  only bound either budget has to satisfy. Deliberately *not* sized against a per-profile
- *  acceptance cap; there is no such thing. */
+ *  Its worst legal emission is 6,301 bytes of fixed fields plus {@link MAX_SNAPSHOT_HINT_BYTES_EDGE}
+ *  of hints, also under {@link MAX_NEIGHBORS_BYTES} — which is the only bound any budget has to
+ *  satisfy. Deliberately *not* sized against a per-profile acceptance cap; there is no such thing. */
 export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
+
+/**
+ * Cap on one base64url-encoded address record in a snapshot's `hints`, in characters (one byte
+ * each — base64url is ASCII). An Ed25519 envelope over a handful of addresses encodes to roughly
+ * 300–700 characters; 2048 leaves room for an RSA key and the {@link MAX_SELF_RECORD_ADDRS}
+ * addresses a self record may carry. Applied on both sides: the parser drops a longer record, and
+ * `SelfAddressRecord` omits its own record rather than emit one the receiver would drop.
+ */
+export const MAX_ADDRESS_RECORD_CHARS = 2048;
+/**
+ * Emission budget for the whole `hints` array of a Core snapshot — the sum over hints of
+ * `JSON.stringify(hint).length + 1` (the `+ 1` is the separating comma), which is what
+ * `FretService.snapshot` counts. Profile-split like the metadata allowance, and for the same
+ * reason: it is this node's own choice of how much it forwards, not a limit on what it accepts.
+ * Worst case: 11,575 (fixed fields) + 49,152 + the field's own framing < {@link MAX_NEIGHBORS_BYTES}.
+ */
+export const MAX_SNAPSHOT_HINT_BYTES_CORE = 48 * 1024;
+/** Same, Edge profile: an edge node forwards less. 6,301 + 16,384 + framing is far under the cap. */
+export const MAX_SNAPSHOT_HINT_BYTES_EDGE = 16 * 1024;
 
 /**
  * Structural validity of an inbound `RouteAndMaybeAct` — everything downstream code touches
@@ -265,12 +285,54 @@ export function makeSnapshotParser(caps: SnapshotCaps): Parser<NeighborSnapshotV
 		// Matches the receiver's own `isPlainObject` gate before it writes the sender's metadata.
 		if (!isPlainObject(msg.metadata)) delete out.metadata; else out.metadata = msg.metadata;
 
+		// Hints are tied to the ids this message names *after* truncation, so the merge caps above
+		// bound the receiver's verify work as well as its hash-and-upsert work: a message cannot
+		// carry more records than it carries ids, whatever its `hints` array holds.
+		const named = new Set<string>([msg.from, ...out.successors, ...out.predecessors, ...out.sample.map((s) => s.id)]);
+		const hints = parseHints(msg.hints, named, msg.from);
+		if (hints.length === 0) delete out.hints; else out.hints = hints;
+
 		// `sig` is deliberately unchecked: message signing is unimplemented, so nothing reads it.
 		return out;
 	};
 }
 
 type SampleEntry = NonNullable<NeighborSnapshotV1['sample']>[number];
+type AddressHint = NonNullable<NeighborSnapshotV1['hints']>[number];
+
+/**
+ * The address hints, vetted per entry against the snapshot's named set — see
+ * {@link makeSnapshotParser}. An entry survives when it is an object whose `id` is a named id not
+ * already hinted and whose `record` is a base64url string of at most {@link MAX_ADDRESS_RECORD_CHARS}
+ * characters. Structural only: the decode proves the string is base64url, nothing about what it
+ * encodes — envelope structure and the signature are checked at ingestion, where the store entry
+ * and the peerStore are. Same skip-and-log-per-entry rule as the sample; never throws.
+ *
+ * The count is bounded by the named set's size through the `seen` set, and the loop stops once
+ * every named id has a hint, so a long junk array costs a per-entry type check and nothing more.
+ */
+function parseHints(value: unknown, named: ReadonlySet<string>, from: string): AddressHint[] {
+	if (!Array.isArray(value)) return [];
+	const out: AddressHint[] = [];
+	const seen = new Set<string>();
+	for (const entry of value) {
+		if (seen.size >= named.size) break;
+		if (!isPlainObject(entry)) continue;
+		if (typeof entry.id !== 'string' || !named.has(entry.id) || seen.has(entry.id)) continue;
+		if (typeof entry.record !== 'string' || entry.record.length > MAX_ADDRESS_RECORD_CHARS) continue;
+		try {
+			u8FromString(entry.record, 'base64url');
+		} catch (err) {
+			// NOTE: one line per dropped entry, bounded by the named set — the same terms as the
+			// sample's per-entry line above.
+			log.error('snapshot from %s: dropping address hint for %s with undecodable record - %e', from, entry.id, err);
+			continue;
+		}
+		seen.add(entry.id);
+		out.push({ id: entry.id, record: entry.record });
+	}
+	return out;
+}
 
 /**
  * The sparsity sample, truncated then vetted per entry. A `coord` is checked by *decoding* it

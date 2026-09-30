@@ -134,7 +134,9 @@ export async function fetchNeighbors(
  * that deliberately target *non-connected* peers — the "tell peers we just learned about"
  * paths, whose whole point is reaching someone we are not talking to yet — pass `dial: true`.
  * Those callers own the reachability check: dialing a peer libp2p holds no address for can
- * only fail (FRET's wire format carries peer ids, never multiaddrs).
+ * only fail. The dial itself is by bare peer id; the addresses it resolves to are whatever the
+ * peerStore holds, which since address hints includes the signed records FRET verified out of
+ * earlier snapshots (`FretService.ingestAddressHints`).
  */
 export async function announceNeighbors(
 	node: Libp2p,

@@ -1,4 +1,4 @@
-import type { Startable, PeerId, Libp2pEvents, IdentifyResult, PeerUpdate } from '@libp2p/interface';
+import type { Startable, PeerId, Libp2pEvents, IdentifyResult, PeerUpdate, PrivateKey } from '@libp2p/interface';
 import type {
 	FretService as IFretService,
 	FretMode,
@@ -8,6 +8,7 @@ import type {
 	NearAnchorV1,
 	BusyResponseV1,
 	NeighborSnapshotV1,
+	AddressHintV1,
 	SerializedTable,
 	ActivityHandler,
 	RouteProgress,
@@ -27,6 +28,8 @@ import {
 	MAX_NEIGHBORS_BYTES,
 	MAX_SNAPSHOT_METADATA_BYTES_CORE,
 	MAX_SNAPSHOT_METADATA_BYTES_EDGE,
+	MAX_SNAPSHOT_HINT_BYTES_CORE,
+	MAX_SNAPSHOT_HINT_BYTES_EDGE,
 } from '../rpc/validate.js';
 import { registerLeave, sendLeave } from '../rpc/leave.js';
 import { registerPing, sendPing } from '../rpc/ping.js';
@@ -37,7 +40,14 @@ import { TokenBucket } from '../utils/token-bucket.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
 import { deadline } from '../utils/deadline.js';
 import { runPooled, type PoolResult } from '../utils/pool.js';
-import { peerIdFromString } from '@libp2p/peer-id';
+import { peerIdFromString, peerIdFromPrivateKey } from '@libp2p/peer-id';
+import {
+	ADDRESS_HINT_FORWARD_MAX_AGE_MS,
+	SelfAddressRecord,
+	decodeAddressRecord,
+	encodeAddressRecord,
+	peekPeerRecord,
+} from './address-records.js';
 import { multiaddr } from '@multiformats/multiaddr';
 import { chooseNextHop, type NextHopOptions } from '../selector/next-hop.js';
 import { DedupCache, DEDUP_TTL_MS } from './dedup-cache.js';
@@ -65,6 +75,16 @@ const log = createLogger('service:fret');
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
 	return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** `[a0, b0, a1, b1, …]`, continuing with the longer list once the shorter runs out. */
+function interleave<T>(a: T[], b: T[]): T[] {
+	const out: T[] = [];
+	for (let i = 0; i < Math.max(a.length, b.length); i++) {
+		if (i < a.length) out.push(a[i]!);
+		if (i < b.length) out.push(b[i]!);
+	}
+	return out;
 }
 
 /**
@@ -170,8 +190,17 @@ export class FretService implements IFretService, Startable {
 	private mode: FretMode = 'passive';
 	private readonly store = new DigitreeStore();
 	// Every optional field is resolved to a default in the constructor, so the service never
-	// re-derives one at a read site.
-	private readonly cfg: Required<FretConfig>;
+	// re-derives one at a read site. `privateKey` is the one field with no default — "absent"
+	// is a real state (see the field below) — so it lives beside the config rather than in it.
+	private readonly cfg: Required<Omit<FretConfig, 'privateKey'>>;
+	/**
+	 * The key that seals this node's own address record (`FretConfig.privateKey`); checked in the
+	 * constructor to derive `node.peerId`. `undefined` means this node advertises no record for
+	 * itself — forwarding and ingestion of other peers' records run regardless.
+	 */
+	private readonly privateKey: PrivateKey | undefined;
+	/** This node's own signed address record, sealed lazily — see {@link SelfAddressRecord}. */
+	private readonly selfRecord = new SelfAddressRecord();
 	private readonly node: Libp2p;
 	/** Own peer id as a string. Bound once: `node` is readonly, so this cannot go stale. */
 	private readonly selfIdStr: string;
@@ -252,9 +281,9 @@ export class FretService implements IFretService, Startable {
 	 * caller of `hasAddresses` is a synchronous `.filter()` predicate. So the answer is
 	 * cached here: rebuilt wholesale from the `peerStore.all()` walk `seedFromPeerStore`
 	 * already performs each stabilization tick (bounded by peerStore size, and self-pruning
-	 * because it is a replacement rather than a merge), and refreshed per-peer on identify
-	 * so a freshly-learned address is usable before the next tick. Not `readonly`: the
-	 * rebuild swaps the whole set.
+	 * because it is a replacement rather than a merge), and refreshed per-peer on identify and
+	 * on an accepted address hint (`ingestAddressHints`), so a freshly-learned address is usable
+	 * before the next tick. Not `readonly`: the rebuild swaps the whole set.
 	 */
 	private addressKnown = new Set<string>();
 	/**
@@ -303,7 +332,7 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * `fetchNeighbors` is `dial: 'never'`, so no dial cost sits inside this budget: it is a stream
 	 * open on an already-multiplexed connection, one write, and a read the wire cap bounds at
-	 * `MAX_NEIGHBORS_BYTES` (16 KiB). 1 s is orders of magnitude above what that costs on any link
+	 * `MAX_NEIGHBORS_BYTES` (64 KiB). 1 s is orders of magnitude above what that costs on any link
 	 * that is not already broken, so exceeding it means "this peer is stalled" — the verdict we
 	 * want promptly, because phase 1 of a tick is bounded by {@link STABILIZE_PHASE_ONE_BUDGET_MS}
 	 * and a stalled snapshot must not eat it. Still well above {@link MAINTENANCE_RPC_TIMEOUT_MS}
@@ -420,6 +449,13 @@ export class FretService implements IFretService, Startable {
 			malformed: 0,
 			/** maybeAct inflight-concurrency-cap saturation (Core 16 / Edge 4) — distinct from a token-bucket rejection: fires when the bucket had a token but the peer is already working on as many maybeAct requests as it allows at once. */
 			concurrencyLimited: 0,
+			/**
+			 * Address hints refused by `ingestAddressHints`: an undecodable envelope, a signer or
+			 * payload peer id that is not the id the hint was labelled with, or a signature that
+			 * failed to verify. A hint that is merely stale (not newer than the record already held)
+			 * is not a rejection and is not counted.
+			 */
+			addressHint: 0,
 		},
 	};
 
@@ -444,6 +480,13 @@ export class FretService implements IFretService, Startable {
 			// disabling the transition rather than failing where the caller could see it.
 			deadAfterFailures: normalizeThreshold(cfg?.deadAfterFailures, 3),
 		};
+		// A key that does not derive this node's peer id would seal records no receiver accepts
+		// (the signer must equal the labelled id) — a caller bug, so it fails here, not silently
+		// on every snapshot.
+		if (cfg?.privateKey && !peerIdFromPrivateKey(cfg.privateKey).equals(node.peerId)) {
+			throw new Error(`FretService: privateKey derives ${peerIdFromPrivateKey(cfg.privateKey).toString()}, not this node's ${node.peerId.toString()}`);
+		}
+		this.privateKey = cfg?.privateKey;
 		// Create network-specific protocols
 		this.protocols = makeProtocols(this.cfg.networkName);
 		this.bucketNeighbors = new TokenBucket(
@@ -1095,6 +1138,9 @@ export class FretService implements IFretService, Startable {
 			})();
 		}
 		this.readyResolved = false;
+		if (!this.privateKey) {
+			log('no privateKey configured: this node advertises no address record for itself, so peers that learn of it only through FRET cannot dial it; forwarding and ingestion of other peers\' records are unaffected');
+		}
 		await this.seedFromPeerStore();
 		// The seed no longer enforces for itself (the caller owns the one enforcement per insert
 		// sequence), so do it here explicitly rather than leaving it to the first stabilization
@@ -1176,6 +1222,10 @@ export class FretService implements IFretService, Startable {
 				// The event carries the updated Peer record, so its addresses are authoritative
 				// here — no peerStore round-trip needed.
 				this.setAddressKnown(id, peer.addresses.length > 0);
+				// identify stores a verified signed record for every directly-connected peer;
+				// mirror it onto the entry so we can forward it. Our own `consumePeerRecord` fires
+				// this event too — the sequence rule inside makes that a no-op.
+				if (peer.peerRecordEnvelope) this.adoptPeerRecord(id, peer.peerRecordEnvelope);
 			} catch (err) { log.error('peer:update handler failed - %e', err) }
 		});
 	}
@@ -1505,10 +1555,12 @@ export class FretService implements IFretService, Startable {
 	 * True when libp2p holds at least one multiaddr for `id`, i.e. a dial can plausibly
 	 * succeed even though no connection is open.
 	 *
-	 * FRET's own wire messages carry peer-id strings only and contribute no addresses, so
-	 * this is entirely about what libp2p itself learned (identify over a direct connection,
-	 * a bootstrap entry, a transport's own discovery). Answered from {@link addressKnown};
-	 * see that field for why the peerStore is not read directly here.
+	 * The peerStore is still the one source of addresses; what changed with address hints is
+	 * who writes it. Besides what libp2p learns on its own (identify over a direct connection, a
+	 * bootstrap entry, a transport's own discovery), FRET now hands it the signed records that
+	 * arrive in neighbour snapshots, verified, through `peerStore.consumePeerRecord` — so a peer
+	 * known only through FRET can have addresses too. Answered from {@link addressKnown}; see that
+	 * field for why the peerStore is not read directly here.
 	 */
 	private hasAddresses(id: string): boolean {
 		return this.addressKnown.has(id);
@@ -2084,9 +2136,10 @@ export class FretService implements IFretService, Startable {
 
 	/**
 	 * Inbound-announce entry point: gate on the per-profile token bucket before any merge work.
-	 * A crafted announce can carry many ids (the RPC accepts up to a 128 KB message), each
-	 * costing a parse + hash + upsert; without this gate one peer could force thousands of ops.
-	 * On rejection we drop the message and count it — never throw, so no inflight state desyncs.
+	 * A crafted announce can carry many ids (the RPC accepts up to `MAX_NEIGHBORS_BYTES`, 64 KiB),
+	 * each costing a parse + hash + upsert — and, for a hint newer than the record held, a
+	 * signature verify; without this gate one peer could force thousands of ops. On rejection we
+	 * drop the message and count it — never throw, so no inflight state desyncs.
 	 */
 	private handleAnnounce(from: string, snap: NeighborSnapshotV1): void {
 		if (!this.bucketAnnounceInbound.tryTake()) {
@@ -2144,7 +2197,7 @@ export class FretService implements IFretService, Startable {
 			// checked: a crafted announce can carry a string or an array here, and storing that
 			// would hand `getMetadata` a value of a shape its type says is impossible.
 			// NOTE: the accepted object is otherwise unbounded (one per authenticated sender,
-			// capped only by the 128 KB message limit and the routing-table capacity); if
+			// capped only by the 64 KiB message limit and the routing-table capacity); if
 			// per-peer metadata ever shows up in memory profiles, cap its serialized size here.
 			if (isPlainObject(snap.metadata)) {
 				// Update metadata via store.update to avoid mutating frozen entries
@@ -2165,6 +2218,11 @@ export class FretService implements IFretService, Startable {
 			// Calibrate local size estimator from snapshot's estimate
 			this.calibrateSizeFromSnapshot(snap, from);
 			await this.enforceCapacity();
+			// After the id merges (a hint only lands on an entry that exists) and after capacity
+			// enforcement (no signature spent on a peer just evicted), but before the announce to
+			// newly discovered peers, which only reaches the ones that are dialable — and a hint is
+			// what makes a relay-only newcomer dialable.
+			await this.ingestAddressHints(snap);
 			if (discovered.length > 0) this.detach(this.announceToNewPeers(discovered), 'announceToNewPeers');
 		} catch (err) {
 			log.error('mergeAnnounceSnapshot failed for %s - %e', from, err);
@@ -2202,7 +2260,8 @@ export class FretService implements IFretService, Startable {
 					// coordinate check for imported entries. Revisit if VRF/epoch ring-coordinate
 					// rotation is ever implemented (open question in `docs/fret.md`): a coordinate
 					// could then go stale and this reuse would be wrong.
-					const coord = this.store.getById(pidStr)?.coord ?? (await hashPeerId(p.id));
+					const held = this.store.getById(pidStr);
+					const coord = held?.coord ?? (await hashPeerId(p.id));
 					this.store.upsert(pidStr, coord);
 					// If identify has populated the peerStore, classify off its protocol
 					// list now rather than waiting for an outbound probe. No `unknown`-only
@@ -2210,6 +2269,10 @@ export class FretService implements IFretService, Startable {
 					// `applyMembershipSignal`: an identify list lacking our protocol demotes
 					// only from `unknown`, wherever the list came from).
 					this.classifyByProtocols(pidStr, p.protocols);
+					// A peer identified before `start()` delivered its signed record to the
+					// peerStore with no `peer:update` for us to see; adopt it here, once. Only
+					// for an entry holding nothing — later records arrive as `peer:update`.
+					if (p.peerRecordEnvelope && !held?.addressRecord) this.adoptPeerRecord(pidStr, p.peerRecordEnvelope);
 				} catch (err) {
 					log.error('failed to add peer from peerStore %s - %e', p?.id?.toString?.(), err);
 				}
@@ -2785,7 +2848,106 @@ export class FretService implements IFretService, Startable {
 		}
 		// Calibrate local size estimator from snapshot's estimate
 		this.calibrateSizeFromSnapshot(snap, id);
+		// After the id merges, so the named ids have entries for their records to land on. The
+		// caller announces to `announced` once the tick's phase 1 drains, and that announce only
+		// reaches dialable peers — so the hints must be in the peerStore by then.
+		await this.ingestAddressHints(snap);
 		return announced;
+	}
+
+	/**
+	 * Verify the signed address records a snapshot carries and hand them to libp2p.
+	 *
+	 * Per hint, in order, and with **no crypto on the common path** — neighbours re-send the same
+	 * records every tick, and steps 1–3 are what keep that free:
+	 *
+	 * 1. Skip self (our addresses come from our address manager, never from gossip) and skip an
+	 *    id with no store entry — never create one. A hint rides on a routing-table entry; entry
+	 *    admission and eviction stay governed by the hearsay rule, so a hint can never push out a
+	 *    peer we contacted ourselves. There is no separate address book to fill.
+	 * 2. `peekPeerRecord`: undecodable, or a signer or payload peer id that is not the labelled
+	 *    id → rejected and counted. The payload check is ours to make — `consumePeerRecord` checks
+	 *    only the signer, then patches the payload's peer id blindly.
+	 * 3. Not newer than the record the entry holds → skip, silently (a resend, not a rejection).
+	 * 4. `consumePeerRecord`, with the labelled id as `expectedPeer`: verifies the signature, then
+	 *    replaces the peer's addresses with the record's — the peer's own statement of where it
+	 *    is, as identify would apply it, so a bootstrap-configured address for that peer gives
+	 *    way. A throw is a bad signature → rejected and counted. `false` means the peerStore
+	 *    already holds an equal-or-newer record (steps 2–3 ruled out the other cause) → nothing
+	 *    to do.
+	 * 5. Accepted → record it on the entry with our clock as `confirmedAt`, and mark the address
+	 *    known now rather than at the next tick, so the dialability predicates see it.
+	 *
+	 * Two merges ingesting the same id concurrently both reach step 4; libp2p's own sequence check
+	 * and identical bytes make the second a no-op, so no lock is needed.
+	 */
+	private async ingestAddressHints(snap: NeighborSnapshotV1): Promise<void> {
+		for (const hint of snap.hints ?? []) {
+			if (hint.id === this.selfIdStr) continue;
+			const entry = this.store.getById(hint.id);
+			if (!entry) continue;
+			let bytes: Uint8Array;
+			try {
+				bytes = decodeAddressRecord(hint.record);
+			} catch (err) {
+				// The parser already vetted the encoding on both inbound paths; this guards a
+				// caller that hands the merge an unparsed snapshot.
+				this.rejectAddressHint(snap.from, hint.id, 'record is not base64url', err);
+				continue;
+			}
+			const peeked = peekPeerRecord(bytes);
+			if (!peeked) { this.rejectAddressHint(snap.from, hint.id, 'record does not decode as a signed peer record'); continue; }
+			if (peeked.signer !== hint.id || peeked.peerId !== hint.id) {
+				this.rejectAddressHint(snap.from, hint.id, `record is signed by ${peeked.signer} and describes ${peeked.peerId}`);
+				continue;
+			}
+			// NOTE: re-decodes the held envelope (two protobuf parses, no crypto) on every resend,
+			// which is every tick per neighbour. The entry keeps only opaque bytes by design; if
+			// snapshot ingestion ever shows up in profiles, cache the peeked seq beside them.
+			const held = entry.addressRecord ? peekPeerRecord(entry.addressRecord.envelope) : undefined;
+			if (held && held.seq >= peeked.seq) continue;
+			let accepted: boolean;
+			try {
+				accepted = await this.node.peerStore.consumePeerRecord(bytes, { expectedPeer: peerIdFromString(hint.id) });
+			} catch (err) {
+				this.rejectAddressHint(snap.from, hint.id, 'signature did not verify', err);
+				continue;
+			}
+			if (!accepted) continue;
+			this.store.update(hint.id, { addressRecord: { envelope: bytes, confirmedAt: Date.now() } });
+			this.setAddressKnown(hint.id, true);
+		}
+	}
+
+	/** Count and report one refused address hint — see `diag.rejected.addressHint`. */
+	private rejectAddressHint(from: string, id: string, why: string, err?: unknown): void {
+		this.diag.rejected.addressHint++;
+		// NOTE: debug-gated (@libp2p/logger emits only under DEBUG), and bounded per message by the
+		// parser's named set; rate-limit if this is ever routed to an always-on sink.
+		if (err === undefined) log.error('snapshot from %s: rejecting address hint for %s - %s', from, id, why);
+		else log.error('snapshot from %s: rejecting address hint for %s - %s - %e', from, id, why, err);
+	}
+
+	/**
+	 * Adopt a record libp2p itself verified and stored for `id` (identify does this for every
+	 * directly-connected peer) onto the routing-table entry, so we can forward it — which is what
+	 * lets a relay or neighbour advertise a peer that runs no FRET self-sealing at all.
+	 *
+	 * Same identity and sequence rules as {@link ingestAddressHints} steps 2–3, minus the counting:
+	 * libp2p already verified the signature and the signer, so a mismatch here would be a libp2p
+	 * bug rather than a hostile peer, and a not-newer record is simply the one we already hold.
+	 */
+	private adoptPeerRecord(id: string, envelope: Uint8Array): void {
+		const entry = this.store.getById(id);
+		if (!entry) return;
+		const peeked = peekPeerRecord(envelope);
+		if (!peeked || peeked.signer !== id || peeked.peerId !== id) {
+			log.error('peerStore record for %s is not a self-signed record for that peer - not adopting', id);
+			return;
+		}
+		const held = entry.addressRecord ? peekPeerRecord(entry.addressRecord.envelope) : undefined;
+		if (held && held.seq >= peeked.seq) return;
+		this.store.update(id, { addressRecord: { envelope, confirmedAt: Date.now() } });
 	}
 
 	// Snapshots
@@ -2808,13 +2970,16 @@ export class FretService implements IFretService, Startable {
 		const sample = selectDiverseSample(this.store, selfCoord, this.sparsity, excludeIds, capSample, isLiveMember);
 		// NOTE: nothing here validates the *encoded* snapshot against MAX_NEIGHBORS_BYTES — the
 		// emission is bounded by construction instead (fixed id counts, ids bounded by the peer-id
-		// encoding, and the metadata byte cap below), and the encoding cases in
-		// `test/rpc.codec-properties.spec.ts` are the guard that the worst legal build still fits.
-		// Measured headroom is ~4.8 KiB (worst Core build 11,575 bytes against the 16 KiB cap), so
-		// the invariant is not close. If the emission caps, the metadata allowance, or the set of
-		// snapshot fields ever grow, add a byte check here rather than widening the test — a
-		// snapshot that overflows the cap is refused at the receiver's length prefix and so fails
-		// silently and one-directionally, which is the failure mode the single cap exists to end.
+		// encoding, the metadata byte cap below, and the hint byte budget `buildAddressHints`
+		// packs to), and the encoding cases in `test/rpc.codec-properties.spec.ts` are the guard
+		// that the worst legal build still fits. Measured headroom is ~4.7 KiB (worst Core build
+		// 11,575 bytes of fixed fields plus a 48 KiB hint budget and its framing, 60,738 bytes
+		// against the 64 KiB cap), so the invariant is not close. If the emission caps, the
+		// metadata allowance, the hint budget, or the set of snapshot fields ever grow, add a byte
+		// check here rather than widening the test — a snapshot that overflows the cap is refused
+		// at the receiver's length prefix and so fails silently and one-directionally, which is the
+		// failure mode the single cap exists to end.
+		const hints = await this.buildAddressHints(successors, predecessors, sample.map((s) => s.id));
 		// NOTE: over-cap metadata is dropped on every snapshot build (each announce and each
 		// served neighbors request), so a persistently over-sized `setMetadata` value logs once
 		// per snapshot rather than once per change, and the application is never told its
@@ -2840,7 +3005,52 @@ export class FretService implements IFretService, Startable {
 			confidence,
 			sig: '',
 			metadata: outMetadata,
+			...(hints.length > 0 ? { hints } : {}),
 		};
+	}
+
+	/**
+	 * The `hints` for an outgoing snapshot: signed address records for the peers it names, packed
+	 * under the profile's byte budget (`MAX_SNAPSHOT_HINT_BYTES_CORE` / `_EDGE`).
+	 *
+	 * Candidates in priority order — self first (the one record nobody else can originate), then
+	 * successors and predecessors **interleaved in ring order**, nearest first (these are what let
+	 * a third party reach a NAT'd neighbour of ours), then the sample. All three lists are the ones
+	 * the snapshot actually emits: the receiver's parser keeps a hint only for an id the message
+	 * names, so a record for anyone else would be bytes it drops on arrival.
+	 *
+	 * A non-self candidate is forwarded only while it is connected to us now, or its record was
+	 * accepted within `ADDRESS_HINT_FORWARD_MAX_AGE_MS` — both measured on our own clock, never on
+	 * a timestamp a remote supplied. A record kept alive by neither goes quiet rather than stale.
+	 *
+	 * Budget accounting counts each hint's full encoded size (`JSON.stringify(hint).length + 1`,
+	 * the `+ 1` being the separating comma); a hint that does not fit is skipped and the walk
+	 * continues, so a large RSA record cannot shadow the small Ed25519 ones behind it.
+	 */
+	private async buildAddressHints(successors: string[], predecessors: string[], sampleIds: string[]): Promise<AddressHintV1[]> {
+		const budget = this.cfg.profile === 'core' ? MAX_SNAPSHOT_HINT_BYTES_CORE : MAX_SNAPSHOT_HINT_BYTES_EDGE;
+		const now = Date.now();
+		const hints: AddressHintV1[] = [];
+		let used = 0;
+		const offer = (id: string, record: string | undefined): void => {
+			if (record === undefined) return;
+			const hint = { id, record };
+			const cost = JSON.stringify(hint).length + 1;
+			if (used + cost > budget) return;
+			used += cost;
+			hints.push(hint);
+		};
+		if (this.privateKey) offer(this.selfIdStr, await this.selfRecord.current(this.node, this.privateKey));
+		const seen = new Set<string>([this.selfIdStr]);
+		for (const id of [...interleave(successors, predecessors), ...sampleIds]) {
+			if (seen.has(id)) continue;
+			seen.add(id);
+			const record = this.store.getById(id)?.addressRecord;
+			if (!record) continue;
+			if (!this.isConnected(id) && now - record.confirmedAt >= ADDRESS_HINT_FORWARD_MAX_AGE_MS) continue;
+			offer(id, encodeAddressRecord(record.envelope));
+		}
+		return hints;
 	}
 
 	// Cohort/neighbors

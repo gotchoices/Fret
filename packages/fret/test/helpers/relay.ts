@@ -11,7 +11,8 @@ import { identify } from '@libp2p/identify'
 // the libp2p stack, bump this too; a stale pin surfaces as a `tsc --noEmit` type error, loudly, but
 // only at that point.
 import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
-import type { Connection } from '@libp2p/interface'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import type { Connection, PrivateKey } from '@libp2p/interface'
 import { stopAll } from './libp2p.js'
 
 /**
@@ -37,8 +38,14 @@ export interface RelayTopology {
 	all: Libp2p[]
 }
 
-async function createRelayNode(): Promise<Libp2p> {
+/**
+ * `privateKey` is optional because libp2p mints one when none is given; the hub below supplies
+ * its own so a spec can hand the same key to FRET, which needs it to seal a self record and which
+ * cannot read it back off a `Libp2p` (the interface does not expose it).
+ */
+async function createRelayNode(privateKey?: PrivateKey): Promise<Libp2p> {
 	return await createLibp2p({
+		...(privateKey ? { privateKey } : {}),
 		addresses: { listen: ['/ip4/127.0.0.1/tcp/0'] },
 		transports: [tcp()],
 		connectionEncrypters: [noise()],
@@ -50,8 +57,9 @@ async function createRelayNode(): Promise<Libp2p> {
 	})
 }
 
-async function createRelayedNode(listenOnCircuit: boolean): Promise<Libp2p> {
+async function createRelayedNode(listenOnCircuit: boolean, privateKey?: PrivateKey): Promise<Libp2p> {
 	return await createLibp2p({
+		...(privateKey ? { privateKey } : {}),
 		addresses: { listen: listenOnCircuit ? ['/p2p-circuit'] : [] },
 		transports: [tcp(), circuitRelayTransport()],
 		connectionEncrypters: [noise()],
@@ -94,8 +102,64 @@ export async function createRelayTopology(): Promise<RelayTopology> {
 	}
 }
 
-/** Reserve a slot on the relay for `listener`, then dial it from `dialer` over that circuit. */
-async function connectThroughRelay(relay: Libp2p, listener: Libp2p, dialer: Libp2p): Promise<void> {
+/**
+ * A relay with two peers that are reachable **only** through it — the shape of Optimystic#11.
+ *
+ * `a` and `b` each listen on `/p2p-circuit` alone, are connected to the relay and nothing else,
+ * and hold a reservation on it. They are never connected to each other: that is the spec's job,
+ * and whether a bare-id dial between them can succeed is the question under test. No FRET
+ * service runs on any of the three — a spec that starts them chooses *when*, which is what makes
+ * a negative control before the exchange meaningful.
+ *
+ * `keys` holds each node's private key by peer id string, since `Libp2p` does not expose it and
+ * FRET needs it to seal this node's own signed address record.
+ */
+export interface RelayHub {
+	relay: Libp2p
+	a: Libp2p
+	b: Libp2p
+	keys: Map<string, PrivateKey>
+	/** Every node, newest last — hand straight to `stopAll`. */
+	all: Libp2p[]
+}
+
+export async function createRelayHub(): Promise<RelayHub> {
+	const all: Libp2p[] = []
+	const keys = new Map<string, PrivateKey>()
+	const withKey = async (make: (key: PrivateKey) => Promise<Libp2p>): Promise<Libp2p> => {
+		const key = await generateKeyPair('Ed25519')
+		const node = await make(key)
+		keys.set(node.peerId.toString(), key)
+		all.push(node)
+		return node
+	}
+	try {
+		const relay = await withKey((key) => createRelayNode(key))
+		const a = await withKey((key) => createRelayedNode(true, key))
+		const b = await withKey((key) => createRelayedNode(true, key))
+		await reserveThroughRelay(relay, a)
+		await reserveThroughRelay(relay, b)
+		return { relay, a, b, keys, all }
+	} catch (err) {
+		// Same reasoning as `createRelayTopology`: nodes already standing must not outlive a
+		// failed setup, or the exit watchdog buries the real error.
+		await stopAll(all)
+		throw err
+	}
+}
+
+/** The address of `node` that proves it holds a reservation on `relay` (see `reserveThroughRelay`). */
+export function reservedCircuitAddr(relay: Libp2p, node: Libp2p): string | undefined {
+	return node.getMultiaddrs().map((ma) => ma.toString()).find((ma) => isReservedCircuitOn(relay, ma))
+}
+
+/** Does this address route through `relay`'s circuit — `…/p2p/<relay>/p2p-circuit…`? */
+export function isReservedCircuitOn(relay: Libp2p, ma: string): boolean {
+	return ma.includes(`/p2p/${relay.peerId.toString()}/p2p-circuit`)
+}
+
+/** Connect `listener` to `relay` and wait until it holds a reservation there. */
+async function reserveThroughRelay(relay: Libp2p, listener: Libp2p): Promise<void> {
 	const relayAddr = relay.getMultiaddrs()[0]
 	if (relayAddr == null) throw new Error('relay is not listening')
 
@@ -105,14 +169,14 @@ async function connectThroughRelay(relay: Libp2p, listener: Libp2p, dialer: Libp
 	// that returns instantly and the dial that follows goes nowhere. The address that means a
 	// reservation landed is the fully-qualified one — the relay's own address, then the circuit
 	// hop, then the listener.
-	const relayId = relay.peerId.toString()
-	const isReservedCircuit = (ma: string): boolean => ma.includes(`/p2p/${relayId}/p2p-circuit`)
-
 	await listener.dial(relayAddr)
-	await waitFor('the listener to obtain a relay reservation', () =>
-		listener.getMultiaddrs().some(ma => isReservedCircuit(ma.toString())))
+	await waitFor('the listener to obtain a relay reservation', () => reservedCircuitAddr(relay, listener) != null)
+}
 
-	const circuitAddr = listener.getMultiaddrs().find(ma => isReservedCircuit(ma.toString()))
+/** Reserve a slot on the relay for `listener`, then dial it from `dialer` over that circuit. */
+async function connectThroughRelay(relay: Libp2p, listener: Libp2p, dialer: Libp2p): Promise<void> {
+	await reserveThroughRelay(relay, listener)
+	const circuitAddr = listener.getMultiaddrs().find((ma) => isReservedCircuitOn(relay, ma.toString()))
 	if (circuitAddr == null) throw new Error('listener has no reserved circuit address')
 	await dialer.dial(circuitAddr)
 	// `dial()` resolves when the *dialer's* half is up; the listener's inbound half is created by

@@ -279,15 +279,17 @@ describe('Profile behavior tests', function () {
 	describe('Payload size limits', () => {
 		// One acceptance number for both profiles: the cap bounds what a *peer* may send us, and
 		// Edge and Core peers talk to each other. A profile split here made a legal Core snapshot
-		// (up to 11,575 bytes) unreadable by every Edge peer, whose cap was 8192.
-		it('maxBytesNeighbors = MAX_NEIGHBORS_BYTES (16384) on both profiles', async () => {
+		// (up to 11,575 bytes of fixed fields) unreadable by every Edge peer, whose cap was 8192.
+		// 64 KiB since address hints: the Core worst case is those fixed fields plus a 48 KiB hint
+		// budget (60,738 bytes) — see `MAX_NEIGHBORS_BYTES` for the arithmetic.
+		it('maxBytesNeighbors = MAX_NEIGHBORS_BYTES (65536) on both profiles', async () => {
 			const core = await createService('core')
 			expect((core.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
 
 			const edge = await createService('edge')
 			expect((edge.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)
 
-			expect(MAX_NEIGHBORS_BYTES).to.equal(16384)
+			expect(MAX_NEIGHBORS_BYTES).to.equal(65536)
 		})
 
 		it('maxBytesMaybeAct = 144 KB (147456) on both profiles', async () => {

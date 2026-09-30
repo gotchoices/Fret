@@ -6,6 +6,9 @@ import type { PeerId, Stream } from '@libp2p/interface'
 import { fromString as u8FromString } from 'uint8arrays/from-string'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import { PeerRecord, RecordEnvelope } from '@libp2p/peer-record'
+import { multiaddr } from '@multiformats/multiaddr'
+import { toString as u8ToString } from 'uint8arrays/to-string'
 import { disable, enable } from '@libp2p/logger'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
@@ -29,6 +32,9 @@ import {
 	MAX_NEIGHBORS_BYTES,
 	MAX_SNAPSHOT_METADATA_BYTES_CORE,
 	MAX_SNAPSHOT_METADATA_BYTES_EDGE,
+	MAX_SNAPSHOT_HINT_BYTES_CORE,
+	MAX_SNAPSHOT_HINT_BYTES_EDGE,
+	MAX_ADDRESS_RECORD_CHARS,
 	MAX_BREADCRUMBS,
 	MAX_CORRELATION_ID_CHARS,
 	MAX_DIGEST_CHARS,
@@ -200,7 +206,7 @@ function withOptionals<T extends object>(
 	})
 }
 
-const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata'] as const
+const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata', 'hints'] as const
 const MAYBE_ACT_OPTIONALS = ['wants', 'digest', 'activity', 'breadcrumbs'] as const
 const LEAVE_OPTIONALS = ['replacements'] as const
 const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'metadata'] as const
@@ -220,6 +226,8 @@ const arbNeighborSnapshot: fc.Arbitrary<NeighborSnapshotV1> = withOptionals(fc.r
 		confidence: arbUnitInterval,
 		sig: arbNastyString,
 		metadata: arbMetadata,
+		// Junk on purpose, like the ids: the parser must drop these without throwing.
+		hints: fc.array(fc.record({ id: arbNastyString, record: arbNastyString }), { maxLength: 4 }),
 	}
 ), [...SNAPSHOT_OPTIONALS])
 
@@ -318,7 +326,7 @@ describe('RPC codec properties', function () {
 		}
 
 		it('round-trips NeighborSnapshotV1, including every optional field', async () => {
-			await assertRoundTrips(arbNeighborSnapshot, ['sample', 'size_estimate', 'confidence', 'metadata'])
+			await assertRoundTrips(arbNeighborSnapshot, [...SNAPSHOT_OPTIONALS])
 		})
 
 		it('round-trips RouteAndMaybeActV1, including every optional field', async () => {
@@ -886,9 +894,9 @@ describe('RPC codec properties', function () {
 	// The maybeAct wire cap and the service's own activity cap are now one derived number rather
 	// than two that can disagree: `maxBytesMaybeAct() = MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES`
 	// (both exported from `src/rpc/validate.ts`), 144 KiB on both profiles. The neighbors wire cap
-	// is 16 KiB Core / 8 KiB Edge. The assertions below pin those current, tightened caps. The tests
-	// use the Edge profile so payloads stay small enough to send quickly; the arithmetic is the same
-	// on Core.
+	// is `MAX_NEIGHBORS_BYTES`, 64 KiB on both profiles. The assertions below pin those caps. The
+	// tests use the Edge profile so payloads stay small enough to send quickly; the arithmetic is
+	// the same on Core.
 	// ---------------------------------------------------------------------------------------------
 	describe('byte caps at the handler', () => {
 		interface WireRig {
@@ -1131,7 +1139,7 @@ describe('RPC codec properties', function () {
 		// since the refusal happens inside `readFramed` itself before any body byte is pulled.
 		const cases: Array<{ label: string; cap: number }> = [
 			{ label: 'maybeAct (144 KiB, both profiles)', cap: MAX_ACTIVITY_BYTES + MAYBE_ACT_OVERHEAD_BYTES },
-			{ label: 'neighbors announce (16 KiB, both profiles)', cap: MAX_NEIGHBORS_BYTES },
+			{ label: 'neighbors announce (64 KiB, both profiles)', cap: MAX_NEIGHBORS_BYTES },
 			{ label: 'leave (fixed 4096)', cap: 4096 },
 		]
 
@@ -1174,6 +1182,27 @@ describe('RPC codec properties', function () {
 			return value
 		}
 
+		/**
+		 * A `hints` array packed to `budget` by the rule `FretService.buildAddressHints` applies —
+		 * each hint costs `JSON.stringify(hint).length + 1`, and a hint that does not fit is
+		 * skipped — with every record at the per-record cap, which is the largest hint the sender
+		 * will emit and the receiver will keep. The pack is asserted to sit at the budget, not
+		 * merely under it, so a case that silently packed nothing could not pass.
+		 */
+		function hintsAtBudget(budget: number): Array<{ id: string; record: string }> {
+			const hints: Array<{ id: string; record: string }> = []
+			let used = 0
+			for (let i = 0; ; i++) {
+				const hint = { id: fakeId(i + 300), record: 'x'.repeat(MAX_ADDRESS_RECORD_CHARS) }
+				const cost = JSON.stringify(hint).length + 1
+				if (used + cost > budget) break
+				used += cost
+				hints.push(hint)
+			}
+			expect(used, 'the pack reaches the budget to within one hint').to.be.greaterThan(budget - (MAX_ADDRESS_RECORD_CHARS + 128))
+			return hints
+		}
+
 		// Both snapshot cases below build the id lists at the *merge* caps (Core 16/16/8, Edge
 		// 8/8/6) rather than the narrower emission caps the service actually uses today (12/12/8,
 		// 6/6/6). That is the conservative direction, and it keeps these cases valid if the
@@ -1183,8 +1212,12 @@ describe('RPC codec properties', function () {
 		// bounds what a *peer* may send, and a peer may be running either profile. So the
 		// requirement is "every profile's largest legal emission fits the one cap every peer
 		// applies" — re-splitting the cap per profile fails here rather than on the wire.
-		it('neighbors snapshot at the core merge caps plus a full metadata allowance fits under MAX_NEIGHBORS_BYTES', async () => {
-			const snapshot = {
+		//
+		// Each case asserts twice. The concrete build is what the sender emits at its worst; the
+		// arithmetic bound (fixed fields + the whole hint budget + the field's framing) is the
+		// invariant the constants carry, and holds whatever the hint packing does.
+		it('neighbors snapshot at the core merge caps plus full metadata and hint budgets fits under MAX_NEIGHBORS_BYTES', async () => {
+			const fixed = {
 				v: 1,
 				from: fakeId(9999),
 				timestamp: Date.now(),
@@ -1200,11 +1233,14 @@ describe('RPC codec properties', function () {
 				sig: 'x'.repeat(256), // reserved for the unimplemented signature field
 				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_CORE),
 			}
-			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(MAX_NEIGHBORS_BYTES)
+			const fixedBytes = (await encodeJson(fixed)).byteLength
+			expect(fixedBytes + MAX_SNAPSHOT_HINT_BYTES_CORE + ',"hints":[]'.length, 'arithmetic bound').to.be.lessThan(MAX_NEIGHBORS_BYTES)
+			const snapshot = { ...fixed, hints: hintsAtBudget(MAX_SNAPSHOT_HINT_BYTES_CORE) }
+			expect((await encodeJson(snapshot)).byteLength, 'concrete worst build').to.be.lessThan(MAX_NEIGHBORS_BYTES)
 		})
 
-		it('neighbors snapshot at the edge merge caps plus a full metadata allowance fits under MAX_NEIGHBORS_BYTES', async () => {
-			const snapshot = {
+		it('neighbors snapshot at the edge merge caps plus full metadata and hint budgets fits under MAX_NEIGHBORS_BYTES', async () => {
+			const fixed = {
 				v: 1,
 				from: fakeId(9999),
 				timestamp: Date.now(),
@@ -1220,7 +1256,10 @@ describe('RPC codec properties', function () {
 				sig: 'x'.repeat(256),
 				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_EDGE),
 			}
-			expect((await encodeJson(snapshot)).byteLength).to.be.lessThan(MAX_NEIGHBORS_BYTES)
+			const fixedBytes = (await encodeJson(fixed)).byteLength
+			expect(fixedBytes + MAX_SNAPSHOT_HINT_BYTES_EDGE + ',"hints":[]'.length, 'arithmetic bound').to.be.lessThan(MAX_NEIGHBORS_BYTES)
+			const snapshot = { ...fixed, hints: hintsAtBudget(MAX_SNAPSHOT_HINT_BYTES_EDGE) }
+			expect((await encodeJson(snapshot)).byteLength, 'concrete worst build').to.be.lessThan(MAX_NEIGHBORS_BYTES)
 		})
 
 		it('both profiles accept neighbors messages up to the same cap', async () => {
@@ -1701,17 +1740,30 @@ describe('RPC codec properties', function () {
 		// Peer ids have to be *real* here. This file's other arbitraries draw ids from
 		// `arbNastyString` on purpose — they prove the codec is lossless, not that a validator
 		// accepts them — so reusing them would make every legal-message property fail on `from`.
+		// Each id also gets a genuine signed address record (a real envelope, base64url) so a
+		// legal snapshot's `hints` are what a sender actually emits, not merely well-typed.
 		const legalPeerIds: string[] = []
+		const legalRecords = new Map<string, string>()
 		before(async () => {
 			for (let i = 0; i < 8; i++) {
-				legalPeerIds.push(peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString())
+				const key = await generateKeyPair('Ed25519')
+				const id = peerIdFromPrivateKey(key)
+				legalPeerIds.push(id.toString())
+				const record = new PeerRecord({ peerId: id, multiaddrs: [multiaddr(`/ip4/127.0.0.1/tcp/${4000 + i}`)], seqNumber: BigInt(i + 1) })
+				legalRecords.set(id.toString(), u8ToString((await RecordEnvelope.seal(record, key)).marshal(), 'base64url'))
 			}
 		})
 		const arbPeerId = fc.nat({ max: 7 }).map((i) => legalPeerIds[i]!)
 
 		// ---- the legal side: what our own encoder can produce from a valid message ----
 
-		const arbLegalSnapshot = withOptionals(fc.record({
+		/** The ids a snapshot names — what the parser ties `hints` to. Post-`withOptionals`, since
+		 *  an absent `sample` names nobody. */
+		function namedIds(snap: { from: string; successors: string[]; predecessors: string[]; sample?: Array<{ id: string }> }): string[] {
+			return [...new Set([snap.from, ...snap.successors, ...snap.predecessors, ...(snap.sample ?? []).map((s) => s.id)])]
+		}
+
+		const arbLegalSnapshot: fc.Arbitrary<NeighborSnapshotV1> = withOptionals(fc.record({
 			v: fc.constant(1 as const),
 			from: arbPeerId,
 			timestamp: arbJsonNumber,
@@ -1725,7 +1777,13 @@ describe('RPC codec properties', function () {
 			confidence: arbUnitInterval,
 			sig: arbNastyString,
 			metadata: arbMetadata,
-		}), [...SNAPSHOT_OPTIONALS])
+		}), ['sample', 'size_estimate', 'confidence', 'metadata'])
+			// `hints` are chained off the finished snapshot: the sender only emits a record for an
+			// id it names, so the legal set depends on which lists survived `withOptionals`.
+			.chain((snap) => fc.tuple(fc.boolean(), fc.subarray(namedIds(snap))).map(([present, ids]) => {
+				if (!present) return snap
+				return { ...snap, hints: ids.map((id) => ({ id, record: legalRecords.get(id)! })) }
+			}))
 
 		const arbLegalRouteAndMaybeAct = withOptionals(fc.record({
 			v: fc.constant(1 as const),
@@ -1773,13 +1831,19 @@ describe('RPC codec properties', function () {
 
 		describe('never reject what our own encoder produced', () => {
 			it('NeighborSnapshot', async () => {
+				const region = { withHints: 0 }
 				await fc.assert(fc.asyncProperty(arbLegalSnapshot, async (snap) => {
+					if ((snap.hints?.length ?? 0) > 0) region.withHints++
 					const parsed = parseSnapshot(await overTheWire(snap))
 					expect(parsed, 'legal snapshot rejected').to.not.equal(undefined)
-					// Nothing is normalized away either. The one difference is an absent `sample`,
-					// which becomes `[]` so the merge loop never has to re-check the field.
-					expect(parsed).to.deep.equal({ ...snap, sample: snap.sample ?? [] })
+					// Nothing is normalized away either. The two differences: an absent `sample`
+					// becomes `[]` so the merge loop never has to re-check the field, and an *empty*
+					// `hints` is dropped, since "no records" is what absence means.
+					const expected: NeighborSnapshotV1 = { ...snap, sample: snap.sample ?? [] }
+					if (expected.hints?.length === 0) delete expected.hints
+					expect(parsed).to.deep.equal(expected)
 				}), opts)
+				expect(region.withHints, 'no snapshot carrying real hints was generated').to.be.greaterThan(0)
 			})
 
 			it('RouteAndMaybeAct', async () => {
@@ -2022,6 +2086,56 @@ describe('RPC codec properties', function () {
 					expect(parseSnapshot(snap({ metadata: bad })), JSON.stringify(bad)).to.not.have.property('metadata')
 				}
 				expect(parseSnapshot(snap({ metadata: { a: 1 } }))?.metadata).to.deep.equal({ a: 1 })
+			})
+
+			// Hints are structural here — a record only has to *be* base64url. Whether it decodes
+			// to an envelope, who signed it, and whether the signature holds are ingestion's job
+			// (`test/address-hints.ingest.spec.ts`), where the store entry and the peerStore are.
+			it('keeps a hint only for a named id, once, with a decodable record no longer than the cap', () => {
+				const [from, s0, p0, sample0, stranger] = legalPeerIds as [string, string, string, string, string]
+				const rec = (n: number): string => u8ToString(new Uint8Array(n).fill(7), 'base64url')
+				const coord = coordToBase64url(new Uint8Array(COORD_BYTES))
+				const parsed = parseSnapshot(snap({
+					from,
+					successors: [s0],
+					predecessors: [p0],
+					sample: [{ id: sample0, coord, relevance: 0.5 }],
+					hints: [
+						{ id: from, record: rec(64) },                            // `from` is named
+						{ id: s0, record: rec(64) },
+						{ id: s0, record: rec(65) },                              // duplicate id: first wins
+						{ id: stranger, record: rec(64) },                        // not named
+						{ id: p0, record: 'not base64url!!' },                    // undecodable
+						{ id: sample0, record: 'x'.repeat(MAX_ADDRESS_RECORD_CHARS + 1) }, // over the cap
+						{ id: 7, record: rec(64) },                               // id not a string
+						{ id: p0 },                                               // record absent
+						null,
+						'string',
+					],
+				}))
+				expect(parsed, 'bad hints drop the hint, never the message').to.not.equal(undefined)
+				expect(parsed?.hints).to.deep.equal([{ id: from, record: rec(64) }, { id: s0, record: rec(64) }])
+			})
+
+			it('keeps a record sitting exactly on the cap and deletes `hints` when nothing survives', () => {
+				const from = legalPeerIds[0]!
+				const atCap = 'A'.repeat(MAX_ADDRESS_RECORD_CHARS)
+				expect(parseSnapshot(snap({ from, hints: [{ id: from, record: atCap }] }))?.hints).to.deep.equal([{ id: from, record: atCap }])
+				for (const empty of [[], [{ id: 'unnamed', record: 'AAAA' }], 'hints', 7, null]) {
+					expect(parseSnapshot(snap({ from, hints: empty })), JSON.stringify(empty)).to.not.have.property('hints')
+				}
+			})
+
+			it('ties the hint count to the named set: truncated ids cannot carry hints', () => {
+				// 17 successors, cap 16: a hint for the 17th is a hint for an id the receiver never
+				// merges, so it is dropped with the id rather than surviving on its own.
+				const distinct = Array.from({ length: CAPS.successors + 1 }, (_, i) => `id${i}`)
+				const parsed = parseSnapshot(snap({
+					successors: distinct,
+					hints: distinct.map((id) => ({ id, record: 'AAAA' })),
+				}))
+				expect(parsed?.successors).to.have.lengthOf(CAPS.successors)
+				expect(parsed?.hints?.map((h) => h.id)).to.deep.equal(distinct.slice(0, CAPS.successors))
 			})
 		})
 

@@ -21,7 +21,7 @@ import type { BusyResponseV1 } from '../index.js';
 /**
  * Default declared-length cap for a reply when the caller passes none: 8 KiB. It tracks no other
  * cap in the system — every FRET sender passes its own explicitly (`sendPing` 1024, the neighbors
- * senders `MAX_NEIGHBORS_BYTES` (16 KiB), maybeAct 144 KiB), so this value is only ever reached by a
+ * senders `MAX_NEIGHBORS_BYTES` (64 KiB), maybeAct 144 KiB), so this value is only ever reached by a
  * direct consumer of `rpcRequest` who forgot one. 8 KiB is chosen as a conservative floor for a
  * reply whose shape we do not know: large enough that a small JSON reply is never truncated,
  * small enough that a forgotten cap still bounds the read.

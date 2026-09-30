@@ -80,6 +80,19 @@ export interface PeerEntry {
 	 */
 	avgLatencyMs: number | null;
 	metadata?: Record<string, unknown>;
+	/**
+	 * This peer's most recent **verified** signed address record — the marshaled libp2p
+	 * `RecordEnvelope` bytes, exactly as accepted — and `confirmedAt`, the *local* clock time it
+	 * was accepted (from a received hint, or mirrored from libp2p's own identify-stored record).
+	 *
+	 * Opaque to the store: it never parses the bytes, so it stays network- and libp2p-agnostic
+	 * (the same rule as `membership`). The service forwards the record to other peers while the
+	 * peer is connected or `confirmedAt` is recent, and orders records by the envelope's own
+	 * sequence number — never by `confirmedAt`, which is our clock, not the signer's. Preserved
+	 * across `upsert` like every other mutable field; written only through `update`. Not
+	 * serialized yet — the persisted-table ticket adds that.
+	 */
+	addressRecord?: { envelope: Uint8Array; confirmedAt: number };
 }
 
 /**

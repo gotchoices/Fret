@@ -1,4 +1,5 @@
 import type { Libp2p } from 'libp2p';
+import type { PrivateKey } from '@libp2p/interface';
 import type { SerializedPeerEntry, SerializedTable } from './store/digitree-store.js';
 import { FretService as FretServiceClass } from './service/fret-service.js';
 
@@ -19,6 +20,29 @@ export interface FretConfig {
 	 * spacing window count once, so the run is genuinely spread over time.
 	 */
 	deadAfterFailures?: number;
+	/**
+	 * This node's libp2p private key — the key `node.peerId` was derived from.
+	 *
+	 * Used to seal this node's own signed address record (a libp2p `PeerRecord` envelope) for the
+	 * `hints` field of its outgoing neighbour snapshots, so peers that only ever hear of this node
+	 * through FRET can still dial it. libp2p hands the key to services as the `privateKey`
+	 * component, so `Libp2pFretService` fills this in automatically; a caller constructing the core
+	 * service directly passes it here. The constructor throws if the key does not derive
+	 * `node.peerId`. Absent → this node advertises no record for itself (logged once at `start()`);
+	 * forwarding other peers' records and consuming received ones are unaffected.
+	 */
+	privateKey?: PrivateKey;
+}
+
+/**
+ * One signed address record riding on a neighbour snapshot: `record` is the base64url encoding
+ * of a marshaled libp2p `RecordEnvelope` over a `PeerRecord` whose signer and payload peer id are
+ * both `id`. The receiver verifies all of that before the record touches its peerStore — see
+ * `FretService.ingestAddressHints`.
+ */
+export interface AddressHintV1 {
+	id: string;
+	record: string;
 }
 
 export interface NeighborSnapshotV1 {
@@ -32,6 +56,12 @@ export interface NeighborSnapshotV1 {
 	confidence?: number;
 	sig: string;
 	metadata?: Record<string, unknown>;
+	/**
+	 * Signed address records for peers this snapshot names (`from`, the id lists, the sample).
+	 * Optional and unversioned: a reader that predates it ignores the field. An array rather than
+	 * an id-keyed object so it truncates like the other lists and has no `__proto__`-key hazard.
+	 */
+	hints?: AddressHintV1[];
 }
 
 export interface RouteAndMaybeActV1 {

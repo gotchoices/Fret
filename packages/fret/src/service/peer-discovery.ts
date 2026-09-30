@@ -183,11 +183,11 @@ export class FretPeerDiscovery extends TypedEventEmitter<PeerDiscoveryEvents> im
 			try {
 				const id = peerIdFromString(entry.id);
 				// NOTE: multiaddrs are deliberately empty — FRET discovery is peerStore-relative
-				// by design. FRET's wire format carries no addresses at all (see *Dialability* in
-				// docs/fret.md), and the only addresses available locally are the ones libp2p's
-				// peerStore already holds, so filling them in would merge a peerStore's contents
-				// into itself. Changing this needs address hints on the wire — see the backlog
-				// ticket `feat-address-hints-in-neighbor-exchange`.
+				// by design. The addresses FRET learns (the signed records in neighbour snapshots)
+				// go into libp2p's peerStore directly through `peerStore.consumePeerRecord` at
+				// ingestion (see *Dialability* in docs/fret.md), so by the time a peer is emitted
+				// here the peerStore already holds everything FRET knows about reaching it, and
+				// filling this in would merge the peerStore's contents into itself.
 				const info: PeerInfo = { id, multiaddrs: [] };
 				this.safeDispatchEvent('peer', { detail: info });
 				this.emitted.set(entry.id, now);
