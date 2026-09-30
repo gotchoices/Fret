@@ -61,6 +61,8 @@ This is simple, cross-platform, and doesn't require additional dependencies. The
 
 #### Private key threading
 
+NOTE: `address-hints-live-exchange` lands steps 1, 3 and 4 below (`FretConfig.privateKey`, the `Libp2pFretService` component fallback, a key/peer-id match check, and a one-time "no key" log at start) because it seals this node's signed address record. Reuse that plumbing rather than adding a second path.
+
 libp2p stores the private key in its internal `Components` object (not exposed on the `Libp2p` class directly). The private key must be threaded through to `FretService`:
 
 1. Add optional `privateKey?: PrivateKey` to `FretConfig`
