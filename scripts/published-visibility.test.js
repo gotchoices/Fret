@@ -12,9 +12,11 @@ import { readFileSync } from 'node:fs';
 
 import {
 	NOT_YET_VISIBLE,
+	TARBALL_NOT_YET_DOWNLOADABLE,
 	expectedPackages,
 	npmViewCommand,
 	publishedPackageDirs,
+	readTarballAnswer,
 	readViewAnswer,
 	waitForVisibility
 } from './published-visibility.js';
@@ -67,14 +69,35 @@ describe('npmViewCommand', () => {
 describe('readViewAnswer', () => {
 	const E404 = JSON.stringify({ error: { code: 'E404', summary: 'No match found for version 1.0.0-beta.4' } }, null, 2);
 
-	it('counts the version echoed back as visible', () => {
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '"1.0.0-beta.4"\n', stderr: '' }, FRET), { visible: true });
+	it('reads the version echoed back as listed, with the URL of its tarball', () => {
+		const tarball = 'https://registry.npmjs.org/p2p-fret/-/p2p-fret-1.0.0-beta.4.tgz';
+		const listing = JSON.stringify({ version: '1.0.0-beta.4', 'dist.tarball': tarball }, null, 2);
+
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: `${listing}\n`, stderr: '' }, FRET), { listed: true, tarball });
+	});
+
+	it('does not count the version as listed while npm names no tarball for it', () => {
+		// npm prints a lone field's value bare, so a listing without dist.tarball is just the version.
+		const answer = readViewAnswer({ status: 0, stdout: '"1.0.0-beta.4"\n', stderr: '' }, FRET);
+
+		assert.equal(answer.listed, false);
+		assert.match(answer.reason, /dist\.tarball/);
+	});
+
+	it('does not count a dist.tarball that is not an http(s) URL', () => {
+		// fetch answers a data: URL with 200 without asking anyone.
+		const listing = JSON.stringify({ version: '1.0.0-beta.4', 'dist.tarball': 'data:,x' });
+
+		const answer = readViewAnswer({ status: 0, stdout: listing, stderr: '' }, FRET);
+
+		assert.equal(answer.listed, false);
+		assert.match(answer.reason, /not an http\(s\) URL/);
 	});
 
 	it('counts both ways npm says a version is not there as not yet visible', () => {
 		// Current npm: exit 1 with an E404 object. Older npm: exit 0 and no output.
-		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, FRET), { visible: false, reason: NOT_YET_VISIBLE });
-		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, FRET), { visible: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 1, stdout: E404, stderr: 'npm error code E404' }, FRET), { listed: false, reason: NOT_YET_VISIBLE });
+		assert.deepEqual(readViewAnswer({ status: 0, stdout: '', stderr: '' }, FRET), { listed: false, reason: NOT_YET_VISIBLE });
 	});
 
 	it('keeps npm\'s own summary for any other failure', () => {
@@ -82,13 +105,22 @@ describe('readViewAnswer', () => {
 
 		const answer = readViewAnswer({ status: 1, stdout: refused, stderr: '' }, FRET);
 
-		assert.equal(answer.visible, false);
+		assert.equal(answer.listed, false);
 		assert.match(answer.reason, /^npm view failed with ECONNREFUSED: FetchError/);
 	});
 
 	it('throws on an answer to some other question rather than reading past it', () => {
-		assert.throws(() => readViewAnswer({ status: 0, stdout: '"1.0.0-beta.3"', stderr: '' }, FRET), /does not understand/);
+		const other = JSON.stringify({ version: '1.0.0-beta.3', 'dist.tarball': 'https://registry.npmjs.org/p2p-fret/-/p2p-fret-1.0.0-beta.3.tgz' });
+
+		assert.throws(() => readViewAnswer({ status: 0, stdout: other, stderr: '' }, FRET), /does not understand/);
 		assert.throws(() => readViewAnswer({ status: 0, stdout: 'npm notice New major version', stderr: '' }, FRET), /not JSON/);
+	});
+});
+
+describe('readTarballAnswer', () => {
+	it('counts a listed version as published only once its tarball answers 200', () => {
+		assert.deepEqual(readTarballAnswer(200), { visible: true });
+		assert.deepEqual(readTarballAnswer(404), { visible: false, reason: TARBALL_NOT_YET_DOWNLOADABLE });
 	});
 });
 
@@ -96,7 +128,7 @@ describe('readViewAnswer', () => {
  * A wait over a fake clock: `sleep` advances it, and `probe` answers from `script` — for each package,
  * one answer per round in which it is asked, repeating the last.
  *
- * @param {Record<string, import('./published-visibility.js').ViewAnswer[]>} script
+ * @param {Record<string, import('./published-visibility.js').Visibility[]>} script
  * @param {{ timeoutMs?: number, intervalMs?: number }} [options]
  */
 async function scriptedWait(script, { timeoutMs = 60_000, intervalMs = 5_000 } = {}) {

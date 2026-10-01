@@ -85,11 +85,18 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
   version some time after `yarn pub` returns, and a downstream upgrade
   run in that gap resolves the old one. The wait reads which packages
   `pub` publishes from the root `package.json` (`pub` → `pub:*` →
-  `publish-package.js <dir>`), asks `npm view <name>@<version>` for each
-  every 5 s, and ends with `all N packages published and visible on npm
-  at <version>`. **Upgrade downstream repos only after that line.** After
-  10 min (`FRET_PUBLISH_WAIT_SECONDS` overrides) it names each missing
-  package and exits non-zero, so no GitHub release is cut. npm already
+  `publish-package.js <dir>`), and every 5 s checks each package twice:
+  `npm view <name>@<version>` must list the version, then a `HEAD` of its
+  `dist.tarball` URL (sent `cache-control: no-cache`) must answer 200.
+  Listing alone is not enough — the registry serves the tarball `npm
+  install` downloads separately and later (sereus 1.8.0: every version
+  listed while three tarballs 404'd for minutes). Ends with `all N
+  packages published and visible on npm at <version>`. **Upgrade
+  downstream repos only after that line.** After 10 min
+  (`FRET_PUBLISH_WAIT_SECONDS` overrides) it names each missing package
+  with the reason — not listed, listed but tarball not downloadable yet,
+  or the npm / tarball error — and exits non-zero, so no GitHub release
+  is cut. npm already
   accepted the publish then: **don't re-run `yarn release`** (it would
   bump again); re-run `yarn await-published`, then `yarn gh-release`.
   Pure logic in `scripts/published-visibility.js`, tested by
