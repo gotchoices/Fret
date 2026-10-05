@@ -1,10 +1,12 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import fc from 'fast-check'
+import { peerIdFromString } from '@libp2p/peer-id'
 import { minDistance, clockwiseDistance, lexLess, normalizedLogMagnitude } from '../src/ring/distance.js'
 import {
 	coordToHex, hexToCoord,
 	coordToBase64url, base64urlToCoord,
+	hashKey, hashPeerId,
 	COORD_BYTES,
 } from '../src/ring/hash.js'
 import { toBigInt, toCoord, refMinDistance } from './helpers/ring.js'
@@ -244,5 +246,16 @@ describe('Ring arithmetic properties', function () {
 			expect(() => hexToCoord('zz'.repeat(COORD_BYTES))).to.throw()
 			expect(() => hexToCoord('gg' + 'ab'.repeat(COORD_BYTES - 1))).to.throw()
 		})
+	})
+
+	// Every other spec derives coordinates through these same two functions, so a dependency
+	// whose digest drifted would pass them all while splitting the ring between FRET versions.
+	// Fixed vectors are the only thing that sees it: plain SHA-256 of the key bytes, and of the
+	// peer id's multihash bytes (docs/fret.md, *Identifier space and hashing*).
+	it('derives ring coordinates as plain SHA-256, byte-identical across releases', async () => {
+		expect(coordToHex(await hashKey(new TextEncoder().encode('abc'))))
+			.to.equal('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad')
+		expect(coordToHex(await hashPeerId(peerIdFromString('12D3KooWQYhTNQdmr3ArTeUHRYzFg94BKuF1dLpjNSRUbMhiCsoL'))))
+			.to.equal('ed44b6e012bf16ed2cce81326d5b95a6c5686a32762018c4693de03cd7fee281')
 	})
 })

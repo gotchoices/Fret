@@ -3,13 +3,12 @@ import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
 import { tcp } from '@libp2p/tcp'
 import { identify } from '@libp2p/identify'
-// NOTE: `@libp2p/circuit-relay-v2` is pinned to an exact version in package.json rather than to a
-// range, and this is its only consumer. 4.1.3 is the newest release whose whole transitive
-// `@libp2p/*` set matches what libp2p 3.1.3 already pulls, so it dedupes completely; a newer one
-// drags in a second `@libp2p/interface` (3.3.0 adds a required `Stream.readableEnded`, which the
-// installed libp2p's streams do not have). Nothing in the repo moves the pin for you — if you bump
-// the libp2p stack, bump this too; a stale pin surfaces as a `tsc --noEmit` type error, loudly, but
-// only at that point.
+// NOTE: this is the only consumer of `@libp2p/circuit-relay-v2`. It must resolve against the same
+// `@libp2p/interface` as the installed `libp2p`: a release built against a newer interface drags in
+// a second copy, and the relay's streams then stop type-checking against libp2p's (on the 3.1 line
+// this forced an exact pin). It is a caret range now, so a libp2p bump that leaves two
+// `@libp2p/interface` versions in `yarn why @libp2p/interface` means this needs bumping alongside —
+// `tsc --noEmit` reports it, but only once the lockfile has moved.
 import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import type { Connection, PrivateKey } from '@libp2p/interface'
