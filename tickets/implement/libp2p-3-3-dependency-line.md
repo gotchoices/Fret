@@ -7,6 +7,13 @@ files:
   - packages/fret/src/service/address-records.ts, packages/fret/src/service/fret-service.ts (import uint8arraylist / multiformats)
   - packages/fret/test/helpers/rpc-fuzz.ts, packages/fret/test/rpc.*.spec.ts and the other specs importing these packages
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-05T04:34:50.923Z (agent: claude)
+  Log file: C:\projects\Fret\tickets\.logs\libp2p-3-3-dependency-line.implement.2026-10-05T04-34-50-919Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # Move p2p-fret onto the libp2p 3.3 dependency line
 
 ## Why (from optimystic)
