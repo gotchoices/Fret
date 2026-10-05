@@ -1700,6 +1700,7 @@ __metadata:
     fast-check: "npm:^4.5.3"
     it-length-prefixed: "npm:^11.0.1"
     libp2p: "npm:^3.3.11"
+    main-event: "npm:^1.0.1"
     mocha: "npm:^11.7.5"
     multiformats: "npm:^14.0.5"
     rimraf: "npm:^6.1.3"
