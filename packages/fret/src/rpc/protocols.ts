@@ -1,5 +1,5 @@
 import type { Libp2p } from 'libp2p';
-import type { Connection, NewStreamOptions, PeerId, Stream, StreamHandlerOptions } from '@libp2p/interface';
+import type { Connection, DialProtocolOptions, PeerId, Stream, StreamHandlerOptions } from '@libp2p/interface';
 import * as lp from 'it-length-prefixed';
 import { byteStream } from '@libp2p/utils';
 import { decode as decodeVarint } from 'uint8-varint';
@@ -721,8 +721,8 @@ export function isLimitedConnection(c: Connection): boolean {
  * exists (neighbors fetch/announce reduce churn this way) and `undefined` is
  * returned; otherwise we `dialProtocol`.
  *
- * `opts.signal` bounds the open itself. Both `newStream` and `dialProtocol` take
- * `NewStreamOptions extends AbortOptions`; without it a dial that hangs — no address,
+ * `opts.signal` bounds the open itself. Both `newStream` and `dialProtocol` take an
+ * `AbortOptions` signal; without it a dial that hangs — no address,
  * unresponsive transport, half-open TCP — hangs the caller with no budget at all. An
  * already-aborted signal throws here rather than dialing, so a `stop()` racing a
  * maintenance tick cannot still issue dials.
@@ -747,7 +747,9 @@ export async function openRpcStream(
 	// Prefer a direct connection; fall back to the limited one only when it is
 	// the only open path (the steady state for browsers and NATed peers).
 	const chosen = open.find(c => !isLimitedConnection(c)) ?? open[0];
-	const streamOpts: NewStreamOptions = {
+	// Typed for the dial: one object feeds both opens below, and since libp2p 3.3 only
+	// `DialProtocolOptions`' `onProgress` also admits connection-open events.
+	const streamOpts: DialProtocolOptions = {
 		runOnLimitedConnection: true,
 		negotiateFully: false,
 		signal: opts.signal,
