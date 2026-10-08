@@ -143,7 +143,7 @@ Despite the design doc specifying "All messages signed with sender's private key
 - `RouteAndMaybeActV1.signature` is always `''` (`fret-service.ts:1257`)
 - `LeaveNoticeV1` has no signature field at all (`leave.ts:9-14`)
 
-Any peer on the network can craft messages with arbitrary `from` fields. The `from` field in `NeighborSnapshotV1` is trusted by `mergeAnnounceSnapshot` to hash and insert the supposed sender. `handleLeave` trusts `notice.from` to remove the specified peer from the store.
+Any peer on the network can craft messages with arbitrary `from` fields. The `from` field in `NeighborSnapshotV1` is trusted by `mergeAnnounceSnapshot` to hash and insert the supposed sender. `handleLeave` trusts `notice.from` to retire the specified peer (today: mark it `dead`; when this was written: remove it from the store).
 
 - **Preconditions**: Any network connection.
 - **Impact**: Complete message forgery. Impersonate any peer. Inject false routing state. Remove honest peers via spoofed leave notices.

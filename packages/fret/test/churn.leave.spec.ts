@@ -293,7 +293,7 @@ describe('Leave amplification cap', function () {
 	})
 
 	// Self would be recreated as `unknown` and drop out of every member-only ring view; the
-	// departing peer would be re-added moments after `handleLeave` removed it.
+	// departing peer, when we held no entry for it, would be created from its own notice.
 	it('never inserts self or the departing peer from the replacement list', async () => {
 		const rig = await makeLeaveRig()
 		try {

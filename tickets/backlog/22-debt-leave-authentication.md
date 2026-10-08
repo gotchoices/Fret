@@ -28,9 +28,9 @@ tradeoffs: A liveness ping before every removal delays a legitimate departure by
 
 ### Overview
 
-`handleLeave` currently removes a peer immediately on receipt of a leave notice and prioritizes attacker-controllable suggested replacements. Three independent hardening measures close the spoofing / replay / Sybil-injection vectors without waiting for the message-signatures or transport-identity tickets:
+`handleLeave` currently marks a peer `dead` immediately on receipt of a leave notice and prioritizes attacker-controllable suggested replacements. Three independent hardening measures close the spoofing / replay / Sybil-injection vectors without waiting for the message-signatures or transport-identity tickets:
 
-1. **Liveness verification** — ping the allegedly departing peer before removal
+1. **Liveness verification** — ping the allegedly departing peer before acting on the notice (marking it dead)
 2. **Untrusted replacement handling** — demote suggested replacements and verify before warming
 3. **Leave notice dedup** — prevent replay of captured leave notices
 
@@ -194,7 +194,7 @@ These are exposed through `getDiagnostics()` for monitoring and test assertions.
 In `docs/fret.md`, "Not yet implemented" section:
 - Move "Leave authentication: Require signature from departing peer" to a "Partially implemented" note
 - Change to: "Leave authentication: Liveness verification and dedup implemented. Signature verification depends on message-signatures ticket."
-- Update the `## Leave` section to note that recipients perform a liveness check before removal and treat suggested replacements as untrusted hints
+- Update the `## Leave` section to note that recipients perform a liveness check before acting on the notice and treat suggested replacements as untrusted hints
 
 ---
 
