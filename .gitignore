@@ -2,6 +2,7 @@ node_modules
 dist
 .yarn
 .yarnrc.yml
+.release-notes.pending.md
 
 tasks/.logs/
 packages/fret/test/simulation/output/
