@@ -90,7 +90,7 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		clockMs += ProbeBackoff.DEFAULT_BASE_MS * ProbeBackoff.DEFAULT_MAX_FACTOR + 1
 	}
 
-	const near = (): Promise<string[]> => (svcA as any).nearProbeTargets() as Promise<string[]>
+	const near = async (): Promise<string[]> => ((await (svcA as any).nearProbeTargets()) as { targets: string[] }).targets
 	const reprobe = (): string[] => (svcA as any).reprobeExcludedTargets() as string[]
 	const entry = (id: string = bId) => store.getById(id)
 

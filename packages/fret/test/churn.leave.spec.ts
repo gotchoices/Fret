@@ -335,16 +335,13 @@ describe('Leave amplification cap', function () {
 		} finally { await rig.stop() }
 	})
 
-	// `handleLeave` calls `store.remove(notice.from)`. Scoring helpers no longer resurrect a
-	// removed peer (`applyTouch`/`applySuccess`/`applyFailure` return early on a miss — see
-	// `docs/fret.md`, *Relevance scoring and table management*), so removal is durable through the
-	// `peer:disconnect` that follows a graceful departure too, not just observable in isolation.
-	// This rig's receiver service is never started, so this test covers the leave notice alone.
-	// The real-`peer:disconnect` half is covered against a *started* service in
-	// `test/scoring-never-creates.spec.ts` ('does not resurrect a peer that was removed while
-	// connected'). Still uncovered: both halves driven in one sequence against one started
-	// receiver - a real leave notice removing the peer, then that peer's real disconnect.
-	it('removes the departing peer from the id map and from the ring window', async () => {
+	// `handleLeave` marks the sender `dead` rather than removing it: libp2p keeps the departed
+	// peer's peerStore record, so a removed entry was re-created as a live `member` by the next
+	// tick's re-seed, while `dead` survives it. That durability — and the `peer:disconnect` that
+	// follows a graceful departure, which never clears `dead` — is pinned against a started
+	// receiver in `test/address-less-departure.spec.ts`. This rig's receiver is never started, so
+	// this test covers the leave notice alone.
+	it('marks the departing peer dead, which drops it from the ring window', async () => {
 		const rig = await makeLeaveRig()
 		try {
 			const store = rig.svc.getStore()
@@ -364,12 +361,8 @@ describe('Leave amplification cap', function () {
 
 			await rig.leave()
 
-			expect(store.getById(departingId), 'gone from the id index').to.equal(undefined)
-			// The tree and the id index are separate views of one population; a removal that
-			// updated only one is silently corrupting (see *Routing store* in `docs/fret.md`), and
-			// the id-map check above cannot see it.
-			expect(spWindow(), 'gone from the ring walk too, not only from the id map')
-				.to.not.include(departingId)
+			expect(store.getById(departingId)?.state, 'marked dead').to.equal('dead')
+			expect(spWindow(), 'out of the live-member ring walk').to.not.include(departingId)
 		} finally { await rig.stop() }
 	})
 

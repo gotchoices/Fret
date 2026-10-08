@@ -1094,15 +1094,15 @@ describe('RPC codec properties', function () {
 				padding: 'x'.repeat(padChars),
 			})
 
-			// `handleLeave` removes the departing peer from the store, so seeding it first makes
-			// "the notice was processed" observable.
+			// `handleLeave` marks the departing peer `dead`, so seeding it first makes "the notice
+			// was processed" observable.
 			rig.svc.getStore().upsert(senderId, await hashKey(enc.encode(senderId)))
 
 			const over = await sendRaw(rig.receiver.peerId, P.PROTOCOL_LEAVE, leave(5000))
 
 			expect(over, 'an over-cap leave gets no reply').to.equal(undefined)
 			await sleep(100)
-			expect(rig.svc.getStore().getById(senderId), 'never reached handleLeave').to.not.equal(undefined)
+			expect(rig.svc.getStore().getById(senderId)?.state, 'never reached handleLeave').to.not.equal('dead')
 			await waitUntil(
 				() => openStreams(rig.receiver, rig.sender, P.PROTOCOL_LEAVE) === 0,
 				2000,
@@ -1113,7 +1113,7 @@ describe('RPC codec properties', function () {
 			expect(under, 'an under-cap leave is answered').to.not.equal(undefined)
 			expect((await decodeJson<{ ok: boolean }>(under!)).ok).to.equal(true)
 			await waitUntil(
-				() => rig.svc.getStore().getById(senderId) == null,
+				() => rig.svc.getStore().getById(senderId)?.state === 'dead',
 				2000,
 				'the under-cap leave was processed'
 			)
@@ -1447,8 +1447,8 @@ describe('RPC codec properties', function () {
 			await d.handleLeave({ v: 1, from: departing, timestamp: Date.now() })
 
 			// `handleLeave` returns void either way, so the *only* local evidence is that the peer
-			// was not removed and the counter moved. See the wire-level asymmetry test below.
-			expect(svc.getStore().getById(departing), 'the notice was not acted on').to.not.equal(undefined)
+			// was not marked dead and the counter moved. See the wire-level asymmetry test below.
+			expect(svc.getStore().getById(departing)?.state, 'the notice was not acted on').to.not.equal('dead')
 			expect(svc.getDiagnostics().rejected.rateLimited.leave - before).to.equal(1)
 		})
 
@@ -1519,7 +1519,7 @@ describe('RPC codec properties', function () {
 			expect(isBusy(d.handlePingRequest()), 'ping still answers').to.equal(false)
 
 			await d.handleLeave({ v: 1, from: departing, timestamp: Date.now() })
-			expect(svc.getStore().getById(departing), 'leave still acted on').to.equal(undefined)
+			expect(svc.getStore().getById(departing)?.state, 'leave still acted on').to.equal('dead')
 
 			const announcer = await newPeerIdString()
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
@@ -1711,7 +1711,7 @@ describe('RPC codec properties', function () {
 			// discriminated result type is what would let leave report a busy.
 			expect(reply, 'still answered').to.not.equal(undefined)
 			expect((await decodeJson<{ ok: boolean }>(reply!)).ok, 'answered ok despite being dropped').to.equal(true)
-			expect(store.getById(senderId), 'but the notice was not acted on').to.not.equal(undefined)
+			expect(store.getById(senderId)?.state, 'but the notice was not acted on').to.not.equal('dead')
 			expect(svc.getDiagnostics().rejected.rateLimited.leave - before, 'visible only as a counter').to.equal(1)
 
 			await waitUntil(() => openStreams(P.PROTOCOL_LEAVE) === 0, 2000, 'no inbound stream left open')

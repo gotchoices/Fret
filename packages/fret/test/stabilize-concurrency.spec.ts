@@ -83,7 +83,7 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		const budget = 400
 		setTickBudget(budget)
 		await seedPeers(4, 'member')
-		const near: string[] = await (svc as any).nearProbeTargets()
+		const near: string[] = (await (svc as any).nearProbeTargets()).targets
 		expect(near, 'all four seeded members are near targets').to.have.length(4)
 		// The *first* in ring order hangs — under a serial walk that is the one that blocks the rest.
 		const hung = near[0]!
@@ -122,7 +122,7 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		const [unknown] = await seedPeers(1, 'unknown')
 		const [dead] = await seedPeers(1, 'member', { state: 'dead' })
 
-		const near: string[] = await (svc as any).nearProbeTargets()
+		const near: string[] = (await (svc as any).nearProbeTargets()).targets
 		expect(near, 'the stalling peer is the only near target this tick has').to.deep.equal([stalled!])
 
 		const elapsed = await tick()
@@ -218,7 +218,7 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 	it('pings a near peer before fetching its snapshot, for every near peer, while peers overlap', async () => {
 		rig.holdMs = 20
 		await seedPeers(4, 'member')
-		const near: string[] = await (svc as any).nearProbeTargets()
+		const near: string[] = (await (svc as any).nearProbeTargets()).targets
 
 		await tick()
 
@@ -242,7 +242,7 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		// Both foreign *and* dead: belongs to the dead arm alone.
 		const [foreignDead] = await seedPeers(1, 'foreign', { state: 'dead' })
 
-		const near: string[] = await (svc as any).nearProbeTargets()
+		const near: string[] = (await (svc as any).nearProbeTargets()).targets
 		const classify: string[] = (svc as any).classifyTargets()
 		const reprobe: string[] = (svc as any).reprobeExcludedTargets()
 

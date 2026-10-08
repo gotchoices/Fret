@@ -348,6 +348,17 @@ function disableProbing(svc: CoreFretService): void {
 	;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {}
 }
 
+/**
+ * Take a service's handlers away the way a restarting peer looks from outside — protocols gone,
+ * node and connection up — *without* the leave notices a graceful `stop()` sends. A delivered
+ * notice marks the sender `dead` at once, which is a departure rather than the transient blip the
+ * negotiate-failure cases below are about.
+ */
+async function stopWithoutNotice(svc: CoreFretService): Promise<void> {
+	;(svc as unknown as { sendLeaveToNeighbors: () => Promise<void> }).sendLeaveToNeighbors = async () => {}
+	await svc.stop()
+}
+
 function negotiateFailures(svc: CoreFretService, id: string): number {
 	return svc.getStore().getById(id)?.negotiateFailures ?? 0
 }
@@ -564,7 +575,7 @@ describe('Ring membership classification (probe-based, no identify)', function (
 
 	// Arm 1: a single failed protocol negotiation is evidence, not a verdict.
 	//
-	// `svcC.stop()` unhandles all five net-a protocols while leaving the node (and the
+	// `stopWithoutNotice(svcC)` unhandles all five net-a protocols while leaving the node (and the
 	// connection) up, which is exactly what a restarting peer looks like from A's side: the
 	// next ping fails with UnsupportedProtocolError. Before the strength ordering, that one
 	// error demoted a *confirmed member* to foreign and shut it out of the ring until a slow
@@ -587,7 +598,7 @@ describe('Ring membership classification (probe-based, no identify)', function (
 
 		// C's FRET service goes away (its five protocol handlers are unhandled); the node and
 		// the connection stay up, so A's next ping fails to negotiate rather than timing out.
-		await svcC.stop()
+		await stopWithoutNotice(svcC)
 
 		// Failures arrive one per stabilization tick (1.5 s apart) and the threshold is 3, so
 		// observing the first one leaves ample margin before any demotion could occur.
@@ -617,7 +628,7 @@ describe('Ring membership classification (probe-based, no identify)', function (
 		const idC = nodeC.peerId.toString()
 		await waitFor(() => store.getById(idC)?.membership === 'member')
 
-		await svcC.stop()
+		await stopWithoutNotice(svcC)
 		await waitFor(() => negotiateFailures(svcA, idC) >= 1)
 		expect(store.getById(idC)?.membership).to.equal('member')
 

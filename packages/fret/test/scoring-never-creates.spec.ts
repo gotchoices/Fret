@@ -12,9 +12,10 @@ import type { DigitreeStore } from '../src/store/digitree-store.js'
 //
 // `applyTouch` / `applySuccess` / `applyFailure` all open with `getById(id); if (!entry) return`,
 // so bookkeeping *about* a peer can never re-admit it. The rule exists for one concrete sequence:
-// `handleLeave` drops a departing peer, its connection closes a moment later, and the
-// `peer:disconnect` listener's `applyFailure` used to bring it straight back as an unclassified
-// stranger the classification pass then spent probes on.
+// a peer is removed from the table (today: evicted at capacity; a leave notice used to remove one
+// too, and now marks it `dead` instead), its connection closes later, and the `peer:disconnect`
+// listener's `applyFailure` used to bring it straight back as an unclassified stranger the
+// classification pass then spent probes on.
 //
 // These tests drive the rule through real call sites — a dispatched `peer:connect` /
 // `peer:disconnect`, and a pooled maintenance ping — rather than reaching in and calling the
@@ -106,7 +107,7 @@ describe('Scoring never creates a routing-table entry', () => {
 			expect(created, 'peer:connect creates the entry').to.not.equal(undefined)
 			expect(created!.accessCount, 'applyTouch credits proven contact').to.be.greaterThan(0)
 
-			// The leave sequence in miniature: the entry goes, then the connection closes.
+			// The eviction sequence in miniature: the entry goes, then the connection closes.
 			store.remove(id)
 			expect(store.getById(id)).to.equal(undefined)
 			const sizeAfterRemoval = store.size()

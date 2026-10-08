@@ -7,7 +7,7 @@ function coreOf(svc: Libp2pFretService): { inner: unknown } {
 	return svc as unknown as { inner: unknown }
 }
 
-const SKIP_LIST = ['constructor', 'start', 'stop', 'setLibp2p', 'getPeerDiscovery', 'ensure', 'discoverySource']
+const SKIP_LIST = ['constructor', 'start', 'beforeStop', 'stop', 'shutdown', 'setLibp2p', 'getPeerDiscovery', 'ensure', 'discoverySource']
 // Wrappers whose body has `async` ahead of the ensure() call: a missing core surfaces as a
 // rejected promise. Every other method (including importTable, whose wrapper forwards a promise
 // but is not itself async) throws synchronously when uninjected.

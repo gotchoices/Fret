@@ -138,7 +138,28 @@ export class Libp2pFretService implements Startable, FretService {
 		await this.discovery.start();
 	}
 
+	/**
+	 * Runs the whole shutdown here, ahead of {@link stop}, because this is the last point at which
+	 * the leave notices can still go out. libp2p's `stop()` runs every component's `beforeStop()`
+	 * first, then every component's `stop()` under one `Promise.all` — and the connection manager's
+	 * `stop()` closes every connection inside that same `Promise.all`. A leave fan-out started from
+	 * our `stop()` therefore races the closing connections and loses: a peer that listens nowhere
+	 * can reach its neighbours only over connections it already holds, so its notices were sent to
+	 * nobody. The registrar is still live here, so unhandling works too.
+	 */
+	async beforeStop(): Promise<void> {
+		await this.shutdown();
+	}
+
+	/**
+	 * A no-op after {@link beforeStop} under libp2p (both halves are idempotent), and the whole
+	 * shutdown for a host that drives this facade by hand without a `beforeStop` call.
+	 */
 	async stop(): Promise<void> {
+		await this.shutdown();
+	}
+
+	private async shutdown(): Promise<void> {
 		await this.discovery.stop();
 		await this.inner?.stop();
 	}

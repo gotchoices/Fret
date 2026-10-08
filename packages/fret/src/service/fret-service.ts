@@ -140,6 +140,14 @@ type MembershipSignal =
 	| 'identify-foreign'
 	| 'negotiate-failure';
 
+/** The live members of self's S/P window, split by whether a tick can contact them at all. */
+interface NearWindow {
+	/** Dialable — pinged then snapshot-fetched; at most 4, closest first. */
+	targets: string[];
+	/** Neither connected nor addressed — each is one failed contact per tick, with no RPC. */
+	uncontactable: string[];
+}
+
 /**
  * Select sample entries spread across diverse ring positions using sparsity-biased scoring.
  * Excludes self and entries already in successors/predecessors (they're redundant).
@@ -642,8 +650,8 @@ export class FretService implements IFretService, Startable {
 	 * Score a direct interaction with `id`.
 	 *
 	 * **Scoring never creates.** A peer we hold no entry for is not scored — bookkeeping *about* a
-	 * peer must not be able to re-admit it, or removing a peer would not stick: `handleLeave` drops
-	 * a departing peer, its connection closes a moment later, and the `peer:disconnect` listener's
+	 * peer must not be able to re-admit it, or removing a peer would not stick: `enforceCapacity`
+	 * evicts a connected peer, its connection closes later, and the `peer:disconnect` listener's
 	 * `applyFailure` would resurrect it as an unclassified stranger the classification pass then
 	 * spends probes on. That is why the helper takes no coordinate: with the entry required to
 	 * exist, `entry.coord` *is* the value every caller used to compute, so "create this peer at
@@ -755,8 +763,8 @@ export class FretService implements IFretService, Startable {
 	 * Record a failed interaction with `id`.
 	 *
 	 * **Scoring never creates** — see {@link applyTouch}. This is the helper the rule exists for:
-	 * the `peer:disconnect` listener calls it for a peer `handleLeave` has just removed, and the
-	 * old create-on-miss arm brought that peer straight back.
+	 * the `peer:disconnect` listener calls it for a peer capacity eviction may already have
+	 * removed, and the old create-on-miss arm brought that peer straight back.
 	 */
 	private async applyFailure(id: string): Promise<void> {
 		const entry = this.store.getById(id);
@@ -1356,9 +1364,9 @@ export class FretService implements IFretService, Startable {
 				),
 				// NOTE: leave is deliberately the one inbound handler with no `noteInboundRpc`
 				// hook (compare neighbors / maybeAct / ping above and below). That hook applies
-				// the `rpc-inbound` membership signal to the sender, which here is the *departing*
-				// peer — it would re-insert it as a confirmed `member` immediately after
-				// `handleLeave` removed it. The asymmetry is the point; do not "fix" it while
+				// the `rpc-inbound` membership signal and proof of life to the sender, which here
+				// is the *departing* peer — it would restore it as a live `member` immediately after
+				// `handleLeave` marked it dead. The asymmetry is the point; do not "fix" it while
 				// tidying these signatures.
 				registerLeave(
 					this.node,
@@ -1965,16 +1973,16 @@ export class FretService implements IFretService, Startable {
 		try {
 			let coord: Uint8Array | null = null;
 			const entry = this.store.getById(peerId);
-			if (entry) coord = entry.coord;
-			else {
+			if (entry) {
+				coord = entry.coord;
+				this.markDeparted(peerId);
+			} else {
 				try {
 					coord = await hashPeerId(peerIdFromString(peerId));
 				} catch (e) {
 					log.error('handleLeave: could not hash departing peer id %s - %e', peerId, e);
 				}
 			}
-			// remove leaving peer from the store
-			this.store.remove(peerId);
 			if (!coord) return;
 			await this.recordLeaveReplacements(notice.replacements, peerId);
 			// One *debounced* announce per departure, shared with the `peer:disconnect` path. A
@@ -1986,6 +1994,28 @@ export class FretService implements IFretService, Startable {
 		} catch (err) {
 			log.error('handleLeave failed for %s - %e', peerId, err);
 		}
+	}
+
+	/**
+	 * A peer told us it is leaving: mark it `dead` — the immediate counterpart of a completed run
+	 * of failed contacts — rather than removing it.
+	 *
+	 * Removal did not stick. libp2p keeps the departed peer's peerStore record, negotiated
+	 * protocols included, so the next tick's `seedFromPeerStore` (or a `peer:update`) re-created
+	 * the entry and labelled it `member` again — a live ring member until three probes failed, and
+	 * forever if it had no address to probe. `dead` survives that re-seed because `upsert`
+	 * preserves `state` and classification touches only `membership`, and it already carries every
+	 * other consequence a departure needs: out of every ring view, unprotected at eviction, skipped
+	 * by the maintenance fan-outs, and restored by any proof of life if the peer comes back.
+	 *
+	 * The contact-failure run is left alone: nothing reads it while the peer is dead, and proof of
+	 * life clears it together with the label.
+	 */
+	private markDeparted(id: string): void {
+		// Unreachable for a leave (the transport identity check rejects a notice from self), but a
+		// dead self has no path back short of a restart — the same guard `applyContactStrike` keeps.
+		if (id === this.selfIdStr) return;
+		this.store.update(id, { state: 'dead' });
 	}
 
 	/**
@@ -2012,8 +2042,9 @@ export class FretService implements IFretService, Startable {
 			// Skipping self is a correctness guard, not tidiness: were self ever absent from the
 			// store, upserting it here would recreate it as `unknown` and drop self out of every
 			// member-only ring view (see *Network-scoped admission* in `docs/fret.md`). Skipping
-			// the departed peer stops us re-adding the one `handleLeave` just removed. Duplicates
-			// inside one list collapse, so 12 copies of an id cost one hash and one upsert.
+			// the departed peer stops a notice naming its own sender from creating an entry for a
+			// peer we held none for. Duplicates inside one list collapse, so 12 copies of an id
+			// cost one hash and one upsert.
 			if (id === selfStr || id === departedId || seen.has(id)) continue;
 			seen.add(id);
 			// `isDialable`, not `isDoomedDial`: we are not dialing, so `foreign` / `dead` are no
@@ -2403,7 +2434,10 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async stabilizeOnce(): Promise<void> {
 		this.sweepBoundedMaps();
-		const near = await this.nearProbeTargets();
+		const { targets: near, uncontactable } = await this.nearProbeTargets();
+		// Before phase 1, and awaited: these peers are disjoint from every pooled candidate set
+		// (live members, but undialable), so nothing in the pool races these strikes.
+		await this.strikeUncontactable(uncontactable);
 		// `runSignal` is undefined before the first start(); `deadline` accepts that. `cancel()` in
 		// the finally is mandatory — see `deadline`.
 		const budget = deadline(FretService.STABILIZE_TICK_BUDGET_MS, this.runSignal);
@@ -2434,11 +2468,11 @@ export class FretService implements IFretService, Startable {
 			// tick still enforces.
 			// NOTE: a throw *earlier* in the tick skips this, and the seeds no longer trim for
 			// themselves, so that tick's inserts stay untrimmed until the next one. The reachable
-			// candidates are the two calls above the try (`sweepBoundedMaps`, `nearProbeTargets`),
-			// both local and neither able to throw on any input a tick can present; the loop's own
-			// try/catch swallows anything that does, and the overshoot self-heals next tick. If a
-			// deterministic throw is ever found on that path, move the enforcement into this
-			// method's `finally` rather than adding a guard here.
+			// candidates are the three calls above the try (`sweepBoundedMaps`, `nearProbeTargets`,
+			// `strikeUncontactable`), all local and none able to throw on any input a tick can
+			// present; the loop's own try/catch swallows anything that does, and the overshoot
+			// self-heals next tick. If a deterministic throw is ever found on that path, move the
+			// enforcement into this method's `finally` rather than adding a guard here.
 			await this.enforceCapacity();
 			if (announced.length > 0) this.detach(this.announceToNewPeers(announced), 'announceToNewPeers');
 
@@ -2458,15 +2492,60 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * The near peers a tick pings and snapshot-fetches: the dialable live members nearest self on
-	 * either side, at most 4, in **ring order** (closest first) — deliberately not rotated like the
-	 * other candidate lists. These are the peers ring correctness depends on most, so a truncated
-	 * tick should skip the 4th-closest and never the immediate successor; it self-corrects next tick.
+	 * The S/P window a tick verifies — the live members nearest self, `max(2, m)` per side — split
+	 * by whether we can contact them at all.
+	 *
+	 * `targets` are the dialable ones a tick pings and snapshot-fetches: at most 4, in **ring
+	 * order** (closest first, sides interleaved) — deliberately not rotated like the other
+	 * candidate lists. These are the peers ring correctness depends on most, so a truncated tick
+	 * should skip the outermost and never the immediate successor or predecessor; it
+	 * self-corrects next tick. `uncontactable` is the rest of the window, uncapped: the 4 bounds
+	 * RPCs, and none is spent on these (see {@link strikeUncontactable}).
+	 *
+	 * Walked through `ringNeighborsBothSides` rather than the public `getNeighbors`, whose `both`
+	 * direction is successor-biased (see the NOTE there): at m = 8 it returned self plus seven
+	 * successors on any ring of more than nine live members, so no predecessor was ever verified.
 	 */
-	private async nearProbeTargets(): Promise<string[]> {
-		const selfStr = this.selfIdStr;
-		const nearAll = this.getNeighbors(await this.selfCoord(), 'both', Math.max(2, this.cfg.m));
-		return nearAll.filter((id) => id !== selfStr && this.isDialable(id)).slice(0, 4);
+	private async nearProbeTargets(): Promise<NearWindow> {
+		const window = ringNeighborsBothSides(
+			this.store, await this.selfCoord(), Math.max(2, this.cfg.m), this.selfIdStr, { filter: isLiveMember }
+		);
+		const targets: string[] = [];
+		const uncontactable: string[] = [];
+		for (const id of window) (this.isDialable(id) ? targets : uncontactable).push(id);
+		return { targets: targets.slice(0, 4), uncontactable };
+	}
+
+	/**
+	 * Count one failed contact against each live member of the S/P window that no pass could
+	 * reach: not connected, and no address libp2p could dial.
+	 *
+	 * Without this such a peer never reaches `dead`, because a strike is booked only when an
+	 * outbound RPC fails and every pass that sends one filters on `isDialable` first. A phone that
+	 * dials out and listens nowhere is exactly that peer once its connection drops — so it stayed a
+	 * live member, and a cohort member, indefinitely.
+	 *
+	 * The observation is the tick, not the disconnect, so "an idle `peer:disconnect` is not a
+	 * strike" stays true: `applyContactStrike`'s spacing guard makes each passive tick (1.5 s) one
+	 * independent strike, the peer is `dead` after `deadAfterFailures` ticks, and one that
+	 * reconnects within a tick or two (`peer:connect` is proof of life) is never killed. Once dead
+	 * it leaves the live-member window, so the strikes stop by themselves.
+	 *
+	 * NOTE: only the S/P window is swept, so on a ring of more than 2·max(2, m) + 1 live members an
+	 * address-less member outside our window is never struck by us and stays a live member in our
+	 * cohorts. If cohorts assembled over such rings start waiting on departed phones, widen this to
+	 * every live member — still local work, one store walk.
+	 *
+	 * Local work with no RPC, so the tick budget does not apply; but our own cancellation is still
+	 * not evidence, so nothing is booked once the run signal has fired.
+	 */
+	private async strikeUncontactable(ids: readonly string[]): Promise<void> {
+		const signal = this.runSignal;
+		for (const id of ids) {
+			if (this.wasCancelled(signal)) return;
+			log('near window: %s has no connection and no address - counted as a failed contact', id);
+			await this.applyContactFailure(id);
+		}
 	}
 
 	/**
