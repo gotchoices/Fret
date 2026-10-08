@@ -260,3 +260,7 @@ Phase 5: Docs and build
 - [ ] Update `docs/fret.md` leave section and "Not yet implemented" list
 - [ ] Type-check passes (`cd packages/fret && npx tsc --noEmit`)
 - [ ] Full test suite passes (`cd packages/fret && yarn test`)
+
+## Interaction with `address-less-peer-never-marked-dead` (noted 2026-10-07)
+
+That ticket moves the leave fan-out into libp2p's `beforeStop` hook (so notices go out before the connection manager closes connections) and makes `handleLeave` mark the departing peer `dead` instead of removing it. Two consequences for this ticket: (1) a departing peer is still fully connected and reachable when its notice arrives, so the "liveness ping before removal" arm would succeed and refuse almost every genuine graceful leave — the "Genuine departure" reasoning above no longer holds; (2) the action being guarded is now "mark dead" (recoverable by any proof of life), not removal, which lowers the stakes of a spoofed notice. Re-weigh the liveness-ping arm against that before implementing it.
