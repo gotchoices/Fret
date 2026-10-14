@@ -118,7 +118,7 @@ describe('SizeObserver', () => {
 		})
 
 		it('accepts a negative estimate — the > 0 gate lives at the caller, not here', () => {
-			// `calibrateSizeFromSnapshot` gates on `size_estimate > 0`; the observer carries today's
+			// `calibrateSizeFromPeer` gates on `size_estimate > 0`; the observer carries today's
 			// behavior across unchanged rather than adding a second, differently-placed gate.
 			const obs = new SizeObserver()
 			obs.report(-5, 0.5, 'negative')

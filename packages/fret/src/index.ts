@@ -75,6 +75,13 @@ export interface NeighborSnapshotV1 {
 	 * an id-keyed object so it truncates like the other lists and has no `__proto__`-key hazard.
 	 */
 	hints?: AddressHintV1[];
+	/**
+	 * Fingerprint of the content a receiver acts on — the id lists, the sample's ids, `metadata`,
+	 * `hints` (see `snapshotDigest` in `service/near-exchange.ts`). A receiver that merged this
+	 * snapshot caches the digest and skips its next fetch while the sender's ping replies carry the
+	 * same one. Optional and unversioned like `hints`: absent means "unknown, fetch as before".
+	 */
+	digest?: string;
 }
 
 export interface RouteAndMaybeActV1 {

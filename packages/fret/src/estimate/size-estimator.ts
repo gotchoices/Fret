@@ -106,7 +106,7 @@ function windowGaps(
  * into a tiny, evenly-spaced arc — an eclipse, or a very young ring — scores high here while
  * `n` is wildly wrong, because no statistic over the sampled arc can see the arc that was never
  * sampled. The defense is corroboration from peer-reported estimates (`reportNetworkSize` /
- * `calibrateSizeFromSnapshot`), not a better local formula.
+ * `calibrateSizeFromPeer`), not a better local formula.
  */
 function dispersionFactor(gaps: bigint[]): number {
 	const count = gaps.length;

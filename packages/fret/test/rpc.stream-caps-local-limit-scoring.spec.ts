@@ -113,10 +113,10 @@ describe('local stream-cap refusals at the service', function () {
 		await stopAll([local, remote])
 	})
 
-	/** The near-neighbor verification pass: one namespaced ping, one hop. */
+	/** The near-neighbor verification pass: one namespaced ping, one hop. Reports whether the peer answered. */
 	const nearProbe = async (): Promise<boolean> =>
-		await (svc as unknown as { probeNeighborLatency(id: string, s: AbortSignal | undefined): Promise<boolean> })
-			.probeNeighborLatency(peerId, undefined)
+		(await (svc as unknown as { probeNeighborLatency(id: string, s: AbortSignal | undefined): Promise<{ answered: boolean }> })
+			.probeNeighborLatency(peerId, undefined)).answered
 
 	/** The off-ring classification / re-probe pass: same ping, different bookkeeping. */
 	const offRingProbe = async (): Promise<void> =>

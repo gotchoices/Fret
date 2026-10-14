@@ -753,7 +753,7 @@ describe('dead state: through a real outbound call site', () => {
 		;(node as any).dial = (...args: unknown[]) => { dials++; return (originalDial as any)(...args) }
 		;(node as any).dialProtocol = (...args: unknown[]) => { dials++; return (originalDialProtocol as any)(...args) }
 		try {
-			const answered = await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
+			const { answered } = await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
 
 			expect(answered).to.equal(false)
 			expect(dials, 'no dial: opening the connection is the redial seam\'s job').to.equal(0)

@@ -60,6 +60,8 @@ import { assembleCohort as assembleCohortOverStore } from './cohort.js';
 import { isLiveMember } from './live-member.js';
 import { SizeObserver } from './size-observer.js';
 import { ProbeBackoff } from './probe-backoff.js';
+import { NearExchange, snapshotDigest } from './near-exchange.js';
+import type { PingReplyExtras } from '../rpc/ping.js';
 import type { LocalSizeEstimate } from './size-observer.js';
 import { ringNeighborsBothSides } from '../ring/ring-walk.js';
 import {
@@ -323,6 +325,12 @@ export class FretService implements IFretService, Startable {
 	 * window.
 	 */
 	private readonly backoff: ProbeBackoff;
+	/**
+	 * What the stabilization pass already knows about each near neighbour — heard-from recently,
+	 * snapshot content fingerprint — so it can skip the ping and fetch that would only re-learn
+	 * it. Pruned to routing-table membership each pass (`sweepBoundedMaps`), cleared by `stop()`.
+	 */
+	private readonly nearExchange = new NearExchange();
 	private readonly bucketPing: TokenBucket;
 	private readonly bucketLeave: TokenBucket;
 	private readonly bucketAnnounce: TokenBucket;
@@ -528,6 +536,15 @@ export class FretService implements IFretService, Startable {
 		pingsSent: 0,
 		pingsOk: 0,
 		pingsFail: 0,
+		/**
+		 * Near-pass work the previous passes made redundant (see `NearExchange`): `probes` counts a
+		 * near target neither redialed, pinged nor fetched because it is connected, was heard from
+		 * during or after the previous pass, and its snapshot digest was confirmed within the last
+		 * `NEAR_PROBE_MAX_SKIPS` passes; `fetches` counts a target that was pinged and whose reply's
+		 * digest matched the content already merged, so the snapshot fetch was skipped. Separate
+		 * counters: a probe skip implies no fetch either, but is not counted there.
+		 */
+		nearExchangeSkipped: { probes: 0, fetches: 0 },
 		/**
 		 * Outbound RPCs our own per-connection stream cap refused (`local-limit`) — libp2p's
 		 * `TooManyOutboundProtocolStreamsError` out of `openRpcStream`, before anything reached the
@@ -878,7 +895,7 @@ export class FretService implements IFretService, Startable {
 		this.applyMembershipSignal(id, 'rpc-success');
 		// …and proves it is reachable, which clears any contact-failure run and resurrects it if
 		// a previous run had marked it dead.
-		this.noteProofOfLife(id);
+		this.noteRpcEvidence(id);
 	}
 
 	/**
@@ -959,11 +976,11 @@ export class FretService implements IFretService, Startable {
 	 * Record that `id` is demonstrably alive: clear its contact-failure run and, if it was marked
 	 * `dead`, restore it to a live state.
 	 *
-	 * Called from every site that proves liveness — a completed outbound RPC (`applySuccess`), an
-	 * inbound RPC (`noteInboundRpc`), and a fresh transport connection (`peer:connect`). The
-	 * counter reset is the load-bearing half at the connect site: `setState(id, 'connected')`
-	 * there would otherwise resurrect a peer whose counter is still clamped at the threshold, so
-	 * its very next failure would re-kill it.
+	 * Called from every site that proves liveness: the RPC sites through {@link noteRpcEvidence},
+	 * and a fresh transport connection (`peer:connect`) directly. The counter reset is the
+	 * load-bearing half at the connect site: `setState(id, 'connected')` there would otherwise
+	 * resurrect a peer whose counter is still clamped at the threshold, so its very next failure
+	 * would re-kill it.
 	 *
 	 * Relevance is deliberately *not* reset to a baseline. `scoreSuccess` already up-ranks on
 	 * success, and wiping the health counters would erase the record of a peer that flaps.
@@ -1004,7 +1021,36 @@ export class FretService implements IFretService, Startable {
 	 */
 	private noteAnsweredOnProtocol(id: string): void {
 		this.applyMembershipSignal(id, 'rpc-success');
+		this.noteRpcEvidence(id);
+	}
+
+	/**
+	 * Proof of life *by RPC* — the peer answered one of ours or called one of ours just now. The
+	 * one seam for every such site: a completed outbound RPC (`applySuccess`), an answer that was
+	 * unusable but arrived (`noteAnsweredOnProtocol`), and any inbound RPC
+	 * ({@link noteInboundEvidence}: ping, neighbors request, maybeAct, announce). Each is
+	 * {@link noteProofOfLife} plus the near-exchange heard stamp that lets the next stabilization
+	 * pass skip pinging this peer. One seam so a proof-of-life site added later cannot stamp one
+	 * and not the other.
+	 *
+	 * Deliberately **not** `peer:connect`: a connection forming is not the peer answering, and
+	 * that listener keeps the bare {@link noteProofOfLife}.
+	 */
+	private noteRpcEvidence(id: string): void {
 		this.noteProofOfLife(id);
+		// Only for a peer the table holds, so the map is bounded by routing-table membership
+		// between prunes as well as at them.
+		if (this.store.getById(id)) this.nearExchange.noteHeard(id);
+	}
+
+	/**
+	 * The transport-authenticated `id` dialed one of *our* namespaced protocols: the strongest
+	 * membership proof there is, and RPC evidence of life. Shared by {@link noteInboundRpc} and
+	 * the announce merge, which upserts and scores the sender itself first.
+	 */
+	private noteInboundEvidence(id: string): void {
+		this.applyMembershipSignal(id, 'rpc-inbound');
+		this.noteRpcEvidence(id);
 	}
 
 	/**
@@ -1218,9 +1264,8 @@ export class FretService implements IFretService, Startable {
 		if (this.stopped) return;
 		try {
 			if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(peerIdFromString(id)));
-			this.applyMembershipSignal(id, 'rpc-inbound');
 			// The peer dialed *us*, which is proof of life however badly our own dials to it fared.
-			this.noteProofOfLife(id);
+			this.noteInboundEvidence(id);
 		} catch (err) {
 			log.error('noteInboundRpc failed for %s - %e', id, err);
 		}
@@ -1446,6 +1491,9 @@ export class FretService implements IFretService, Startable {
 		// that fan-out still sees the run's state. Mirrors `FretPeerDiscovery.stop()`.
 		this.backoff.clearAll();
 		this.departureDebounce.clear();
+		// What a run heard from, and merged from, each near neighbour is that run's; the next run's
+		// first pass probes and fetches everyone. The pass counter itself need not reset.
+		this.nearExchange.clear();
 		// The in-flight redials belong to the run that asked for them: the abort above makes each
 		// settle `cancelled`, and clearing the map here means the next run's first request for a
 		// peer starts a fresh dial rather than inheriting a verdict of "cancelled". Each entry also
@@ -1591,12 +1639,27 @@ export class FretService implements IFretService, Startable {
 		return await this.snapshot();
 	}
 
-	private handlePingRequest(): { size_estimate?: number; confidence?: number } | BusyResponseV1 {
+	/**
+	 * The pong's extras come from a freshly built snapshot: its **raw** local size estimate (the
+	 * same rule the snapshot itself follows — advertise raw so the receiver's blend does not
+	 * re-amplify an already-blended value; the blended `getNetworkSizeEstimate` this used to
+	 * answer with was read by nobody) and its `digest`, which is what lets a neighbour that already
+	 * merged this content skip its snapshot fetch (see `probeAndFetch`).
+	 *
+	 * NOTE: each inbound ping now builds a whole snapshot — size estimate, two neighbour walks,
+	 * the diverse sample, hints, one SHA-256 — where it used to compute the size estimate alone.
+	 * Still less than the ping-then-neighbors pair it replaces for a stabilizing neighbour, but a
+	 * peer pinging us for another reason (classification, warm-up) pays it too, metered only by
+	 * the ping bucket. If ping handling shows in profiles, memoize the snapshot or its digest for
+	 * a short TTL here.
+	 */
+	private async handlePingRequest(): Promise<PingReplyExtras | BusyResponseV1> {
 		if (!this.bucketPing.tryTake()) {
 			this.diag.rejected.rateLimited.ping++;
 			return { v: 1, busy: true, retry_after_ms: this.bucketPing.retryAfterMs() } satisfies BusyResponseV1;
 		}
-		return this.getNetworkSizeEstimate();
+		const snap = await this.snapshot();
+		return { size_estimate: snap.size_estimate, confidence: snap.confidence, snapshot_digest: snap.digest };
 	}
 
 	/**
@@ -2317,12 +2380,16 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Feed a received snapshot's network-size estimate into the local estimator.
-	 * No-op unless both estimate and confidence are present and positive.
+	 * Feed a neighbour's reported network-size estimate into the local estimator — from an announce
+	 * snapshot or from a near-pass ping reply, which carries the responder's raw estimate for
+	 * exactly this purpose. No-op unless both numbers are present and positive. One source label
+	 * per neighbour whichever message carried it, since the observer appends per report and does
+	 * not dedupe by source. The fetched snapshot deliberately does **not** report: a pass that pings
+	 * and then fetches would report the same neighbour twice.
 	 */
-	private calibrateSizeFromSnapshot(snap: NeighborSnapshotV1, sourceId: string): void {
-		if (snap.size_estimate && snap.size_estimate > 0 && snap.confidence && snap.confidence > 0) {
-			this.reportNetworkSize(snap.size_estimate, snap.confidence, 'snapshot:' + sourceId);
+	private calibrateSizeFromPeer(estimate: number | undefined, confidence: number | undefined, sourceId: string): void {
+		if (estimate && estimate > 0 && confidence && confidence > 0) {
+			this.reportNetworkSize(estimate, confidence, 'peer:' + sourceId);
 		}
 	}
 
@@ -2430,8 +2497,10 @@ export class FretService implements IFretService, Startable {
 			this.store.upsert(from, senderCoord);
 			await this.applyTouch(from);
 			// `from` is transport-authenticated (the handler drops any mismatch) and it dialed
-			// our namespaced announce protocol — strongest possible membership proof.
-			this.applyMembershipSignal(from, 'rpc-inbound');
+			// our namespaced announce protocol — strongest possible membership proof, and proof of
+			// life like any other inbound RPC: an announce clears a contact-failure run and restores
+			// a `dead` sender.
+			this.noteInboundEvidence(from);
 
 			// Wire JSON is untrusted, so the declared `Record<string, unknown>` is a claim until
 			// checked: a crafted announce can carry a string or an array here, and storing that
@@ -2455,14 +2524,16 @@ export class FretService implements IFretService, Startable {
 			for (const s of snap.sample ?? []) {
 				await this.mergeDiscoveredId(s.id, discovered, 'mergeAnnounceSnapshot sample');
 			}
-			// Calibrate local size estimator from snapshot's estimate
-			this.calibrateSizeFromSnapshot(snap, from);
+			this.calibrateSizeFromPeer(snap.size_estimate, snap.confidence, from);
 			await this.enforceCapacity();
 			// After the id merges (a hint only lands on an entry that exists) and after capacity
 			// enforcement (no signature spent on a peer just evicted), but before the announce to
 			// newly discovered peers, which only reaches the ones that are dialable — and a hint is
 			// what makes a relay-only newcomer dialable.
 			await this.ingestAddressHints(snap);
+			// Everything the announce carried is merged now, so its digest names content we hold and
+			// the next pass need not refetch it. Last, so a throw above leaves the cache untouched.
+			if (snap.digest !== undefined) this.nearExchange.confirmDigest(from, snap.digest);
 			if (discovered.length > 0) this.detach(this.announceToNewPeers(discovered), 'announceToNewPeers');
 		} catch (err) {
 			log.error('mergeAnnounceSnapshot failed for %s - %e', from, err);
@@ -2666,6 +2737,9 @@ export class FretService implements IFretService, Startable {
 	 * rather than the sum of 14–20 round trips.
 	 */
 	private async stabilizeOnce(): Promise<void> {
+		// First, so a hand-driven pass counts exactly like a loop pass and every "since the previous
+		// pass" comparison in `probeAndFetch` sees this pass's number.
+		this.nearExchange.beginPass();
 		this.sweepBoundedMaps();
 		const { targets: near, uncontactable } = await this.nearProbeTargets();
 		// Before phase 1, and awaited: these peers are disjoint from every pooled candidate set
@@ -2893,13 +2967,35 @@ export class FretService implements IFretService, Startable {
 	 * parallelises across peers — strictly better than the old "all pings, then all fetches", which
 	 * lost it for any peer whose ping landed late.
 	 *
+	 * **Two skips, both from what earlier passes already learned** (`NearExchange`):
+	 * - the whole probe, when the peer is connected now, was heard from by RPC during or after the
+	 *   previous pass, and its snapshot digest was confirmed within `NEAR_PROBE_MAX_SKIPS` passes.
+	 *   Recent RPC evidence went through `noteRpcEvidence`, so it already cleared any strike run;
+	 *   a skip therefore records **nothing** — no success, no strike, no decay, no backoff, no
+	 *   `pingsSent`, no calibration. Once a peer's traffic stops, at most one more pass skips it
+	 *   (the one after our own last answered ping), then the probing passes strike it as before.
+	 * - the fetch alone, when the ping answered `ok` with a `snapshot_digest` equal to the digest
+	 *   of the content we last merged from it. Equality re-confirms the cache; anything else —
+	 *   a different digest, none, a busy or bad reply — fetches exactly as before.
+	 *
+	 * NOTE: a skipped slot is not refilled from the window's outer members. The point is fewer
+	 * RPCs per pass, and the near list's "truncate the outermost, never the immediate successor"
+	 * ordering is left as it is. Refill from the outer window if coverage of the window's far
+	 * members ever matters more than per-pass traffic.
+	 *
 	 * Returns the ids the merge saw for the first time, for the tick's single announce.
 	 */
 	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
+		// Connected is rule 1 and is checked here, not in `NearExchange`: a peer with no connection
+		// takes the redial path below whatever we heard, since the redial is what reconnects it.
+		if (this.isConnected(id) && this.nearExchange.canSkipProbe(id)) {
+			this.diag.nearExchangeSkipped.probes++;
+			return [];
+		}
 		// `failed` has already booked its strike inside the seam, and the near pass owes no backoff
 		// on top (see `probeNeighborLatency`); every other non-connected verdict is "not this tick".
 		if (!this.isConnected(id) && (await this.redialWithin(id, signal)) !== 'connected') return [];
-		const answered = await this.probeNeighborLatency(id, signal);
+		const { answered, digest } = await this.probeNeighborLatency(id, signal);
 		// A tick that ran out of budget mid-ping has nothing to fetch — and `fetchNeighbors` would
 		// swallow the abort into an empty snapshot and count it as fetched. Stays *ahead* of the
 		// answered gate below so the two can never disagree about a cancelled ping.
@@ -2909,6 +3005,11 @@ export class FretService implements IFretService, Startable {
 		// phase-1 wall time for nothing. This removes an RPC that could not have succeeded; it
 		// scores nothing and changes no verdict.
 		if (!answered) return [];
+		if (digest !== undefined && digest === this.nearExchange.digestOf(id)) {
+			this.nearExchange.confirmDigest(id, digest);
+			this.diag.nearExchangeSkipped.fetches++;
+			return [];
+		}
 		return this.fetchAndMergeSnapshot(id, signal);
 	}
 
@@ -2925,8 +3026,13 @@ export class FretService implements IFretService, Startable {
 	 * unreachable in practice — `probeAndFetch`'s `wasCancelled` check sits ahead of the gate that
 	 * reads this, so our own cancellation never reaches it. Scoring is unchanged by the return:
 	 * the only caller uses it to skip a fetch that could not have succeeded.
+	 *
+	 * A good pong (`ok: true`) also hands back the responder's `snapshot_digest`, when it sent one,
+	 * so the caller can skip a fetch of content it already holds — and feeds the pong's raw size
+	 * estimate to the observer, since the fetched snapshot no longer does (a skipped fetch must not
+	 * starve calibration, and a fetch that does happen must not report the neighbour twice).
 	 */
-	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<boolean> {
+	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<{ answered: boolean; digest?: string }> {
 		try {
 			// `dial: 'never'`: opening the connection is `redial`'s job under its own budget; a ping
 			// to a peer with no connection is `skipped` here and records nothing.
@@ -2939,14 +3045,16 @@ export class FretService implements IFretService, Startable {
 					if (out.value.ok) {
 						await this.applySuccess(id, out.rttMs);
 						this.diag.pingsOk++;
-					} else {
-						// The peer's own negative pong: alive and on our protocol — decay relevance
-						// only, never a strike.
-						this.noteAnsweredOnProtocol(id);
-						await this.applyFailure(id);
-						this.diag.pingsFail++;
+						this.calibrateSizeFromPeer(out.value.size_estimate, out.value.confidence, id);
+						return { answered: true, digest: out.value.snapshot_digest };
 					}
-					return true;
+					// The peer's own negative pong: alive and on our protocol — decay relevance
+					// only, never a strike. Whatever digest it carried is not trusted to stand for
+					// content, so the fetch proceeds as before.
+					this.noteAnsweredOnProtocol(id);
+					await this.applyFailure(id);
+					this.diag.pingsFail++;
+					return { answered: true };
 				case 'busy':
 					// Deliberate NEW behavior: the near pass records backoff for busy alone; timeout
 					// and unreachable still record none here (failure-recovery.spec pins that). Busy
@@ -2955,34 +3063,34 @@ export class FretService implements IFretService, Startable {
 					this.diag.pingsFail++;
 					this.noteAnsweredOnProtocol(id);
 					this.backoff.record(id);
-					return true;
+					return { answered: true };
 				case 'decode-error':
 					this.diag.pingsSent++;
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out); // decay only
-					return true;
+					return { answered: true };
 				case 'foreign-protocol':
 				case 'unreachable':
 				case 'timeout':
 					this.diag.pingsFail++;
 					await this.noteRpcFailure(id, out);
-					return false;
+					return { answered: false };
 				case 'local-limit':
 					// Our own per-connection stream ceiling refused the open before anything reached the
 					// wire — the same class as a tick-budget expiry. No ping diagnostics (none was
 					// sent), no strike, no backoff. `false` because the peer did not answer, so the
 					// caller skips the snapshot fetch it could not have completed either.
 					await this.noteRpcFailure(id, out);
-					return false;
+					return { answered: false };
 				case 'cancelled':
 				case 'skipped':
-					return false; // our own cancellation / never attempted: record nothing
+					return { answered: false }; // our own cancellation / never attempted: record nothing
 			}
 		} catch (err) {
 			// Reachable only for a malformed id (peerIdFromString throws inside rpcRequest).
 			log.error('probeNeighborLatency failed for %s - %e', id, err);
 		}
-		return false;
+		return { answered: false };
 	}
 
 	/**
@@ -3289,12 +3397,16 @@ export class FretService implements IFretService, Startable {
 		for (const s of snap.sample ?? []) {
 			await this.mergeDiscoveredId(s.id, announced, 'fetchAndMergeSnapshot sample');
 		}
-		// Calibrate local size estimator from snapshot's estimate
-		this.calibrateSizeFromSnapshot(snap, id);
+		// No size calibration here: the ping that preceded this fetch already reported this
+		// neighbour's raw estimate (see `probeNeighborLatency`), and the observer does not dedupe.
 		// After the id merges, so the named ids have entries for their records to land on. The
 		// caller announces to `announced` once the tick's phase 1 drains, and that announce only
 		// reaches dialable peers — so the hints must be in the peerStore by then.
 		await this.ingestAddressHints(snap);
+		// The snapshot's own digest, not the ping's: it is the fingerprint of the content just
+		// merged, which is the one invariant the cache keeps. A failed or cancelled fetch returned
+		// above and left the cache untouched.
+		if (snap.digest !== undefined) this.nearExchange.confirmDigest(id, snap.digest);
 		return announced;
 	}
 
@@ -3425,19 +3537,21 @@ export class FretService implements IFretService, Startable {
 		// emission is bounded by construction instead (fixed id counts, ids bounded by the peer-id
 		// encoding, the metadata byte cap below, and the hint byte budget `buildAddressHints`
 		// packs to), and the encoding cases in `test/rpc.codec-properties.spec.ts` are the guard
-		// that the worst legal build still fits. Measured headroom is ~4.7 KiB (worst Core build
-		// 11,575 bytes of fixed fields plus a 48 KiB hint budget and its framing, 60,738 bytes
-		// against the 64 KiB cap), so the invariant is not close. If the emission caps, the
+		// that the worst legal build still fits. Measured headroom is ~4.6 KiB (worst Core build
+		// 11,651 bytes of fixed fields — digest included — plus a 48 KiB hint budget and its
+		// framing, 60,814 bytes against the 64 KiB cap), so the invariant is not close. If the
+		// emission caps, the
 		// metadata allowance, the hint budget, or the set of snapshot fields ever grow, add a byte
 		// check here rather than widening the test — a snapshot that overflows the cap is refused
 		// at the receiver's length prefix and so fails silently and one-directionally, which is the
 		// failure mode the single cap exists to end.
 		const hints = await this.buildAddressHints(successors, predecessors, sample.map((s) => s.id));
-		// NOTE: over-cap metadata is dropped on every snapshot build (each announce and each
-		// served neighbors request), so a persistently over-sized `setMetadata` value logs once
-		// per snapshot rather than once per change, and the application is never told its
-		// metadata is not propagating. Fine while metadata is a rarely-used diagnostic channel;
-		// if it becomes load-bearing, validate the size in `setMetadata` and reject there.
+		// NOTE: over-cap metadata is dropped on every snapshot build (each announce, each served
+		// neighbors request, and — since the ping reply carries the snapshot digest — each served
+		// ping), so a persistently over-sized `setMetadata` value logs once per snapshot rather than
+		// once per change, and the application is never told its metadata is not propagating. Fine
+		// while metadata is a rarely-used diagnostic channel; if it becomes load-bearing, validate
+		// the size in `setMetadata` and reject there.
 		let outMetadata = this.metadata;
 		if (outMetadata) {
 			const metadataCap = this.cfg.profile === 'core' ? MAX_SNAPSHOT_METADATA_BYTES_CORE : MAX_SNAPSHOT_METADATA_BYTES_EDGE;
@@ -3447,6 +3561,9 @@ export class FretService implements IFretService, Startable {
 				outMetadata = undefined;
 			}
 		}
+		// The digest covers exactly the fields a receiver acts on, as emitted — so it is computed
+		// from the same values this return carries, after the metadata cap and the hint packing.
+		const digest = await snapshotDigest({ successors, predecessors, sample, metadata: outMetadata, ...(hints.length > 0 ? { hints } : {}) });
 		return {
 			v: 1,
 			from: this.selfIdStr,
@@ -3459,6 +3576,7 @@ export class FretService implements IFretService, Startable {
 			sig: '',
 			metadata: outMetadata,
 			...(hints.length > 0 ? { hints } : {}),
+			digest,
 		};
 	}
 
@@ -3833,7 +3951,9 @@ export class FretService implements IFretService, Startable {
 	private sweepBoundedMaps(): void {
 		this.backoff.sweep();
 		this.departureDebounce.sweep();
-		this.backoff.prune((id) => this.store.getById(id) !== undefined);
+		const inStore = (id: string): boolean => this.store.getById(id) !== undefined;
+		this.backoff.prune(inStore);
+		this.nearExchange.prune(inStore);
 	}
 
 	report(_evt: ReportEvent): void {

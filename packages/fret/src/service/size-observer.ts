@@ -62,7 +62,7 @@ export class SizeObserver {
 	 * Record an external observation, then trim by age and by count.
 	 *
 	 * Non-finite input is refused outright rather than stored: this class is the boundary now
-	 * (`FretService.reportNetworkSize` is public, and `calibrateSizeFromSnapshot` feeds it
+	 * (`FretService.reportNetworkSize` is public, and `calibrateSizeFromPeer` feeds it
 	 * wire-derived numbers), and a single `NaN` in the array poisons every subsequent blend —
 	 * `weightedSum`/`totalWeight` are both `NaN` from then on, so `totalWeight === 0` never fires
 	 * and the degenerate guard cannot catch it. Negative values are *not* refused: the caller

@@ -268,7 +268,7 @@ describe('Profile behavior tests', function () {
 			const bucket: TokenBucket = (svc as any).bucketPing
 			drainBucket(bucket, 20)
 
-			const result = (svc as any).handlePingRequest()
+			const result = await (svc as any).handlePingRequest()
 			expect(result).to.have.property('busy', true)
 			expect(result).to.have.property('retry_after_ms')
 		})
@@ -279,9 +279,9 @@ describe('Profile behavior tests', function () {
 	describe('Payload size limits', () => {
 		// One acceptance number for both profiles: the cap bounds what a *peer* may send us, and
 		// Edge and Core peers talk to each other. A profile split here made a legal Core snapshot
-		// (up to 11,575 bytes of fixed fields) unreadable by every Edge peer, whose cap was 8192.
+		// (up to 11,651 bytes of fixed fields) unreadable by every Edge peer, whose cap was 8192.
 		// 64 KiB since address hints: the Core worst case is those fixed fields plus a 48 KiB hint
-		// budget (60,738 bytes) — see `MAX_NEIGHBORS_BYTES` for the arithmetic.
+		// budget (60,814 bytes) — see `MAX_NEIGHBORS_BYTES` for the arithmetic.
 		it('maxBytesNeighbors = MAX_NEIGHBORS_BYTES (65536) on both profiles', async () => {
 			const core = await createService('core')
 			expect((core.svc as any).maxBytesNeighbors()).to.equal(MAX_NEIGHBORS_BYTES)

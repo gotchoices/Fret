@@ -80,7 +80,7 @@ describe('local stream-cap refusals at every outcome-observing arm', function ()
 	// these are internal passes, and the alternative — widening the public interface for a test —
 	// would change the shipped surface in order to observe it.
 	const priv = () => svc as unknown as {
-		probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<boolean>
+		probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<{ answered: boolean; digest?: string }>
 		probeMembership(id: string, signal: AbortSignal | undefined): Promise<void>
 		pingWarmupTargets(ids: readonly string[], label: string, budget?: number): Promise<void>
 		sendAnnouncementsRateLimited(ids: string[], snap: unknown): Promise<void>

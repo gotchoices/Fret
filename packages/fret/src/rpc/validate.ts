@@ -1,6 +1,7 @@
 import { peerIdFromString } from '@libp2p/peer-id';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { base64urlToCoord } from '../ring/hash.js';
+import { MAX_SNAPSHOT_DIGEST_CHARS } from '../service/near-exchange.js';
 import { createLogger } from '../logger.js';
 import type { NearAnchorV1, NeighborSnapshotV1, RouteAndMaybeActV1 } from '../index.js';
 // Type-only, so the `leave.ts` ⇄ `validate.ts` pair is a compile-time cycle and not a runtime one:
@@ -110,16 +111,17 @@ export const MAYBE_ACT_OVERHEAD_BYTES = 16 * 1024;
  * `FretService.snapshot` produces (53-char peer ids, a 32-byte base64url coordinate per sample
  * entry, `metadata` grown until `JSON.stringify(metadata)` hits
  * {@link MAX_SNAPSHOT_METADATA_BYTES_CORE} exactly, 256 bytes reserved for the still-empty `sig`
- * field, and a `hints` array packed to {@link MAX_SNAPSHOT_HINT_BYTES_CORE}):
+ * field, a `digest` at the parser's 64-character cap, and a `hints` array packed to
+ * {@link MAX_SNAPSHOT_HINT_BYTES_CORE}):
  *
  *   16 successors + 16 predecessors + 8 sample entries (the *merge* caps, which are wider than
- *   today's emission caps of 12/12/8)  ....................................  3,371 bytes
+ *   today's emission caps of 12/12/8), plus the 64-char digest  .............  3,447 bytes
  *   + 8 KiB metadata (including the `,"metadata":` key)  ..................  8,204 bytes
- *   = 11,575 bytes of fixed fields
+ *   = 11,651 bytes of fixed fields
  *   + 48 KiB of hints (the whole array, plus its `,"hints":[]` framing)  ....  49,163 bytes
- *   = 60,738 bytes
+ *   = 60,814 bytes
  *
- * 64 KiB leaves ~4.7 KiB of headroom over that. Sereus used the same 64 KiB for the same payload.
+ * 64 KiB leaves ~4.6 KiB of headroom over that. Sereus used the same 64 KiB for the same payload.
  *
  * The invariant this constant carries, pinned by `test/rpc.codec-properties.spec.ts`: **the
  * largest legal emission of *any* profile — fixed fields, metadata allowance and hint budget
@@ -132,12 +134,12 @@ export const MAX_NEIGHBORS_BYTES = 64 * 1024;
  *  application metadata it will carry — not an acceptance limit; acceptance is
  *  {@link MAX_NEIGHBORS_BYTES}, one network-wide number. The invariant the emission budgets must
  *  keep is `largest emission of any profile <= MAX_NEIGHBORS_BYTES`: at the merge caps the Core
- *  fixed fields cost 3,371 bytes, so this allowance plus them lands at 11,575, and the hint budget
- *  ({@link MAX_SNAPSHOT_HINT_BYTES_CORE}) on top of that at 60,738 — under. Over-cap metadata is
+ *  fixed fields cost 3,447 bytes, so this allowance plus them lands at 11,651, and the hint budget
+ *  ({@link MAX_SNAPSHOT_HINT_BYTES_CORE}) on top of that at 60,814 — under. Over-cap metadata is
  *  omitted from the snapshot rather than truncated — see `FretService.snapshot`. */
 export const MAX_SNAPSHOT_METADATA_BYTES_CORE = 8 * 1024;
 /** Same, Edge profile: an emission budget, half of Core's because an edge node carries less.
- *  Its worst legal emission is 6,301 bytes of fixed fields plus {@link MAX_SNAPSHOT_HINT_BYTES_EDGE}
+ *  Its worst legal emission is 6,377 bytes of fixed fields plus {@link MAX_SNAPSHOT_HINT_BYTES_EDGE}
  *  of hints, also under {@link MAX_NEIGHBORS_BYTES} — which is the only bound any budget has to
  *  satisfy. Deliberately *not* sized against a per-profile acceptance cap; there is no such thing. */
 export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
@@ -155,10 +157,10 @@ export const MAX_ADDRESS_RECORD_CHARS = 2048;
  * `JSON.stringify(hint).length + 1` (the `+ 1` is the separating comma), which is what
  * `FretService.snapshot` counts. Profile-split like the metadata allowance, and for the same
  * reason: it is this node's own choice of how much it forwards, not a limit on what it accepts.
- * Worst case: 11,575 (fixed fields) + 49,152 + the field's own framing < {@link MAX_NEIGHBORS_BYTES}.
+ * Worst case: 11,651 (fixed fields) + 49,152 + the field's own framing < {@link MAX_NEIGHBORS_BYTES}.
  */
 export const MAX_SNAPSHOT_HINT_BYTES_CORE = 48 * 1024;
-/** Same, Edge profile: an edge node forwards less. 6,301 + 16,384 + framing is far under the cap. */
+/** Same, Edge profile: an edge node forwards less. 6,377 + 16,384 + framing is far under the cap. */
 export const MAX_SNAPSHOT_HINT_BYTES_EDGE = 16 * 1024;
 
 /**
@@ -292,9 +294,23 @@ export function makeSnapshotParser(caps: SnapshotCaps): Parser<NeighborSnapshotV
 		const hints = parseHints(msg.hints, named, msg.from);
 		if (hints.length === 0) delete out.hints; else out.hints = hints;
 
+		// Advisory like the numerics: a usable digest lets the receiver skip its next fetch, an
+		// unusable one costs it nothing but that.
+		const digest = snapshotDigestOr(msg.digest, undefined);
+		if (digest === undefined) delete out.digest; else out.digest = digest;
+
 		// `sig` is deliberately unchecked: message signing is unimplemented, so nothing reads it.
 		return out;
 	};
+}
+
+/**
+ * The value when it is a snapshot digest a receiver can compare — a non-empty string of at most
+ * {@link MAX_SNAPSHOT_DIGEST_CHARS} characters — else `fallback`. Width-checked only: the receiver
+ * tests equality against a digest it cached from the same peer, so no encoding rule is enforced.
+ */
+function snapshotDigestOr(value: unknown, fallback: string | undefined): string | undefined {
+	return typeof value === 'string' && value.length > 0 && value.length <= MAX_SNAPSHOT_DIGEST_CHARS ? value : fallback;
 }
 
 type SampleEntry = NonNullable<NeighborSnapshotV1['sample']>[number];
@@ -419,14 +435,17 @@ export function parseOrThrow<T>(parse: Parser<T>, msg: unknown): T {
  * this replaces could only ever have hidden a malformed peer. `ts` is carried by the wire type and
  * read by nobody, so it is neither checked nor returned — but it must not make a reply *reject*.
  */
-export const parsePingResponse: Parser<{ ok: boolean; size_estimate?: number; confidence?: number }> = (msg) => {
+export const parsePingResponse: Parser<{ ok: boolean; size_estimate?: number; confidence?: number; snapshot_digest?: string }> = (msg) => {
 	if (!isPlainObject(msg)) return undefined;
 	if (typeof msg.ok !== 'boolean') return undefined;
-	const out: { ok: boolean; size_estimate?: number; confidence?: number } = { ok: msg.ok };
+	const out: { ok: boolean; size_estimate?: number; confidence?: number; snapshot_digest?: string } = { ok: msg.ok };
 	const sizeEstimate = finiteNumberInRangeOr(msg.size_estimate, 0, Infinity, undefined);
 	if (sizeEstimate !== undefined) out.size_estimate = sizeEstimate;
 	const confidence = finiteNumberInRangeOr(msg.confidence, 0, 1, undefined);
 	if (confidence !== undefined) out.confidence = confidence;
+	// Same drop-not-reject rule as the snapshot's `digest`, which this fingerprints.
+	const snapshotDigest = snapshotDigestOr(msg.snapshot_digest, undefined);
+	if (snapshotDigest !== undefined) out.snapshot_digest = snapshotDigest;
 	return out;
 };
 

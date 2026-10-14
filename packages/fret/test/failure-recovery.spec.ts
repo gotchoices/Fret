@@ -437,6 +437,12 @@ describe('failure recovery: a service-only outage is membership evidence, not a 
 		}
 		const tick = async (): Promise<void> => {
 			await (svcObserver as any).seedFromPeerStore()
+			// This spec is about the negotiate-failure run, which needs the remote *probed* on every
+			// tick. The near pass would legitimately skip the tick after the warm-up (the remote is
+			// connected, answered our ping during the previous pass, and its digest is fresh — see
+			// `NearExchange`), so that memory is cleared between ticks here; what is pinned is the
+			// escalation, not the per-tick probing.
+			;(svcObserver as any).nearExchange.clear()
 			await (svcObserver as any).stabilizeOnce()
 		}
 

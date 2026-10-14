@@ -26,6 +26,7 @@ import { DigitreeStore, type SerializedPeerEntry, type SerializedTable } from '.
 import type { TokenBucket } from '../src/utils/token-bucket.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { PingResponseV1 } from '../src/rpc/ping.js'
+import { MAX_SNAPSHOT_DIGEST_CHARS, SNAPSHOT_DIGEST_CHARS } from '../src/service/near-exchange.js'
 import {
 	MAX_ACTIVITY_BYTES,
 	MAYBE_ACT_OVERHEAD_BYTES,
@@ -206,7 +207,7 @@ function withOptionals<T extends object>(
 	})
 }
 
-const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata', 'hints'] as const
+const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata', 'hints', 'digest'] as const
 const MAYBE_ACT_OPTIONALS = ['wants', 'digest', 'activity', 'breadcrumbs'] as const
 const LEAVE_OPTIONALS = ['replacements'] as const
 const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'metadata', 'addressRecord'] as const
@@ -228,6 +229,7 @@ const arbNeighborSnapshot: fc.Arbitrary<NeighborSnapshotV1> = withOptionals(fc.r
 		metadata: arbMetadata,
 		// Junk on purpose, like the ids: the parser must drop these without throwing.
 		hints: fc.array(fc.record({ id: arbNastyString, record: arbNastyString }), { maxLength: 4 }),
+		digest: arbNastyString,
 	}
 ), [...SNAPSHOT_OPTIONALS])
 
@@ -1053,7 +1055,7 @@ describe('RPC codec properties', function () {
 			)
 
 			// Arm B of the cross-profile defect: ~11 KiB is over the *old* Edge announce cap of
-			// 8 KiB but inside a legal Core emission (worst case 11,575 bytes). This receiver is
+			// 8 KiB but inside a legal Core emission (worst case 11,651 bytes). This receiver is
 			// Edge, and it must accept it — its own fetch path already read 16 KiB replies, so the
 			// announce path refusing the identical snapshot was the two paths disagreeing about
 			// one question. Fails on the pre-fix code; that is the repro.
@@ -1240,6 +1242,9 @@ describe('RPC codec properties', function () {
 				confidence: 0.87654321,
 				sig: 'x'.repeat(256), // reserved for the unimplemented signature field
 				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_CORE),
+				// At the parser's cap, not the 22 characters this node emits — the conservative
+				// direction, as with the id lists above.
+				digest: 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS),
 			}
 			const fixedBytes = (await encodeJson(fixed)).byteLength
 			expect(fixedBytes + MAX_SNAPSHOT_HINT_BYTES_CORE + ',"hints":[]'.length, 'arithmetic bound').to.be.lessThan(MAX_NEIGHBORS_BYTES)
@@ -1263,6 +1268,7 @@ describe('RPC codec properties', function () {
 				confidence: 0.87654321,
 				sig: 'x'.repeat(256),
 				metadata: metadataAtAllowance(MAX_SNAPSHOT_METADATA_BYTES_EDGE),
+				digest: 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS),
 			}
 			const fixedBytes = (await encodeJson(fixed)).byteLength
 			expect(fixedBytes + MAX_SNAPSHOT_HINT_BYTES_EDGE + ',"hints":[]'.length, 'arithmetic bound').to.be.lessThan(MAX_NEIGHBORS_BYTES)
@@ -1324,7 +1330,7 @@ describe('RPC codec properties', function () {
 	interface Drivable {
 		handleMaybeAct(msg: unknown): Promise<MaybeActReply>
 		handleNeighborsRequest(): Promise<NeighborSnapshotV1 | BusyResponseV1>
-		handlePingRequest(): { size_estimate?: number; confidence?: number } | BusyResponseV1
+		handlePingRequest(): Promise<{ size_estimate?: number; confidence?: number; snapshot_digest?: string } | BusyResponseV1>
 		handleLeave(notice: LeaveNoticeV1): Promise<void>
 		handleAnnounce(from: string, snap: NeighborSnapshotV1): void
 		bucketMaybeAct: TokenBucket
@@ -1429,7 +1435,7 @@ describe('RPC codec properties', function () {
 			drain(d.bucketPing)
 			const before = svc.getDiagnostics().rejected.rateLimited.ping
 
-			const res = d.handlePingRequest()
+			const res = await d.handlePingRequest()
 
 			expect(isBusy(res), 'busy reply').to.equal(true)
 			expect((res as BusyResponseV1).retry_after_ms).to.be.greaterThan(0)
@@ -1492,7 +1498,7 @@ describe('RPC codec properties', function () {
 
 			await d.handleMaybeAct(maybeActMsg())
 			await d.handleNeighborsRequest()
-			d.handlePingRequest()
+			await d.handlePingRequest()
 			await d.handleLeave({ v: 1, from: await newPeerIdString(), timestamp: Date.now() })
 			const announcer = await newPeerIdString()
 			d.handleAnnounce(announcer, snapshotFrom(announcer))
@@ -1516,7 +1522,7 @@ describe('RPC codec properties', function () {
 
 			expect(isBusy(await d.handleMaybeAct(maybeActMsg())), 'maybeAct is drained').to.equal(true)
 			expect(isBusy(await d.handleNeighborsRequest()), 'neighbors still answers').to.equal(false)
-			expect(isBusy(d.handlePingRequest()), 'ping still answers').to.equal(false)
+			expect(isBusy(await d.handlePingRequest()), 'ping still answers').to.equal(false)
 
 			await d.handleLeave({ v: 1, from: departing, timestamp: Date.now() })
 			expect(svc.getStore().getById(departing)?.state, 'leave still acted on').to.equal('dead')
@@ -1559,9 +1565,9 @@ describe('RPC codec properties', function () {
 			const d = drivable(svc)
 			drain(d.bucketPing)
 
-			expect(isBusy(d.handlePingRequest()), 'busy before the wait').to.equal(true)
+			expect(isBusy(await d.handlePingRequest()), 'busy before the wait').to.equal(true)
 			await sleep(d.bucketPing.retryAfterMs() + 50)
-			expect(isBusy(d.handlePingRequest()), 'admitted after the wait').to.equal(false)
+			expect(isBusy(await d.handlePingRequest()), 'admitted after the wait').to.equal(false)
 		})
 
 		it('rejects on Edge the same burst Core absorbs', async () => {
@@ -1765,6 +1771,9 @@ describe('RPC codec properties', function () {
 
 		// ---- the legal side: what our own encoder can produce from a valid message ----
 
+		/** What `snapshotDigest` emits: 16 bytes, base64url, 22 characters. */
+		const arbDigest = fc.uint8Array({ minLength: 16, maxLength: 16 }).map((b) => u8ToString(b, 'base64url'))
+
 		/** The ids a snapshot names — what the parser ties `hints` to. Post-`withOptionals`, since
 		 *  an absent `sample` names nobody. */
 		function namedIds(snap: { from: string; successors: string[]; predecessors: string[]; sample?: Array<{ id: string }> }): string[] {
@@ -1785,7 +1794,8 @@ describe('RPC codec properties', function () {
 			confidence: arbUnitInterval,
 			sig: arbNastyString,
 			metadata: arbMetadata,
-		}), ['sample', 'size_estimate', 'confidence', 'metadata'])
+			digest: arbDigest,
+		}), ['sample', 'size_estimate', 'confidence', 'metadata', 'digest'])
 			// `hints` are chained off the finished snapshot: the sender only emits a record for an
 			// id it names, so the legal set depends on which lists survived `withOptionals`.
 			.chain((snap) => fc.tuple(fc.boolean(), fc.subarray(namedIds(snap))).map(([present, ids]) => {
@@ -1830,7 +1840,8 @@ describe('RPC codec properties', function () {
 			ts: arbJsonNumber,
 			size_estimate: arbNonNegativeJsonNumber,
 			confidence: arbUnitInterval,
-		}), ['size_estimate', 'confidence'])
+			snapshot_digest: arbDigest,
+		}), ['size_estimate', 'confidence', 'snapshot_digest'])
 
 		/** Push a value through the real wire codec, exactly as a handler would receive it. */
 		async function overTheWire(value: unknown): Promise<unknown> {
@@ -1894,6 +1905,7 @@ describe('RPC codec properties', function () {
 					const expected: Record<string, unknown> = { ok: reply.ok }
 					if (reply.size_estimate !== undefined) expected.size_estimate = reply.size_estimate
 					if (reply.confidence !== undefined) expected.confidence = reply.confidence
+					if (reply.snapshot_digest !== undefined) expected.snapshot_digest = reply.snapshot_digest
 					expect(parsed).to.deep.equal(expected)
 				}), opts)
 			})
@@ -2145,6 +2157,17 @@ describe('RPC codec properties', function () {
 				expect(parsed?.successors).to.have.lengthOf(CAPS.successors)
 				expect(parsed?.hints?.map((h) => h.id)).to.deep.equal(distinct.slice(0, CAPS.successors))
 			})
+
+			it('keeps a `digest` of 1 to MAX_SNAPSHOT_DIGEST_CHARS characters and drops the rest, never rejecting', () => {
+				const legal = 'd'.repeat(SNAPSHOT_DIGEST_CHARS)
+				expect(parseSnapshot(snap({ digest: legal }))?.digest).to.equal(legal)
+				expect(parseSnapshot(snap({ digest: 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS) }))?.digest, 'exactly at the cap').to.equal('x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS))
+				for (const bad of [7, null, true, {}, [], '', 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS + 1)]) {
+					const parsed = parseSnapshot(snap({ digest: bad }))
+					expect(parsed, `${JSON.stringify(bad)} never rejects the message`).to.not.equal(undefined)
+					expect(parsed, `${JSON.stringify(bad)} is dropped`).to.not.have.property('digest')
+				}
+			})
 		})
 
 		describe('LeaveNotice normalization', () => {
@@ -2204,6 +2227,15 @@ describe('RPC codec properties', function () {
 				const mixed = parsePingResponse({ ok: true, confidence: 0.5, size_estimate: -5 })
 				expect(mixed?.confidence).to.equal(0.5)
 				expect(mixed).to.not.have.property('size_estimate')
+			})
+
+			it('parsePingResponse keeps a snapshot_digest of 1 to MAX_SNAPSHOT_DIGEST_CHARS characters and drops the rest', () => {
+				const legal = 'd'.repeat(SNAPSHOT_DIGEST_CHARS)
+				expect(parsePingResponse({ ok: true, snapshot_digest: legal })).to.deep.equal({ ok: true, snapshot_digest: legal })
+				expect(parsePingResponse({ ok: true, snapshot_digest: 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS) })?.snapshot_digest, 'exactly at the cap').to.have.lengthOf(MAX_SNAPSHOT_DIGEST_CHARS)
+				for (const bad of [7, null, true, {}, [], '', 'x'.repeat(MAX_SNAPSHOT_DIGEST_CHARS + 1)]) {
+					expect(parsePingResponse({ ok: true, snapshot_digest: bad }), JSON.stringify(bad)).to.deep.equal({ ok: true })
+				}
 			})
 
 			it('parseNearAnchor rejects a reply that cannot state its numerics', () => {

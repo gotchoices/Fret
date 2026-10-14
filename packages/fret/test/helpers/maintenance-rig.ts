@@ -34,7 +34,8 @@ import type { FretConfig, NeighborSnapshotV1 } from '../../src/index.js'
  * What one peer does when a maintenance pass opens a stream to it.
  *
  * - `'answers'` — ping replies `{ok: true, ts}`; a neighbors fetch replies with an empty
- *   snapshot. The default at both lookup sites, so a spec that sets nothing is unchanged.
+ *   snapshot. The default at both lookup sites, so a spec that sets nothing is unchanged. Both
+ *   replies carry the peer's digest when {@link PeerRig.digest} holds one for it.
  * - `'hangs'` — the stream open settles only when the caller's signal aborts.
  * - `'busy'` — `{busy: true, retry_after_ms: 500}`, on **either** protocol. `rpcRequest`'s
  *   `decodeReply` tests the busy shape on the parsed body before any reply validator runs, so one
@@ -112,6 +113,13 @@ export class PeerRig {
 
 	/** `id + '|' + protocol` to behavior; consulted before the per-peer map. */
 	readonly protocolBehavior = new Map<string, Behavior>()
+	/**
+	 * Per-peer snapshot digest an `'answers'` peer advertises: its ping reply carries it as
+	 * `snapshot_digest` and its neighbors reply as `digest`, the way a real responder emits one
+	 * fingerprint from both handlers. A peer with no entry here answers as a pre-digest responder
+	 * would — no field on either reply — which is the version-skew path every older spec drives.
+	 */
+	readonly digest = new Map<string, string>()
 
 	constructor(
 		private readonly pingProtocol: string,
@@ -177,8 +185,14 @@ export class PeerRig {
 			return this.framed({ ok: false, ts: Date.now() })
 		}
 
-		if (protocol === this.pingProtocol) return this.framed({ ok: true, ts: Date.now() })
-		const snap: NeighborSnapshotV1 = { v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '' }
+		const digest = this.digest.get(id)
+		if (protocol === this.pingProtocol) {
+			return this.framed({ ok: true, ts: Date.now(), ...(digest === undefined ? {} : { snapshot_digest: digest }) })
+		}
+		const snap: NeighborSnapshotV1 = {
+			v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '',
+			...(digest === undefined ? {} : { digest }),
+		}
 		return this.framed(snap)
 	}
 

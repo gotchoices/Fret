@@ -18,14 +18,24 @@ export interface PingResponseV1 {
 	ts: number;
 	size_estimate?: number;
 	confidence?: number;
+	/**
+	 * The responder's current `NeighborSnapshotV1.digest`, so a neighbour that already merged that
+	 * content can skip its snapshot fetch. Optional, no version bump: an older responder omits it
+	 * and the sender fetches as before.
+	 */
+	snapshot_digest?: string;
 }
 
-export type SizeEstimateProvider = () => { size_estimate?: number; confidence?: number } | BusyResponseV1 | Promise<{ size_estimate?: number; confidence?: number } | BusyResponseV1>;
+/** The optional fields a responder adds to its pong — see {@link PingResponseV1}. */
+export type PingReplyExtras = Pick<PingResponseV1, 'size_estimate' | 'confidence' | 'snapshot_digest'>;
+
+/** Supplies {@link PingReplyExtras} per inbound ping, or a busy refusal in place of the pong. */
+export type PingReplyProvider = () => PingReplyExtras | BusyResponseV1 | Promise<PingReplyExtras | BusyResponseV1>;
 
 export async function registerPing(
 	node: Libp2p,
 	protocol = PROTOCOL_PING,
-	getSizeEstimate?: SizeEstimateProvider,
+	getReplyExtras?: PingReplyProvider,
 	onInbound?: (from: string) => void,
 	// Trailing and optional so existing positional callers keep compiling. Forwarded verbatim to
 	// `node.handle`; omitting it leaves libp2p's own per-connection defaults.
@@ -41,38 +51,39 @@ export async function registerPing(
 		...streamCaps,
 		serve: (connection) => {
 			onInbound?.(connection.remotePeer.toString());
-			return pingReply(getSizeEstimate);
+			return pingReply(getReplyExtras);
 		},
 	});
 }
 
 /**
- * The body of a ping answer. Split out so the estimate's `try` covers the *provider* alone: while
+ * The body of a ping answer. Split out so the provider's `try` covers the *provider* alone: while
  * it also wrapped the send-and-close tail, a stream that failed mid-reply was logged as a failed
- * estimate and then answered a second time on the same broken stream.
+ * provider and then answered a second time on the same broken stream.
  *
- * A failed estimate is not a failed ping — it degrades to a plain pong.
+ * A failed provider is not a failed ping — it degrades to a plain pong.
  */
-async function pingReply(getSizeEstimate?: SizeEstimateProvider): Promise<PingResponseV1 | BusyResponseV1> {
-	// Busy test on the size-estimate *provider's return* — an in-process value, not a wire reply,
-	// so this is not a copy of `rpcRequest`'s busy classification.
+async function pingReply(getReplyExtras?: PingReplyProvider): Promise<PingResponseV1 | BusyResponseV1> {
+	// Busy test on the *provider's return* — an in-process value, not a wire reply, so this is not
+	// a copy of `rpcRequest`'s busy classification.
 	const isBusy = (res: unknown): res is BusyResponseV1 =>
 		typeof res === 'object' && res !== null && 'busy' in res && (res as { busy?: unknown }).busy === true;
 	const pong = (): PingResponseV1 => ({ ok: true, ts: Date.now() });
-	if (!getSizeEstimate) return pong();
-	let sizeInfo: Awaited<ReturnType<SizeEstimateProvider>>;
+	if (!getReplyExtras) return pong();
+	let extras: Awaited<ReturnType<PingReplyProvider>>;
 	try {
-		sizeInfo = await getSizeEstimate();
+		extras = await getReplyExtras();
 	} catch (err) {
-		log.error('getSizeEstimate failed - %e', err);
+		log.error('ping reply provider failed - %e', err);
 		return pong();
 	}
-	if (isBusy(sizeInfo)) return sizeInfo;
+	if (isBusy(extras)) return extras;
 	const response = pong();
-	if (sizeInfo.size_estimate !== undefined) {
-		response.size_estimate = sizeInfo.size_estimate;
-		response.confidence = sizeInfo.confidence;
+	if (extras.size_estimate !== undefined) {
+		response.size_estimate = extras.size_estimate;
+		response.confidence = extras.confidence;
 	}
+	if (extras.snapshot_digest !== undefined) response.snapshot_digest = extras.snapshot_digest;
 	return response;
 }
 
@@ -89,10 +100,12 @@ export async function sendPing(
 	peer: string,
 	protocol = PROTOCOL_PING,
 	opts: { signal?: AbortSignal; timeoutMs?: number; dial?: RpcRequestOptions<unknown>['dial'] } = {}
-): Promise<RpcOutcome<{ ok: boolean; size_estimate?: number; confidence?: number }>> {
+): Promise<RpcOutcome<{ ok: boolean; size_estimate?: number; confidence?: number; snapshot_digest?: string }>> {
 	return rpcRequest(node, peer, protocol, {
 		...opts,
-		maxBytes: 1024, // ping reply is tiny, fixed-shape ({ok, size_estimate?, confidence?}); ample headroom
+		// A ping reply is tiny and fixed-shape ({ok, ts, size_estimate?, confidence?,
+		// snapshot_digest?}) — ~140 bytes at its worst against this cap.
+		maxBytes: 1024,
 		// The parser replaces the old `Boolean(r.ok)` coercion: a legal value always encodes as a
 		// boolean, so the coercion could only ever have hidden a malformed peer. A rejection
 		// throws (see `parseOrThrow`) and surfaces as `decode-error` — proof of life, never a
