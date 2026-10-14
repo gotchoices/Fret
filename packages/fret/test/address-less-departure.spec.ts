@@ -23,6 +23,11 @@ import { hashPeerId } from '../src/ring/hash.js'
 //
 // Mutation-checked when written: reverting any one of the three fixes reddens exactly the case
 // that names it.
+//
+// The fourth case is the same ungraceful departure against an observer whose stabilization loop
+// has backed off to a 30 s interval (idle backoff, `src/service/idle-backoff.ts`): the
+// `peer:disconnect` must snap the loop back to the 1.5 s base, or the first uncontactable strike
+// is 30 s away. Mutation: removing `noteChange` from the `peer:disconnect` listener reddens it.
 
 /** A memory-transport node that listens nowhere — it can dial, and nobody can dial it. */
 async function dialOnlyNode(fret?: ReturnType<typeof fretService>): Promise<Libp2p> {
@@ -49,7 +54,7 @@ describe('address-less peer departure', function () {
 		await stopAll(nodes.splice(0))
 	})
 
-	async function listeningObserver(cfg: { deadAfterFailures?: number } = {}): Promise<{ b: Libp2p; svcB: CoreFretService }> {
+	async function listeningObserver(cfg: { deadAfterFailures?: number; maxPassiveIntervalMs?: number } = {}): Promise<{ b: Libp2p; svcB: CoreFretService }> {
 		const b = await createMemNode()
 		await b.start()
 		nodes.push(b)
@@ -128,6 +133,41 @@ describe('address-less peer departure', function () {
 		// what re-created a removed entry as a live member on the very next tick.
 		await tick(svcB)
 		expect(store.getById(aId)?.state, 'still dead after the re-seed').to.equal('dead')
+		expect(svcB.getNeighbors(await hashPeerId(b.peerId), 'both', 8), 'out of the ring views').to.not.include(aId)
+	})
+
+	it('retires a vanished address-less member on the usual bound even when the loop had backed off', async () => {
+		const CAP = 30_000
+		// A started observer this time: the loop itself must be shown waking. Its leave handler is
+		// a no-op so `dead` can come only from the uncontactable strikes — the mirror of the case
+		// above, which pushes the strikes out of reach so only the notice can act.
+		const { b, svcB } = await listeningObserver({ maxPassiveIntervalMs: CAP })
+		;(svcB as unknown as { handleLeave: () => Promise<void> }).handleLeave = async () => {}
+		await svcB.start()
+		const a = await dialOnlyNode(fretService({ profile: 'core', k: 7, networkName: 'net-test' }))
+		nodes.push(a)
+		;(a.services.fret as unknown as Libp2pFretService).setLibp2p(a)
+		await a.start()
+		const aId = a.peerId.toString()
+		await a.dial(b.getMultiaddrs()[0]!)
+
+		const store = svcB.getStore()
+		await waitFor(() => store.getById(aId)?.membership === 'member', 10000, 25, 'the observer labelled the phone a member')
+
+		// Push the observer's backoff to the cap by hand, then wait for the loop to arm a timer at
+		// it: the next natural pass finds nothing to act on (the phone pings, which is not a
+		// change) and arms `min(cap · 2, cap)`. Re-pushed inside the predicate in case a late
+		// settling event (the connect's own aftermath) reset it once.
+		const idle = (svcB as unknown as { idle: { beginPass: () => void; endPass: () => number; delayMs: number } }).idle
+		const armedAt = (): number | null => (svcB as unknown as { stabilizeTimerDelayMs: number | null }).stabilizeTimerDelayMs
+		const push = (): void => { while (idle.delayMs < CAP) { idle.beginPass(); idle.endPass() } }
+		await waitFor(() => { push(); return armedAt() === CAP }, 8000, 25, 'the loop armed a timer at the cap')
+
+		await a.stop()
+
+		// Without the reset the first strike is 30 s away; with it the disconnect re-arms at the
+		// base and three spaced strikes land in 3–4.5 s, exactly as on an un-backed-off loop.
+		await waitFor(() => store.getById(aId)?.state === 'dead', 8000, 25, 'three uncontactable passes at the base interval')
 		expect(svcB.getNeighbors(await hashPeerId(b.peerId), 'both', 8), 'out of the ring views').to.not.include(aId)
 	})
 })

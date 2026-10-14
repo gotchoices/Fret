@@ -10,6 +10,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   ├── service/libp2p-fret-service.ts
 │   │   ├── service/address-records.ts  # Signed peer records: peek, self-seal, forwarding window, persisted-table age + vetting
 │   │   ├── service/near-exchange.ts   # Per-neighbour pass memory + snapshot digest: skips redundant near pings/fetches
+│   │   ├── service/idle-backoff.ts    # Clock-free policy: passive interval doubles while nothing changes, snaps back on a change
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
 │   │   ├── store/{digitree-store,relevance}.ts
 │   │   ├── ring/{distance,hash,ring-walk}.ts

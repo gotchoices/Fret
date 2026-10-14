@@ -6,7 +6,9 @@ import { buildMaintenanceRig, type MaintenanceRig } from './helpers/maintenance-
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { hashPeerId, coordToBase64url, COORD_BYTES } from '../src/ring/hash.js'
 import { NEAR_PROBE_MAX_SKIPS, SNAPSHOT_DIGEST_CHARS, snapshotDigest } from '../src/service/near-exchange.js'
-import type { NeighborSnapshotV1 } from '../src/index.js'
+import { makeProtocols } from '../src/rpc/protocols.js'
+import { sendPing } from '../src/rpc/ping.js'
+import type { FretConfig, NeighborSnapshotV1 } from '../src/index.js'
 
 // gotchoices/Fret#2: on an idle two-phone strand every stabilization pass pinged the other phone
 // and downloaded its whole neighbour list, although the other phone had pinged *us* a moment ago
@@ -14,10 +16,13 @@ import type { NeighborSnapshotV1 } from '../src/index.js'
 // (`src/service/near-exchange.ts`): the probe is skipped on fresh RPC evidence, the fetch is
 // skipped when the ping reply's snapshot digest matches the content already merged.
 //
-// Three cases, kept to the ticket's list:
+// Four cases:
 //   1. what the digest covers — pure, no network;
 //   2. the reproduction — two real memory nodes driven pass by pass, alternately;
-//   3. strike accounting on the stub-connection rig — a skip records nothing, and a peer whose
+//   3. the idle backoff on that same strand (the issue's suggestion 1): both sides' passive
+//      interval climbs to the cap while they keep pinging each other, and a real change on one
+//      side resets that side alone;
+//   4. strike accounting on the stub-connection rig — a skip records nothing, and a peer whose
 //      traffic stops is still struck dead on the usual schedule.
 
 describe('snapshotDigest covers what a receiver acts on, and nothing else', () => {
@@ -76,11 +81,11 @@ describe('idle two-node strand: the reproduction', function () {
 	 * no loop races the hand-driven passes, and no listener admits the other side — membership is
 	 * set by hand below, the way `failure-recovery.spec.ts` drives its remote.
 	 */
-	async function member(): Promise<{ node: Libp2p; svc: CoreFretService }> {
+	async function member(cfg: Partial<FretConfig> = {}): Promise<{ node: Libp2p; svc: CoreFretService }> {
 		const node = await createMemNode()
 		await node.start()
 		nodes.push(node)
-		const svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test' })
+		const svc = new CoreFretService(node, { profile: 'core', networkName: 'net-test', ...cfg })
 		svcs.push(svc)
 		await (svc as any).registerRpcHandlers()
 		return { node, svc }
@@ -146,6 +151,55 @@ describe('idle two-node strand: the reproduction', function () {
 			passes++
 		}
 		expect(dA.snapshotsFetched, `A refetched within ${NEAR_PROBE_MAX_SKIPS + 1} passes of B's content change`).to.equal(fetchedBefore + 1)
+	})
+
+	it('backs the passive interval off to the cap on both sides, and a change on one side resets only that side', async () => {
+		// A small cap so the ladder (1.5 → 3 → 6 → 12 s) reaches it in three quiet passes.
+		const CAP = 12_000
+		const BASE = (CoreFretService as any).PASSIVE_INTERVAL_MS as number
+		const a = await member({ maxPassiveIntervalMs: CAP })
+		const b = await member({ maxPassiveIntervalMs: CAP })
+		await a.node.dial(b.node.getMultiaddrs()[0]!)
+		await admit(a.svc, b.node)
+		await admit(b.svc, a.node)
+		const dA = a.svc.getDiagnostics()
+		const dB = b.svc.getDiagnostics()
+		// The loop's pass body, not the bare tick: it is what brackets the pass with the backoff.
+		const cycle = (svc: CoreFretService): Promise<number> => (svc as any).runStabilizationPass()
+		const live = (svc: CoreFretService): number => (svc as any).idle.delayMs
+
+		// Every pass pings the other side at most every third pass and fetches nothing (the case
+		// above) — and what the other side's ping lands as, an inbound RPC from a peer already
+		// held, writes nothing through the change seams. So every pass is quiet on both sides.
+		let passes = 0
+		while ((dA.loop.delayMs < CAP || dB.loop.delayMs < CAP) && passes < 8) {
+			await cycle(a.svc); await cycle(b.svc)
+			passes++
+		}
+		expect(dA.loop.delayMs, `A reached the cap (after ${passes} alternating passes)`).to.equal(CAP)
+		expect(dB.loop.delayMs, `B reached the cap (after ${passes} alternating passes)`).to.equal(CAP)
+		expect(passes, 'non-vacuity: the warm-up pass and the climb were real passes').to.be.at.least(3)
+		expect(dA.pingsSent, 'non-vacuity: A pinged B during the climb').to.be.greaterThan(0)
+		expect(dB.pingsSent, 'non-vacuity: B pinged A during the climb').to.be.greaterThan(0)
+
+		// A real change on B's side only: a stranger connects to B and calls one of its namespaced
+		// protocols, which creates an entry (the one path by which a new peer reaches a table that
+		// is not started — the `peer:connect` listener is attached by `start()`). Read live, before
+		// the ring propagates it: B's next pass labels the stranger and its snapshot then names it,
+		// which is how A would legitimately learn of it and reset too.
+		const stranger = await createMemNode()
+		await stranger.start()
+		nodes.push(stranger)
+		await stranger.dial(b.node.getMultiaddrs()[0]!)
+		const pong = await sendPing(stranger, b.node.peerId.toString(), makeProtocols('net-test').PROTOCOL_PING)
+		expect(pong.kind, 'premise: the stranger reached B').to.equal('ok')
+		await new Promise((r) => setTimeout(r, 50)) // `noteInboundRpc` is detached from the handler
+		expect(live(b.svc), 'B is back at the base').to.equal(BASE)
+		expect(live(a.svc), 'A is still at the cap').to.equal(CAP)
+		// And B's next pass settles at the base too — the stranger is `unknown`, so phase 2 selects
+		// it (pending) and the probe moves its label (a change).
+		await cycle(b.svc)
+		expect(dB.loop.delayMs, "B's next pass arms the base").to.equal(BASE)
 	})
 })
 

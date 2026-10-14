@@ -155,8 +155,10 @@ describe('FretService start/stop lifecycle', function () {
 
 		ticks = 0
 		await delay(3400)
-		// 1500 ms passive cadence => ~2 ticks (3 allowing for the immediate leading tick and
-		// scheduling slop). Two concurrent loops produced 5 before the fix.
+		// The stubbed pass is quiet, so the passive interval backs off from the 1.5 s base after
+		// every pass, the first included: passes at t = 0, 3 s, then 9 s (measured) — at most 2 in
+		// 3.4 s per loop (3 allowing for scheduling slop). Two concurrent loops produced 5 before
+		// the fix.
 		expect(ticks, 'stabilization ticks in 3.4 s').to.be.at.most(3)
 	})
 

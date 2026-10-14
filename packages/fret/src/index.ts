@@ -34,6 +34,23 @@ export interface FretConfig {
 	 */
 	dialTimeoutMs?: number;
 	/**
+	 * The ceiling, in milliseconds, the passive stabilization interval may grow to while nothing in
+	 * the network changes (default 60 000 ms).
+	 *
+	 * Passive stabilization runs every 1.5 s while things are changing and doubles that interval
+	 * after every pass that finds nothing to act on — 1.5 → 3 → 6 → 12 → 24 → 48 s, then this
+	 * ceiling — snapping back to 1.5 s the moment anything changes (a connection forms or drops, a
+	 * peer is discovered, a label or liveness verdict moves, an address becomes known). At the
+	 * default an idle node runs about one pass a minute instead of forty. The cost of a higher
+	 * ceiling is detection latency for what only a pass can see: a peer that went silent with no
+	 * disconnect event is first struck on the next pass (up to one interval away) and dead a few
+	 * seconds after, a neighbour's content is re-checked once per interval, and an off-ring peer
+	 * whose backoff window expired is re-probed up to one interval late. A host that wants faster
+	 * detection sets this lower; a value at or below 1.5 s disables backoff altogether.
+	 * Must be a positive finite number; the constructor throws otherwise.
+	 */
+	maxPassiveIntervalMs?: number;
+	/**
 	 * This node's libp2p private key — the key `node.peerId` was derived from.
 	 *
 	 * Used to seal this node's own signed address record (a libp2p `PeerRecord` envelope) for the

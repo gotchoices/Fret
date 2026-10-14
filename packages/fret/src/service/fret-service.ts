@@ -61,6 +61,7 @@ import { isLiveMember } from './live-member.js';
 import { SizeObserver } from './size-observer.js';
 import { ProbeBackoff } from './probe-backoff.js';
 import { NearExchange, snapshotDigest } from './near-exchange.js';
+import { IdleBackoff } from './idle-backoff.js';
 import type { PingReplyExtras } from '../rpc/ping.js';
 import type { LocalSizeEstimate } from './size-observer.js';
 import { ringNeighborsBothSides } from '../ring/ring-walk.js';
@@ -297,7 +298,27 @@ export class FretService implements IFretService, Startable {
 	 * exists to prevent.
 	 */
 	private runAbort: AbortController | null = null;
+	/**
+	 * The armed stabilization timer, or `null` while a pass is in flight (the timer callback nulls
+	 * it before running the pass) and outside a run. That null-while-in-flight is load-bearing for
+	 * {@link wakeLoop}: "no timer" means a pass is open and its `endPass` will see the change.
+	 */
 	private stabilizeTimer: ReturnType<typeof setTimeout> | null = null;
+	/** The delay {@link stabilizeTimer} was armed at; `null` whenever the timer is. */
+	private stabilizeTimerDelayMs: number | null = null;
+	/**
+	 * Arms the stabilization timer for the current run — one closure per run, created by
+	 * {@link startStabilizationLoop} with the run generation captured, nulled by
+	 * {@link clearLoopTimers}. Shared by the pass that just ended and by {@link wakeLoop}, so a
+	 * change can shorten a long timer through the same guarded path the loop re-arms by.
+	 */
+	private armLoop: ((delayMs: number) => void) | null = null;
+	/**
+	 * How long the passive loop waits between passes — the base interval while things change,
+	 * doubling toward `maxPassiveIntervalMs` while they do not. See {@link IdleBackoff}; the
+	 * sites that count as a change all route through {@link noteChange}.
+	 */
+	private readonly idle: IdleBackoff;
 	private preconnectTimer: ReturnType<typeof setTimeout> | null = null;
 	/** runGen the active-preconnect loop is armed for; -1 when no loop is armed. */
 	private preconnectGen = -1;
@@ -484,6 +505,15 @@ export class FretService implements IFretService, Startable {
 	 */
 	private static readonly STABILIZE_TICK_BUDGET_MS = 5000;
 	/**
+	 * The passive stabilization interval's **base**: the delay between passes while something is
+	 * changing, and the floor the idle backoff snaps back to on any change. The interval doubles
+	 * from here while nothing changes, up to `FretConfig.maxPassiveIntervalMs` — see
+	 * {@link IdleBackoff}.
+	 */
+	private static readonly PASSIVE_INTERVAL_MS = 1500;
+	/** The active-mode interval. Never backed off: active mode exists to warm connections fast. */
+	private static readonly ACTIVE_INTERVAL_MS = 300;
+	/**
 	 * Wall-clock cap on **phase 1** of a stabilization tick (the pooled near-peer ping then
 	 * snapshot-fetch pass), opened as a *child* of the tick deadline.
 	 *
@@ -560,6 +590,15 @@ export class FretService implements IFretService, Startable {
 		 * sent). A redial cancelled mid-flight by `stop()` counts in neither verdict.
 		 */
 		redials: { started: 0, connected: 0, failed: 0 },
+		/**
+		 * The stabilization loop's idle backoff, as of the last completed pass (see `IdleBackoff`):
+		 * `delayMs` is the passive delay the loop armed after it — the base while things change,
+		 * doubling toward `maxPassiveIntervalMs` while they do not — and `quietPasses` how many
+		 * consecutive passes found nothing to act on. A host reads these to see the loop idling, or
+		 * to see why it is not. Written after every pass, hand-driven or not; back to the base on
+		 * `stop()`. In active mode the loop ignores `delayMs` and runs at 300 ms regardless.
+		 */
+		loop: { delayMs: FretService.PASSIVE_INTERVAL_MS, quietPasses: 0 },
 		maybeActForwarded: 0,
 		evictions: 0,
 		/**
@@ -629,7 +668,11 @@ export class FretService implements IFretService, Startable {
 			// that set it meant a number, and a non-positive or non-finite one would either abort
 			// every dial at once or never bound one.
 			dialTimeoutMs: requirePositiveMs(cfg?.dialTimeoutMs, 10_000, 'dialTimeoutMs'),
+			// Validated like `dialTimeoutMs`: a host that set it meant a number. A value at or
+			// below the base interval is the off switch — `IdleBackoff` clamps the cap to the base.
+			maxPassiveIntervalMs: requirePositiveMs(cfg?.maxPassiveIntervalMs, 60_000, 'maxPassiveIntervalMs'),
 		};
+		this.idle = new IdleBackoff({ baseMs: FretService.PASSIVE_INTERVAL_MS, capMs: this.cfg.maxPassiveIntervalMs });
 		// A key that does not derive this node's peer id would seal records no receiver accepts
 		// (the signer must equal the labelled id) — a caller bug, so it fails here, not silently
 		// on every snapshot.
@@ -847,6 +890,10 @@ export class FretService implements IFretService, Startable {
 		const entry = this.store.upsert(id, coord);
 		const x = normalizedLogDistance(await this.selfCoord(), coord);
 		this.store.update(id, { relevance: initialRelevance(entry, x, this.sparsity) });
+		// A new entry is `unknown`, and the classification arm acts on exactly those — one seam for
+		// every hearsay path (both snapshot merges, leave replacements, the bootstrap seed, the
+		// peerStore listeners). A repeated mention returned above and is not a change.
+		this.noteChange(`discovered ${id}`);
 		return true;
 	}
 
@@ -970,6 +1017,11 @@ export class FretService implements IFretService, Startable {
 		const patch: PeerPatch = { contactFailures: failures, lastContactFailureAt: now };
 		if (failures >= threshold && e.state !== 'dead') patch.state = 'dead';
 		this.store.update(id, patch);
+		// A strike on a peer that was not already dead progressed a run (or completed one). One
+		// on a peer already `dead` — the dead arm re-probing it — moves nothing: the peer is backed
+		// off, there is nothing new to act on, and counting it would reset the delay on every
+		// dead-arm probe forever.
+		if (e.state !== 'dead') this.noteChange(`contact strike ${failures} on ${id}`);
 	}
 
 	/**
@@ -1000,6 +1052,9 @@ export class FretService implements IFretService, Startable {
 		if (e.state === 'dead') patch.state = this.isConnected(id) ? 'connected' : 'disconnected';
 		if (Object.keys(patch).length === 0) return; // already settled
 		this.store.update(id, patch);
+		// Only when it wrote — a run cleared or a `dead` peer revived. Proof of life from a peer
+		// already settled (an idle neighbour's ping) returned above and is not a change.
+		this.noteChange(patch.state === undefined ? `contact run cleared for ${id}` : `${id} revived`);
 	}
 
 	/**
@@ -1217,12 +1272,18 @@ export class FretService implements IFretService, Startable {
 				// Positive proof outranks whatever label the peer currently carries.
 				if (e.membership === 'member' && e.negotiateFailures === 0) return; // already settled
 				this.store.update(id, { membership: 'member', negotiateFailures: 0 });
+				// The label flip is the change (the peer joins every ring view); clearing a
+				// negotiate run on a peer already `member` moves nothing a pass acts on.
+				if (e.membership !== 'member') this.noteChange(`${id} is a member (${signal})`);
 				return;
 			}
 			case 'identify-foreign': {
 				// The protocol list is only what the remote advertised *at capture time*; it can
 				// predate our own handler registration, so it must not overturn a confirmed member.
-				if (e.membership === 'unknown') this.store.setMembership(id, 'foreign');
+				if (e.membership === 'unknown') {
+					this.store.setMembership(id, 'foreign');
+					this.noteChange(`${id} is foreign (identify)`);
+				}
 				return;
 			}
 			case 'negotiate-failure': {
@@ -1241,6 +1302,12 @@ export class FretService implements IFretService, Startable {
 					patch.membership = 'foreign';
 				}
 				this.store.update(id, patch);
+				// A strike that progressed the run, or the demotion it completed. A peer already
+				// `foreign` at the threshold failing again rewrites only the spacing stamp: not a
+				// change, or every foreign-arm probe would reset the delay forever.
+				if (failures !== e.negotiateFailures || patch.membership !== undefined) {
+					this.noteChange(`negotiate strike ${failures} on ${id}`);
+				}
 				return;
 			}
 		}
@@ -1263,7 +1330,13 @@ export class FretService implements IFretService, Startable {
 	private async noteInboundRpc(id: string): Promise<void> {
 		if (this.stopped) return;
 		try {
-			if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(peerIdFromString(id)));
+			if (!this.store.getById(id)) {
+				this.store.upsert(id, await hashPeerId(peerIdFromString(id)));
+				// A stranger. An RPC from a peer already held is judged by the seams below —
+				// `applyMembershipSignal` and `noteProofOfLife` count only what they write — so an
+				// idle neighbour's periodic ping is not a change and cannot keep us from idling.
+				this.noteChange(`inbound RPC from new peer ${id}`);
+			}
 			// The peer dialed *us*, which is proof of life however badly our own dials to it fared.
 			this.noteInboundEvidence(id);
 		} catch (err) {
@@ -1340,6 +1413,9 @@ export class FretService implements IFretService, Startable {
 		// "already announced" state of the previous run.
 		this.postBootstrapAnnounced = false;
 		this.firstStabilizeDone = false;
+		// `stop()` reset it already; this covers a pass that was in flight at that `stop()` and
+		// closed afterwards, whose `endPass` would otherwise hand this run its doubled delay.
+		this.resetIdleBackoff();
 		if (this.readyResolved) {
 			// Prior run already settled this gate — a restart needs its own, fresh one.
 			this.readyDeferred = (() => {
@@ -1379,6 +1455,7 @@ export class FretService implements IFretService, Startable {
 				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt.detail.toString();
+				this.noteChange(`peer:connect ${id}`);
 				const coord = await this.coordOf(id);
 				this.store.upsert(id, coord);
 				this.store.setState(id, 'connected');
@@ -1398,6 +1475,10 @@ export class FretService implements IFretService, Startable {
 				if (this.stopped) return;
 				// libp2p v3: evt.detail is the PeerId directly, not { id: PeerId }
 				const id = evt.detail.toString();
+				// Load-bearing, not an optimisation: this is what keeps an address-less phone's
+				// departure on today's 3–4.5 s bound when the loop is backed off — the next pass,
+				// which books the first uncontactable strike, is at most one base interval away.
+				this.noteChange(`peer:disconnect ${id}`);
 				const wasNear = this.isNearNeighbor(id);
 				this.noteDisconnected(id);
 				await this.applyFailure(id);
@@ -1494,6 +1575,9 @@ export class FretService implements IFretService, Startable {
 		// What a run heard from, and merged from, each near neighbour is that run's; the next run's
 		// first pass probes and fetches everyone. The pass counter itself need not reset.
 		this.nearExchange.clear();
+		// The idle backoff is run-scoped too: the next run starts at the base, and `diag.loop` reads
+		// the base while stopped.
+		this.resetIdleBackoff();
 		// The in-flight redials belong to the run that asked for them: the abort above makes each
 		// settle `cancelled`, and clearing the map here means the next run's first request for a
 		// peer starts a fresh dial rather than inheriting a verdict of "cancelled". Each entry also
@@ -1505,11 +1589,24 @@ export class FretService implements IFretService, Startable {
 		this.sizeObserver.clear();
 	}
 
-	/** Cancel any pending loop timers. Ticks already in flight exit on the generation check. */
+	/**
+	 * Cancel any pending loop timers. Ticks already in flight exit on the generation check — and the
+	 * arming closure is nulled too, so a pass that was in flight when the run ended cannot re-arm a
+	 * timer that is now often tens of seconds long.
+	 */
 	private clearLoopTimers(): void {
 		if (this.stabilizeTimer != null) { clearTimeout(this.stabilizeTimer); this.stabilizeTimer = null; }
+		this.stabilizeTimerDelayMs = null;
+		this.armLoop = null;
 		if (this.preconnectTimer != null) { clearTimeout(this.preconnectTimer); this.preconnectTimer = null; }
 		this.preconnectGen = -1;
+	}
+
+	/** Back to the base interval, with `diag.loop` saying so — on `stop()` and at `start()`. */
+	private resetIdleBackoff(): void {
+		this.idle.reset();
+		this.diag.loop.delayMs = this.idle.delayMs;
+		this.diag.loop.quietPasses = 0;
 	}
 
 	/** Attach a logging catch to an intentionally-detached promise so a rejection can never escape. */
@@ -1533,6 +1630,9 @@ export class FretService implements IFretService, Startable {
 
 	setMode(mode: FretMode): void {
 		this.mode = mode;
+		// A mode switch is a change: into active it cuts a pending long timer to the active
+		// interval; back to passive it starts the backoff ladder from the base.
+		this.noteChange(`setMode(${mode})`);
 		if (mode === 'active') this.startActivePreconnectLoop();
 	}
 
@@ -1844,9 +1944,14 @@ export class FretService implements IFretService, Startable {
 	 * {@link readPeerStore}).
 	 */
 	private setAddressKnown(id: string, known: boolean): void {
+		const had = this.addressKnown.has(id);
 		if (known) this.addressKnown.add(id);
 		else this.addressKnown.delete(id);
 		for (const touched of this.addressWritesDuringWalks) touched.add(id);
+		// Dialability flipped for a peer the table holds: a pass that skipped it as undialable, or
+		// struck it as uncontactable, decides differently now. A re-fired identical answer, or an
+		// address for a peer we hold no entry for, changes nothing a pass acts on.
+		if (had !== known && this.store.getById(id)) this.noteChange(`${id} ${known ? 'became' : 'is no longer'} dialable`);
 	}
 
 	/**
@@ -2235,6 +2340,8 @@ export class FretService implements IFretService, Startable {
 		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited.leave++; return; }
 		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		const peerId = notice.from;
+		// Always: the sender is marked dead below, and its replacements land as `unknown`.
+		this.noteChange(`leave from ${peerId}`);
 		try {
 			let coord: Uint8Array | null = null;
 			const entry = this.store.getById(peerId);
@@ -2486,6 +2593,9 @@ export class FretService implements IFretService, Startable {
 
 	private async mergeAnnounceSnapshot(from: string, snap: NeighborSnapshotV1): Promise<void> {
 		if (!validateTimestamp(snap.timestamp)) { this.diag.rejected.timestampBounds++; return; }
+		// Always: an announce is sent only when the sender saw a join or a departure, never
+		// periodically, so the one that reaches the merge is a change whatever the merge finds.
+		this.noteChange(`announce from ${from}`);
 		try {
 			// The *sending* peer's id and ring coordinate, not ours — named so the next reader
 			// cannot mistake them for `selfCoord()`. Substituting our own coordinate here would
@@ -2627,13 +2737,32 @@ export class FretService implements IFretService, Startable {
 				if (this.addressKnown.has(id)) rebuilt.add(id);
 				else rebuilt.delete(id);
 			}
+			const previous = this.addressKnown;
 			this.addressKnown = rebuilt;
+			// The silent changes this walk exists for (an aged-out address, a deleted record) are
+			// changes for the peers the table holds; the many peerStore-only ids are not.
+			if (this.dialabilityDiffersForHeldPeers(previous, rebuilt)) this.noteChange('peerStore walk moved dialability');
 			return peers;
 		} finally {
 			this.addressWritesDuringWalks.delete(touched);
 		}
 	}
 
+	/** Whether two address-known sets disagree on any id the routing table holds. */
+	private dialabilityDiffersForHeldPeers(before: ReadonlySet<string>, after: ReadonlySet<string>): boolean {
+		for (const id of before) if (!after.has(id) && this.store.getById(id)) return true;
+		for (const id of after) if (!before.has(id) && this.store.getById(id)) return true;
+		return false;
+	}
+
+	/**
+	 * The stabilization loop: a pass, then a timer, then a pass. The passive delay between passes is
+	 * the idle backoff's ({@link idle}) — the base while things change, doubling toward the cap while
+	 * they do not — and active mode runs at {@link ACTIVE_INTERVAL_MS} regardless. The timer is
+	 * armed through {@link armLoop}, a closure per run that captures the generation and refuses once
+	 * the run is over; {@link wakeLoop} shortens it through the same closure when a change lands
+	 * while a long timer is pending.
+	 */
 	private startStabilizationLoop(): void {
 		// One loop per run; start() guards re-entry, so no "already running" check is needed.
 		const gen = this.runGen;
@@ -2652,27 +2781,91 @@ export class FretService implements IFretService, Startable {
 			} catch (err) {
 				log.error('stabilize tick failed - %e', err);
 			} finally {
-				// Re-check after the awaits: a stop() during the tick must not re-arm the timer.
-				if (!this.stopped && gen === this.runGen) {
-					const delay = this.mode === 'active' ? 300 : 1500;
-					this.stabilizeTimer = setTimeout(tick, delay);
-				}
+				// Armed from the *live* delay rather than the pass's return value: a change landing
+				// in the microtask gap between the pass's `endPass` and this line has already reset
+				// the delay but found no timer to shorten (`wakeLoop` reads "no timer" as "a pass is
+				// in flight"), so reading here is what keeps it from waiting out a long timer. The
+				// closure itself re-checks the generation, so a stop() during the pass arms nothing.
+				this.armLoop?.(this.loopDelayMs());
 			}
+		};
+		this.armLoop = (delayMs: number): void => {
+			if (this.stopped || gen !== this.runGen) return;
+			if (this.stabilizeTimer != null) clearTimeout(this.stabilizeTimer);
+			this.stabilizeTimerDelayMs = delayMs;
+			this.stabilizeTimer = setTimeout(() => {
+				// Nulled *before* the pass opens, synchronously, so `wakeLoop` sees "in flight" for
+				// the whole pass and never races a second arm against the one the pass will do.
+				this.stabilizeTimer = null;
+				this.stabilizeTimerDelayMs = null;
+				this.detach(tick(), 'stabilization loop');
+			}, delayMs);
 		};
 		this.detach(tick(), 'stabilization loop');
 	}
 
+	/** The delay the loop arms next: the active interval in active mode, else the idle backoff's. */
+	private loopDelayMs(): number {
+		return this.mode === 'active' ? FretService.ACTIVE_INTERVAL_MS : this.idle.delayMs;
+	}
+
 	/**
-	 * One pass of the stabilization loop: the peerStore address backstop when it is due, then the
-	 * tick. Riding the pass is what gives the backstop the loop's lifecycle (run generation,
-	 * `stop()`) with no timer of its own; under idle backoff it is at most one backed-off interval
-	 * late, which is nothing against libp2p's hour-scale aging clock.
+	 * A change landed between passes: if the armed timer is longer than the delay the change calls
+	 * for, re-arm it at that delay. Never runs a pass at once — events arrive in bursts
+	 * (`peer:connect`, then `peer:identify`, then several `peer:update`s), a pass per event would be
+	 * a pass storm, and the base interval is the natural debounce; this keeps today's bound exactly
+	 * (after a `peer:disconnect` the next pass is at most one base interval away).
+	 *
+	 * No timer armed means a pass is in flight — its `endPass` sees the change and arms at the base
+	 * itself — or no run is live, where {@link armLoop} is `null` anyway. A timer already at or
+	 * below the target is left alone.
 	 */
-	private async runStabilizationPass(): Promise<void> {
+	private wakeLoop(): void {
+		if (this.stopped || this.armLoop == null || this.stabilizeTimer == null) return;
+		const target = this.loopDelayMs();
+		if (this.stabilizeTimerDelayMs != null && this.stabilizeTimerDelayMs <= target) return;
+		this.armLoop(target);
+	}
+
+	/**
+	 * The one seam for "something the next pass could act on happened": reset the idle backoff,
+	 * wake a backed-off loop, and say why — on a phone the log line is the only way to see what
+	 * keeps the loop from idling. Every site in the change table of `docs/fret.md` calls this, and
+	 * nothing else resets the delay.
+	 */
+	private noteChange(reason: string): void {
+		this.idle.noteChange();
+		log('change: %s - stabilization interval back to %d ms', reason, this.idle.baseMs);
+		this.wakeLoop();
+	}
+
+	/**
+	 * One pass of the stabilization loop, bracketed by the idle backoff: the peerStore address
+	 * backstop when it is due, then the tick, then the pending-redial check, then `endPass`. Riding
+	 * the pass is what gives the backstop the loop's lifecycle (run generation, `stop()`) with no
+	 * timer of its own; under idle backoff it is at most one backed-off interval late, which is
+	 * nothing against libp2p's hour-scale aging clock.
+	 *
+	 * Returns the delay the backoff settled on, so a hand-driven pass exercises the policy exactly
+	 * as a loop pass does (a hand-driven `stabilizeOnce` bypasses it). `diag.loop` is written here,
+	 * not in the loop, for the same reason.
+	 */
+	private async runStabilizationPass(): Promise<number> {
+		this.idle.beginPass();
 		if (Date.now() - this.lastPeerStoreWalkAt >= FretService.PEERSTORE_BACKSTOP_INTERVAL_MS) {
 			await this.reconcileAddressesFromPeerStore();
 		}
 		await this.stabilizeOnce();
+		// A redial the pass outlived (a slow relayed dial) settles later, and when it does, the
+		// outcome is a change only if it moves something: a connection fires `peer:connect`, a
+		// failure books a strike through `applyContactStrike` (a change while the run progresses),
+		// a cancellation is a `stop()`. Holding at the base meanwhile is what lets the pass after
+		// it settles follow up within one base interval.
+		if (this.redials.size > 0) this.idle.notePending();
+		const delay = this.idle.endPass();
+		this.diag.loop.delayMs = delay;
+		this.diag.loop.quietPasses = this.idle.quietPasses;
+		return delay;
 	}
 
 	/**
@@ -2789,8 +2982,26 @@ export class FretService implements IFretService, Startable {
 			// (STABILIZE_TICK_BUDGET_MS - STABILIZE_PHASE_ONE_BUDGET_MS = one ping) is exactly what
 			// buys phase 2 its turn. This return still fires for a `stop()` or a tick that really
 			// is out of time.
-			if (budget.signal.aborted) return;
+			if (budget.signal.aborted) {
+				// Work left undone that no event will announce — the same reason a non-empty phase
+				// 2 is pending below. Harmless on a `stop()`, which resets the backoff anyway.
+				this.idle.notePending();
+				return;
+			}
 			const targets = this.phaseTwoTargets();
+			// Pending on the *selection*, not on the label counts: a ring that ever lost a phone
+			// ungracefully holds a `dead` entry until capacity evicts it (never, on a small ring),
+			// and "a dead peer exists" would keep the loop from ever backing off. The selection is
+			// empty whenever every off-ring peer is inside its backoff window, so the loop sleeps
+			// over those windows — and re-probes a peer whose window expired meanwhile up to one
+			// interval late, which the docs state.
+			// NOTE: the ladder restarts at every probe of a *permanently* off-ring peer, and climbs
+			// 1.5 + 3 + 6 + 12 + 24 s = 46.5 s before that peer's 32 s window has passed, so a ring
+			// holding one settles at about five passes per window (~9 s apart) rather than at the
+			// cap. If idle rings with a dead entry still show up in profiles, hold pending for the
+			// classify arm only: the dead and foreign arms' probe outcomes land inside the pass (a
+			// strike that progresses nothing needs no follow-up pass), so they need no hold.
+			if (targets.length > 0) this.idle.notePending();
 			const phaseTwoPool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
 			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), phaseTwoPool);
 			logRejected(probed, targets, 'probeMembership');
@@ -2837,7 +3048,9 @@ export class FretService implements IFretService, Startable {
 	 * strike" stays true: `applyContactStrike`'s spacing guard makes each passive tick (1.5 s) one
 	 * independent strike, the peer is `dead` after `deadAfterFailures` ticks, and one that
 	 * reconnects within a tick or two (`peer:connect` is proof of life) is never killed. Once dead
-	 * it leaves the live-member window, so the strikes stop by themselves.
+	 * it leaves the live-member window, so the strikes stop by themselves. The 1.5 s spacing holds
+	 * under idle backoff because the disconnect itself is a change (the loop is back at the base
+	 * before the first strike) and each strike that progresses the run is another.
 	 *
 	 * NOTE: only the S/P window is swept, so on a ring of more than 2·max(2, m) + 1 live members an
 	 * address-less member outside our window is never struck by us and stays a live member in our
@@ -2978,6 +3191,16 @@ export class FretService implements IFretService, Startable {
 	 *   of the content we last merged from it. Equality re-confirms the cache; anything else —
 	 *   a different digest, none, a busy or bad reply — fetches exactly as before.
 	 *
+	 * **The probe skip and the idle backoff do not stack.** The skip spares a probe on a *frequent*
+	 * pass — one at the base interval, where a neighbour heard from moments ago is not worth
+	 * pinging again — while the backoff spares whole passes. A pass the backoff has already
+	 * delayed is the rare event and verifies everything it came for, so the skip is consulted only
+	 * while the loop's quiet count is zero. Otherwise the skip cap, measured in passes, stretches
+	 * with the ladder: a node whose neighbour keeps pinging it (fresh heard stamp) and whose cached
+	 * digest came from that neighbour's announce skipped three passes that were 1.5 + 3 + 6 + 12 =
+	 * 22.5 s of ladder rather than 4.5 s, and a fresh ring took that long to exchange its first
+	 * snapshots (measured on the TCP mesh and four-node star rigs).
+	 *
 	 * NOTE: a skipped slot is not refilled from the window's outer members. The point is fewer
 	 * RPCs per pass, and the near list's "truncate the outermost, never the immediate successor"
 	 * ordering is left as it is. Refill from the outer window if coverage of the window's far
@@ -2988,8 +3211,14 @@ export class FretService implements IFretService, Startable {
 	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		// Connected is rule 1 and is checked here, not in `NearExchange`: a peer with no connection
 		// takes the redial path below whatever we heard, since the redial is what reconnects it.
-		if (this.isConnected(id) && this.nearExchange.canSkipProbe(id)) {
+		// `quietPasses === 0` is the no-stacking rule above: a backed-off pass skips nothing.
+		if (this.isConnected(id) && this.idle.quietPasses === 0 && this.nearExchange.canSkipProbe(id)) {
 			this.diag.nearExchangeSkipped.probes++;
+			// The probe not sent is a check no event will make, so the pass is pending: the ladder
+			// starts only from a pass that verified its neighbours (the skip cap forces one within
+			// four). Measured without this on a four-node line: a skipped pass at the base counted
+			// as quiet, the re-check moved from 3 s to 4.5 s, and the first snapshot exchange with it.
+			this.idle.notePending();
 			return [];
 		}
 		// `failed` has already booked its strike inside the seam, and the near pass owes no backoff
@@ -3473,6 +3702,10 @@ export class FretService implements IFretService, Startable {
 			if (!accepted) continue;
 			this.store.update(hint.id, { addressRecord: { envelope: bytes, confirmedAt: Date.now() } });
 			this.setAddressKnown(hint.id, true);
+			// A newer record for a held peer: its addresses changed, so its dialability may have
+			// even when it already read as dialable (which is why `setAddressKnown` alone is not
+			// enough — it counts only a flip).
+			this.noteChange(`newer address record for ${hint.id}`);
 		}
 	}
 
@@ -4313,6 +4546,8 @@ export class FretService implements IFretService, Startable {
 		const count = this.store.importEntries(entries);
 		await this.enforceCapacity();
 		await this.consumeImportedAddressRecords(new Set(entries.filter((e) => e.addressRecord).map((e) => e.id)));
+		// Always: every imported entry is `disconnected` and worth a pass, whatever its label.
+		this.noteChange(`imported ${count} entries`);
 		return count;
 	}
 

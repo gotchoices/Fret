@@ -107,7 +107,9 @@ interface NearPeerMemory {
 /**
  * Most consecutive passes a near neighbour's probe may be skipped before it is pinged again
  * regardless of recent traffic — the bound rule 3 of {@link NearExchange.canSkipProbe} enforces.
- * 3 means at least one probe per four passes: 6 s at the 1.5 s passive interval.
+ * 3 means at least one probe per four passes: 6 s at the 1.5 s base interval. The skip is consulted
+ * only while the loop is at that base — a pass the idle backoff delayed probes every near target
+ * (see `probeAndFetch`), so a backed-off loop re-checks each neighbour once per interval.
  */
 export const NEAR_PROBE_MAX_SKIPS = 3;
 
