@@ -152,12 +152,14 @@ interface NearWindow {
  * The one verdict a maintenance redial ({@link FretService.redial}) reaches, shared by everyone
  * who awaited it.
  *
- * - `connected` — a connection to the peer is open; the caller may ping over it.
+ * - `connected` — a connection to the peer is open; the caller may ping over it. Also the answer
+ *   for a peer that was already connected when asked (no dial issued, nothing counted), so a
+ *   caller whose own `isConnected` check lost a race to the peer dialing us still pings it.
  * - `failed` — the dial failed on its own merits and the seam has **already booked** the contact
  *   strike. A caller adds only what its own arm owes on top (backoff, in the off-ring passes).
  * - `cancelled` — our own run signal fired; not evidence about the peer, nothing booked.
- * - `skipped` — no dial was issued and nothing was booked: the peer is already connected, has no
- *   address to dial, or `maintenanceConcurrency` redials are already in flight. Re-asked next tick.
+ * - `skipped` — no dial was issued and nothing was booked: the peer has no address to dial, or
+ *   `maintenanceConcurrency` redials are already in flight. Re-asked next tick.
  */
 type RedialResult = 'connected' | 'failed' | 'cancelled' | 'skipped';
 
@@ -2646,9 +2648,9 @@ export class FretService implements IFretService, Startable {
 	 *   sharing safe in the other direction too: a concurrent `dialProtocol` to the same peer (an
 	 *   announce, say) *joins* the pending dial, and the joined job is aborted only once every
 	 *   joiner's signal has aborted, so a 2 s announce timing out does not kill the redial.
-	 * - **`skipped` when there is nothing to dial**: already connected, no address libp2p could
-	 *   dial, or `maintenanceConcurrency` redials already in flight — no dial, no score; the
-	 *   caller re-asks next tick, nothing queues.
+	 * - **`skipped` when there is nothing to dial**: no address libp2p could dial, or
+	 *   `maintenanceConcurrency` redials already in flight — no dial, no score; the caller re-asks
+	 *   next tick, nothing queues. A peer already connected is `connected` with no dial.
 	 * - **The seam books the verdict, exactly once.** A dial that fails on its own merits — not
 	 *   our cancellation — is a failed contact (`applyContactFailure`), the same evidence a dialing
 	 *   ping's `unreachable` / `timeout` used to be. Success books nothing here: the `peer:connect`
@@ -2664,7 +2666,14 @@ export class FretService implements IFretService, Startable {
 	private redial(id: string): Promise<RedialResult> {
 		const inflight = this.redials.get(id);
 		if (inflight !== undefined) return inflight;
-		if (this.isConnected(id) || !this.hasAddresses(id) || this.redials.size >= this.maintenanceConcurrency) {
+		// Already connected is `connected`, not `skipped`: the caller asked because its own check
+		// said otherwise a moment ago, and the peer dialing us in between is the common way that
+		// happens — it should ping over the connection it now has rather than wait a tick.
+		if (this.isConnected(id)) return Promise.resolve('connected');
+		// NOTE: a request past the concurrency cap, or for an address-less peer, is `skipped`
+		// silently — no counter by reason. If reconnection on a busy node (many non-connected
+		// warm-up targets holding the cap) ever looks slow, count skips by reason in `diag.redials`.
+		if (!this.hasAddresses(id) || this.redials.size >= this.maintenanceConcurrency) {
 			return Promise.resolve('skipped');
 		}
 		const run: Promise<RedialResult> = this.dialForMaintenance(id, this.runSignal).finally(() => {

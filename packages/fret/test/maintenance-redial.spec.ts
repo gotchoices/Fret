@@ -185,7 +185,7 @@ describe('maintenance redial: opening a connection has its own budget, outside t
 		expect((svcA as any).redials.size, 'the entry removed itself on settling').to.equal(0)
 	})
 
-	it('skips — no dial, no score — when connected, when address-less, and when the cap is full', async () => {
+	it('issues no dial and scores nothing when address-less or the cap is full, and answers connected for a peer already connected', async () => {
 		await build(300)
 		const concurrency = (svcA as any).maintenanceConcurrency as number
 		const redials = (svcA as any).redials as Map<string, Promise<string>>
@@ -200,11 +200,13 @@ describe('maintenance redial: opening a connection has its own budget, outside t
 		expect(await redial(), 'no address').to.equal('skipped')
 		;(svcA as any).setAddressKnown(bId, true)
 
-		// Already connected.
+		// Already connected: the honest verdict is `connected` — a caller whose own check lost a
+		// race to the peer dialing us pings over the connection it now has — and still no dial.
 		await a.dial(b.peerId)
-		expect(await redial(), 'already connected').to.equal('skipped')
+		expect(await redial(), 'already connected').to.equal('connected')
 
 		expect(diag().redials.started, 'none of the three issued a dial').to.equal(0)
+		expect(diag().redials.connected, 'a connection not dialed here is not counted here').to.equal(0)
 		expect(entry().contactFailures, 'none of the three scored').to.equal(0)
 	})
 

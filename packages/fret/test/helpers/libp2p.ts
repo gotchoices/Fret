@@ -45,6 +45,7 @@ function slowHandshake(ms: number): (components: unknown) => ConnectionEncrypter
 	return (components) => {
 		const inner = base(components as Parameters<typeof base>[0])
 		const wait = (signal?: AbortSignal): Promise<void> => new Promise<void>((resolve, reject) => {
+			if (signal?.aborted === true) { reject(signal.reason); return }
 			const timer = setTimeout(resolve, ms)
 			signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
 		})

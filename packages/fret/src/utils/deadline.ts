@@ -93,21 +93,24 @@ export const ABORTED: unique symbol = Symbol('aborted');
  *
  * The caller keeps a budget the awaited work deliberately does not share: a stabilization tick
  * waits on a redial only for the rest of its own phase, while the redial runs on under its own
- * dial budget and is reclaimed by the next tick. `promise` must never reject — once the signal has
- * fired nothing is listening to it any more, so a later rejection would surface as an unhandled
- * rejection with no caller to attribute it to.
+ * dial budget and is reclaimed by the next tick.
+ *
+ * A rejection is propagated while the caller is still waiting, so a bug in the awaited work
+ * surfaces at the call site instead of being read as "the budget ran out". One that lands after
+ * the signal fired has no listener left and is dropped here — so `promise` should own its own
+ * failure handling (the redial seam never rejects) rather than rely on this to report it.
  *
  * No `signal` means wait unconditionally (the never-started service in tests has no run signal).
  */
 export function awaitUnlessAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | typeof ABORTED> {
 	if (signal === undefined) return promise;
 	if (signal.aborted) return Promise.resolve(ABORTED);
-	return new Promise<T | typeof ABORTED>((resolve) => {
+	return new Promise<T | typeof ABORTED>((resolve, reject) => {
 		const onAbort = (): void => resolve(ABORTED);
 		signal.addEventListener('abort', onAbort, { once: true });
 		promise.then(
 			(value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
-			() => { signal.removeEventListener('abort', onAbort); resolve(ABORTED); }
+			(err: unknown) => { signal.removeEventListener('abort', onAbort); reject(err); }
 		);
 	});
 }
