@@ -9,7 +9,7 @@ import type { Libp2p } from 'libp2p'
 // The probe-based classification path (a namespaced ping → member, UnsupportedProtocolError
 // → foreign) is covered by ring-membership.spec.ts using in-memory nodes. Those nodes run no
 // identify service, so the peerStore protocol list never populates and the identify-driven
-// path — the `peer:identify` / `peer:update` listeners and the opportunistic peerStore poll in
+// path — the `peer:identify` / `peer:update` listeners and the start-time peerStore poll in
 // seedFromPeerStore (which classifies `peerStore.all()` entries off their protocol list) —
 // never fires there. This spec covers that gap with real TCP + identify nodes.
 //
@@ -18,7 +18,7 @@ import type { Libp2p } from 'libp2p'
 // classifyTargets, reprobeExcludedTargets) lives inside stabilizeOnce and is the ONLY code
 // that calls applySuccess/markForeign off an RPC — so a no-op stabilizeOnce leaves identify
 // (the event listeners + the peerStore-backed poll in seedFromPeerStore) as
-// the sole classification source. seedFromPeerStore still runs each tick, but it is itself the
+// the sole classification source. seedFromPeerStore runs once, at start(), and is itself the
 // identify path (it reads the identify-populated peerStore) and never sends a probe. We also
 // assert getDiagnostics().pingsSent === 0 as a public-API witness that no probe was sent.
 
@@ -87,10 +87,10 @@ describe('Ring membership classification (identify-driven)', function () {
 	// as a peer:update. With the probe pass disabled, identify is the only remaining classification
 	// source, so the re-admission cannot have come from an RPC — asserted directly via `pingsSent`.
 	//
-	// It is *identify*, not specifically the `peer:update` listener: `seedFromPeerStore` re-reads
-	// the same peerStore list every tick and its positive arm promotes from any label (the
-	// `unknown`-only guard applies to the negative arm alone — see `applyMembershipSignal`), so
-	// whichever of the two observes the pushed list first re-admits C. Both are the identify path.
+	// `seedFromPeerStore` reads the peerStore only at start(), before C connects, so after start
+	// the identify listeners are the only reader of the pushed list. Its positive arm promotes from
+	// any label (the `unknown`-only guard applies to the negative arm alone — see
+	// `applyMembershipSignal`).
 	it('re-admits foreign → member on peer:update when a peer begins serving this network', async () => {
 		const nodeA = await createIdentifyNode(); await nodeA.start()
 		const nodeC = await createIdentifyNode(); await nodeC.start()
@@ -161,7 +161,8 @@ describe('Ring membership classification (identify-driven)', function () {
 	// Isolates the peerStore *poll* path — seedFromPeerStore enumerates `node.peerStore.all()` and
 	// classifies each entry off its identify-advertised protocol list — from the peer:identify /
 	// peer:update event handlers (which the two tests above leave racing). start() awaits
-	// seedFromPeerStore BEFORE it attaches any node event listener, so if A's peerStore is already
+	// seedFromPeerStore before any event could have fired — the listeners attach just ahead of it,
+	// but nothing changes A's peerStore once identify has settled — so if A's peerStore is already
 	// populated when start() runs, the poll is the only thing that can have classified. We let
 	// libp2p identify populate A's peerStore while A has no FretService, then start A and assert
 	// membership SYNCHRONOUSLY right after start() resolves — before the event loop can deliver a
@@ -191,9 +192,9 @@ describe('Ring membership classification (identify-driven)', function () {
 		}
 		expect(peerStoreReady).to.equal(true, "A's peerStore should learn C's net-a protocols via identify")
 
-		// Now start A. seedFromPeerStore is awaited inside start() before listeners attach, so the
-		// poll path classifies C synchronously — asserted with no waitFor, leaving the event
-		// handlers no opportunity to have run.
+		// Now start A. seedFromPeerStore is awaited inside start() and no event for C fires once
+		// identify has settled, so the poll path is what classifies C — asserted with no waitFor,
+		// leaving the event handlers no opportunity to have run.
 		const svcA = new CoreFretService(nodeA, { profile: 'core', networkName: 'net-a' })
 		services = [svcC, svcA]
 		disableProbing(svcA)

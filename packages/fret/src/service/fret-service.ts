@@ -1,4 +1,4 @@
-import type { Startable, PeerId, Libp2pEvents, IdentifyResult, PeerUpdate, PrivateKey } from '@libp2p/interface';
+import type { Startable, Peer, PeerId, Libp2pEvents, IdentifyResult, PeerUpdate, PrivateKey } from '@libp2p/interface';
 import type {
 	FretService as IFretService,
 	FretMode,
@@ -221,6 +221,34 @@ function requirePositiveMs(value: number | undefined, fallback: number, name: st
 	return value;
 }
 
+/**
+ * The peer ids named by configured bootstrap entries: a multiaddr's `p2p` component, otherwise
+ * the entry itself as a bare peer id. An entry that yields no parseable id is logged and skipped
+ * — once, here, rather than on every seed.
+ */
+function parseBootstrapPeers(entries: readonly string[]): PeerId[] {
+	const peers: PeerId[] = [];
+	for (const entry of entries) {
+		try {
+			peers.push(peerIdFromString(bootstrapIdOf(entry)));
+		} catch (err) {
+			log.error('ignoring bootstrap entry %s: no parseable peer id - %e', entry, err);
+		}
+	}
+	return peers;
+}
+
+/** The id string a bootstrap entry names — see {@link parseBootstrapPeers}. */
+function bootstrapIdOf(entry: string): string {
+	if (!entry.startsWith('/')) return entry;
+	try {
+		return multiaddr(entry).getComponents().find((c) => c.name === 'p2p')?.value ?? entry;
+	} catch {
+		// Not a valid multiaddr; let the peer-id parse decide.
+		return entry;
+	}
+}
+
 export class FretService implements IFretService, Startable {
 	private mode: FretMode = 'passive';
 	private readonly store = new DigitreeStore();
@@ -314,13 +342,52 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * The authoritative source is `node.peerStore`, but its `get` is async while every
 	 * caller of `hasAddresses` is a synchronous `.filter()` predicate. So the answer is
-	 * cached here: rebuilt wholesale from the `peerStore.all()` walk `seedFromPeerStore`
-	 * already performs each stabilization tick (bounded by peerStore size, and self-pruning
-	 * because it is a replacement rather than a merge), and refreshed per-peer on identify and
-	 * on an accepted address hint (`ingestAddressHints`), so a freshly-learned address is usable
-	 * before the next tick. Not `readonly`: the rebuild swaps the whole set.
+	 * cached here and maintained by events: per peer on `peer:update` (whose record carries the
+	 * post-change addresses), on `peer:identify`, and on an accepted address hint
+	 * (`ingestAddressHints`) or imported record. It is rebuilt wholesale from `peerStore.all()`
+	 * twice over — by the start walk, and by the {@link PEERSTORE_BACKSTOP_INTERVAL_MS} backstop for
+	 * the changes libp2p makes without an event — bounded by peerStore size, and self-pruning
+	 * because a rebuild is a replacement rather than a merge. Every write goes through
+	 * {@link setAddressKnown}, which is what lets a rebuild defer to an event that landed while it
+	 * was reading (see {@link readPeerStore}). Not `readonly`: the rebuild swaps the whole set.
 	 */
 	private addressKnown = new Set<string>();
+	/**
+	 * One set per peerStore walk awaiting `peerStore.all()`, collecting the ids
+	 * {@link setAddressKnown} wrote meanwhile — see {@link readPeerStore}. Per walk rather than one
+	 * shared field, so a host-driven `seedFromPeerStore` overlapping a backstop walk cannot have
+	 * one walk close the other's window; each walk removes its own set in a `finally`, so a walk
+	 * cut short by `stop()` or a throw leaves nothing open.
+	 */
+	private readonly addressWritesDuringWalks = new Set<Set<string>>();
+	/**
+	 * When the last peerStore walk began (start walk or backstop); the backstop is due once
+	 * {@link PEERSTORE_BACKSTOP_INTERVAL_MS} has passed since. 0 = never, so a pass driven before any
+	 * walk runs the backstop at once.
+	 */
+	private lastPeerStoreWalkAt = 0;
+	/**
+	 * Re-read the whole peerStore at most this often, and only to reconcile {@link addressKnown}.
+	 *
+	 * Everything else the peerStore tells us arrives as a `peer:update`: libp2p fires one for every
+	 * `save` / `patch` / `merge` / `consumePeerRecord` that changed the record, and none when
+	 * nothing changed. Three changes are silent — `peerStore.delete` (libp2p never calls it; only a
+	 * host does), **address aging** (an address whose `observed` stamp is older than `maxAddressAge`,
+	 * 1 h by default, is dropped *on read*), and **peer expiry** (a record not updated for
+	 * `maxPeerAge`, 6 h, is deleted on read) — and each leaves a peer reading dialable when it is
+	 * not. 5 min adds at most ~8% to libp2p's own hour-scale aging clock, at 1/200 of the cost of the
+	 * per-tick walk this replaced at the passive 1.5 s cadence; the cost of the window is one dial
+	 * that fails `NoValidAddressesError`, a failed contact like any other.
+	 *
+	 * NOTE: a backstop for libp2p's silent changes, not for missed events. If libp2p ever emits an
+	 * event for deletion and aging, the backstop can go.
+	 */
+	private static readonly PEERSTORE_BACKSTOP_INTERVAL_MS = 300_000;
+	/**
+	 * The configured bootstrap peers, parsed once at construction — the config is static for the
+	 * life of the service — and seeded once per `start()` by {@link seedFromBootstraps}.
+	 */
+	private readonly bootstrapPeers: PeerId[];
 	/**
 	 * Maintenance redials in flight, by peer id — see {@link redial}. One entry is one dial and one
 	 * verdict, whoever asked for it: a later tick, a warm-up pass and the dead arm all receive the
@@ -553,6 +620,7 @@ export class FretService implements IFretService, Startable {
 			throw new Error(`FretService: privateKey derives ${peerIdFromPrivateKey(cfg.privateKey).toString()}, not this node's ${node.peerId.toString()}`);
 		}
 		this.privateKey = cfg?.privateKey;
+		this.bootstrapPeers = parseBootstrapPeers(this.cfg.bootstraps.slice(0, 8));
 		// Create network-specific protocols
 		this.protocols = makeProtocols(this.cfg.networkName);
 		this.bucketNeighbors = new TokenBucket(
@@ -709,8 +777,9 @@ export class FretService implements IFretService, Startable {
 	 * spends probes on. That is why the helper takes no coordinate: with the entry required to
 	 * exist, `entry.coord` *is* the value every caller used to compute, so "create this peer at
 	 * coordinate X while scoring it" is not expressible rather than merely guarded. Creation
-	 * belongs to {@link noteDiscovered} and to the explicit `upsert` sites (`peer:connect`,
-	 * `peer:identify`, `noteInboundRpc`, the seed paths).
+	 * belongs to {@link noteDiscovered} (which the peerStore listeners, the start walk and the
+	 * bootstrap seed reach through) and to the explicit `upsert` sites (`peer:connect`,
+	 * `noteInboundRpc`, `importTable`).
 	 *
 	 * The early return sits before `await this.selfCoord()`, so a call about an unknown peer costs
 	 * one map lookup and no await.
@@ -1076,7 +1145,7 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * Foreign is never permanent: a later successful namespaced RPC (in either direction) or a
 	 * re-identify promotes back to member. We tag and retain rather than evict — an evicted
-	 * foreign peer is just re-added by the next peer:connect / peerStore seed and re-probed in
+	 * foreign peer is just re-added by its next peer:connect / peer:update and re-probed in
 	 * a loop.
 	 *
 	 * NOTE: accepted tradeoff — lifting this guard (plus `classifyByProtocols` and
@@ -1163,23 +1232,51 @@ export class FretService implements IFretService, Startable {
 	 * non-empty but contains none of them; left unknown if empty (identify pending).
 	 * The demotion arm is deliberately weak — see `applyMembershipSignal`.
 	 *
-	 * NOTE: `seedFromPeerStore` calls this every tick, and the positive arm resets the
-	 * negotiate-failure run (identify listing one of our protocols is strong evidence). That is
-	 * correct while the list can go stale-*negative*, which is what `identifyPush` delivers when a
-	 * peer unhandles our protocols. A deployment that configures `identify` **without**
-	 * `identifyPush` never gets that update, so a peer that stops serving this network has its
-	 * negotiate run reset on every tick and can never demote to `foreign` — it stays a cohort
-	 * member and routing candidate that can only fail. Liveness is unaffected (a peer whose node
-	 * goes away still reaches `dead`). If FRET ever ships a recommended libp2p config, require
-	 * `identifyPush`; if that is not possible, this arm needs a freshness bound on the list rather
-	 * than trusting it unconditionally. `test/failure-recovery.spec.ts` documents the same fact
-	 * from the test side — its service-only-outage block needs identify nodes for this reason.
+	 * NOTE: the positive arm resets the negotiate-failure run (identify listing one of our protocols
+	 * is strong evidence), so a stale-positive list re-applied often enough would keep a peer that
+	 * stopped serving this network from ever demoting to `foreign`. That used to happen: the
+	 * peerStore walk ran on every tick and re-applied each peer's list each time, so on a deployment
+	 * without `identifyPush` (which is what delivers the shortened list when a peer unhandles our
+	 * protocols) the run was reset every 1.5 s and could never complete. The list is now applied once
+	 * at `start()` (the start walk) and thereafter only on a real peerStore change — libp2p's `merge`
+	 * of an unchanged protocol list fires no `peer:update` — so the run can accumulate. The
+	 * address backstop deliberately does not classify, which is what keeps it that way; if a
+	 * periodic re-classification is ever added, it reopens this. `test/failure-recovery.spec.ts`'s
+	 * service-only-outage block still runs on identify nodes, the realistic rig.
 	 */
 	private classifyByProtocols(id: string, protocols: string[] | undefined): void {
 		if (!protocols || protocols.length === 0) return; // identify not complete → stay unknown
 		const mine = Object.values(this.protocols);
 		const signal = protocols.some((p) => mine.includes(p)) ? 'identify-member' : 'identify-foreign';
 		this.applyMembershipSignal(id, signal);
+	}
+
+	/**
+	 * Admit a peer libp2p's peerStore told us about, then classify it off `protocols` — the shared
+	 * step of the `peer:update` / `peer:identify` listeners and the start walk.
+	 *
+	 * A missing entry is created through {@link noteDiscovered}, at the hearsay baseline: a peerStore
+	 * record is a peer libp2p was told about, not one we contacted (a real connection is scored
+	 * separately, by `peer:connect`). An entry we already hold is left completely alone — not
+	 * re-upserted, which would refresh `lastAccess` and so distort recency and re-sort the unknown
+	 * peers' probe rotation (see `noteDiscovered`).
+	 *
+	 * The hash is paid only on a miss, and a held entry's coordinate is reused as-is. Sound because
+	 * the coordinate is `SHA-256(peer id)` and nothing rotates it. It does remove an *incidental*
+	 * repair path: a wrong coordinate for a peer the peerStore also knew, which only `importTable`
+	 * can introduce (it trusts the snapshot's coord), used to be overwritten by a re-hash. That
+	 * defense belongs at the import boundary — see `tickets/backlog/4-debt-import-table-coordinate-verification`.
+	 * NOTE: revisit if VRF/epoch ring-coordinate rotation is ever implemented (open question
+	 * in `docs/fret.md`) — a coordinate could then go stale and this reuse would be wrong.
+	 *
+	 * For a held entry no await is taken before classifying, so a caller sees the classification
+	 * applied by the time this call returns its promise — which `test/membership-identify.spec.ts`'s
+	 * synchronous stale-update assertion relies on.
+	 */
+	private async notePeerStorePeer(pid: PeerId, protocols: string[] | undefined): Promise<void> {
+		const id = pid.toString();
+		if (!this.store.getById(id)) await this.noteDiscovered(id, await hashPeerId(pid));
+		this.classifyByProtocols(id, protocols);
 	}
 
 	async start(): Promise<void> {
@@ -1207,8 +1304,14 @@ export class FretService implements IFretService, Startable {
 		if (!this.privateKey) {
 			log('no privateKey configured: this node advertises no address record for itself, so peers that learn of it only through FRET cannot dial it; forwarding and ingestion of other peers\' records are unaffected');
 		}
+		// Before the start walk: with no per-tick walk any more, a `peer:update` that fired while
+		// `start()` was awaiting would be lost for good. The walk and an event for the same peer may
+		// now interleave, which is safe — creation re-checks the store synchronously, classification
+		// and record adoption carry their own ordering rules, and the address set lets the event win.
+		this.attachPeerStoreListeners();
 		await this.seedFromPeerStore();
-		// The seed no longer enforces for itself (the caller owns the one enforcement per insert
+		await this.seedFromBootstraps();
+		// Neither seed enforces for itself (the caller owns the one enforcement per insert
 		// sequence), so do it here explicitly rather than leaving it to the first stabilization
 		// tick — that would couple a capacity bound to timer arming.
 		await this.enforceCapacity();
@@ -1259,34 +1362,44 @@ export class FretService implements IFretService, Startable {
 				}
 			} catch (err) { log.error('peer:disconnect handler failed - %e', err) }
 		});
-		// identify-driven membership: once libp2p learns a peer's negotiated protocols
-		// it can classify without an outbound probe. peer:update also delivers
-		// re-admission — a peer that later starts serving this network re-identifies
-		// and is re-evaluated foreign → member. (No-op on transports without identify,
-		// e.g. the in-memory test nodes; those rely on the probe pass.)
+	}
+
+	/**
+	 * The peerStore's events — after the start walk, the only way the peerStore reaches the routing
+	 * table. libp2p fires `peer:update` for every change to a stored record (a first-time merge
+	 * included) and never for a no-op, so entry creation, classification and record adoption all
+	 * ride it; only the address set has silent changes, which the backstop covers (see
+	 * {@link PEERSTORE_BACKSTOP_INTERVAL_MS}).
+	 *
+	 * identify-driven membership: once libp2p learns a peer's negotiated protocols it can classify
+	 * without an outbound probe, and `peer:update` delivers re-admission — a peer that later starts
+	 * serving this network re-identifies and is re-evaluated foreign → member. (Classification is a
+	 * no-op on transports without identify, e.g. the in-memory test nodes; those rely on the probe
+	 * pass.)
+	 *
+	 * An entry created here lands between passes and is trimmed by the next pass's
+	 * `enforceCapacity`, never from a listener: two enforcements running concurrently over-evict.
+	 */
+	private attachPeerStoreListeners(): void {
 		this.addNodeListener('peer:identify', async (evt: CustomEvent<IdentifyResult>) => {
 			try {
 				if (this.stopped) return;
 				const pid = evt.detail.peerId;
-				const id = pid.toString();
-				// Ensure an entry exists to label, but don't reset an existing one.
-				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid));
-				this.classifyByProtocols(id, evt.detail.protocols);
-				// identify is where a peer's addresses usually arrive; pick them up now rather
-				// than at the next stabilization tick, so the peer is dialable immediately.
-				await this.refreshAddressKnown(id);
+				await this.notePeerStorePeer(pid, evt.detail.protocols);
+				// identify is where a peer's addresses usually arrive; pick them up now so the peer
+				// is dialable immediately.
+				await this.refreshAddressKnown(pid.toString());
 			} catch (err) { log.error('peer:identify handler failed - %e', err) }
 		});
 		this.addNodeListener('peer:update', async (evt: CustomEvent<PeerUpdate>) => {
 			try {
 				if (this.stopped) return;
 				const peer = evt.detail.peer;
-				const pid = peer.id;
-				const id = pid.toString();
-				if (!this.store.getById(id)) this.store.upsert(id, await hashPeerId(pid));
-				this.classifyByProtocols(id, peer.protocols);
-				// The event carries the updated Peer record, so its addresses are authoritative
-				// here — no peerStore round-trip needed.
+				const id = peer.id.toString();
+				await this.notePeerStorePeer(peer.id, peer.protocols);
+				// The event carries the post-change record with addresses already age-filtered, so
+				// its count is authoritative — an explicit address drop arrives here too, and no
+				// peerStore round-trip is needed.
 				this.setAddressKnown(id, peer.addresses.length > 0);
 				// identify stores a verified signed record for every directly-connected peer;
 				// mirror it onto the entry so we can forward it. Our own `consumePeerRecord` fires
@@ -1659,15 +1772,20 @@ export class FretService implements IFretService, Startable {
 		return this.hasAddresses(id) || this.isConnected(id);
 	}
 
-	/** Record whether libp2p holds an address for `id`, keeping {@link addressKnown} in sync. */
+	/**
+	 * Record whether libp2p holds an address for `id`, keeping {@link addressKnown} in sync — the
+	 * only per-peer write to that set, so every open peerStore walk sees it (see
+	 * {@link readPeerStore}).
+	 */
 	private setAddressKnown(id: string, known: boolean): void {
 		if (known) this.addressKnown.add(id);
 		else this.addressKnown.delete(id);
+		for (const touched of this.addressWritesDuringWalks) touched.add(id);
 	}
 
 	/**
 	 * Refresh one peer's address-known state from the peerStore, so an address learned via
-	 * identify is usable immediately rather than at the next stabilization tick.
+	 * identify is usable immediately.
 	 *
 	 * "Not in the peerStore" is the ordinary negative answer, not a fault; any *other* failure
 	 * is logged rather than swallowed.
@@ -1677,7 +1795,7 @@ export class FretService implements IFretService, Startable {
 			const peer = await this.node.peerStore.get(peerIdFromString(id));
 			this.setAddressKnown(id, (peer.addresses?.length ?? 0) > 0);
 		} catch (err) {
-			if ((err as { name?: string })?.name === 'NotFoundError') { this.addressKnown.delete(id); return; }
+			if ((err as { name?: string })?.name === 'NotFoundError') { this.setAddressKnown(id, false); return; }
 			log.error('refreshAddressKnown failed for %s - %e', id, err);
 		}
 	}
@@ -2082,12 +2200,14 @@ export class FretService implements IFretService, Startable {
 	 * of failed contacts — rather than removing it.
 	 *
 	 * Removal did not stick. libp2p keeps the departed peer's peerStore record, negotiated
-	 * protocols included, so the next tick's `seedFromPeerStore` (or a `peer:update`) re-created
-	 * the entry and labelled it `member` again — a live ring member until three probes failed, and
-	 * forever if it had no address to probe. `dead` survives that re-seed because `upsert`
-	 * preserves `state` and classification touches only `membership`, and it already carries every
-	 * other consequence a departure needs: out of every ring view, unprotected at eviction, skipped
-	 * by the maintenance fan-outs, and restored by any proof of life if the peer comes back.
+	 * protocols included, so the per-tick peerStore walk that used to run re-created the entry and
+	 * labelled it `member` again — a live ring member until three probes failed, and forever if it
+	 * had no address to probe. That walk is gone, but any later change to the peer's peerStore
+	 * record (tags, protocols, a fresh address) still delivers a `peer:update` for it, and `dead`
+	 * survives that: the listener leaves an existing entry alone and classification touches only
+	 * `membership`. It also already carries every other consequence a departure needs: out of every
+	 * ring view, unprotected at eviction, skipped by the maintenance fan-outs, and restored by any
+	 * proof of life if the peer comes back.
 	 *
 	 * The contact-failure run is left alone: nothing reads it while the peer is dead, and proof of
 	 * life clears it together with the label.
@@ -2347,73 +2467,96 @@ export class FretService implements IFretService, Startable {
 	}
 
 	// Seeding and stabilization
+
+	/**
+	 * The start walk: populate the routing table from everything libp2p's peerStore already holds.
+	 * Runs once per `start()` — after the peerStore listeners attach, which own every later change
+	 * — and is also the "populate from the peerStore" step specs drive directly.
+	 *
+	 * Per peer: admit and classify ({@link notePeerStorePeer}), and adopt the signed record identify
+	 * stored for a peer identified before `start()` — it delivered that record with no `peer:update`
+	 * for us to see; only for an entry holding nothing, since later records arrive as `peer:update`.
+	 * Then self is upserted and labelled `member`, once per run: nothing rotates self's coordinate,
+	 * `importTable` never writes it, and eviction protects it.
+	 *
+	 * No `enforceCapacity` here: the caller does the one enforcement for the whole insert sequence
+	 * (`start()`, after this and the bootstrap seed) — the same rule `fetchAndMergeSnapshot` follows.
+	 */
 	private async seedFromPeerStore(): Promise<void> {
 		try {
-			// NOTE: runs at start() and on every stabilization tick, re-enumerating the whole
-			// peerStore (upsert preserves existing stats, so it is correct, just not free). The
-			// per-peer SHA-256 is now paid only on a store miss — see the coord reuse below. Fine
-			// at current capacity (C=2048); if the peerStore grows large or the tick cadence
-			// tightens, gate the re-seed itself on a peerStore change/epoch.
-			// NOTE: FretPeerDiscovery now feeds this loop — every member it emits becomes an
-			// (address-less) peerStore entry, so the peerStore is no longer bounded by peers
-			// libp2p learned on its own. It is still bounded by C=2048 via the FRET store the
-			// emissions come from, which is why the sizing above still holds.
-			const peers = await this.node.peerStore.all();
-			// Rebuilt wholesale rather than merged, so a peer whose addresses the peerStore
-			// dropped stops reading as dialable (see `addressKnown`).
-			const addressKnown = new Set<string>();
+			const peers = await this.readPeerStore();
 			for (const p of peers) {
 				try {
-					const pidStr = p.id.toString();
-					if (p.addresses.length > 0) addressKnown.add(pidStr);
-					// NOTE: reuse the stored ring coordinate and hash only on a miss. Sound because
-					// the coordinate is `SHA-256(peer id)` and nothing rotates it, so a stored one
-					// cannot legitimately go stale — re-deriving it produces the same 32 bytes every
-					// tick. This removes an *incidental* repair path: the unconditional re-hash used
-					// to silently overwrite a wrong coordinate for any peer the libp2p peerStore also
-					// knew, which only `importTable` can introduce (it trusts the snapshot's coord).
-					// That defense belongs at the import boundary — see
-					// `tickets/backlog/plan/2-routing-table-export-integrity` item 3, now the only
-					// coordinate check for imported entries. Revisit if VRF/epoch ring-coordinate
-					// rotation is ever implemented (open question in `docs/fret.md`): a coordinate
-					// could then go stale and this reuse would be wrong.
-					const held = this.store.getById(pidStr);
-					const coord = held?.coord ?? (await hashPeerId(p.id));
-					this.store.upsert(pidStr, coord);
-					// If identify has populated the peerStore, classify off its protocol
-					// list now rather than waiting for an outbound probe. No `unknown`-only
-					// guard here any more — that rule is now general (see
-					// `applyMembershipSignal`: an identify list lacking our protocol demotes
-					// only from `unknown`, wherever the list came from).
-					this.classifyByProtocols(pidStr, p.protocols);
-					// A peer identified before `start()` delivered its signed record to the
-					// peerStore with no `peer:update` for us to see; adopt it here, once. Only
-					// for an entry holding nothing — later records arrive as `peer:update`.
-					if (p.peerRecordEnvelope && !held?.addressRecord) this.adoptPeerRecord(pidStr, p.peerRecordEnvelope);
+					const id = p.id.toString();
+					await this.notePeerStorePeer(p.id, p.protocols);
+					if (p.peerRecordEnvelope && !this.store.getById(id)?.addressRecord) this.adoptPeerRecord(id, p.peerRecordEnvelope);
 				} catch (err) {
 					log.error('failed to add peer from peerStore %s - %e', p?.id?.toString?.(), err);
 				}
 			}
-			// NOTE: wholesale replacement clobbers any `setAddressKnown` an identify handler ran
-			// while this walk was awaiting its per-peer hashes, so an address learned inside that
-			// window is missed until the next tick (~1.5s passive). Harmless today — a connected
-			// peer is dialable via `isConnected` regardless — but if the window ever matters,
-			// apply the walk's result as a diff instead of a swap.
-			this.addressKnown = addressKnown;
-			try {
-				const coord = await this.selfCoord();
-				const selfStr = this.selfIdStr;
-				this.store.upsert(selfStr, coord);
-				// Self always serves its own network.
-				this.store.setMembership(selfStr, 'member');
-			} catch (err) {
-				log.error('failed to add self to store - %e', err);
-			}
-			// No `enforceCapacity` here: the caller does the one enforcement for the whole insert
-			// sequence (see `stabilizeOnce` phase 1, and `start()` for the direct call before the
-			// loop is armed) — the same rule `fetchAndMergeSnapshot` follows.
+			await this.seedSelf();
 		} catch (err) {
 			log.error('seedFromPeerStore failed - %e', err);
+		}
+	}
+
+	/** Upsert self at its own coordinate, labelled `member` — self always serves its own network. */
+	private async seedSelf(): Promise<void> {
+		try {
+			this.store.upsert(this.selfIdStr, await this.selfCoord());
+			this.store.setMembership(this.selfIdStr, 'member');
+		} catch (err) {
+			log.error('failed to add self to store - %e', err);
+		}
+	}
+
+	/**
+	 * The backstop walk: re-read the peerStore and reconcile {@link addressKnown} against it, and
+	 * nothing else — see {@link PEERSTORE_BACKSTOP_INTERVAL_MS} for the silent libp2p changes it
+	 * exists for. No entry creation, classification or record adoption: those only change through
+	 * `patch` / `merge` / `consumePeerRecord`, which always fire `peer:update`. Not re-creating
+	 * entries is also what makes capacity eviction stick — an evicted peer comes back only on fresh
+	 * evidence (its next `peer:update`, a connect, an inbound RPC, a snapshot naming it).
+	 */
+	private async reconcileAddressesFromPeerStore(): Promise<void> {
+		try {
+			await this.readPeerStore();
+		} catch (err) {
+			log.error('peerStore backstop walk failed - %e', err);
+		}
+	}
+
+	/**
+	 * Read every peerStore record and rebuild {@link addressKnown} from it — the step both walks
+	 * share. Rebuilt wholesale rather than merged, so a peer whose addresses the peerStore dropped
+	 * stops reading as dialable, and the set prunes itself.
+	 *
+	 * **An event wins over the walk.** An id {@link setAddressKnown} wrote while `peerStore.all()`
+	 * was pending keeps its *current* membership in the set rather than the walk's answer: the event
+	 * is at least as new as the snapshot. Everything after that await is synchronous, so the await is
+	 * the only window, and the swap happens before the caller's per-peer work begins.
+	 *
+	 * NOTE: `peerStore.all()` decodes every record. `FretPeerDiscovery` emissions add (address-less)
+	 * peerStore entries for the members it emits, so the peerStore is no longer bounded by the peers
+	 * libp2p learned on its own — but still by C=2048 through the FRET store those emissions come
+	 * from, and this now runs once per start and once per backstop interval rather than every tick.
+	 */
+	private async readPeerStore(): Promise<Peer[]> {
+		this.lastPeerStoreWalkAt = Date.now();
+		const touched = new Set<string>();
+		this.addressWritesDuringWalks.add(touched);
+		try {
+			const peers = await this.node.peerStore.all();
+			const rebuilt = new Set<string>();
+			for (const p of peers) if (p.addresses.length > 0) rebuilt.add(p.id.toString());
+			for (const id of touched) {
+				if (this.addressKnown.has(id)) rebuilt.add(id);
+				else rebuilt.delete(id);
+			}
+			this.addressKnown = rebuilt;
+			return peers;
+		} finally {
+			this.addressWritesDuringWalks.delete(touched);
 		}
 	}
 
@@ -2424,9 +2567,7 @@ export class FretService implements IFretService, Startable {
 		const tick = async () => {
 			if (this.stopped || gen !== this.runGen) return;
 			try {
-				await this.seedFromPeerStore();
-				await this.seedFromBootstraps();
-				await this.stabilizeOnce();
+				await this.runStabilizationPass();
 				// Proactive announce after first stabilization (table populated)
 				if (!this.firstStabilizeDone) {
 					this.firstStabilizeDone = true;
@@ -2447,34 +2588,42 @@ export class FretService implements IFretService, Startable {
 		this.detach(tick(), 'stabilization loop');
 	}
 
+	/**
+	 * One pass of the stabilization loop: the peerStore address backstop when it is due, then the
+	 * tick. Riding the pass is what gives the backstop the loop's lifecycle (run generation,
+	 * `stop()`) with no timer of its own; under idle backoff it is at most one backed-off interval
+	 * late, which is nothing against libp2p's hour-scale aging clock.
+	 */
+	private async runStabilizationPass(): Promise<void> {
+		if (Date.now() - this.lastPeerStoreWalkAt >= FretService.PEERSTORE_BACKSTOP_INTERVAL_MS) {
+			await this.reconcileAddressesFromPeerStore();
+		}
+		await this.stabilizeOnce();
+	}
+
+	/**
+	 * Seed the configured bootstrap peers, once per `start()`. A configured *name*, not a peer we
+	 * contacted — so each takes the same hearsay baseline as any other id we were told about
+	 * (`noteDiscovered`), and is pinged moments later by the warm-up and classification passes,
+	 * scoring properly then.
+	 *
+	 * Deliberately not re-run per pass. A bootstrap leaves the table only by capacity eviction, which
+	 * happens only when enough better-scored peers are present — exactly when it is not needed — so
+	 * re-adding it every pass would just have the next enforcement evict it again; one libp2p is
+	 * connected to is re-admitted by `peer:connect` anyway.
+	 *
+	 * No `enforceCapacity` here either — same rule as `seedFromPeerStore`: `start()` enforces once
+	 * for the whole insert sequence.
+	 */
 	private async seedFromBootstraps(): Promise<void> {
-		if (!this.cfg.bootstraps || this.cfg.bootstraps.length === 0) return;
-		for (const bootstrapEntry of this.cfg.bootstraps.slice(0, 8)) {
+		for (const pid of this.bootstrapPeers) {
 			try {
-				let id = bootstrapEntry;
-				// If it's a multiaddr, extract the peer ID using proper parsing
-				if (bootstrapEntry.startsWith('/')) {
-					try {
-						const ma = multiaddr(bootstrapEntry);
-						const p2p = ma.getComponents().find((c) => c.name === 'p2p');
-						if (p2p?.value) id = p2p.value;
-					} catch {
-						// Not a valid multiaddr, assume it's already a peer ID
-					}
-				}
-				const pid = peerIdFromString(id);
-				const coord = await hashPeerId(pid);
-				// A configured *name*, not a peer we contacted — so it takes the same hearsay
-				// baseline as any other id we were told about. It is pinged moments later by the
-				// warm-up and classification passes, and scores properly then.
-				await this.noteDiscovered(id, coord);
+				const id = pid.toString();
+				if (!this.store.getById(id)) await this.noteDiscovered(id, await hashPeerId(pid));
 			} catch (err) {
-				log.error('seedFromBootstraps failed for %s - %e', bootstrapEntry, err);
+				log.error('seedFromBootstraps failed for %s - %e', pid.toString(), err);
 			}
 		}
-		// No `enforceCapacity` here either — same rule as `seedFromPeerStore` above: the caller
-		// enforces once for the whole insert sequence. This is only ever called from the
-		// stabilization tick, which does so at the end of phase 1.
 	}
 
 	/**
@@ -2537,18 +2686,19 @@ export class FretService implements IFretService, Startable {
 			} finally {
 				phaseOne.cancel();
 			}
-			// The tick's one capacity enforcement. It sits after phase 1's seeds and snapshot
-			// merges, so it sees every insert the tick made — which is why `seedFromPeerStore` and
-			// `seedFromBootstraps` no longer trim for themselves.
-			// NOTE: accepted cost — the table may sit over capacity for the span of phase 1
-			// (bounded by STABILIZE_TICK_BUDGET_MS, 5 s) instead of being trimmed after each seed.
-			// Capacity is a soft eviction target, not an allocation bound, and the transient
-			// overshoot is whatever one tick's seeding added, not unbounded growth. Revisit if a
-			// deployment ever needs the table to be a hard memory bound.
+			// The tick's one capacity enforcement. It sits after phase 1's snapshot merges, so it
+			// sees every insert the tick made — and every insert the peerStore listeners made since
+			// the last pass, which deliberately never enforce for themselves (two concurrent
+			// enforcements over-evict). `start()` enforces for its own walk and bootstrap seed.
+			// NOTE: accepted cost — the table may sit over capacity between passes and for the span
+			// of phase 1 (bounded by STABILIZE_TICK_BUDGET_MS, 5 s) instead of being trimmed per
+			// insert. Capacity is a soft eviction target, not an allocation bound, and the transient
+			// overshoot is whatever one interval's merges and first-time peerStore records added, not
+			// unbounded growth. Revisit if a deployment ever needs the table to be a hard memory bound.
 			// Must stay *above* the `budget.signal.aborted` early return below, so a truncated
 			// tick still enforces.
-			// NOTE: a throw *earlier* in the tick skips this, and the seeds no longer trim for
-			// themselves, so that tick's inserts stay untrimmed until the next one. The reachable
+			// NOTE: a throw *earlier* in the tick skips this, and no insert site trims for itself,
+			// so the inserts since the last pass stay untrimmed until the next one. The reachable
 			// candidates are the three calls above the try (`sweepBoundedMaps`, `nearProbeTargets`,
 			// `strikeUncontactable`), all local and none able to throw on any input a tick can
 			// present; the loop's own try/catch swallows anything that does, and the overshoot
@@ -2923,8 +3073,9 @@ export class FretService implements IFretService, Startable {
 	 * - **`dead`** — a peer marked dead by a run of failed contacts is out of every ring view, so
 	 *   `stabilizeOnce` (which draws its probe targets from `getNeighbors`) never touches it
 	 *   again. Without this arm a peer that recovers but never dials us and never forms a
-	 *   connection stays dead until it is evicted at capacity — `upsert` preserves `state`, so
-	 *   even a peerStore re-seed does not resurrect it — which is a black hole on a small ring.
+	 *   connection stays dead until it is evicted at capacity — a `peer:update` for it does not
+	 *   resurrect it either, since the listener leaves an existing entry's `state` alone — which is
+	 *   a black hole on a small ring.
 	 *   A successful ping runs `applySuccess`, which both confirms membership and resurrects.
 	 *
 	 * **Separate budgets, not one merged candidate list**, so a large foreign population cannot
@@ -3165,7 +3316,8 @@ export class FretService implements IFretService, Startable {
 	 *    already holds an equal-or-newer record (steps 2–3 ruled out the other cause) → nothing
 	 *    to do.
 	 * 5. Accepted → record it on the entry with our clock as `confirmedAt`, and mark the address
-	 *    known now rather than at the next tick, so the dialability predicates see it.
+	 *    known now rather than waiting on the `peer:update` the consume fires, so the
+	 *    dialability predicates see it before this method returns.
 	 *
 	 * Two merges ingesting the same id concurrently both reach step 4; libp2p's own sequence check
 	 * and identical bytes make the second a no-op, so no lock is needed.
@@ -4026,9 +4178,9 @@ export class FretService implements IFretService, Startable {
 		// self's entry authoritative are supplied by the snapshot: `membership` (absent in a
 		// pre-membership snapshot, and `unknown` in one taken by another peer, which would drop
 		// self out of every member-only ring view) and `coord` (a wrong one moves self off its
-		// own ring position, so capacity enforcement no longer protects it). Both would heal on
-		// the next stabilization tick's peer-store re-seed, but dropping self's record is one
-		// rule instead of two repairs — and the local entry is better information regardless.
+		// own ring position, so capacity enforcement no longer protects it). Nothing would repair
+		// either before the next `start()` — the peerStore walk that used to re-seed self every
+		// tick is gone — and the local entry is better information regardless.
 		// The count therefore reports ids actually stored, self excluded.
 		const selfStr = this.selfIdStr;
 		// Vetted over the whole table before the store sees any of it, so a corrupt address record

@@ -46,8 +46,8 @@ function unsupportedProtocolError(): Error {
 
 describe('dead state: contact-failure counter on the store', () => {
 	// The counter is what turns a single unreachable moment into mere evidence, so — like
-	// `negotiateFailures` — it has to survive the network-agnostic re-seeds that run every
-	// stabilization tick, or the run could never reach the threshold.
+	// `negotiateFailures` — it has to survive the network-agnostic re-upserts (`peer:connect`), or
+	// the run could never reach the threshold.
 	it('defaults contactFailures to 0 and preserves it across a re-upsert', () => {
 		const s = new DigitreeStore()
 		const fresh = s.upsert('id1', coordAt(1))

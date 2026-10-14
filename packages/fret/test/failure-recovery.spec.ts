@@ -51,15 +51,18 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 	const spareNodes: Libp2p[] = []
 	const spareSvcs: CoreFretService[] = []
 
-	/** The peerStore re-seed the real stabilization loop runs before every tick. */
+	/** The peerStore walk `start()` runs once — the observer is never started, so it is driven here. */
 	const seed = (): Promise<void> => (svcA as any).seedFromPeerStore()
 
 	/**
-	 * One whole stabilization tick, exactly as `startStabilizationLoop` drives it.
+	 * One whole stabilization tick, preceded by the peerStore walk.
 	 *
-	 * The re-seed is not decoration: it rebuilds the dialability set wholesale from
+	 * The walk is not decoration: it rebuilds the dialability set wholesale from
 	 * `peerStore.all()`, and a peer that is not dialable is in neither the near list nor either
-	 * re-probe arm — so a tick without it would silently test an empty target list.
+	 * re-probe arm — so a tick without it would silently test an empty target list. The live loop
+	 * no longer walks every pass (the peerStore's events and a slow backstop keep that set), but
+	 * the walk is idempotent, so repeating it per tick here is a valid stand-in for a started
+	 * observer whose listeners would have seen the same records.
 	 */
 	const tick = async (): Promise<void> => {
 		await seed()
@@ -391,15 +394,15 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 // evidence about which network the remote serves and proof that it is alive, so the run goes to
 // `membership` and `contactFailures` never moves.
 //
-// It needs TCP + `identify` + `identifyPush` nodes rather than the memory nodes above, and the
-// reason is behavior worth stating rather than a harness quirk: `seedFromPeerStore` re-classifies
-// every peer off its peerStore protocol list on *every* tick, and a list containing one of ours is
+// It runs on TCP + `identify` + `identifyPush` nodes rather than the memory nodes above, because
+// that is the realistic rig for this case: a peerStore protocol list containing one of ours is
 // strong positive evidence that resets the negotiate run (see *Evidence strength* in
-// `docs/fret.md`). On a memory node that list is filled in by the first successful negotiation and
-// can never go stale-negative, because nothing pushes an update — so the reset fires every tick and
-// the run never completes. `identifyPush` is what propagates the shortened list when the remote
-// unhandles its protocols, which is what lets the run accumulate here. See the NOTE at
-// `classifyByProtocols`.
+// `docs/fret.md`), and `identifyPush` is what propagates the shortened list when the remote
+// unhandles its protocols. The hand-driven ticks below repeat the peerStore walk each time, which
+// re-applies that list per tick — so here, as on a deployment without `identifyPush`, a stale
+// positive list would reset the run every tick. The live service no longer does that: it walks
+// the peerStore only at `start()` and otherwise re-applies a list only on a real peerStore change.
+// See the NOTE at `classifyByProtocols`.
 describe('failure recovery: a service-only outage is membership evidence, not a liveness verdict', function () {
 	this.timeout(20000)
 

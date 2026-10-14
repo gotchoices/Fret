@@ -11,11 +11,12 @@ import { FretService } from '../src/service/fret-service.js'
 import { hashPeerId, coordToBase64url, COORD_BYTES } from '../src/ring/hash.js'
 import type { NeighborSnapshotV1 } from '../src/index.js'
 
-// Three per-tick costs the background maintenance loop used to pay every tick, and the behaviour
+// Four per-tick costs the background maintenance loop used to pay every tick, and the behaviour
 // each removal must preserve:
 //
-// (a) `seedFromPeerStore` re-hashed every peerStore entry's ring coordinate per tick. It now
-//     reuses the coordinate already in the routing table and hashes only on a miss.
+// (a) `seedFromPeerStore` re-hashed every peerStore entry's ring coordinate per tick. It now runs
+//     once per `start()`, reuses the coordinate already in the routing table and hashes only on a
+//     miss.
 // (b) Five sites re-hashed this node's *own* peer id instead of reading the cached `selfCoord()`.
 //     The one that is easy to get wrong is `mergeAnnounceSnapshot`, which deals with the
 //     *announcing* peer's coordinate — its locals were renamed `sender` / `senderCoord` precisely
@@ -23,10 +24,14 @@ import type { NeighborSnapshotV1 } from '../src/index.js'
 // (c) Capacity was enforced after every seed. It is now enforced once per tick (end of
 //     `stabilizeOnce` phase 1), plus one explicit call in `start()` so the bound does not depend
 //     on a timer being armed.
+// (d) Every pass re-read and re-decoded the whole peerStore (`peerStore.all()`) and re-parsed the
+//     configured bootstraps. The peerStore's events now carry its changes, the bootstraps are
+//     seeded once per `start()`, and a pass re-reads the peerStore only when the address backstop
+//     (`PEERSTORE_BACKSTOP_INTERVAL_MS`) is due.
 //
-// A "maintenance cycle" is not `stabilizeOnce` alone: the loop tick body is
-// `seedFromPeerStore()` -> `seedFromBootstraps()` -> `stabilizeOnce()`, and only the first of
-// those seeds. `cycle()` below is that body, driven directly so no timer races the assertions.
+// A "maintenance cycle" is not `stabilizeOnce` alone: the loop's pass body is
+// `runStabilizationPass()` — the backstop when due, then `stabilizeOnce()`. `cycle()` below drives
+// it directly so no timer races the assertions.
 
 /** A real Ed25519 peer id — the senders parse ids before anything else, so stubs will not do. */
 async function newPeerId(): Promise<PeerId> {
@@ -42,11 +47,22 @@ async function seedPeerStore(node: Libp2p, pid: PeerId): Promise<void> {
 	await node.peerStore.merge(pid, { multiaddrs: [multiaddr('/ip4/127.0.0.1/tcp/1')] })
 }
 
-/** One loop tick body: seed from the peerStore, seed bootstraps, then stabilize. */
+/** One loop pass: the peerStore backstop if due, then stabilize. */
 async function cycle(svc: FretService): Promise<void> {
+	await (svc as any).runStabilizationPass()
+}
+
+/** The start walk `start()` runs once: populate the routing table from the peerStore. */
+async function startWalk(svc: FretService): Promise<void> {
 	await (svc as any).seedFromPeerStore()
-	await (svc as any).seedFromBootstraps()
-	await (svc as any).stabilizeOnce()
+}
+
+/** Count `node.peerStore.all()` calls — each one decodes every peerStore record. */
+function countPeerStoreReads(node: Libp2p): () => number {
+	let reads = 0
+	const all = node.peerStore.all.bind(node.peerStore)
+	node.peerStore.all = async (...args) => { reads++; return await all(...args) }
+	return () => reads
 }
 
 function coordOf(svc: FretService, id: string): string | undefined {
@@ -69,7 +85,7 @@ describe('per-tick hot path', function () {
 	describe('coordinate reuse in seedFromPeerStore', () => {
 		it('does not re-hash a peer already in the routing table', async () => {
 			// The property, stated without counting hash calls: whatever coordinate the routing
-			// table holds for a peer is what survives a cycle. Writing a coordinate that is
+			// table holds for a peer is what survives the walk. Writing a coordinate that is
 			// deliberately *not* SHA-256(id) is the only way to tell reuse from a re-hash, since a
 			// re-hash reproduces the same 32 bytes for every honest entry.
 			//
@@ -94,7 +110,7 @@ describe('per-tick hot path', function () {
 					.to.not.equal(coordToBase64url(truth))
 				svc.getStore().upsert(id, tampered)
 
-				await cycle(svc)
+				await startWalk(svc)
 
 				expect(coordOf(svc, id), 'a stored coordinate is reused, not re-derived')
 					.to.equal(coordToBase64url(tampered))
@@ -116,7 +132,7 @@ describe('per-tick hot path', function () {
 				await seedPeerStore(node, pid)
 				expect(svc.getStore().getById(id), 'must be a genuine miss').to.equal(undefined)
 
-				await cycle(svc)
+				await startWalk(svc)
 
 				expect(coordOf(svc, id)).to.equal(coordToBase64url(await hashPeerId(pid)))
 			} finally {
@@ -168,14 +184,18 @@ describe('per-tick hot path', function () {
 		const CAPACITY = 20
 		const SEEDED = 40
 
-		it('one maintenance cycle trims a table seeded over capacity', async () => {
-			// The seeds no longer trim for themselves; `stabilizeOnce` phase 1 owns the tick's one
-			// enforcement, and it sits after the seeds so it sees every insert the tick made.
+		it('one maintenance cycle trims a table left over capacity between passes', async () => {
+			// No insert site trims for itself — not the start walk, and not the peerStore listeners
+			// whose inserts land between passes; `stabilizeOnce` phase 1 owns the tick's one
+			// enforcement. The start walk stands in for those inserts here.
 			const node = await createMemNode()
 			await node.start()
 			const svc = new FretService(node, { profile: 'core', k: K, capacity: CAPACITY })
 			try {
 				for (let i = 0; i < SEEDED; i++) await seedPeerStore(node, await newPeerId())
+				await startWalk(svc)
+				expect(svc.getStore().size(), 'sanity: the walk left the table over capacity')
+					.to.be.greaterThan(CAPACITY)
 
 				await cycle(svc)
 
@@ -263,6 +283,45 @@ describe('per-tick hot path', function () {
 					.to.not.be.empty
 			} finally {
 				if (harness != null) await harness.teardown()
+			}
+		})
+	})
+
+	// ----- (d) the peerStore is re-read only by the backstop -----
+
+	describe('peerStore reads per pass', () => {
+		it('re-reads the peerStore only once the backstop is due, and never re-seeds bootstraps', async () => {
+			// The success measure for dropping the per-pass walk: a pass reads the peerStore only
+			// when `PEERSTORE_BACKSTOP_INTERVAL_MS` has elapsed since the last walk, and bootstraps
+			// are not a pass's business at all.
+			const node = await createMemNode()
+			await node.start()
+			const bootstrap = await newPeerId()
+			const svc = new FretService(node, { profile: 'core', k: 7, bootstraps: [bootstrap.toString()] })
+			try {
+				await seedPeerStore(node, await newPeerId())
+				const reads = countPeerStoreReads(node)
+				let bootstrapSeeds = 0
+				const realSeedBootstraps = (svc as any).seedFromBootstraps.bind(svc)
+				;(svc as any).seedFromBootstraps = async () => { bootstrapSeeds++; await realSeedBootstraps() }
+
+				await startWalk(svc)
+				expect(reads(), 'the start walk reads once').to.equal(1)
+
+				for (let i = 0; i < 3; i++) await cycle(svc)
+				expect(reads(), 'passes inside the backstop interval read nothing').to.equal(1)
+				expect(bootstrapSeeds, 'a pass never re-seeds bootstraps').to.equal(0)
+				expect(svc.getStore().getById(bootstrap.toString()), 'nor did any pass add the bootstrap')
+					.to.equal(undefined)
+
+				const interval = (FretService as any).PEERSTORE_BACKSTOP_INTERVAL_MS as number
+				;(svc as any).lastPeerStoreWalkAt -= interval
+				await cycle(svc)
+				expect(reads(), 'the backstop reads once it is due').to.equal(2)
+				await cycle(svc)
+				expect(reads(), 'and then waits out a full interval again').to.equal(2)
+			} finally {
+				await stopAll([node])
 			}
 		})
 	})

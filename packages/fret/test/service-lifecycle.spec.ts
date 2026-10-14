@@ -44,9 +44,9 @@ function listenerCount(svc: FretService): number {
 /**
  * A peer libp2p holds an address for but that nothing answers at.
  *
- * Seeded through the peerStore rather than the service's `addressKnown` set because the
- * stabilization tick rebuilds that set wholesale from the peerStore on every pass — a
- * directly-poked entry would be dropped again before `stop()` ran. Returns the ghost's id.
+ * Seeded through the peerStore rather than the service's `addressKnown` set because `start()`'s
+ * peerStore walk rebuilds that set wholesale from the peerStore — a directly-poked entry would be
+ * dropped again before `stop()` ran. Returns the ghost's id.
  */
 async function createGhost(node: Libp2p): Promise<string> {
 	const ghost = await createMemNode()
@@ -410,39 +410,35 @@ describe('FretService start/stop lifecycle', function () {
 		// why `stop()` keeps the aborted controller instead of nulling it; without this test the
 		// service can silently regress to a null and every pass would resume dialing after stop().
 		const store = svc.getStore()
-		// A well-formed, address-known member, so the resumed tick has a genuine probe target and
-		// the "nothing happened" assertions below are not vacuous.
+		// A well-formed member, so the resumed tick has a genuine probe target and the "nothing
+		// happened" assertions below are not vacuous. Made address-known once the tick is parked.
 		const targetPid = peerIdFromPrivateKey(await generateKeyPair('Ed25519'))
 		const targetId = targetPid.toString()
 		store.upsert(targetId, await hashPeerId(targetPid))
 		store.setMembership(targetId, 'member')
-		;(svc as unknown as { setAddressKnown: (id: string, known: boolean) => void }).setAddressKnown(targetId, true)
 
-		// Park `seedFromPeerStore`: it is the only awaited seam ahead of every signal capture, so
-		// parking there is what puts stop() *before* the passes rather than after them. start()
-		// awaits it once itself before arming the loop, so the second call is the tick's — that is
-		// the one to park. The stub does no seeding: the real one rebuilds `addressKnown` wholesale
-		// from the peerStore, which would drop the synthetic target above.
-		let seedCalls = 0
+		// Park the pass just ahead of the real `stabilizeOnce`: every signal capture is inside it,
+		// so parking there is what puts stop() *before* the passes rather than after them. The
+		// first pass reaches it directly — start()'s own peerStore walk has just run, so the
+		// backstop is not due. Completions of the real pass are counted, so "the tick resumed and
+		// touched nothing" is distinguishable from "the tick never resumed".
+		let ticksCompleted = 0
 		let unpark: (() => void) | undefined
+		const realStabilizeOnce = (svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce.bind(svc)
 		const parked = new Promise<void>((tickEntered) => {
-			;(svc as unknown as { seedFromPeerStore: () => Promise<void> }).seedFromPeerStore = async () => {
-				if (++seedCalls < 2) return
+			;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {
 				tickEntered()
 				await new Promise<void>((resume) => { unpark = resume })
+				await realStabilizeOnce()
+				ticksCompleted++
 			}
 		})
-		// Count completions of the real pass, so "the tick resumed and touched nothing" is
-		// distinguishable from "the tick never resumed".
-		let ticksCompleted = 0
-		const realStabilizeOnce = (svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce.bind(svc)
-		;(svc as unknown as { stabilizeOnce: () => Promise<void> }).stabilizeOnce = async () => {
-			await realStabilizeOnce()
-			ticksCompleted++
-		}
 
 		await svc.start()
 		await parked
+		// Only now: start()'s walk rebuilds `addressKnown` wholesale from the peerStore, which
+		// holds nothing for the synthetic target and would have dropped it.
+		;(svc as unknown as { setAddressKnown: (id: string, known: boolean) => void }).setAddressKnown(targetId, true)
 
 		const selfCoord = await hashPeerId(node.peerId)
 		const ring = (svc as unknown as { getNeighbors: (c: Uint8Array, s: string, n: number) => string[] }).getNeighbors(selfCoord, 'both', 8)

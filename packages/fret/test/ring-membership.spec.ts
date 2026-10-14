@@ -94,7 +94,7 @@ describe('DigitreeStore membership field', () => {
 	})
 
 	// upsert's contract is "ensure an entry exists", not "reset to defaults".
-	// All mutable stats must survive a re-upsert (simulating a per-tick re-seed).
+	// All mutable stats must survive a re-upsert (simulating a `peer:connect` re-upsert).
 	it('preserves relevance and health counters across a re-upsert', () => {
 		const s = new DigitreeStore()
 		s.upsert('id1', new Uint8Array(32))
@@ -107,7 +107,7 @@ describe('DigitreeStore membership field', () => {
 			state: 'connected',
 			membership: 'member',
 		})
-		s.upsert('id1', new Uint8Array(32)) // simulate a per-tick re-seed
+		s.upsert('id1', new Uint8Array(32)) // simulate a peer:connect re-upsert
 		const e = s.getById('id1')!
 		expect(e.relevance).to.equal(0.9)
 		expect(e.successCount).to.equal(5)
@@ -170,9 +170,9 @@ describe('DigitreeStore membership field', () => {
 	})
 
 	// The negotiate-failure counter is what turns a single failed handshake from a verdict into
-	// mere evidence, so it has to survive the network-agnostic re-seeds the same way membership
-	// does — otherwise every stabilization tick would reset the run and the threshold could
-	// never be reached.
+	// mere evidence, so it has to survive the network-agnostic re-upserts the same way membership
+	// does — otherwise every `peer:connect` would reset the run and the threshold could never be
+	// reached.
 	it('defaults negotiateFailures to 0 and preserves it across a re-upsert', () => {
 		const s = new DigitreeStore()
 		expect(s.upsert('id1', new Uint8Array(32)).negotiateFailures).to.equal(0)

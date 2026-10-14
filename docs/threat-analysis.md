@@ -72,7 +72,7 @@ The attack proceeds:
 
 - **Preconditions**: ~2m Sybil IDs near the target (where m=8), plus connectivity to the target.
 - **Impact**: Total control over target's network view. All routing, cluster membership, and activity forwarding go through the attacker. Target cannot discover honest peers.
-- **Current mitigations**: S/P entries are protected from eviction (`FretService.enforceCapacity`). Multiple bootstrap peers provide initial diversity. `seedFromPeerStore` pulls from libp2p's peer store each stabilization tick. But if the attacker controls all near positions, these mitigations are insufficient.
+- **Current mitigations**: S/P entries are protected from eviction (`FretService.enforceCapacity`). Multiple bootstrap peers provide initial diversity. The routing table picks up libp2p's peer store at `start()` (`seedFromPeerStore`) and on every `peer:update` thereafter. But if the attacker controls all near positions, these mitigations are insufficient.
 - **Missing**: Mandatory multi-path bootstrap verification. Random walk discovery. Alert on sudden S/P set changes (mentioned in design doc but not implemented).
 
 #### 2.2 Route Hijacking for Specific Keys
@@ -293,12 +293,9 @@ Every peer ID received in a snapshot must be hashed: `hashPeerId(peerIdFromStrin
 #### 4.5 Stabilization Amplification
 **Severity: Medium**
 
-`startStabilizationLoop` (`fret-service.ts:662-684`) runs every 300ms (active) or 1500ms (passive) and calls:
-1. `seedFromPeerStore` — iterates all known peers
-2. `seedFromBootstraps` — up to 8 bootstrap peers
-3. `stabilizeOnce` — pings 4 neighbors + fetches 4 snapshots
+`startStabilizationLoop` (`fret-service.ts:662-684`) runs every 300ms (active) or 1500ms (passive) and calls `stabilizeOnce` — pings 4 neighbors + fetches 4 snapshots — plus, at most every 5 minutes, a peer-store re-read that reconciles the address set. (It used to walk the whole peer store and re-seed up to 8 bootstrap peers on every pass; the peer store's events carry its changes now, and bootstraps are seeded once per `start()`.)
 
-An attacker who manipulates the peer store (via snapshot injection) to contain many entries makes `seedFromPeerStore` expensive. The stabilization loop has **no jitter**, making all nodes synchronized and creating thundering-herd patterns.
+An attacker who manipulates the peer store (via snapshot injection) to contain many entries makes the start-time walk and each backstop re-read more expensive, and each first-time peer-store record costs one `peer:update` (one hash on a routing-table miss). The stabilization loop has **no jitter**, making all nodes synchronized and creating thundering-herd patterns.
 
 - **Preconditions**: Ability to inflate the target's peer store.
 - **Impact**: Periodic CPU/network spikes. Thundering-herd effects in dense networks.

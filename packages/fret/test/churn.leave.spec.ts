@@ -396,8 +396,8 @@ describe('Leave amplification cap', function () {
 			await rig.receiver.peerStore.merge(target.peerId, { multiaddrs: target.getMultiaddrs() })
 			nodes.push(target)
 		}
-		// Populate `addressKnown` first: the seed walk re-upserts every peerStore peer at its
-		// *hashed* coordinate, which would undo the placement below if it ran after.
+		// Populate `addressKnown` first: the seed walk creates each peerStore peer at its *hashed*
+		// coordinate, and the placement below then moves it.
 		await (rig.svc as any).seedFromPeerStore()
 		const store = rig.svc.getStore()
 		return nodes.map((target, i) => {
