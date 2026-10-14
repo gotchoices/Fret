@@ -180,3 +180,5 @@ Phase 4: Documentation
 ### Additional arm: address-hint ingestion (from `address-hints-live-exchange`)
 
 Neighbour snapshots now carry signed address records (`NeighborSnapshotV1.hints`). A record newer than the one held costs the receiver one signature verify plus a peerStore write. Today that is bounded only by the global announce bucket and by the snapshot's named set (Core ≤ 41 ids per message); a sender with throwaway keys can mint fresh records for its own throwaway ids on every message. When per-peer buckets land, meter hint verification per sender too: at most one snapshot's worth of new records per sender per window, with an exception for a fresher record by the sender about itself (an honest address change). Site: `FretService.ingestAddressHints`.
+
+**Arm added by `stabilize-skip-redundant-near-exchange` (plan stage):** the inbound ping handler now builds a full snapshot (to fingerprint it) on every request it answers, instead of only the size estimate. It is still metered by the global ping bucket, but per-sender metering of ping is worth correspondingly more once this ticket lands.

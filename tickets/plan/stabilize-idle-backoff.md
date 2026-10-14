@@ -41,3 +41,10 @@ The reporter offered to re-measure on the same two phones. Target: on an idle tw
 ## Interaction with `peerstore-reseed-on-change` (added by that ticket's plan stage)
 
 That ticket removes the per-pass `peerStore.all()` walk. Peers, protocol lists and records now arrive through the `peer:update` / `peer:identify` listeners, and a time-driven backstop walk (`PEERSTORE_BACKSTOP_INTERVAL_MS`, 5 min, run from the pass when due) reconciles only the has-addresses set against libp2p's silent changes (address aging, `delete`, peer expiry). With idle backoff the backstop runs at most one backed-off interval late, which is fine against libp2p's 1 h address-age clock. A backstop pass that changes the has-addresses set should count as "something new". The listener reset triggers listed above are unaffected.
+
+## Interaction with `stabilize-skip-redundant-near-exchange` (added by that ticket's plan stage)
+
+That ticket lets a pass skip a near neighbour's ping when proof of life arrived during or after the previous pass, and skip its snapshot fetch when the neighbour's snapshot fingerprint is unchanged. Both windows are counted in **passes** (a monotonic pass sequence number), not milliseconds, so under backoff they scale with the delay automatically. Consequences for this ticket:
+- **Silent-loss detection gains one interval.** After a peer's last answered ping, the next pass may skip it, then three probing passes strike it dead — four backed-off intervals in the worst case, not three. Use that figure in the worst-case detection time this ticket must state.
+- **Content re-check cadence is per pass.** A neighbour's fingerprint must be re-confirmed at least every fourth pass (`NEAR_PROBE_MAX_SKIPS` = 3), so at a 60 s cap a changed neighbour list is noticed within ~4 minutes unless an announce delivers it first. Decide whether a pass that fetched because a fingerprint changed counts as "something new" (it merged content; the conservative answer is yes when the merge discovered an id, which is already on the list above).
+- A pass in which every near probe was skipped and nothing was fetched is, by itself, "nothing new".
