@@ -19,7 +19,7 @@ import { hashPeerId } from '../src/ring/hash.js'
 //   - gracefully, hosted as a libp2p service: its leave notices went out from `stop()`, after
 //     libp2p had already closed every connection, so none arrived. They now go out from
 //     `beforeStop()`; and the notice that does arrive marks it `dead` rather than removing it,
-//     which the next tick's peerStore re-seed used to undo.
+//     which the per-tick peerStore re-seed used to undo (and a later `peer:update` still could).
 //
 // Mutation-checked when written: reverting any one of the three fixes reddens exactly the case
 // that names it.
@@ -58,7 +58,11 @@ describe('address-less peer departure', function () {
 		return { b, svcB }
 	}
 
-	/** One whole stabilization tick as the loop drives it: the peerStore re-seed, then the tick. */
+	/**
+	 * A peerStore walk, then a stabilization tick — the shape the loop's pass had while it re-seeded
+	 * from the peerStore every tick. Kept as the stronger test: the walk is a superset of what a
+	 * `peer:update` can do to an existing entry.
+	 */
 	async function tick(svc: CoreFretService): Promise<void> {
 		await (svc as any).seedFromPeerStore()
 		await (svc as any).stabilizeOnce()

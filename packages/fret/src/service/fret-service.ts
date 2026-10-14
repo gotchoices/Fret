@@ -1241,7 +1241,10 @@ export class FretService implements IFretService, Startable {
 	 * at `start()` (the start walk) and thereafter only on a real peerStore change — libp2p's `merge`
 	 * of an unchanged protocol list fires no `peer:update` — so the run can accumulate. The
 	 * address backstop deliberately does not classify, which is what keeps it that way; if a
-	 * periodic re-classification is ever added, it reopens this. `test/failure-recovery.spec.ts`'s
+	 * periodic re-classification is ever added, it reopens this. Any `peer:update` re-applies the
+	 * record's list, not only a protocol change — so a record some other service churns often (tags,
+	 * addresses) re-applies a stale-positive list just as often; if that is ever seen, classify only
+	 * when the event's `previous` protocol list differs. `test/failure-recovery.spec.ts`'s
 	 * service-only-outage block still runs on identify nodes, the realistic rig.
 	 */
 	private classifyByProtocols(id: string, protocols: string[] | undefined): void {

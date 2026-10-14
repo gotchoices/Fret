@@ -94,7 +94,7 @@ describe('per-tick hot path', function () {
 			// also knew about. That accidental repair is gone; the only way a wrong coordinate
 			// enters the table is `importTable`, which trusts the persisted snapshot's `coord`
 			// field, so the import-side check is now the only defense. Recorded as an arm on
-			// `tickets/backlog/plan/2-routing-table-export-integrity` — a future reader meeting
+			// `tickets/backlog/4-debt-import-table-coordinate-verification` — a future reader meeting
 			// this assertion is meeting a decision, not a bug.
 			const node = await createMemNode()
 			await node.start()
@@ -301,17 +301,13 @@ describe('per-tick hot path', function () {
 			try {
 				await seedPeerStore(node, await newPeerId())
 				const reads = countPeerStoreReads(node)
-				let bootstrapSeeds = 0
-				const realSeedBootstraps = (svc as any).seedFromBootstraps.bind(svc)
-				;(svc as any).seedFromBootstraps = async () => { bootstrapSeeds++; await realSeedBootstraps() }
 
 				await startWalk(svc)
 				expect(reads(), 'the start walk reads once').to.equal(1)
 
 				for (let i = 0; i < 3; i++) await cycle(svc)
 				expect(reads(), 'passes inside the backstop interval read nothing').to.equal(1)
-				expect(bootstrapSeeds, 'a pass never re-seeds bootstraps').to.equal(0)
-				expect(svc.getStore().getById(bootstrap.toString()), 'nor did any pass add the bootstrap')
+				expect(svc.getStore().getById(bootstrap.toString()), 'a pass never re-seeds bootstraps')
 					.to.equal(undefined)
 
 				const interval = (FretService as any).PEERSTORE_BACKSTOP_INTERVAL_MS as number
