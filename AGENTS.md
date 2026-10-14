@@ -6,7 +6,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 ├── packages/fret/                 # Only package — workspace name: "p2p-fret"
 │   ├── register.mjs              # ESM loader hook for running TS directly
 │   ├── src/
-│   │   ├── service/fret-service.ts  # Main service (~4100 lines)
+│   │   ├── service/fret-service.ts  # Main service (~4650 lines)
 │   │   ├── service/libp2p-fret-service.ts
 │   │   ├── service/address-records.ts  # Signed peer records: peek, self-seal, forwarding window, persisted-table age + vetting
 │   │   ├── service/near-exchange.ts   # Per-neighbour pass memory + snapshot digest: skips redundant near pings/fetches
@@ -110,7 +110,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 
 - **Read this file first** — layout + quickstart above answer most structural questions. Don't explore to find what already documented here.
 - Spawning sub-agents: pass them relevant file paths from tree above, not let them `find`/`ls`/`Glob` to discovery.
-- `fret-service.ts` large (~4100 lines). Read targeted line ranges, not full file repeatedly. Key
+- `fret-service.ts` large (~4650 lines). Read targeted line ranges, not full file repeatedly. Key
   regions (approximate — grep the named symbol rather than trusting the number):
   - Config defaults + constructor: `constructor(` ~365
   - Lifecycle (`start` / `stop` / `setMode`): ~780–950

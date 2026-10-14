@@ -595,8 +595,8 @@ export class FretService implements IFretService, Startable {
 		 * `delayMs` is the passive delay the loop armed after it — the base while things change,
 		 * doubling toward `maxPassiveIntervalMs` while they do not — and `quietPasses` how many
 		 * consecutive passes found nothing to act on. A host reads these to see the loop idling, or
-		 * to see why it is not. Written after every pass, hand-driven or not; back to the base on
-		 * `stop()`. In active mode the loop ignores `delayMs` and runs at 300 ms regardless.
+		 * to see why it is not. Written after every passive pass, hand-driven or not; back to the
+		 * base on `stop()`. Active-mode passes run at 300 ms and leave the ladder (and these) alone.
 		 */
 		loop: { delayMs: FretService.PASSIVE_INTERVAL_MS, quietPasses: 0 },
 		maybeActForwarded: 0,
@@ -2340,14 +2340,16 @@ export class FretService implements IFretService, Startable {
 		if (!this.bucketLeave.tryTake()) { this.diag.rejected.rateLimited.leave++; return; }
 		if (!validateTimestamp(notice.timestamp)) { this.diag.rejected.timestampBounds++; return; }
 		const peerId = notice.from;
-		// Always: the sender is marked dead below, and its replacements land as `unknown`.
-		this.noteChange(`leave from ${peerId}`);
 		try {
 			let coord: Uint8Array | null = null;
 			const entry = this.store.getById(peerId);
 			if (entry) {
 				coord = entry.coord;
 				this.markDeparted(peerId);
+				// The change is a held peer leaving every ring view. A notice from a peer we hold no
+				// entry for creates nothing, and any replacement it names counts for itself through
+				// `noteDiscovered` — so an unheld stranger's notice alone does not wake the loop.
+				this.noteChange(`leave from ${peerId}`);
 			} else {
 				try {
 					coord = await hashPeerId(peerIdFromString(peerId));
@@ -2784,12 +2786,14 @@ export class FretService implements IFretService, Startable {
 				// Armed from the *live* delay rather than the pass's return value: a change landing
 				// in the microtask gap between the pass's `endPass` and this line has already reset
 				// the delay but found no timer to shorten (`wakeLoop` reads "no timer" as "a pass is
-				// in flight"), so reading here is what keeps it from waiting out a long timer. The
-				// closure itself re-checks the generation, so a stop() during the pass arms nothing.
-				this.armLoop?.(this.loopDelayMs());
+				// in flight"), so reading here is what keeps it from waiting out a long timer.
+				// Through *this run's* closure, not `this.armLoop`: after a stop() → start() during
+				// the pass that field is the next run's closure, which would accept — and a pass
+				// armed by a run that is over could then overlap the new run's own pass.
+				arm(this.loopDelayMs());
 			}
 		};
-		this.armLoop = (delayMs: number): void => {
+		const arm = (delayMs: number): void => {
 			if (this.stopped || gen !== this.runGen) return;
 			if (this.stabilizeTimer != null) clearTimeout(this.stabilizeTimer);
 			this.stabilizeTimerDelayMs = delayMs;
@@ -2801,6 +2805,7 @@ export class FretService implements IFretService, Startable {
 				this.detach(tick(), 'stabilization loop');
 			}, delayMs);
 		};
+		this.armLoop = arm;
 		this.detach(tick(), 'stabilization loop');
 	}
 
@@ -2849,13 +2854,25 @@ export class FretService implements IFretService, Startable {
 	 * Returns the delay the backoff settled on, so a hand-driven pass exercises the policy exactly
 	 * as a loop pass does (a hand-driven `stabilizeOnce` bypasses it). `diag.loop` is written here,
 	 * not in the loop, for the same reason.
+	 *
+	 * The ladder is driven by passive passes only. An active-mode pass runs at the active interval
+	 * whatever the ladder says, so letting it count would climb a delay nobody arms, make
+	 * `diag.loop` read a number the loop ignores, and — through {@link IdleBackoff.backedOff} — turn
+	 * off the near-exchange probe skip on 300 ms passes. `setMode` is a change in both directions,
+	 * so the ladder re-enters passive mode at the base.
 	 */
 	private async runStabilizationPass(): Promise<number> {
-		this.idle.beginPass();
+		const gen = this.runGen;
+		const passive = this.mode !== 'active';
+		if (passive) this.idle.beginPass();
 		if (Date.now() - this.lastPeerStoreWalkAt >= FretService.PEERSTORE_BACKSTOP_INTERVAL_MS) {
 			await this.reconcileAddressesFromPeerStore();
 		}
 		await this.stabilizeOnce();
+		// A pass that outlived its run (a `stop()` landed mid-pass, and perhaps a `start()` after it)
+		// reports nothing: `start()` reset the ladder for the new run, and this pass's verdict would
+		// overwrite that with a delay doubled from a run that is over.
+		if (!passive || gen !== this.runGen) return this.loopDelayMs();
 		// A redial the pass outlived (a slow relayed dial) settles later, and when it does, the
 		// outcome is a change only if it moves something: a connection fires `peer:connect`, a
 		// failure books a strike through `applyContactStrike` (a change while the run progresses),
@@ -3195,7 +3212,7 @@ export class FretService implements IFretService, Startable {
 	 * pass — one at the base interval, where a neighbour heard from moments ago is not worth
 	 * pinging again — while the backoff spares whole passes. A pass the backoff has already
 	 * delayed is the rare event and verifies everything it came for, so the skip is consulted only
-	 * while the loop's quiet count is zero. Otherwise the skip cap, measured in passes, stretches
+	 * while the loop is at the base interval. Otherwise the skip cap, measured in passes, stretches
 	 * with the ladder: a node whose neighbour keeps pinging it (fresh heard stamp) and whose cached
 	 * digest came from that neighbour's announce skipped three passes that were 1.5 + 3 + 6 + 12 =
 	 * 22.5 s of ladder rather than 4.5 s, and a fresh ring took that long to exchange its first
@@ -3211,8 +3228,10 @@ export class FretService implements IFretService, Startable {
 	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
 		// Connected is rule 1 and is checked here, not in `NearExchange`: a peer with no connection
 		// takes the redial path below whatever we heard, since the redial is what reconnects it.
-		// `quietPasses === 0` is the no-stacking rule above: a backed-off pass skips nothing.
-		if (this.isConnected(id) && this.idle.quietPasses === 0 && this.nearExchange.canSkipProbe(id)) {
+		// `!backedOff` is the no-stacking rule above: a backed-off pass skips nothing. It keys on the
+		// delay, not the quiet count — under the off switch (cap at the base) and in active mode the
+		// loop runs at a short interval whatever the ladder counted, and every pass is a frequent one.
+		if (this.isConnected(id) && !this.idle.backedOff && this.nearExchange.canSkipProbe(id)) {
 			this.diag.nearExchangeSkipped.probes++;
 			// The probe not sent is a check no event will make, so the pass is pending: the ladder
 			// starts only from a pass that verified its neighbours (the skip cap forces one within

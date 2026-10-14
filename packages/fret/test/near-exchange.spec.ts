@@ -201,6 +201,38 @@ describe('idle two-node strand: the reproduction', function () {
 		await cycle(b.svc)
 		expect(dB.loop.delayMs, "B's next pass arms the base").to.equal(BASE)
 	})
+
+	/**
+	 * Drive both sides through the loop's pass body (the ladder included) and require the
+	 * near-exchange probe skip to still fire: the no-stacking rule spares the skip only on a pass
+	 * the backoff *delayed*, and in both configurations below every pass is a base-interval pass.
+	 */
+	async function expectSkipsUnderTheLadder(cfg: Partial<FretConfig>, prepare: (svc: CoreFretService) => void): Promise<void> {
+		const a = await member(cfg)
+		const b = await member(cfg)
+		prepare(a.svc); prepare(b.svc)
+		await a.node.dial(b.node.getMultiaddrs()[0]!)
+		await admit(a.svc, b.node)
+		await admit(b.svc, a.node)
+		const dA = a.svc.getDiagnostics()
+		const cycle = (svc: CoreFretService): Promise<number> => (svc as any).runStabilizationPass()
+		await cycle(a.svc); await cycle(b.svc) // warm-up: first passes probe and fetch
+		const before = { pings: dA.pingsSent, skipped: dA.nearExchangeSkipped.probes }
+		for (let i = 0; i < 6; i++) { await cycle(a.svc); await cycle(b.svc) }
+		expect(dA.loop.delayMs, 'premise: the loop never left the base').to.equal((CoreFretService as any).PASSIVE_INTERVAL_MS)
+		expect(dA.nearExchangeSkipped.probes, 'A still skipped probes with the ladder running').to.be.greaterThan(before.skipped)
+		expect(dA.pingsSent - before.pings, 'A pinged at most every other pass').to.be.at.most(3)
+	}
+
+	it('keeps the probe skip when the host disabled backoff (cap at the base)', async () => {
+		await expectSkipsUnderTheLadder({ maxPassiveIntervalMs: (CoreFretService as any).PASSIVE_INTERVAL_MS }, () => {})
+	})
+
+	it('keeps the probe skip in active mode, where the loop runs at 300 ms whatever the ladder says', async () => {
+		// The mode field directly: `setMode` would also start the active preconnect loop, which is
+		// not under test here and would outlive these never-started services.
+		await expectSkipsUnderTheLadder({}, (svc) => { (svc as any).mode = 'active' })
+	})
 })
 
 describe('strike accounting across a skipped pass', function () {

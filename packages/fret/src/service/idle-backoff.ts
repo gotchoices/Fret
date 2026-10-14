@@ -5,7 +5,7 @@
  *
  * The ladder: the delay starts at `baseMs` and doubles after every **quiet** pass up to `capMs`,
  * so at the shipped numbers (1.5 s base, 60 s cap) it runs 1.5 → 3 → 6 → 12 → 24 → 48 → 60 s and
- * the seventh quiet pass reaches the cap about 95 s after the last change. It snaps back to the
+ * the sixth quiet pass reaches the cap about 95 s after the last change. It snaps back to the
  * base the moment a **change** is noted — anything the next pass could act on (a connection
  * forming or dropping, a new entry, a label or liveness transition, an address becoming known) —
  * and holds at the base, without counting as a change, while a pass left work **pending**
@@ -45,6 +45,15 @@ export class IdleBackoff {
 	/** Consecutive passes that found nothing; 0 after any change. Diagnostics only. */
 	get quietPasses(): number {
 		return this.quiet;
+	}
+
+	/**
+	 * Whether the pass now opening was delayed by the ladder — the delay is above the base. This,
+	 * not {@link quietPasses}, is what a per-pass economy should key on: under the off switch the
+	 * quiet count climbs while the delay never leaves the base, and every pass is still a frequent one.
+	 */
+	get backedOff(): boolean {
+		return this.delay > this.baseMs;
 	}
 
 	/**
