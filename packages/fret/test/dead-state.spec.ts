@@ -294,6 +294,25 @@ describe('dead state: liveness seam', () => {
 		expect(store.getById(id)?.state).to.equal('disconnected')
 	})
 
+	// An announce reaches no `onInbound` seam — only the neighbors *request* handler fires that —
+	// so the merge itself carries the proof. It used to apply the membership signal alone, leaving
+	// a `dead` announcer dead; now it takes the same seam as the other handlers, and caches the
+	// announce's digest so the next pass need not refetch what it just merged.
+	it('resurrects a dead peer on an inbound announce, and caches the announce digest', async () => {
+		const id = peerIdFromPrivateKey(await generateKeyPair('Ed25519')).toString()
+		seedPeer(id)
+		store.update(id, { state: 'dead', contactFailures: 3 })
+		const digest = 'd'.repeat(22)
+
+		await (svc as any).mergeAnnounceSnapshot(id, {
+			v: 1, from: id, timestamp: Date.now(), successors: [], predecessors: [], sample: [], sig: '', digest,
+		})
+
+		expect(store.getById(id)?.contactFailures).to.equal(0)
+		expect(store.getById(id)?.state).to.equal('disconnected')
+		expect((svc as any).nearExchange.digestOf(id), 'digest cached after the merge').to.equal(digest)
+	})
+
 	// The counter reset is the load-bearing half at the connect site: `setState('connected')`
 	// alone would resurrect a peer whose counter is still clamped, so the next failure re-kills it.
 	it('clears the run on proof of life even when the peer was not dead', async () => {

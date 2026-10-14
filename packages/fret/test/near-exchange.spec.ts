@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from 'mocha'
+import { afterEach, beforeEach, describe, it } from 'mocha'
 import { expect } from 'chai'
 import type { Libp2p } from 'libp2p'
 import { createMemNode, stopAll } from './helpers/libp2p.js'
@@ -154,7 +154,14 @@ describe('strike accounting across a skipped pass', function () {
 
 	let harness: MaintenanceRig | undefined
 
+	// The silent ticks below each end on the ping's own deadline — `timeout`, the strike arm,
+	// whatever its length — so the shipped 2 s is shrunk the way `fetch-snapshot-failure-arms.spec.ts`
+	// shrinks the snapshot timeout, saving ~6 s. Only the RPC timeout: shrinking the *tick* budget
+	// instead would turn the same hang into `cancelled`, which records nothing.
+	const REAL_RPC_TIMEOUT = (CoreFretService as any).MAINTENANCE_RPC_TIMEOUT_MS as number
+	beforeEach(() => { (CoreFretService as any).MAINTENANCE_RPC_TIMEOUT_MS = 100 })
 	afterEach(async () => {
+		;(CoreFretService as any).MAINTENANCE_RPC_TIMEOUT_MS = REAL_RPC_TIMEOUT
 		if (harness != null) await harness.teardown()
 		harness = undefined
 	})
@@ -182,7 +189,7 @@ describe('strike accounting across a skipped pass', function () {
 		expect(entry().contactFailures, 'no strike').to.equal(0)
 		expect(entry().failureCount, 'no decay').to.equal(0)
 
-		// Its traffic stops: every open now settles only on the ping's own 2 s deadline (`timeout`).
+		// Its traffic stops: every open now settles only on the ping's own deadline (`timeout`).
 		rig.behavior.set(id, 'hangs')
 		for (let i = 0; i < 3; i++) {
 			unspace()

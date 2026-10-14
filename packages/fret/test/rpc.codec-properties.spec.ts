@@ -26,7 +26,7 @@ import { DigitreeStore, type SerializedPeerEntry, type SerializedTable } from '.
 import type { TokenBucket } from '../src/utils/token-bucket.js'
 import type { LeaveNoticeV1 } from '../src/rpc/leave.js'
 import type { PingResponseV1 } from '../src/rpc/ping.js'
-import { MAX_SNAPSHOT_DIGEST_CHARS, SNAPSHOT_DIGEST_CHARS } from '../src/service/near-exchange.js'
+import { SNAPSHOT_DIGEST_CHARS } from '../src/service/near-exchange.js'
 import {
 	MAX_ACTIVITY_BYTES,
 	MAYBE_ACT_OVERHEAD_BYTES,
@@ -36,6 +36,7 @@ import {
 	MAX_SNAPSHOT_HINT_BYTES_CORE,
 	MAX_SNAPSHOT_HINT_BYTES_EDGE,
 	MAX_ADDRESS_RECORD_CHARS,
+	MAX_SNAPSHOT_DIGEST_CHARS,
 	MAX_BREADCRUMBS,
 	MAX_CORRELATION_ID_CHARS,
 	MAX_DIGEST_CHARS,

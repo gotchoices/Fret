@@ -1,7 +1,6 @@
 import { peerIdFromString } from '@libp2p/peer-id';
 import { fromString as u8FromString } from 'uint8arrays/from-string';
 import { base64urlToCoord } from '../ring/hash.js';
-import { MAX_SNAPSHOT_DIGEST_CHARS } from '../service/near-exchange.js';
 import { createLogger } from '../logger.js';
 import type { NearAnchorV1, NeighborSnapshotV1, RouteAndMaybeActV1 } from '../index.js';
 // Type-only, so the `leave.ts` ⇄ `validate.ts` pair is a compile-time cycle and not a runtime one:
@@ -152,6 +151,13 @@ export const MAX_SNAPSHOT_METADATA_BYTES_EDGE = 4 * 1024;
  * `SelfAddressRecord` omits its own record rather than emit one the receiver would drop.
  */
 export const MAX_ADDRESS_RECORD_CHARS = 2048;
+/**
+ * Longest snapshot digest a parser keeps (`NeighborSnapshotV1.digest`,
+ * `PingResponseV1.snapshot_digest`). Wider than the 22 characters `snapshotDigest`
+ * (`service/near-exchange.ts`) emits so a longer digest can be introduced later without a parser
+ * change; a receiver compares digests for equality only, so the width never matters to it.
+ */
+export const MAX_SNAPSHOT_DIGEST_CHARS = 64;
 /**
  * Emission budget for the whole `hints` array of a Core snapshot — the sum over hints of
  * `JSON.stringify(hint).length + 1` (the `+ 1` is the separating comma), which is what

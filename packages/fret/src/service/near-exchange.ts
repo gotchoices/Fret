@@ -30,7 +30,7 @@ import type { NeighborSnapshotV1 } from '../index.js';
  */
 export class NearExchange {
 	private seq = 0;
-	private readonly peers = new Map<string, { heardSeq: number; digest?: string; digestSeq: number }>();
+	private readonly peers = new Map<string, NearPeerMemory>();
 
 	/** The current pass number; 0 before the first pass. */
 	get passSeq(): number {
@@ -87,7 +87,7 @@ export class NearExchange {
 		this.peers.clear();
 	}
 
-	private entry(id: string): { heardSeq: number; digest?: string; digestSeq: number } {
+	private entry(id: string): NearPeerMemory {
 		let e = this.peers.get(id);
 		if (e === undefined) {
 			e = { heardSeq: -1, digestSeq: -1 };
@@ -97,6 +97,13 @@ export class NearExchange {
 	}
 }
 
+/** What {@link NearExchange} remembers per peer; `-1` means "never". */
+interface NearPeerMemory {
+	heardSeq: number;
+	digest?: string;
+	digestSeq: number;
+}
+
 /**
  * Most consecutive passes a near neighbour's probe may be skipped before it is pinged again
  * regardless of recent traffic — the bound rule 3 of {@link NearExchange.canSkipProbe} enforces.
@@ -104,15 +111,12 @@ export class NearExchange {
  */
 export const NEAR_PROBE_MAX_SKIPS = 3;
 
-/** Characters in a digest {@link snapshotDigest} emits: 16 bytes of SHA-256, base64url, unpadded. */
-export const SNAPSHOT_DIGEST_CHARS = 22;
-
 /**
- * Longest digest a parser keeps (`NeighborSnapshotV1.digest`, `PingResponseV1.snapshot_digest`).
- * Wider than {@link SNAPSHOT_DIGEST_CHARS} so a longer digest can be introduced later without a
- * parser change; a receiver compares digests for equality only, so the width never matters to it.
+ * Characters in a digest {@link snapshotDigest} emits: 16 bytes of SHA-256, base64url, unpadded.
+ * The *acceptance* width is the parsers' `MAX_SNAPSHOT_DIGEST_CHARS` (`rpc/validate.ts`), wider
+ * on purpose so a longer digest can be introduced here without a parser change.
  */
-export const MAX_SNAPSHOT_DIGEST_CHARS = 64;
+export const SNAPSHOT_DIGEST_CHARS = 22;
 
 /** The snapshot fields a digest covers — exactly the ones a receiver acts on. */
 export type SnapshotDigestInput = Pick<NeighborSnapshotV1, 'successors' | 'predecessors' | 'sample' | 'metadata' | 'hints'>;
@@ -144,6 +148,9 @@ export async function snapshotDigest(content: SnapshotDigestInput): Promise<stri
 	const hints = (content.hints ?? [])
 		.map((h): [string, string] => [h.id, h.record])
 		.sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+	// NOTE: `metadata` is hashed in `JSON.stringify` key order — stable for one sender reusing one
+	// object, but a `setMetadata` with the same keys reordered changes the digest and costs the
+	// neighbours one extra fetch. Sort keys here if that ever shows up.
 	const canonical = JSON.stringify([
 		content.successors,
 		content.predecessors,
