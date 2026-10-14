@@ -37,3 +37,7 @@ In **passive mode**, after a pass that observed nothing new, the delay to the ne
 ## Measuring success
 
 The reporter offered to re-measure on the same two phones. Target: on an idle two-member strand, passes fall from ~20/min to ~1–2/min after a few minutes of stability, and the loop returns to 1.5 s within one pass of a `peer:connect` or `peer:disconnect`.
+
+## Interaction with `peerstore-reseed-on-change` (added by that ticket's plan stage)
+
+That ticket removes the per-pass `peerStore.all()` walk. Peers, protocol lists and records now arrive through the `peer:update` / `peer:identify` listeners, and a time-driven backstop walk (`PEERSTORE_BACKSTOP_INTERVAL_MS`, 5 min, run from the pass when due) reconciles only the has-addresses set against libp2p's silent changes (address aging, `delete`, peer expiry). With idle backoff the backstop runs at most one backed-off interval late, which is fine against libp2p's 1 h address-age clock. A backstop pass that changes the has-addresses set should count as "something new". The listener reset triggers listed above are unaffected.
