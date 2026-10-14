@@ -19,8 +19,9 @@ import type { NeighborSnapshotV1 } from '../src/index.js'
 // the three things a seam-level test cannot see:
 //
 //   1. the whole stabilization tick — `stabilizeOnce` → `nearProbeTargets` → pooled `probeAndFetch`
-//      → `probeNeighborLatency` → `noteRpcFailure` — so a regression in *target selection* fails
-//      here rather than passing every hand-written probe loop;
+//      → `redial` (B is not connected once it is down, so the near pass has to open a connection
+//      before it can ping; the dial failing is the failed contact) → `applyContactFailure` — so a
+//      regression in *target selection* fails here rather than passing every hand-written probe loop;
 //   2. the handoff between passes across ticks: while a peer is alive the near pass verifies it
 //      every tick with no backoff; once it is `dead` it leaves the near list entirely and only the
 //      backed-off dead arm of `reprobeExcludedTargets` will touch it again;
@@ -167,13 +168,18 @@ describe('failure recovery: a real peer goes down, dies, and comes back', functi
 		expect(await near(), 'B is a near-probe target before the failing tick').to.include(bId)
 
 		await stopRemote()
-		const failsBefore = svcA.getDiagnostics().pingsFail
+		const redialsFailedBefore = svcA.getDiagnostics().redials.failed
+		const pingsFailBefore = svcA.getDiagnostics().pingsFail
 		await tick()
 
 		const after = entry()!
 		expect(after.relevance, 'relevance decayed').to.be.lessThan(before.relevance)
 		expect(after.failureCount, 'one relevance decay').to.equal(1)
-		expect(svcA.getDiagnostics().pingsFail, 'one failed ping counted').to.equal(failsBefore + 1)
+		// B's connection closed with its node, so the near pass redials it; the memory transport
+		// refuses at once and that refusal is the failed contact. No ping was sent — a ping never
+		// dials — so the failure is visible as a redial, not as a ping.
+		expect(svcA.getDiagnostics().redials.failed, 'one failed redial counted').to.equal(redialsFailedBefore + 1)
+		expect(svcA.getDiagnostics().pingsFail, 'no ping failed, because none dialed').to.equal(pingsFailBefore)
 		expect(after.contactFailures, 'one strike').to.equal(1)
 		expect(after.state, 'one failed contact is not a verdict').to.not.equal('dead')
 		// The assertion that pins the shipped staging: backoff belongs to the off-ring probe passes

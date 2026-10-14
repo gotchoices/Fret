@@ -83,3 +83,31 @@ export function abortReasonError(signal: AbortSignal): Error {
 	err.name = 'AbortError';
 	return err;
 }
+
+/** The value {@link awaitUnlessAborted} resolves to when the signal fired before the promise settled. */
+export const ABORTED: unique symbol = Symbol('aborted');
+
+/**
+ * Wait for `promise`, but stop waiting — **without cancelling the promise** — the moment `signal`
+ * aborts. Resolves to the promise's value, or to {@link ABORTED} if the signal fired first.
+ *
+ * The caller keeps a budget the awaited work deliberately does not share: a stabilization tick
+ * waits on a redial only for the rest of its own phase, while the redial runs on under its own
+ * dial budget and is reclaimed by the next tick. `promise` must never reject — once the signal has
+ * fired nothing is listening to it any more, so a later rejection would surface as an unhandled
+ * rejection with no caller to attribute it to.
+ *
+ * No `signal` means wait unconditionally (the never-started service in tests has no run signal).
+ */
+export function awaitUnlessAborted<T>(promise: Promise<T>, signal?: AbortSignal): Promise<T | typeof ABORTED> {
+	if (signal === undefined) return promise;
+	if (signal.aborted) return Promise.resolve(ABORTED);
+	return new Promise<T | typeof ABORTED>((resolve) => {
+		const onAbort = (): void => resolve(ABORTED);
+		signal.addEventListener('abort', onAbort, { once: true });
+		promise.then(
+			(value) => { signal.removeEventListener('abort', onAbort); resolve(value); },
+			() => { signal.removeEventListener('abort', onAbort); resolve(ABORTED); }
+		);
+	});
+}

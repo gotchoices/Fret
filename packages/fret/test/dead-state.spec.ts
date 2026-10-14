@@ -688,11 +688,14 @@ describe('dead state: recovery through the re-probe pass', () => {
 	})
 })
 
-// The tests above drive the seam helpers directly, which leaves the wiring at the outbound-RPC
-// call sites unasserted — a call site that forgot to route its catch through `noteRpcFailure`
-// would pass every one of them. These drive a real `sendPing` instead, so the transition is
-// observed end to end through `probeNeighborLatency`.
-describe('dead state: through a real outbound RPC call site', () => {
+// The tests above drive the seam helpers directly, which leaves the wiring at the outbound call
+// sites unasserted — a call site that forgot to route its failure into the contact-failure seam
+// would pass every one of them. These drive the near pass's real task (`probeAndFetch`) instead,
+// so the transition is observed end to end: for a peer with no connection that task first asks
+// the redial seam to open one, and a dial that fails on its merits is the failed contact. The
+// ping itself no longer dials (`dial: 'never'`), so a strike against a non-connected peer can only
+// come from the redial — which is what the first case pins.
+describe('dead state: through a real outbound call site', () => {
 	let node: Libp2p
 	let svc: CoreFretService
 	let store: DigitreeStore
@@ -712,20 +715,25 @@ describe('dead state: through a real outbound RPC call site', () => {
 		await stopAll([node, ...spares.splice(0)])
 	})
 
-	/** A well-formed peer id this node holds no address for — every dial to it fails outright. */
+	/**
+	 * A well-formed peer id this node holds no peerStore address for, marked address-known in
+	 * FRET's own set so the near pass selects it and the redial seam issues the dial — which libp2p
+	 * then fails outright (`NoValidAddressesError`). Every dial to it fails.
+	 */
 	async function unreachablePeer(): Promise<string> {
 		const ghost = await createMemNode()
 		const id = ghost.peerId.toString()
 		await stopAll([ghost])
 		store.upsert(id, await hashPeerId(ghost.peerId))
 		store.setMembership(id, 'member')
+		;(svc as any).setAddressKnown(id, true)
 		return id
 	}
 
-	it('marks an unreachable neighbor dead after a run of failed pings', async () => {
+	it('marks an unreachable neighbor dead after a run of failed redials', async () => {
 		const id = await unreachablePeer()
 		for (let i = 0; i < 3; i++) {
-			await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
+			await (svc as any).probeAndFetch(id, (svc as any).runSignal)
 			store.update(id, { lastContactFailureAt: 0 }) // stand in for the spacing interval
 		}
 
@@ -733,6 +741,29 @@ describe('dead state: through a real outbound RPC call site', () => {
 		expect(store.getById(id)?.state).to.equal('dead')
 		// A dial that never reached the remote says nothing about which network it serves.
 		expect(store.getById(id)?.membership).to.equal('member')
+		expect(svc.getDiagnostics().redials.failed, 'three failed redials, no pings').to.equal(3)
+		expect(svc.getDiagnostics().pingsSent, 'a ping never dials, so none was sent').to.equal(0)
+	})
+
+	it('a ping alone cannot strike a peer with no connection: skipped, never dialed', async () => {
+		const id = await unreachablePeer()
+		let dials = 0
+		const originalDial = node.dial.bind(node)
+		const originalDialProtocol = node.dialProtocol.bind(node)
+		;(node as any).dial = (...args: unknown[]) => { dials++; return (originalDial as any)(...args) }
+		;(node as any).dialProtocol = (...args: unknown[]) => { dials++; return (originalDialProtocol as any)(...args) }
+		try {
+			const answered = await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
+
+			expect(answered).to.equal(false)
+			expect(dials, 'no dial: opening the connection is the redial seam\'s job').to.equal(0)
+			expect(store.getById(id)?.contactFailures, 'no strike').to.equal(0)
+			expect(store.getById(id)?.failureCount, 'no relevance decay').to.equal(0)
+			expect(svc.getDiagnostics().pingsSent + svc.getDiagnostics().pingsFail, 'no ping counted either way').to.equal(0)
+		} finally {
+			;(node as any).dial = originalDial
+			;(node as any).dialProtocol = originalDialProtocol
+		}
 	})
 
 	it('resurrects a dead peer once a ping to it succeeds again', async () => {
@@ -957,15 +988,28 @@ describe('cancellation is not evidence about a peer', () => {
 		expect(backoffOf(svc).factor(id), `${label}: no backoff recorded`).to.equal(0)
 	}
 
-	/** Count `dialProtocol` calls — the direct form of "no dial was issued". */
+	/**
+	 * Count dials — the direct form of "no dial was issued". Both of the node's dial entry points
+	 * are wrapped: `dialProtocol` is what a dialing RPC uses, `dial` is what the maintenance redial
+	 * seam uses, and libp2p's `dialProtocol` does not route through `dial`, so neither is counted
+	 * twice.
+	 */
 	function countDials(): { get: () => number; restore: () => void } {
 		let dials = 0
-		const original = node.dialProtocol.bind(node)
+		const originalProtocol = node.dialProtocol.bind(node)
+		const originalDial = node.dial.bind(node)
 		;(node as any).dialProtocol = (...args: unknown[]) => {
 			dials++
-			return (original as any)(...args)
+			return (originalProtocol as any)(...args)
 		}
-		return { get: () => dials, restore: () => { (node as any).dialProtocol = original } }
+		;(node as any).dial = (...args: unknown[]) => {
+			dials++
+			return (originalDial as any)(...args)
+		}
+		return {
+			get: () => dials,
+			restore: () => { (node as any).dialProtocol = originalProtocol; (node as any).dial = originalDial },
+		}
 	}
 
 	/** `coord` shifted by one in ring arithmetic, so a seeded peer sits immediately beside a key. */
@@ -992,17 +1036,39 @@ describe('cancellation is not evidence about a peer', () => {
 	})
 
 	// The contrast that keeps the guard from being over-broad: the same unreachable peer, the same
-	// call, but a live run — the failure is now genuinely about the peer and is scored exactly once.
-	// (The full run to `dead` is pinned by "marks an unreachable neighbor dead after a run of
-	// failed pings" above; this is the single-strike half, so the pair reads together.)
-	it('still strikes once from the latency probe when the run is live', async () => {
+	// near-pass task, but a live run — the failure is now genuinely about the peer and is scored
+	// exactly once. The strike comes from the redial seam, since the ping never dials. (The full
+	// run to `dead` is pinned by "marks an unreachable neighbor dead after a run of failed redials"
+	// above; this is the single-strike half, so the pair reads together.)
+	it('still strikes once from the near pass when the run is live', async () => {
 		const id = await unreachablePeer()
+		dialable(id)
 		liveRun()
 
-		await (svc as any).probeNeighborLatency(id, (svc as any).runSignal)
+		await (svc as any).probeAndFetch(id, (svc as any).runSignal)
 
 		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
-		expect(svc.getDiagnostics().pingsFail).to.equal(1)
+		expect(svc.getDiagnostics().redials.failed, 'the redial is what failed').to.equal(1)
+		expect(backoffOf(svc).factor(id), 'the near pass still records no backoff').to.equal(0)
+	})
+
+	// The redial seam itself under a cancelled run: no dial is issued at all, so there is nothing
+	// to score — the same rule every pooled RPC follows, now at the one place maintenance dials.
+	it('issues no dial and records nothing from a redial when the run is cancelled', async () => {
+		const id = await unreachablePeer()
+		dialable(id)
+		cancelRun()
+		const dials = countDials()
+		try {
+			const verdict = await (svc as any).redial(id)
+
+			expect(verdict).to.equal('cancelled')
+			expect(dials.get(), 'cancelled before dialing').to.equal(0)
+			expect(svc.getDiagnostics().redials.started).to.equal(0)
+			expectUnscored(id)
+		} finally {
+			dials.restore()
+		}
 	})
 
 	// `probeMembership` is the site that also backs off on the unguarded path, so the backoff
@@ -1022,18 +1088,23 @@ describe('cancellation is not evidence about a peer', () => {
 
 	it('still strikes and backs off from a membership probe when the run is live', async () => {
 		const id = await unreachablePeer()
+		dialable(id)
 		liveRun()
 
 		await (svc as any).probeMembership(id, (svc as any).runSignal)
 
+		// The strike is the redial seam's; the backoff is this arm's own, booked on the seam's
+		// `failed` verdict exactly as it is on a failed ping.
 		expect(store.getById(id)?.contactFailures, 'one strike').to.equal(1)
 		expect(backoffOf(svc).factor(id), 'backoff recorded').to.not.equal(0)
-		expect(svc.getDiagnostics().pingsFail).to.equal(1)
+		expect(svc.getDiagnostics().redials.failed, 'the redial is what failed').to.equal(1)
 	})
 
 	// `preconnectNeighbors` never increments `pingsSent` for a failed ping either way, so counting
 	// dials is what actually separates "cancelled before dialing" from "the target list was empty".
-	// `openRpcStream` throws on an already-aborted signal *before* dialing, which is the mechanism.
+	// A non-connected warm-up target is handed to the redial seam, which checks the run signal
+	// *before* dialing — that is the mechanism (a connected target's ping goes through
+	// `openRpcStream`, which throws on an already-aborted signal before dialing, the same way).
 	it('issues no dial from the preconnect pass when the run is cancelled', async () => {
 		const id = await unreachablePeer()
 		dialable(id)

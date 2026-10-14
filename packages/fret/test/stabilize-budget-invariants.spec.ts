@@ -12,6 +12,12 @@ import { FretService } from '../src/service/fret-service.js'
  *
  * The invariant: the worst-case cost of one pooled unit inside a phase must fit inside that
  * phase's own budget, and the phases' budgets plus a one-RPC reserve must fit inside the tick.
+ *
+ * `FretConfig.dialTimeoutMs` (the maintenance redial's whole-dial budget, default 10 s) is
+ * deliberately **not** part of this arithmetic. A redial runs under the run signal, outside the
+ * tick; a tick only waits on it for the rest of its own phase and records nothing when the phase
+ * ends first. So a dial budget larger than the whole tick is the intended shape, not a violation —
+ * the pooled unit above is a ping and a fetch over a connection that already exists.
  */
 describe('stabilize budget invariants', () => {
 	const s = FretService as unknown as {

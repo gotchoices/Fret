@@ -21,6 +21,19 @@ export interface FretConfig {
 	 */
 	deadAfterFailures?: number;
 	/**
+	 * Whole-dial budget, in milliseconds, for a maintenance **redial** — the connection FRET opens
+	 * on its own to a routing-table peer it is not connected to (default 10 000 ms).
+	 *
+	 * A maintenance ping assumes an open connection and is bounded by a 2 s exchange budget; opening
+	 * one is a separate step with this budget, run outside the stabilization tick. The default
+	 * restates libp2p's own `dialTimeout` default (10 s), because libp2p applies that only to a dial
+	 * that carries *no* abort signal — FRET always passes one, so this is the only whole-dial limit
+	 * in force (libp2p's per-address `addressDialTimeout` still applies underneath). A host on slow
+	 * relayed links sets it from its link budget: a circuit-relay dial that completes in 9 s is
+	 * ordinary there. Must be a positive finite number; the constructor throws otherwise.
+	 */
+	dialTimeoutMs?: number;
+	/**
 	 * This node's libp2p private key — the key `node.peerId` was derived from.
 	 *
 	 * Used to seal this node's own signed address record (a libp2p `PeerRecord` envelope) for the

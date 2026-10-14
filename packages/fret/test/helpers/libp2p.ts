@@ -5,7 +5,7 @@ import { tcp } from '@libp2p/tcp'
 import { memory } from '@libp2p/memory'
 import { plaintext } from '@libp2p/plaintext'
 import { identify, identifyPush } from '@libp2p/identify'
-import type { PrivateKey } from '@libp2p/interface'
+import type { ConnectionEncrypter, PrivateKey } from '@libp2p/interface'
 
 let memAddrCounter = 0
 
@@ -28,6 +28,46 @@ export async function createMemNode(addr?: string): Promise<Libp2p> {
 		streamMuxers: [yamux()]
 	})
 	return node
+}
+
+/**
+ * A connection encrypter that delays its **outbound** handshake by `ms` and is otherwise
+ * `plaintext`. Honours the abort signal libp2p hands the handshake, so an aborted dial fails
+ * promptly rather than after the delay.
+ *
+ * Models a slow *dial* with a fast *exchange* — the shape of a circuit-relayed connection on a slow
+ * link, where the Noise handshake over the circuit is what takes seconds. The memory transport's
+ * own `latency` option cannot express this: it slows every buffer, so a dial and a ping on the open
+ * connection slow down together.
+ */
+function slowHandshake(ms: number): (components: unknown) => ConnectionEncrypter {
+	const base = plaintext()
+	return (components) => {
+		const inner = base(components as Parameters<typeof base>[0])
+		const wait = (signal?: AbortSignal): Promise<void> => new Promise<void>((resolve, reject) => {
+			const timer = setTimeout(resolve, ms)
+			signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason) }, { once: true })
+		})
+		return {
+			protocol: inner.protocol,
+			secureInbound: (conn, opts) => inner.secureInbound(conn, opts),
+			secureOutbound: async (conn, opts) => { await wait(opts?.signal); return inner.secureOutbound(conn, opts) },
+		}
+	}
+}
+
+/**
+ * {@link createMemNode} whose outbound handshake takes `handshakeMs` — see {@link slowHandshake}.
+ * Dialing *from* this node is slow; everything over the open connection is as fast as any memory
+ * node. The inbound side is untouched, so a node dialed by one of these is not slowed.
+ */
+export async function createSlowHandshakeMemNode(handshakeMs: number): Promise<Libp2p> {
+	return await createLibp2p({
+		addresses: { listen: [`/memory/slow-node-${++memAddrCounter}-${Date.now()}`] },
+		transports: [memory()],
+		connectionEncrypters: [slowHandshake(handshakeMs)],
+		streamMuxers: [yamux()]
+	})
 }
 
 /**

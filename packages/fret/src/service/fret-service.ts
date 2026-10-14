@@ -39,7 +39,7 @@ import { equals as u8Equals } from 'uint8arrays/equals';
 import { estimateSizeAndConfidence } from '../estimate/size-estimator.js';
 import { TokenBucket } from '../utils/token-bucket.js';
 import { ExpiringMap } from '../utils/expiring-map.js';
-import { deadline } from '../utils/deadline.js';
+import { deadline, awaitUnlessAborted, ABORTED } from '../utils/deadline.js';
 import { runPooled, type PoolResult } from '../utils/pool.js';
 import { peerIdFromString, peerIdFromPrivateKey } from '@libp2p/peer-id';
 import {
@@ -149,6 +149,19 @@ interface NearWindow {
 }
 
 /**
+ * The one verdict a maintenance redial ({@link FretService.redial}) reaches, shared by everyone
+ * who awaited it.
+ *
+ * - `connected` — a connection to the peer is open; the caller may ping over it.
+ * - `failed` — the dial failed on its own merits and the seam has **already booked** the contact
+ *   strike. A caller adds only what its own arm owes on top (backoff, in the off-ring passes).
+ * - `cancelled` — our own run signal fired; not evidence about the peer, nothing booked.
+ * - `skipped` — no dial was issued and nothing was booked: the peer is already connected, has no
+ *   address to dial, or `maintenanceConcurrency` redials are already in flight. Re-asked next tick.
+ */
+type RedialResult = 'connected' | 'failed' | 'cancelled' | 'skipped';
+
+/**
  * Select sample entries spread across diverse ring positions using sparsity-biased scoring.
  * Excludes self and entries already in successors/predecessors (they're redundant).
  *
@@ -195,6 +208,15 @@ export function selectDiverseSample(
 function normalizeThreshold(value: number | undefined, fallback: number): number {
 	if (value === undefined || !Number.isFinite(value)) return fallback;
 	return Math.max(1, Math.floor(value));
+}
+
+/** A configured budget must be a positive finite number of milliseconds; absent takes `fallback`. */
+function requirePositiveMs(value: number | undefined, fallback: number, name: string): number {
+	if (value === undefined) return fallback;
+	if (!Number.isFinite(value) || value <= 0) {
+		throw new Error(`FretService: ${name} must be a positive finite number of milliseconds, got ${String(value)}`);
+	}
+	return value;
 }
 
 export class FretService implements IFretService, Startable {
@@ -298,6 +320,13 @@ export class FretService implements IFretService, Startable {
 	 */
 	private addressKnown = new Set<string>();
 	/**
+	 * Maintenance redials in flight, by peer id — see {@link redial}. One entry is one dial and one
+	 * verdict, whoever asked for it: a later tick, a warm-up pass and the dead arm all receive the
+	 * same promise rather than racing three dials at one peer. Run-scoped: cleared by `stop()`, and
+	 * each entry removes itself when its dial settles.
+	 */
+	private readonly redials = new Map<string, Promise<RedialResult>>();
+	/**
 	 * Consecutive failed protocol negotiations before a peer is demoted to `foreign`.
 	 *
 	 * Delaying the `unknown → foreign` demotion costs nothing in correctness — `unknown` is
@@ -328,13 +357,22 @@ export class FretService implements IFretService, Startable {
 	 */
 	private static readonly CONTACT_FAILURE_MIN_SPACING_MS = 500;
 	/**
-	 * Whole-RPC budget for the single-hop maintenance RPCs — ping and announce.
+	 * Whole-RPC budget for the single-hop maintenance RPCs — ping and announce — **over a
+	 * connection that already exists.**
 	 *
 	 * A ping is a ~50-byte round trip and an announce is a fire-and-forget push with no reply of
 	 * substance, so the default `RPC_TIMEOUT_MS` (5 s) on these paths only ever means "this peer
 	 * is gone" — and they are exactly the paths that must not hold a stabilization or warm-up tick
 	 * open. `sendMaybeAct` deliberately keeps the default: it returns only once the *whole
 	 * remaining route* has completed downstream, so its budget is a route budget, not a link one.
+	 *
+	 * It does **not** cover opening the connection. A relayed dial on a slow link takes 9–21 s
+	 * (Sereus measured both), so a dialing ping under this budget never lands there, and because
+	 * `rpcRequest` always passes a signal, libp2p's own whole-dial `dialTimeout` is switched off
+	 * and this would be the *only* limit on the dial. The maintenance passes therefore ping with
+	 * `dial: 'never'`, and opening a connection is a separate {@link redial} under
+	 * `FretConfig.dialTimeoutMs`, run outside the tick. The announce fan-out still dials under this
+	 * budget — see the NOTE at `sendAnnouncementsRateLimited`.
 	 */
 	private static readonly MAINTENANCE_RPC_TIMEOUT_MS = 2000;
 	/**
@@ -429,6 +467,13 @@ export class FretService implements IFretService, Startable {
 		 * messages we refused; this is an outbound refusal by our own stack.
 		 */
 		streamLimit: 0,
+		/**
+		 * Maintenance redials (see `redial`): `started` counts dials actually issued — never a
+		 * `skipped` or a `cancelled` request — and `connected` / `failed` their verdicts, so a
+		 * failed redial is visible as itself rather than as a `pingsFail` it is not (no ping was
+		 * sent). A redial cancelled mid-flight by `stop()` counts in neither verdict.
+		 */
+		redials: { started: 0, connected: 0, failed: 0 },
 		maybeActForwarded: 0,
 		evictions: 0,
 		/**
@@ -492,6 +537,12 @@ export class FretService implements IFretService, Startable {
 			// non-finite value would compare false against the counter forever — silently
 			// disabling the transition rather than failing where the caller could see it.
 			deadAfterFailures: normalizeThreshold(cfg?.deadAfterFailures, 3),
+			// libp2p's own `dialTimeout` default, restated: libp2p applies it only to a dial that
+			// carries no signal, and FRET always passes one, so this is the whole-dial limit in
+			// force for a maintenance redial. Rejected rather than defaulted when unusable — a host
+			// that set it meant a number, and a non-positive or non-finite one would either abort
+			// every dial at once or never bound one.
+			dialTimeoutMs: requirePositiveMs(cfg?.dialTimeoutMs, 10_000, 'dialTimeoutMs'),
 		};
 		// A key that does not derive this node's peer id would seal records no receiver accepts
 		// (the signer must equal the labelled id) — a caller bug, so it fails here, not silently
@@ -1277,6 +1328,11 @@ export class FretService implements IFretService, Startable {
 		// that fan-out still sees the run's state. Mirrors `FretPeerDiscovery.stop()`.
 		this.backoff.clearAll();
 		this.departureDebounce.clear();
+		// The in-flight redials belong to the run that asked for them: the abort above makes each
+		// settle `cancelled`, and clearing the map here means the next run's first request for a
+		// peer starts a fresh dial rather than inheriting a verdict of "cancelled". Each entry also
+		// removes itself on settling, guarded so it cannot delete a successor run's entry.
+		this.redials.clear();
 		// Same rule for the size observations: peer-reported estimates are a run's view of the
 		// network, and carrying them into the next run would blend a stale ring's size into a
 		// fresh one's.
@@ -1682,6 +1738,12 @@ export class FretService implements IFretService, Startable {
 			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
+				// NOTE: an announce to a non-connected peer dials within MAINTENANCE_RPC_TIMEOUT_MS;
+				// on links where a dial exceeds that (a relayed dial on a slow link takes 9–21 s) it
+				// never lands. Left as is: announces are opportunistic and score nothing, and a
+				// slow dial here must not stall this deliberately serial loop. If announce
+				// delivery to fresh peers ever matters on such links, request a `redial` for the
+				// target and announce on the next pass instead of dialing inline.
 				const out = await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
 					dial: true, signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
 				});
@@ -1744,11 +1806,21 @@ export class FretService implements IFretService, Startable {
 	 *   pool slot nor a slot of the caller's per-pass budget goes to a peer that can only fail to
 	 *   dial. Filtering after the slice would let a run of undialable near peers consume the whole
 	 *   budget and warm nobody, which is the opposite of what a warm-up pass is for.
+	 * - **A target with no connection is redialed, not pinged.** Warming it *means* opening the
+	 *   connection, and a 2 s dialing ping cannot do that on a slow link (see
+	 *   {@link MAINTENANCE_RPC_TIMEOUT_MS}). The {@link redial} is requested and not awaited — an
+	 *   awaited redial would hold a pool slot for up to `dialTimeoutMs` — so the pool below covers
+	 *   only the pings to peers already connected, each `dial: 'never'`. A budgeted slot is spent
+	 *   either way: the slice above counts both kinds, since both are one peer warmed.
 	 *
-	 * `pingsSent` counts only a ping that completed, as it did serially. Cancellation is not
-	 * evidence: a task that fails under an aborted run logs nothing — these paths never scored
-	 * anything, so the guard suppresses only the log line — and a task the pool never started is
-	 * `skipped`, so an aborted run issues no dial at all.
+	 * The pings score nothing against a peer, as this pass never did. The redials are the one
+	 * exception, and deliberately so: a redial owns its verdict wherever it was requested from, so a
+	 * dial that fails on its merits books one contact strike against the peer (a failed dial is a
+	 * failed contact, whoever asked) and a dial that connects books nothing here — `peer:connect`
+	 * records the connection. `pingsSent` counts only a ping that completed, as it did serially.
+	 * Cancellation is not evidence: a task that fails under an aborted run logs nothing — the guard
+	 * suppresses only the log line — a task the pool never started is `skipped`, and a redial
+	 * requested under an aborted run issues no dial, so an aborted run dials nobody at all.
 	 *
 	 * @param budget optional cap on how many peers this pass may target (the active tick's Core 6 /
 	 *   Edge 3 per second). Distinct from the concurrency cap, which is how many may be in flight.
@@ -1758,10 +1830,17 @@ export class FretService implements IFretService, Startable {
 		// `wasCancelled` compares against — see `wasCancelled`.
 		const sig = this.runSignal;
 		const dialable = ids.filter((id) => this.isDialable(id));
-		const targets = budget === undefined ? dialable : dialable.slice(0, budget);
+		const budgeted = budget === undefined ? dialable : dialable.slice(0, budget);
+		const targets: string[] = [];
+		for (const id of budgeted) {
+			if (this.isConnected(id)) targets.push(id);
+			else this.detach(this.redial(id), `${label} redial`);
+		}
 		const results = await runPooled(targets.map((id) => async () => {
 			try {
-				const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+				const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
+					dial: 'never', signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+				});
 				switch (out.kind) {
 					case 'ok': case 'busy': case 'decode-error':
 						this.diag.pingsSent++; // parity: counted whenever the old sendPing *returned*
@@ -2549,17 +2628,115 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Ping `id`, then fetch and merge its neighbor snapshot — one pooled task per near peer.
+	 * Open a connection to a routing-table peer we are not connected to — the one place
+	 * maintenance dials, under its own budget, outside the tick that asked.
 	 *
-	 * The two stay in this order *per peer*: `fetchNeighbors` is connection-only
-	 * (`requireExisting`), so it returns an empty snapshot unless a connection already exists, and
-	 * it is usually the preceding ping that opens one. Fusing them per peer preserves that
-	 * dependency while the pool parallelises across peers — strictly better than the old "all
-	 * pings, then all fetches", which lost it for any peer whose ping landed late.
+	 * Why a separate step: every maintenance ping runs under {@link MAINTENANCE_RPC_TIMEOUT_MS}
+	 * (2 s), sized for the exchange on an open connection, and a relayed dial on a slow link takes
+	 * 9–21 s. Inside a tick nothing larger fits either — phase 1 is bounded at 3 s and the tick at
+	 * 5 s, and the tick's signal aborts any dial still running when it expires — so such a peer
+	 * was never reconnected: each tick's ping timed out, each timeout was a strike, three strikes
+	 * made it `dead`, and the dead arm re-probed it with the same 2 s. The dial has to run on the
+	 * **run** signal with a host-configurable budget (`FretConfig.dialTimeoutMs`); a tick merely
+	 * waits on it for the rest of its own phase ({@link redialWithin}).
+	 *
+	 * - **One dial, one verdict per peer.** A redial already in flight for `id` is returned as the
+	 *   same promise, so a later tick, a warm-up pass and the dead arm share it; nobody races a
+	 *   second dial at the peer and no peer collects two verdicts. libp2p's dial queue makes the
+	 *   sharing safe in the other direction too: a concurrent `dialProtocol` to the same peer (an
+	 *   announce, say) *joins* the pending dial, and the joined job is aborted only once every
+	 *   joiner's signal has aborted, so a 2 s announce timing out does not kill the redial.
+	 * - **`skipped` when there is nothing to dial**: already connected, no address libp2p could
+	 *   dial, or `maintenanceConcurrency` redials already in flight — no dial, no score; the
+	 *   caller re-asks next tick, nothing queues.
+	 * - **The seam books the verdict, exactly once.** A dial that fails on its own merits — not
+	 *   our cancellation — is a failed contact (`applyContactFailure`), the same evidence a dialing
+	 *   ping's `unreachable` / `timeout` used to be. Success books nothing here: the `peer:connect`
+	 *   listener sets `connected`, clears any `dead` label and the contact-failure run, and touches
+	 *   the entry. Backoff is **not** recorded here, because the near pass records none and the
+	 *   off-ring passes do — each caller's arm adds what it owes on its own `failed`.
+	 * - **Our own cancellation is not evidence** (`wasCancelled` on the run signal), exactly as for
+	 *   a pooled RPC.
+	 *
+	 * Never rejects: a caller that stopped waiting (its phase ended) is no longer listening, so a
+	 * rejection would have nobody to land on. A malformed id is logged and `skipped`.
+	 */
+	private redial(id: string): Promise<RedialResult> {
+		const inflight = this.redials.get(id);
+		if (inflight !== undefined) return inflight;
+		if (this.isConnected(id) || !this.hasAddresses(id) || this.redials.size >= this.maintenanceConcurrency) {
+			return Promise.resolve('skipped');
+		}
+		const run: Promise<RedialResult> = this.dialForMaintenance(id, this.runSignal).finally(() => {
+			// Guarded: `stop()` clears the map and the next run may have re-entered this id.
+			if (this.redials.get(id) === run) this.redials.delete(id);
+		});
+		this.redials.set(id, run);
+		return run;
+	}
+
+	/** The dial behind {@link redial}: one `node.dial` under `dialTimeoutMs`, a child of the run signal. */
+	private async dialForMaintenance(id: string, sig: AbortSignal | undefined): Promise<RedialResult> {
+		if (this.wasCancelled(sig)) return 'cancelled';
+		let pid: PeerId;
+		try {
+			pid = peerIdFromString(id);
+		} catch (err) {
+			log.error('redial: malformed peer id %s - %e', id, err);
+			return 'skipped';
+		}
+		// The existing util rather than `AbortSignal.any`, which React Native's Hermes lacks.
+		const d = deadline(this.cfg.dialTimeoutMs, sig);
+		try {
+			this.diag.redials.started++;
+			await this.node.dial(pid, { signal: d.signal });
+			this.diag.redials.connected++;
+			return 'connected';
+		} catch (err) {
+			if (this.wasCancelled(sig)) return 'cancelled';
+			log('redial to %s failed - %e', id, err);
+			this.diag.redials.failed++;
+			await this.applyContactFailure(id);
+			return 'failed';
+		} finally {
+			d.cancel();
+		}
+	}
+
+	/**
+	 * Ask for a {@link redial} and wait for its verdict only until `signal` — the tick or phase
+	 * budget the caller is running under — fires. `'pending'` means the budget ran out first: the
+	 * redial carries on under the run signal and will book its own verdict; the caller records
+	 * nothing, exactly as for any other work its budget cut short. Nothing here cancels the dial.
+	 */
+	private async redialWithin(id: string, signal: AbortSignal | undefined): Promise<RedialResult | 'pending'> {
+		const verdict = await awaitUnlessAborted(this.redial(id), signal);
+		return verdict === ABORTED ? 'pending' : verdict;
+	}
+
+	/**
+	 * Connect to, ping, then fetch and merge the snapshot of one near peer — one pooled task per
+	 * near peer.
+	 *
+	 * A target with no connection is first redialed ({@link redialWithin}, raced against the
+	 * phase-1 signal). A fast dial — the common case on a direct link — still reconnects *and*
+	 * verifies within one tick, and a fast-failing dial (connection refused) still books its strike
+	 * within the tick. A dial the phase outlives returns with no score; the redial carries on and the
+	 * next tick finds the connection or shares the still-pending dial. The ping itself never dials
+	 * (`dial: 'never'`), so a ping can no longer time out on a slow dial and strike a peer that is
+	 * merely far away.
+	 *
+	 * Ping and fetch stay in this order *per peer*: `fetchNeighbors` is connection-only
+	 * (`requireExisting`), and fusing the two per peer preserves that dependency while the pool
+	 * parallelises across peers — strictly better than the old "all pings, then all fetches", which
+	 * lost it for any peer whose ping landed late.
 	 *
 	 * Returns the ids the merge saw for the first time, for the tick's single announce.
 	 */
 	private async probeAndFetch(id: string, signal: AbortSignal | undefined): Promise<string[]> {
+		// `failed` has already booked its strike inside the seam, and the near pass owes no backoff
+		// on top (see `probeNeighborLatency`); every other non-connected verdict is "not this tick".
+		if (!this.isConnected(id) && (await this.redialWithin(id, signal)) !== 'connected') return [];
 		const answered = await this.probeNeighborLatency(id, signal);
 		// A tick that ran out of budget mid-ping has nothing to fetch — and `fetchNeighbors` would
 		// swallow the abort into an empty snapshot and count it as fetched. Stays *ahead* of the
@@ -2589,7 +2766,11 @@ export class FretService implements IFretService, Startable {
 	 */
 	private async probeNeighborLatency(id: string, signal: AbortSignal | undefined): Promise<boolean> {
 		try {
-			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			// `dial: 'never'`: opening the connection is `redial`'s job under its own budget; a ping
+			// to a peer with no connection is `skipped` here and records nothing.
+			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
+				dial: 'never', signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+			});
 			switch (out.kind) {
 				case 'ok':
 					this.diag.pingsSent++;
@@ -2804,12 +2985,25 @@ export class FretService implements IFretService, Startable {
 	 * `unreachable` / `timeout` count toward the dead-state run. Every failure backs off so we
 	 * don't hammer an unreachable-but-connected peer every tick.
 	 *
+	 * A target with no connection is first redialed ({@link redialWithin}, raced against the tick
+	 * signal), the same shape as the near pass. A redial that `failed` has already booked its
+	 * strike; this arm adds the backoff it books for every failure of its own — recorded by the
+	 * caller's arm rather than inside the seam, because the near pass records none. A redial the
+	 * tick outlives records nothing and carries on. The ping never dials (`dial: 'never'`).
+	 *
 	 * `signal` is the tick budget (a child of the run signal), an explicit parameter for the same
 	 * reason as on `probeNeighborLatency`.
 	 */
 	private async probeMembership(id: string, signal: AbortSignal | undefined): Promise<void> {
+		if (!this.isConnected(id)) {
+			const verdict = await this.redialWithin(id, signal);
+			if (verdict === 'failed') this.backoff.record(id);
+			if (verdict !== 'connected') return;
+		}
 		try {
-			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, { signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS });
+			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
+				dial: 'never', signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+			});
 			switch (out.kind) {
 				case 'ok':
 					this.diag.pingsSent++;
@@ -2868,8 +3062,10 @@ export class FretService implements IFretService, Startable {
 	 * announce for the whole tick — neither belongs in a pooled task (see `stabilizeOnce`).
 	 *
 	 * NOTE: `fetchNeighbors` is connection-only (dial `'never'`), so for an address-known but
-	 * non-connected peer it returns `skipped` — nothing attempted, nothing counted — and the
-	 * preceding ping in `probeAndFetch` usually opens the connection anyway. Cancellation (stop()
+	 * non-connected peer it returns `skipped` — nothing attempted, nothing counted. In practice
+	 * `probeAndFetch` reaches this only for a connected peer: a near peer with no connection is
+	 * redialed first, and one the redial could not connect within the phase is never fetched.
+	 * Cancellation (stop()
 	 * or the tick budget) surfaces as the `cancelled` outcome and likewise counts and scores
 	 * nothing: our own cancellation is not evidence about the peer. `snapshotsFetched` counts only
 	 * `ok` replies.
@@ -3357,6 +3553,12 @@ export class FretService implements IFretService, Startable {
 				};
 				// Default (route) budget — this returns only once the whole downstream route has
 				// completed — but still run-scoped, so a stop() mid-forward does not hold teardown.
+				// NOTE: a forward to a non-connected hop dials inside this 5 s route budget
+				// (`RPC_TIMEOUT_MS`), the same class as the announce case on a slow relayed link,
+				// where a dial alone takes 9–21 s. Left as is: routing mostly goes through the near
+				// peers the stabilization tick now keeps connected through `redial`. If forwards to
+				// non-connected hops ever show up as timeouts on such links, request a `redial` for
+				// the hop and fall through to the NearAnchor below rather than dialing inline.
 				const sig = this.runSignal;
 				try {
 					this.diag.maybeActForwarded++;

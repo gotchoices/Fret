@@ -5,7 +5,7 @@ import {
 	registerJsonHandler,
 } from './protocols.js';
 import type { StreamCaps } from './protocols.js';
-import { rpcRequest } from './request.js';
+import { rpcRequest, type RpcRequestOptions } from './request.js';
 import { parseOrThrow, parsePingResponse } from './validate.js';
 import type { RpcOutcome } from './outcome.js';
 import type { BusyResponseV1 } from '../index.js';
@@ -78,15 +78,17 @@ async function pingReply(getSizeEstimate?: SizeEstimateProvider): Promise<PingRe
 
 /**
  * Ping `peer` over this network's namespaced protocol. Read-only request (the handler replies
- * without reading); dial 'always'. `ok.value.ok` is the peer's own pong flag; rttMs on the
- * outcome. Truncation/undecodable replies are `decode-error` — the service scores them as
- * proof of life.
+ * without reading). `dial` defaults to `'always'`; the service's maintenance passes pass
+ * `'never'`, because opening a connection is the redial seam's job under its own budget and a
+ * 2 s ping budget cannot cover a dial on a slow link. `ok.value.ok` is the peer's own pong flag;
+ * rttMs on the outcome. Truncation/undecodable replies are `decode-error` — the service scores
+ * them as proof of life.
  */
 export async function sendPing(
 	node: Libp2p,
 	peer: string,
 	protocol = PROTOCOL_PING,
-	opts: { signal?: AbortSignal; timeoutMs?: number } = {}
+	opts: { signal?: AbortSignal; timeoutMs?: number; dial?: RpcRequestOptions<unknown>['dial'] } = {}
 ): Promise<RpcOutcome<{ ok: boolean; size_estimate?: number; confidence?: number }>> {
 	return rpcRequest(node, peer, protocol, {
 		...opts,
