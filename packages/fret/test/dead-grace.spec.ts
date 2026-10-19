@@ -16,8 +16,9 @@ import { deadGraceMs, provenTenureMs } from '../src/store/tenure.js'
 // an address, exactly as in `address-less-departure.spec.ts`. Long tenure is written into the
 // entry's stamps rather than waited for, and the run start is rewound the way the spacing stamp is.
 //
-// Mutation-checked when written: dropping the grace condition from the dead verdict reddens the
-// "held through its grace" assertions.
+// Mutation-checked: dropping the grace condition from the dead verdict reddens the "held through
+// its grace" assertions; restoring the old change rule (every strike on a live peer) reddens the
+// "not a change" one.
 
 const HOUR = 60 * 60_000
 
@@ -90,6 +91,14 @@ describe('dead-verdict grace for long-tenured peers', function () {
 		expect(entry(serverId).state, 'but it is held through its grace').to.not.equal('dead')
 		expect(await ringViews(), 'and is still a live member of the ring').to.include(serverId)
 		expect(observer.getDiagnostics().deadGraceHeld, 'the threshold strike was held').to.equal(1)
+
+		// A held strike at the clamped threshold repeats every pass for the whole grace; were it a
+		// change, the idle backoff would stay pinned at its base for minutes.
+		const changes = (): number => (observer as any).idle.changes
+		const changesBefore = changes()
+		await pass()
+		expect(observer.getDiagnostics().deadGraceHeld, 'premise: another held strike').to.equal(2)
+		expect(changes(), 'a held strike is not a change for the idle backoff').to.equal(changesBefore)
 
 		// ----- maintenance over: the server answers within its grace -----
 		await serverFret.start()
