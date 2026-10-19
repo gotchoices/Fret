@@ -58,12 +58,14 @@ export function noteProven(cur: TenureFields, now: number): TenureFields | undef
 /** Proven tenure in ms: 0 when never proven, and never negative or non-finite. */
 export function provenTenureMs(cur: TenureFields): number {
 	const t = cur.lastProvenAliveAt - cur.sessionStartedAt;
-	return t > 0 ? t : 0;
+	// Two finite stamps can still subtract to Infinity (an imported table carrying ±1e308), and
+	// `stabilityFactor(Infinity)` is NaN — which would poison the relevance it multiplies.
+	return Number.isFinite(t) && t > 0 ? t : 0;
 }
 
 /**
  * The relevance multiplier tenure earns: `1 + MAX · t / (t + HALF)` — 1 at zero tenure, about
- * 1.038 at 5 minutes, 1.25 at an hour, 1.49 at a day. Monotone and bounded below
+ * 1.038 at 5 minutes, 1.25 at an hour, 1.48 at a day. Monotone and bounded below
  * `1 + STABILITY_MAX_BONUS`, so tenure can tip a close eviction but never dominate the other
  * relevance terms.
  */

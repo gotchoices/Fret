@@ -2,6 +2,7 @@ import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import {
 	noteProven,
+	provenTenureMs,
 	stabilityFactor,
 	STABILITY_MAX_BONUS,
 	TENURE_GAP_TOLERANCE_MS,
@@ -28,6 +29,11 @@ describe('session tenure', () => {
 			{ name: 'clock backwards → new session, never negative', cur: running, now: LAST - 1, want: { sessionStartedAt: LAST - 1, lastProvenAliveAt: LAST - 1 } },
 		]
 		for (const r of rows) expect(noteProven(r.cur, r.now), r.name).to.deep.equal(r.want)
+	})
+
+	it('provenTenureMs stays finite when the stamps subtract past the float range', () => {
+		// Both values are legal JSON, so a persisted table can carry them; the difference is Infinity.
+		expect(provenTenureMs({ sessionStartedAt: -Number.MAX_VALUE, lastProvenAliveAt: Number.MAX_VALUE })).to.equal(0)
 	})
 
 	it('stabilityFactor is 1 at zero tenure, strictly increasing, and bounded below 1 + max bonus', () => {

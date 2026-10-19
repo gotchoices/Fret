@@ -903,7 +903,7 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * **Scoring never creates** — a peer we hold no entry for is not scored, and the call returns
 	 * before the `selfCoord()` await. See {@link applyTouch} for why, and for where creation does
-	 * belong. The trailing `applyMembershipSignal` / `noteProofOfLife` land inside that guard and
+	 * belong. The `applyMembershipSignal` / `noteProofOfLife` land inside that guard and
 	 * so stop running for a missing peer, which loses nothing: both already no-op on one.
 	 *
 	 * `latencyMs` is optional and must be supplied **only** when the caller timed a round trip
@@ -921,6 +921,15 @@ export class FretService implements IFretService, Startable {
 	 * inside the store instead of patching a value derived outside it.
 	 */
 	private async applySuccess(id: string, latencyMs?: number): Promise<void> {
+		if (!this.store.getById(id)) return;
+		// Every applySuccess call in this service follows a completed RPC over this
+		// network's namespaced protocol (ping or maybeAct), which proves the peer
+		// serves this network → confirm membership for free off normal traffic…
+		this.applyMembershipSignal(id, 'rpc-success');
+		// …and proves it is reachable, which clears any contact-failure run and resurrects it if
+		// a previous run had marked it dead. Before the score, so the score reads the tenure this
+		// very proof extended or restarted — not a session from before a long absence.
+		this.noteRpcEvidence(id);
 		const entry = this.store.getById(id);
 		if (!entry) return;
 		const x = normalizedLogDistance(await this.selfCoord(), entry.coord);
@@ -937,13 +946,6 @@ export class FretService implements IFretService, Startable {
 			// has nothing to say about.
 			...(latencyMs === undefined ? {} : { avgLatencyMs: next.avgLatencyMs }),
 		});
-		// Every applySuccess call in this service follows a completed RPC over this
-		// network's namespaced protocol (ping or maybeAct), which proves the peer
-		// serves this network → confirm membership for free off normal traffic.
-		this.applyMembershipSignal(id, 'rpc-success');
-		// …and proves it is reachable, which clears any contact-failure run and resurrects it if
-		// a previous run had marked it dead.
-		this.noteRpcEvidence(id);
 	}
 
 	/**
