@@ -81,6 +81,20 @@ export interface PeerEntry {
 	 * measurements away. Neither mistake is expressible now.
 	 */
 	avgLatencyMs: number | null;
+	/**
+	 * Local-clock unix ms at which this peer's current *session* began — the first proof of life
+	 * of a run in which no two consecutive proofs were further apart than the tenure gap tolerance.
+	 * 0 = never proven. Paired with {@link lastProvenAliveAt}; proven tenure is the span between
+	 * them (see `store/tenure.ts`). Like the counters, the store stores and exposes it and never
+	 * branches on it.
+	 */
+	sessionStartedAt: number;
+	/**
+	 * Local-clock unix ms of the latest proof of life counted toward the current session (stamped
+	 * at a granularity of about a second, so a burst of RPCs is one write). 0 = never proven.
+	 * Written only by `FretService.noteProofOfLife`; hearsay never touches it.
+	 */
+	lastProvenAliveAt: number;
 	metadata?: Record<string, unknown>;
 	/**
 	 * This peer's most recent **verified** signed address record — the marshaled libp2p
@@ -149,6 +163,11 @@ export interface SerializedPeerEntry {
 	successCount: number;
 	failureCount: number;
 	avgLatencyMs: number | null; // null = never measured; absent in pre-nullable snapshots → null
+	// Optional; local-clock unix ms, absent in tables predating tenure → 0. Kept on import, unlike
+	// the failure counters: tenure is history, not liveness, and the gap rule already discounts our
+	// own downtime.
+	sessionStartedAt?: number;
+	lastProvenAliveAt?: number;
 	metadata?: Record<string, unknown>;
 	addressRecord?: SerializedAddressRecord; // optional; absent in tables predating address hints
 }
@@ -386,7 +405,9 @@ export class DigitreeStore {
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
-			avgLatencyMs: null
+			avgLatencyMs: null,
+			sessionStartedAt: 0,
+			lastProvenAliveAt: 0
 		});
 	}
 
@@ -630,6 +651,8 @@ export class DigitreeStore {
 			successCount: e.successCount,
 			failureCount: e.failureCount,
 			avgLatencyMs: e.avgLatencyMs,
+			sessionStartedAt: e.sessionStartedAt,
+			lastProvenAliveAt: e.lastProvenAliveAt,
 			...(e.metadata ? { metadata: e.metadata } : {}),
 			...(e.addressRecord ? { addressRecord: serializeAddressRecord(e.addressRecord) } : {}),
 		}));
@@ -688,6 +711,12 @@ export class DigitreeStore {
 				// reads back as a genuine 0 ms — accepted, since the next ping overwrites it and
 				// a coercion would instead discard real 0 ms measurements.
 				avgLatencyMs: s.avgLatencyMs ?? null,
+				// Restored rather than reset: tenure is history, and a proof after a restart longer
+				// than the gap tolerance starts a fresh session anyway. NOTE: a tampered file can
+				// inflate it, exactly as it can inflate the imported relevance and counters — table
+				// signing (tickets/backlog/23-debt-routing-table-export-signing.md) closes that class.
+				sessionStartedAt: s.sessionStartedAt ?? 0,
+				lastProvenAliveAt: s.lastProvenAliveAt ?? 0,
 				...(s.metadata ? { metadata: s.metadata } : {}),
 				...(addressRecord ? { addressRecord } : {}),
 			};

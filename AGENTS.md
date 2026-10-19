@@ -12,7 +12,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   ├── service/near-exchange.ts   # Per-neighbour pass memory + snapshot digest: skips redundant near pings/fetches
 │   │   ├── service/idle-backoff.ts    # Clock-free policy: passive interval doubles while nothing changes, snaps back on a change
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
-│   │   ├── store/{digitree-store,relevance}.ts
+│   │   ├── store/{digitree-store,relevance,tenure}.ts
 │   │   ├── ring/{distance,hash,ring-walk}.ts
 │   │   ├── rpc/{protocols,neighbors,maybe-act,leave,ping}.ts
 │   │   ├── selector/next-hop.ts

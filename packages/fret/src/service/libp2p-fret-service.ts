@@ -194,7 +194,7 @@ export class Libp2pFretService implements Startable, FretService {
 	// dropping the `return` changes nothing a caller can observe. What it does change is
 	// `test/libp2p-facade-forwarding.spec.ts`, which injects a mock core returning a distinct
 	// sentinel from *every* method and asserts each facade method hands that exact object back —
-	// one uniform exact-forwarding rule over all 20 members rather than a per-method judgement
+	// one uniform exact-forwarding rule over all 21 members rather than a per-method judgement
 	// about which returns are worth checking. Deleting a `return` here fails that spec with
 	// "<method> return identity"; keep them.
 	async ready(): Promise<void> {
@@ -220,6 +220,10 @@ export class Libp2pFretService implements Startable, FretService {
 
 	listPeers(): Array<{ id: string; metadata?: Record<string, unknown> }> {
 		return this.ensure().listPeers();
+	}
+
+	getPeerTenure(peerId: string): number | undefined {
+		return this.ensure().getPeerTenure(peerId);
 	}
 
 	exportTable(): SerializedTable {

@@ -52,10 +52,10 @@ describe('Libp2pFretService — forwarding', function () {
 		}
 	})
 
-	it('enumerates a non-empty, exactly-20-member forwarding set (getters excluded)', () => {
+	it('enumerates a non-empty, exactly-21-member forwarding set (getters excluded)', () => {
 		const forwarding = enumerateForwardingMethods()
-		expect(forwarding.length).to.equal(20)
-		expect(forwarding).to.include('getDiagnostics')
+		expect(forwarding.length).to.equal(21)
+		expect(forwarding).to.include.members(['getDiagnostics', 'getPeerTenure'])
 		expect(forwarding).to.not.include.members(SKIP_LIST.filter(n => n !== 'constructor'))
 	})
 

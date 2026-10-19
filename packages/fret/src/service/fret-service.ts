@@ -75,6 +75,7 @@ import {
 	initialRelevance,
 	type SparsityModel,
 } from '../store/relevance.js';
+import { noteProven, provenTenureMs } from '../store/tenure.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('service:fret');
@@ -1026,7 +1027,7 @@ export class FretService implements IFretService, Startable {
 
 	/**
 	 * Record that `id` is demonstrably alive: clear its contact-failure run and, if it was marked
-	 * `dead`, restore it to a live state.
+	 * `dead`, restore it to a live state — and advance its session tenure (`store/tenure.ts`).
 	 *
 	 * Called from every site that proves liveness: the RPC sites through {@link noteRpcEvidence},
 	 * and a fresh transport connection (`peer:connect`) directly. The counter reset is the
@@ -1036,10 +1037,30 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * Relevance is deliberately *not* reset to a baseline. `scoreSuccess` already up-ranks on
 	 * success, and wiping the health counters would erase the record of a peer that flaps.
+	 *
+	 * This is the **only** place tenure advances, so it counts proof of life and nothing else:
+	 * hearsay (`noteDiscovered`, address hints, the peerStore listeners) never reaches it. The
+	 * stamp rides the same write as the liveness patch, and a stamp alone is **not** a change —
+	 * otherwise every RPC from a settled neighbour would snap the idle backoff back to its base.
 	 */
 	private noteProofOfLife(id: string): void {
 		const e = this.store.getById(id);
 		if (!e) return;
+		const patch = this.livenessPatch(e);
+		const settled = Object.keys(patch).length === 0;
+		// Self never reaches here by RPC; the guard keeps a meaningless tenure off its entry anyway.
+		const tenure = id === this.selfIdStr ? undefined : noteProven(e, Date.now());
+		if (settled && tenure === undefined) return;
+		this.store.update(id, { ...patch, ...tenure });
+		// Only when the liveness half wrote — a run cleared or a `dead` peer revived. Proof of life
+		// from a peer already settled (an idle neighbour's ping) at most stamped tenure, which is
+		// not something the next pass could act on.
+		if (settled) return;
+		this.noteChange(patch.state === undefined ? `contact run cleared for ${id}` : `${id} revived`);
+	}
+
+	/** What proof of life changes about `e`'s liveness bookkeeping — empty when already settled. */
+	private livenessPatch(e: PeerEntry): PeerPatch {
 		const patch: PeerPatch = {};
 		// The spacing stamp is cleared alongside the count, because it only means anything
 		// *within* a run: leaving it behind makes the first failure of the next run land inside
@@ -1049,12 +1070,8 @@ export class FretService implements IFretService, Startable {
 			patch.contactFailures = 0;
 			patch.lastContactFailureAt = 0;
 		}
-		if (e.state === 'dead') patch.state = this.isConnected(id) ? 'connected' : 'disconnected';
-		if (Object.keys(patch).length === 0) return; // already settled
-		this.store.update(id, patch);
-		// Only when it wrote — a run cleared or a `dead` peer revived. Proof of life from a peer
-		// already settled (an idle neighbour's ping) returned above and is not a change.
-		this.noteChange(patch.state === undefined ? `contact run cleared for ${id}` : `${id} revived`);
+		if (e.state === 'dead') patch.state = this.isConnected(e.id) ? 'connected' : 'disconnected';
+		return patch;
 	}
 
 	/**
@@ -4182,6 +4199,9 @@ export class FretService implements IFretService, Startable {
 		};
 	}
 
+	// NOTE: link quality is the success rate alone; session tenure (`store/tenure.ts`) is available
+	// on the entry but deliberately not folded in. If routes are ever measured failing mid-path on
+	// short-lived hops, weight this by `stabilityFactor(provenTenureMs(entry))`.
 	private linkQuality(id: string): number {
 		const entry = this.store.getById(id);
 		if (!entry) return 0;
@@ -4534,6 +4554,11 @@ export class FretService implements IFretService, Startable {
 			id: entry.id,
 			metadata: entry.metadata
 		}));
+	}
+
+	getPeerTenure(peerId: string): number | undefined {
+		const entry = this.store.getById(peerId);
+		return entry ? provenTenureMs(entry) : undefined;
 	}
 
 	exportTable(): SerializedTable {

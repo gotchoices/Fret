@@ -211,7 +211,7 @@ function withOptionals<T extends object>(
 const SNAPSHOT_OPTIONALS = ['sample', 'size_estimate', 'confidence', 'metadata', 'hints', 'digest'] as const
 const MAYBE_ACT_OPTIONALS = ['wants', 'digest', 'activity', 'breadcrumbs'] as const
 const LEAVE_OPTIONALS = ['replacements'] as const
-const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'metadata', 'addressRecord'] as const
+const PEER_ENTRY_OPTIONALS = ['membership', 'negotiateFailures', 'contactFailures', 'sessionStartedAt', 'lastProvenAliveAt', 'metadata', 'addressRecord'] as const
 
 const arbNeighborSnapshot: fc.Arbitrary<NeighborSnapshotV1> = withOptionals(fc.record(
 	{
@@ -284,6 +284,8 @@ const arbSerializedPeerEntry: fc.Arbitrary<SerializedPeerEntry> = withOptionals(
 		// `null` is the documented "never measured" value and must survive as `null` — not as 0,
 		// and not by vanishing. See the *bucketless sparsity model* note in `docs/fret.md`.
 		avgLatencyMs: fc.option(arbJsonNumber, { nil: null }),
+		sessionStartedAt: arbJsonNumber,
+		lastProvenAliveAt: arbJsonNumber,
 		metadata: arbMetadata,
 		// The store never parses the envelope, so any bytes will do; canonical base64url because
 		// that is the only form its own export writes.

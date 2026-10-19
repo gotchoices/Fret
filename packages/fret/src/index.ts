@@ -178,6 +178,13 @@ export interface FretService {
 	setMetadata(metadata: Record<string, unknown>): void;
 	getMetadata(peerId: string): Record<string, unknown> | undefined;
 	listPeers(): Array<{ id: string; metadata?: Record<string, unknown> }>;
+	/**
+	 * How long, in ms, this node has itself watched `peerId` stay continuously up — measured from
+	 * proof of life only, never gossiped (see *Tenure* in docs/fret.md). 0 for a peer the table
+	 * holds but has never proven alive; `undefined` for one it does not hold. Cohort order does not
+	 * use it — a higher layer may, e.g. to choose which cohort members to ask first.
+	 */
+	getPeerTenure(peerId: string): number | undefined;
 
 	// Network size estimation
 	reportNetworkSize(estimate: number, confidence: number, source?: string): void;

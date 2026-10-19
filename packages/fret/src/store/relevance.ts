@@ -1,5 +1,6 @@
 import type { PeerEntry } from './digitree-store.js';
 import { minDistance, normalizedLogMagnitude } from '../ring/distance.js';
+import { provenTenureMs, stabilityFactor } from './tenure.js';
 
 export interface SparsityModel {
 	centers: number[];
@@ -117,11 +118,21 @@ function baseRelevance(entry: PeerEntry, now: number): number {
 	);
 }
 
+/**
+ * `base · S(x) · stability`: every scoring function's final step. Stability comes from the
+ * entry's *proven* tenure (`store/tenure.ts`), which is 0 — factor 1 — for a brand-new or hearsay
+ * entry, so only a peer this node has itself watched stay up earns the multiplier. A failing peer
+ * is scored with its tenure frozen at the last proof, which is what lets a long-lived server under
+ * maintenance keep its edge at eviction over a fresh peer with similar counters.
+ */
+function weighted(base: number, entry: PeerEntry, x: number, model: SparsityModel): number {
+	return base * sparsityBonus(model, x) * stabilityFactor(provenTenureMs(entry));
+}
+
 export function touch(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): PeerEntry {
 	observeDistance(model, x);
 	const base = baseRelevance({ ...entry, accessCount: entry.accessCount + 1 }, now);
-	const bonus = sparsityBonus(model, x);
-	const relevance = base * bonus;
+	const relevance = weighted(base, entry, x, model);
 	return {
 		...entry,
 		lastAccess: now,
@@ -136,9 +147,7 @@ export function touch(entry: PeerEntry, x: number, model: SparsityModel, now = D
  * a distance we accessed.
  */
 export function initialRelevance(entry: PeerEntry, x: number, model: SparsityModel, now = Date.now()): number {
-	const base = baseRelevance(entry, now);
-	const bonus = sparsityBonus(model, x);
-	return base * bonus;
+	return weighted(baseRelevance(entry, now), entry, x, model);
 }
 
 /**
@@ -174,8 +183,7 @@ export function recordSuccess(entry: PeerEntry, latencyMs: number | undefined, x
 	observeDistance(model, x);
 	const avgLatencyMs = blendLatency(entry.avgLatencyMs, latencyMs);
 	const base = baseRelevance({ ...entry, avgLatencyMs, successCount: entry.successCount + 1, accessCount: entry.accessCount + 1 }, now);
-	const bonus = sparsityBonus(model, x);
-	const relevance = base * bonus;
+	const relevance = weighted(base, entry, x, model);
 	return {
 		...entry,
 		lastAccess: now,
@@ -190,8 +198,7 @@ export function recordFailure(entry: PeerEntry, x: number, model: SparsityModel,
 	observeDistance(model, x);
 	// degrade relevance softly
 	const base = baseRelevance({ ...entry, failureCount: entry.failureCount + 1 }, now) * 0.7;
-	const bonus = sparsityBonus(model, x);
-	const relevance = base * bonus;
+	const relevance = weighted(base, entry, x, model);
 	return {
 		...entry,
 		lastAccess: now,

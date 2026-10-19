@@ -46,6 +46,8 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		successCount: 0,
 		failureCount: 0,
 		avgLatencyMs: null, // never measured, matching the store's default for a fresh peer
+		sessionStartedAt: 0,
+		lastProvenAliveAt: 0,
 		...overrides,
 	}
 }

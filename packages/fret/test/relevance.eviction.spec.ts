@@ -347,6 +347,7 @@ describe('FretService capacity enforcement and victim selection', function () {
 			negotiateFailures: 0, lastNegotiateFailureAt: 0,
 			contactFailures: 0, lastContactFailureAt: 0,
 			accessCount: 0, successCount: 0, failureCount: 0, avgLatencyMs: null,
+			sessionStartedAt: 0, lastProvenAliveAt: 0,
 		}
 
 		// Named once and then named 500 more times: `FretService.noteDiscovered` scores a new
