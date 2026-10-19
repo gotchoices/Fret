@@ -75,7 +75,7 @@ import {
 	initialRelevance,
 	type SparsityModel,
 } from '../store/relevance.js';
-import { noteProven, provenTenureMs } from '../store/tenure.js';
+import { deadGraceMs, noteProven, provenTenureMs, TENURE_GAP_TOLERANCE_MS } from '../store/tenure.js';
 import { createLogger } from '../logger.js';
 
 const log = createLogger('service:fret');
@@ -221,6 +221,20 @@ function requirePositiveMs(value: number | undefined, fallback: number, name: st
 	if (value === undefined) return fallback;
 	if (!Number.isFinite(value) || value <= 0) {
 		throw new Error(`FretService: ${name} must be a positive finite number of milliseconds, got ${String(value)}`);
+	}
+	return value;
+}
+
+/**
+ * The configured dead-verdict grace ceiling (`FretConfig.maxDeadGraceMs`): a finite number of ms
+ * from 0 (the off switch) up to the tenure gap tolerance; absent takes `fallback`. Past the
+ * tolerance a grace could hold a peer "not dead" across a silence long enough that its session
+ * restarts on return — a contradiction, so it fails here rather than being clamped.
+ */
+function requireDeadGraceMs(value: number | undefined, fallback: number): number {
+	if (value === undefined) return fallback;
+	if (!Number.isFinite(value) || value < 0 || value > TENURE_GAP_TOLERANCE_MS) {
+		throw new Error(`FretService: maxDeadGraceMs must be a finite number of milliseconds from 0 to ${TENURE_GAP_TOLERANCE_MS}, got ${String(value)}`);
 	}
 	return value;
 }
@@ -592,6 +606,13 @@ export class FretService implements IFretService, Startable {
 		 */
 		redials: { started: 0, connected: 0, failed: 0 },
 		/**
+		 * Contact strikes that completed a failure run against a live peer but did not mark it
+		 * `dead`, because the run had not yet lasted the peer's tenure-earned grace (see
+		 * `applyContactStrike`). One per such strike, so a long-tenured peer that stays silent
+		 * through its grace counts once per pass until the verdict lands.
+		 */
+		deadGraceHeld: 0,
+		/**
 		 * The stabilization loop's idle backoff, as of the last completed pass (see `IdleBackoff`):
 		 * `delayMs` is the passive delay the loop armed after it — the base while things change,
 		 * doubling toward `maxPassiveIntervalMs` while they do not — and `quietPasses` how many
@@ -672,6 +693,7 @@ export class FretService implements IFretService, Startable {
 			// Validated like `dialTimeoutMs`: a host that set it meant a number. A value at or
 			// below the base interval is the off switch — `IdleBackoff` clamps the cap to the base.
 			maxPassiveIntervalMs: requirePositiveMs(cfg?.maxPassiveIntervalMs, 60_000, 'maxPassiveIntervalMs'),
+			maxDeadGraceMs: requireDeadGraceMs(cfg?.maxDeadGraceMs, 300_000),
 		};
 		this.idle = new IdleBackoff({ baseMs: FretService.PASSIVE_INTERVAL_MS, capMs: this.cfg.maxPassiveIntervalMs });
 		// A key that does not derive this node's peer id would seal records no receiver accepts
@@ -987,7 +1009,16 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
-	 * Count one failed contact against `id`, marking it `dead` once the run completes.
+	 * Count one failed contact against `id`, marking it `dead` once the run completes — and, for a
+	 * peer with long proven tenure, has also lasted that peer's grace.
+	 *
+	 * **The grace** (`deadGraceMs` in `store/tenure.ts`, capped by `maxDeadGraceMs`) is time, not
+	 * strikes: strikes arrive at the pass rate, so a larger count would stretch seconds, never the
+	 * minutes a server's maintenance takes. A peer under 10 minutes of tenure has none and is judged
+	 * exactly as before. Tenure is frozen during the outage (no proof of life arrives), so the grace
+	 * is stable across the run without being snapshotted at its start. A peer held in grace is still
+	 * a live member: routing steers around it by its probe backoff, and cohorts keep it as a member
+	 * that is merely unavailable.
 	 *
 	 * **Synchronous by construction.** `applySuccess` / `applyFailure` read an entry, await the
 	 * self coordinate, then write a value derived before the await — so two concurrent chains
@@ -1017,14 +1048,24 @@ export class FretService implements IFretService, Startable {
 		// Clamped at the threshold so the counter stays bounded for a peer we keep re-probing;
 		// a peer already dead simply stays dead.
 		const failures = Math.min(e.contactFailures + 1, threshold);
-		const patch: PeerPatch = { contactFailures: failures, lastContactFailureAt: now };
-		if (failures >= threshold && e.state !== 'dead') patch.state = 'dead';
+		// A run carrying no start stamp (counter written outside this method) reads as long over, so
+		// its verdict falls back to the strike count alone — today's rule, never a stuck grace.
+		const runStart = e.contactFailures === 0 ? now : e.contactRunStartedAt;
+		const completed = failures >= threshold && e.state !== 'dead';
+		const toDead = completed && now - runStart >= deadGraceMs(provenTenureMs(e), this.cfg.maxDeadGraceMs);
+		const patch: PeerPatch = { contactFailures: failures, lastContactFailureAt: now, contactRunStartedAt: runStart };
+		if (toDead) patch.state = 'dead';
 		this.store.update(id, patch);
-		// A strike on a peer that was not already dead progressed a run (or completed one). One
-		// on a peer already `dead` — the dead arm re-probing it — moves nothing: the peer is backed
-		// off, there is nothing new to act on, and counting it would reset the delay on every
-		// dead-arm probe forever.
-		if (e.state !== 'dead') this.noteChange(`contact strike ${failures} on ${id}`);
+		if (completed && !toDead) this.diag.deadGraceHeld++;
+		// A change is a strike that progressed the count, or the one that marked the peer dead. A
+		// grace-held strike at the clamped threshold moves nothing — it can repeat every pass for
+		// minutes, and counting it would pin the idle backoff at its base for the whole grace. So
+		// the verdict lands at most one passive interval after the grace expires. A strike on a peer
+		// already `dead` (the dead arm re-probing it) is never a change, or every dead-arm probe
+		// would reset the delay forever.
+		if (e.state !== 'dead' && (failures > e.contactFailures || toDead)) {
+			this.noteChange(toDead ? `contact run completed on ${id}` : `contact strike ${failures} on ${id}`);
+		}
 	}
 
 	/**
@@ -1068,9 +1109,10 @@ export class FretService implements IFretService, Startable {
 		// *within* a run: leaving it behind makes the first failure of the next run land inside
 		// the spacing window of a failure from the run just ended, so that strike is discarded
 		// and the peer gets a free miss after every recovery.
-		if (e.contactFailures !== 0 || e.lastContactFailureAt !== 0) {
+		if (e.contactFailures !== 0 || e.lastContactFailureAt !== 0 || e.contactRunStartedAt !== 0) {
 			patch.contactFailures = 0;
 			patch.lastContactFailureAt = 0;
+			patch.contactRunStartedAt = 0;
 		}
 		if (e.state === 'dead') patch.state = this.isConnected(e.id) ? 'connected' : 'disconnected';
 		return patch;
@@ -2410,6 +2452,9 @@ export class FretService implements IFretService, Startable {
 		// Unreachable for a leave (the transport identity check rejects a notice from self), but a
 		// dead self has no path back short of a restart — the same guard `applyContactStrike` keeps.
 		if (id === this.selfIdStr) return;
+		// NOTE: immediate whatever the sender's tenure — no dead-verdict grace — because the notice is
+		// the peer's own statement that it is going. A "back in N minutes" leave flavour that earns
+		// grace needs leave authentication first (tickets/backlog/22-debt-leave-authentication.md).
 		this.store.update(id, { state: 'dead' });
 	}
 

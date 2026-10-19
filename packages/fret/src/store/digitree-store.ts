@@ -66,6 +66,15 @@ export interface PeerEntry {
 	 * serialized — it describes a live attempt and says nothing after a restart. 0 = never counted.
 	 */
 	lastContactFailureAt: number;
+	/**
+	 * Unix ms of the first strike counted in the current contact-failure run; 0 = no run.
+	 *
+	 * The dead-verdict grace (`deadGraceMs` in `store/tenure.ts`) is measured from here: a peer we
+	 * have watched stay up for a long time is marked `dead` only once its run has both reached the
+	 * strike threshold *and* lasted that long. Same lifecycle as `lastContactFailureAt` — not
+	 * serialized, 0 on insert and import, cleared together with the run by proof of life.
+	 */
+	contactRunStartedAt: number;
 	accessCount: number;
 	successCount: number;
 	failureCount: number;
@@ -402,6 +411,7 @@ export class DigitreeStore {
 			lastNegotiateFailureAt: 0,
 			contactFailures: 0,
 			lastContactFailureAt: 0,
+			contactRunStartedAt: 0,
 			accessCount: 0,
 			successCount: 0,
 			failureCount: 0,
@@ -698,6 +708,7 @@ export class DigitreeStore {
 				// on its very next failure.
 				contactFailures: 0,
 				lastContactFailureAt: 0,
+				contactRunStartedAt: 0,
 				// NOTE: a snapshot taken before frequency credit was narrowed to proven contact
 				// carries an accessCount that also counted mentions, so a restored entry can be
 				// over-credited. Self-correcting — the next scoring call rewrites relevance from

@@ -6,6 +6,7 @@ import { memory } from '@libp2p/memory'
 import { plaintext } from '@libp2p/plaintext'
 import { identify, identifyPush } from '@libp2p/identify'
 import type { ConnectionEncrypter, PrivateKey } from '@libp2p/interface'
+import type { fretService } from '../../src/service/libp2p-fret-service.js'
 
 let memAddrCounter = 0
 
@@ -28,6 +29,21 @@ export async function createMemNode(addr?: string): Promise<Libp2p> {
 		streamMuxers: [yamux()]
 	})
 	return node
+}
+
+/**
+ * A memory-transport node that listens nowhere — it can dial, and nobody can dial it: a phone.
+ * Created unstarted. Pass `fret` to host a FRET service on it the ordinary libp2p way.
+ */
+export async function createDialOnlyMemNode(fret?: ReturnType<typeof fretService>): Promise<Libp2p> {
+	return await createLibp2p({
+		start: false,
+		addresses: { listen: [] },
+		transports: [memory()],
+		connectionEncrypters: [plaintext()],
+		streamMuxers: [yamux()],
+		...(fret ? { services: { fret } } : {}),
+	})
 }
 
 /**

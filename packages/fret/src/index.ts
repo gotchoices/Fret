@@ -51,6 +51,22 @@ export interface FretConfig {
 	 */
 	maxPassiveIntervalMs?: number;
 	/**
+	 * The longest grace, in milliseconds, a peer this node has watched stay up for a long time is
+	 * given to come back before it is marked `dead` (default 300 000 ms — 5 minutes).
+	 *
+	 * A peer is normally marked dead after `deadAfterFailures` spaced failed contacts — a few
+	 * seconds. A peer with long *proven tenure* (how long this node itself has watched it stay up)
+	 * is instead marked dead only once its failure run has also lasted `tenure / 12`, capped here:
+	 * nothing below 10 minutes of tenure, 50 s at 10 minutes, 2.5 minutes at 30, the full cap from
+	 * an hour on. So a long-running server down for a few minutes of maintenance keeps its place in
+	 * the ring rather than having the ring re-form around it twice. While in grace the peer is still
+	 * a live member — routing steers around it by its probe backoff, and cohorts keep it as a
+	 * member that is merely unavailable. `0` disables grace for every peer. Must be a finite number
+	 * between 0 and 15 minutes (the tenure gap tolerance — a longer grace could keep a peer "alive"
+	 * across a silence long enough to restart its session); the constructor throws otherwise.
+	 */
+	maxDeadGraceMs?: number;
+	/**
 	 * This node's libp2p private key — the key `node.peerId` was derived from.
 	 *
 	 * Used to seal this node's own signed address record (a libp2p `PeerRecord` envelope) for the

@@ -73,3 +73,28 @@ export function stabilityFactor(tenureMs: number): number {
 	const t = tenureMs > 0 ? tenureMs : 0;
 	return 1 + STABILITY_MAX_BONUS * t / (t + STABILITY_HALF_TENURE_MS);
 }
+
+/** Below this proven tenure a peer gets no dead-verdict grace: newcomers keep the fast verdict. */
+export const DEAD_GRACE_MIN_TENURE_MS = 10 * 60_000;
+/**
+ * Grace earned per unit of proven tenure: a peer we have watched stay up for T is given T/12 to
+ * come back before it is declared dead. A judgement call, not a measurement — Lindy-shaped: the
+ * longer a peer has been up, the longer an absence is still plausibly "brief".
+ */
+export const DEAD_GRACE_TENURE_RATIO = 1 / 12;
+
+/**
+ * How long a contact-failure run against a peer with `tenureMs` of proven tenure must last before
+ * the peer may be marked `dead`, capped at `capMs` (`FretConfig.maxDeadGraceMs`; 0 disables grace).
+ *
+ * 0 below {@link DEAD_GRACE_MIN_TENURE_MS}, so a phone that appeared five minutes ago is judged
+ * exactly as before; at the default 5-minute cap, 50 s at 10 minutes of tenure, 2.5 minutes at
+ * 30, and the full cap from an hour on. Strike count alone cannot do this — strikes arrive at the
+ * stabilization pass rate, so a larger count stretches seconds, not minutes.
+ */
+export function deadGraceMs(tenureMs: number, capMs: number): number {
+	// Written so `NaN` falls to 0: a NaN grace would compare false against every run length and
+	// keep the peer from ever being declared dead.
+	if (!(tenureMs >= DEAD_GRACE_MIN_TENURE_MS)) return 0;
+	return Math.min(capMs, tenureMs * DEAD_GRACE_TENURE_RATIO);
+}

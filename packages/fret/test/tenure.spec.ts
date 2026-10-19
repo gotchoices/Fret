@@ -1,6 +1,9 @@
 import { describe, it } from 'mocha'
 import { expect } from 'chai'
 import {
+	deadGraceMs,
+	DEAD_GRACE_MIN_TENURE_MS,
+	DEAD_GRACE_TENURE_RATIO,
 	noteProven,
 	provenTenureMs,
 	stabilityFactor,
@@ -45,5 +48,20 @@ describe('session tenure', () => {
 			expect(factors[i], `factor at ${tenures[i]} ms`).to.be.greaterThan(factors[i - 1]!)
 			expect(factors[i], `factor at ${tenures[i]} ms`).to.be.lessThan(1 + STABILITY_MAX_BONUS)
 		}
+	})
+
+	it('deadGraceMs is 0 below the tenure floor, the tenure ratio above it, and never past the cap', () => {
+		const CAP = 5 * 60_000
+		const hour = 60 * 60_000
+		const rows: Array<{ name: string; tenure: number; cap: number; want: number }> = [
+			{ name: 'below the floor (a phone up 5 min) → no grace', tenure: 5 * 60_000, cap: CAP, want: 0 },
+			{ name: 'just below the floor → no grace', tenure: DEAD_GRACE_MIN_TENURE_MS - 1, cap: CAP, want: 0 },
+			{ name: 'at the floor → ratio', tenure: DEAD_GRACE_MIN_TENURE_MS, cap: CAP, want: DEAD_GRACE_MIN_TENURE_MS * DEAD_GRACE_TENURE_RATIO },
+			{ name: 'above the floor (30 min) → ratio', tenure: 30 * 60_000, cap: CAP, want: 150_000 },
+			{ name: 'way above (a week) → cap', tenure: 7 * 24 * hour, cap: CAP, want: CAP },
+			{ name: 'cap 0 disables grace', tenure: 7 * 24 * hour, cap: 0, want: 0 },
+			{ name: 'NaN tenure → no grace, never a NaN that disables the verdict', tenure: NaN, cap: CAP, want: 0 },
+		]
+		for (const r of rows) expect(deadGraceMs(r.tenure, r.cap), r.name).to.equal(r.want)
 	})
 })

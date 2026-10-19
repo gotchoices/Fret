@@ -42,6 +42,7 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		lastNegotiateFailureAt: 0,
 		contactFailures: 0,
 		lastContactFailureAt: 0,
+		contactRunStartedAt: 0,
 		accessCount: 0,
 		successCount: 0,
 		failureCount: 0,

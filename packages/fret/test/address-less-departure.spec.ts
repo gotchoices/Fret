@@ -1,10 +1,7 @@
 import { describe, it, afterEach } from 'mocha'
 import { expect } from 'chai'
-import { createLibp2p, type Libp2p } from 'libp2p'
-import { memory } from '@libp2p/memory'
-import { plaintext } from '@libp2p/plaintext'
-import { yamux } from '@chainsafe/libp2p-yamux'
-import { createMemNode, stopAll } from './helpers/libp2p.js'
+import type { Libp2p } from 'libp2p'
+import { createDialOnlyMemNode, createMemNode, stopAll } from './helpers/libp2p.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
 import { fretService, type Libp2pFretService } from '../src/service/libp2p-fret-service.js'
@@ -28,18 +25,6 @@ import { hashPeerId } from '../src/ring/hash.js'
 // has backed off to a 30 s interval (idle backoff, `src/service/idle-backoff.ts`): the
 // `peer:disconnect` must snap the loop back to the 1.5 s base, or the first uncontactable strike
 // is 30 s away. Mutation: removing `noteChange` from the `peer:disconnect` listener reddens it.
-
-/** A memory-transport node that listens nowhere — it can dial, and nobody can dial it. */
-async function dialOnlyNode(fret?: ReturnType<typeof fretService>): Promise<Libp2p> {
-	return await createLibp2p({
-		start: false,
-		addresses: { listen: [] },
-		transports: [memory()],
-		connectionEncrypters: [plaintext()],
-		streamMuxers: [yamux()],
-		...(fret ? { services: { fret } } : {}),
-	})
-}
 
 describe('address-less peer departure', function () {
 	this.timeout(20000)
@@ -78,7 +63,7 @@ describe('address-less peer departure', function () {
 		// count. The phone runs no FRET at all — from the observer's side an ungraceful departure
 		// is just a connection that stops existing.
 		const { b, svcB } = await listeningObserver()
-		const a = await dialOnlyNode()
+		const a = await createDialOnlyMemNode()
 		await a.start()
 		nodes.push(a)
 		const aId = a.peerId.toString()
@@ -115,7 +100,7 @@ describe('address-less peer departure', function () {
 		// reach it within a few of the observer's real 1.5 s ticks.
 		const { b, svcB } = await listeningObserver({ deadAfterFailures: 1000 })
 		await svcB.start() // registers the leave handler
-		const a = await dialOnlyNode(fretService({ profile: 'core', k: 7, networkName: 'net-test' }))
+		const a = await createDialOnlyMemNode(fretService({ profile: 'core', k: 7, networkName: 'net-test' }))
 		nodes.push(a)
 		;(a.services.fret as unknown as Libp2pFretService).setLibp2p(a)
 		await a.start()
@@ -144,7 +129,7 @@ describe('address-less peer departure', function () {
 		const { b, svcB } = await listeningObserver({ maxPassiveIntervalMs: CAP })
 		;(svcB as unknown as { handleLeave: () => Promise<void> }).handleLeave = async () => {}
 		await svcB.start()
-		const a = await dialOnlyNode(fretService({ profile: 'core', k: 7, networkName: 'net-test' }))
+		const a = await createDialOnlyMemNode(fretService({ profile: 'core', k: 7, networkName: 'net-test' }))
 		nodes.push(a)
 		;(a.services.fret as unknown as Libp2pFretService).setLibp2p(a)
 		await a.start()
