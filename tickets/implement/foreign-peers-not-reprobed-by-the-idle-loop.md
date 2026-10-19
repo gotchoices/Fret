@@ -2,6 +2,13 @@ description: A node connected to a relay that runs no FRET (or to a node of anot
 architecture: docs/fret.md#ring-membership-same-network-vs-foreign
 files: packages/fret/src/service/fret-service.ts (`stabilizeOnce` phase-2 pending site and its NOTE, `phaseTwoTargets`, `reprobeExcludedTargets`, `reprobeOffRingTargets`, `applyMembershipSignal` identify arms, `classifyByProtocols`), packages/fret/src/store/digitree-store.ts (`PeerEntry`, `upsert` defaults, `importEntries`), packages/fret/src/service/idle-backoff.ts (class doc only), packages/fret/test/near-exchange.spec.ts, docs/fret.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-19T18:50:46.277Z (agent: claude)
+  Log file: C:\projects\Fret\tickets\.logs\foreign-peers-not-reprobed-by-the-idle-loop.implement.2026-10-19T18-50-46-277Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # Foreign peers are not re-probed by the idle loop
 
 GitHub [#3](https://github.com/gotchoices/Fret/issues/3), from sereus's message accounting (gotchoices/sereus#50).
