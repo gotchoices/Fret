@@ -9,8 +9,8 @@
  * base the moment a **change** is noted — anything the next pass could act on (a connection
  * forming or dropping, a new entry, a label or liveness transition, an address becoming known) —
  * and holds at the base, without counting as a change, while a pass left work **pending**
- * (unknown peers it selected for classification, a redial it outlived, a phase its tick budget
- * cut off).
+ * (a near probe it skipped on recent evidence, unknown peers it selected for classification, a
+ * redial it outlived, a phase its tick budget cut off).
  *
  * A change is recorded as a bump of a monotonic counter, and a pass snapshots that counter when it
  * opens: {@link endPass} compares the two, so a change that lands *during* a pass is seen at that
