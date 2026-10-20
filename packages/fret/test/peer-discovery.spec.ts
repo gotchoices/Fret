@@ -9,6 +9,8 @@ import { peerDiscoverySymbol, type PeerInfo } from '@libp2p/interface';
 import { hashPeerId, coordToBase64url } from '../src/ring/hash.js';
 import { createMemNode, stopAll } from './helpers/libp2p.js';
 import { starMesh, type Mesh } from './helpers/mesh.js';
+import { waitFor } from './helpers/wait-for.js';
+import { isLiveMember } from '../src/service/live-member.js';
 import { FretService as CoreFretService } from '../src/service/fret-service.js';
 import { Libp2pFretService, fretService } from '../src/service/libp2p-fret-service.js';
 import type { SerializedPeerEntry, SerializedTable } from '../src/index.js';
@@ -488,10 +490,16 @@ describe('FretPeerDiscovery integration with CoreFretService', function () {
 	it('emits peers discovered by FretService stabilization', async () => {
 		mesh = await starMesh(3);
 		const { nodes, services } = mesh;
+		const store = services[0]!.getStore();
 
-		await new Promise(r => setTimeout(r, 4000));
+		// Poll for convergence rather than sleeping a fixed duration: discovery emits live
+		// members only, so wait until stabilization has classified both remote peers.
+		await waitFor(() => [1, 2].every(i => {
+			const e = store.getById(nodes[i]!.peerId.toString());
+			return e !== undefined && isLiveMember(e);
+		}), 12000, 25, 'hub classifies both spokes as live members');
 
-		const disc = new FretPeerDiscovery(services[0]!.getStore(), {
+		const disc = new FretPeerDiscovery(store, {
 			emissionIntervalMs: 200,
 			batchSize: 20,
 			debounceMs: 60_000,
