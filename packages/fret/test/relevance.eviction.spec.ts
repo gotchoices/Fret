@@ -344,7 +344,7 @@ describe('FretService capacity enforcement and victim selection', function () {
 		const fresh: PeerEntry = {
 			id: 'derivation-only', coord: new Uint8Array(COORD_BYTES), relevance: 0,
 			lastAccess: FIXED_NOW, state: 'disconnected', membership: 'member',
-			negotiateFailures: 0, lastNegotiateFailureAt: 0,
+			negotiateFailures: 0, advertisedForeign: false, lastNegotiateFailureAt: 0,
 			contactFailures: 0, lastContactFailureAt: 0, contactRunStartedAt: 0,
 			accessCount: 0, successCount: 0, failureCount: 0, avgLatencyMs: null,
 			sessionStartedAt: 0, lastProvenAliveAt: 0,

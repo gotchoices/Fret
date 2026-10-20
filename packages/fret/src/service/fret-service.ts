@@ -153,6 +153,17 @@ interface NearWindow {
 }
 
 /**
+ * A tick's phase-2 selection, kept apart by arm because only one of them holds the idle backoff at
+ * its base (see `stabilizeOnce`). Disjoint, and pooled together for execution.
+ */
+interface PhaseTwoTargets {
+	/** `unknown` peers to classify — a transient population the ring is waiting on. */
+	classify: string[];
+	/** `foreign` and `dead` peers to re-probe — each probe's outcome lands inside the pass. */
+	reprobe: string[];
+}
+
+/**
  * The one verdict a maintenance redial ({@link FretService.redial}) reaches, shared by everyone
  * who awaited it.
  *
@@ -1409,7 +1420,9 @@ export class FretService implements IFretService, Startable {
 	 * Classify `id` from a libp2p-reported protocol list (available once identify has
 	 * run). Member if any of our namespaced protocols appears; foreign if the list is
 	 * non-empty but contains none of them; left unknown if empty (identify pending).
-	 * The demotion arm is deliberately weak — see `applyMembershipSignal`.
+	 * The demotion arm is deliberately weak — see `applyMembershipSignal`. A non-empty list also
+	 * records whether it named ours (`PeerEntry.advertisedForeign`), which the label alone cannot
+	 * say for a member — see {@link noteAdvertisedProtocols}.
 	 *
 	 * NOTE: the positive arm resets the negotiate-failure run (identify listing one of our protocols
 	 * is strong evidence), so a stale-positive list re-applied often enough would keep a peer that
@@ -1429,8 +1442,24 @@ export class FretService implements IFretService, Startable {
 	private classifyByProtocols(id: string, protocols: string[] | undefined): void {
 		if (!protocols || protocols.length === 0) return; // identify not complete → stay unknown
 		const mine = Object.values(this.protocols);
-		const signal = protocols.some((p) => mine.includes(p)) ? 'identify-member' : 'identify-foreign';
-		this.applyMembershipSignal(id, signal);
+		const advertisesOurs = protocols.some((p) => mine.includes(p));
+		this.noteAdvertisedProtocols(id, advertisesOurs);
+		this.applyMembershipSignal(id, advertisesOurs ? 'identify-member' : 'identify-foreign');
+	}
+
+	/**
+	 * Record on `id`'s entry whether its latest non-empty advertised protocol list named ours
+	 * (`PeerEntry.advertisedForeign`) — whatever its label, which the evidence-strength ordering
+	 * settles separately: a confirmed member stays `member` on a list lacking ours, but the flag
+	 * still says what it now advertises. Never a change on its own: clearing it coincides with the
+	 * `identify-member` promotion, which counts for itself, and setting it on a member moves nothing
+	 * a pass acts on — the flag only helps keep an *off-ring* peer out of the re-probe arms (see
+	 * {@link isSettledForeign}).
+	 */
+	private noteAdvertisedProtocols(id: string, advertisesOurs: boolean): void {
+		const advertisedForeign = !advertisesOurs;
+		const e = this.store.getById(id);
+		if (e && e.advertisedForeign !== advertisedForeign) this.store.update(id, { advertisedForeign });
 	}
 
 	/**
@@ -3064,25 +3093,35 @@ export class FretService implements IFretService, Startable {
 			// buys phase 2 its turn. This return still fires for a `stop()` or a tick that really
 			// is out of time.
 			if (budget.signal.aborted) {
-				// Work left undone that no event will announce — the same reason a non-empty phase
-				// 2 is pending below. Harmless on a `stop()`, which resets the backoff anyway.
+				// Work left undone that no event will announce — phase 2 never selected, so nothing
+				// can tell whether unknowns were waiting. Harmless on a `stop()`, which resets the
+				// backoff anyway.
 				this.idle.notePending();
 				return;
 			}
-			const targets = this.phaseTwoTargets();
-			// Pending on the *selection*, not on the label counts: a ring that ever lost a phone
-			// ungracefully holds a `dead` entry until capacity evicts it (never, on a small ring),
-			// and "a dead peer exists" would keep the loop from ever backing off. The selection is
-			// empty whenever every off-ring peer is inside its backoff window, so the loop sleeps
-			// over those windows — and re-probes a peer whose window expired meanwhile up to one
-			// interval late, which the docs state.
-			// NOTE: the ladder restarts at every probe of a *permanently* off-ring peer, and climbs
-			// 1.5 + 3 + 6 + 12 + 24 s = 46.5 s before that peer's 32 s window has passed, so a ring
-			// holding one settles at about five passes per window (~9 s apart) rather than at the
-			// cap. If idle rings with a dead entry still show up in profiles, hold pending for the
-			// classify arm only: the dead and foreign arms' probe outcomes land inside the pass (a
-			// strike that progresses nothing needs no follow-up pass), so they need no hold.
-			if (targets.length > 0) this.idle.notePending();
+			const { classify, reprobe } = this.phaseTwoTargets();
+			// Pending on the classify arm's selection alone. An `unknown` peer is a transient
+			// population the ring is waiting on, so the next pass should carry on classifying at the
+			// base. A re-probe's outcome lands inside this pass: a success is a membership or revival
+			// change, a failure that progresses a run is a change, and one that progresses nothing
+			// needs no follow-up pass — so holding for it only kept a ring with a permanently
+			// off-ring peer (a dead phone, a relay) restarting the ladder every backoff window. A
+			// redial this pass outlives is held by `runStabilizationPass` on its own.
+			// NOTE: accepted tradeoff — once the loop has backed off, the re-probe arms service their
+			// budget (Core 2 / Edge 1 per arm) per *interval*, not per 1.5 s: a dead or
+			// negotiate-foreign peer whose window expires during a backed-off interval is re-probed up
+			// to one interval late, and with more such peers than the budget each waits about
+			// ceil(count / budget) intervals — at the 60 s cap, a Core ring holding 10 dead entries
+			// re-probes each about every 5 minutes while idle. Accepted because a recovered neighbour
+			// contacts us itself (an inbound RPC revives it), a reconnect revives it through
+			// `peer:connect`, and any change returns the loop to the base. Holding pending whenever an
+			// arm was truncated by its budget was rejected: at Edge's budget of 1, two dead entries
+			// whose windows align truncate every window and restart the ladder about every 32 s.
+			// Revisit if dead-recovery latency on large idle rings shows up as a problem — then hold
+			// pending when an off-ring arm was budget-truncated, accepting that saturated arms keep the
+			// loop awake.
+			if (classify.length > 0) this.idle.notePending();
+			const targets = [...classify, ...reprobe];
 			const phaseTwoPool = { concurrency: this.maintenanceConcurrency, signal: budget.signal };
 			const probed = await runPooled(targets.map((id) => () => this.probeMembership(id, budget.signal)), phaseTwoPool);
 			logRejected(probed, targets, 'probeMembership');
@@ -3424,11 +3463,14 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * The gate lives here rather than inside the selectors so a bare selector call (from a test)
 	 * still exercises the real selection logic against the live table.
+	 *
+	 * The two selections come back apart ({@link PhaseTwoTargets}) because only the classify arm
+	 * holds the idle backoff at its base; the tick pools them together.
 	 */
-	private phaseTwoTargets(): string[] {
+	private phaseTwoTargets(): PhaseTwoTargets {
 		if (this.store.countByMembership('unknown') === 0
 			&& this.store.countByMembership('foreign') === 0
-			&& this.store.countByState('dead') === 0) return [];
+			&& this.store.countByState('dead') === 0) return { classify: [], reprobe: [] };
 		// NOTE: the walk is captured once and `put` writes a *new* entry object rather than editing
 		// in place, so a store mutation made after this line is invisible to the arms that run
 		// after it. Sound today: all three arms are pure selection — they read the backoff state,
@@ -3436,7 +3478,7 @@ export class FretService implements IFretService, Startable {
 		// happens later, in the pooled phase. If an arm ever writes to the store while selecting,
 		// re-walk per arm rather than leaving the later arms on a stale array.
 		const entries = this.store.list();
-		return [...this.classifyTargets(entries), ...this.reprobeExcludedTargets(entries)];
+		return { classify: this.classifyTargets(entries), reprobe: this.reprobeExcludedTargets(entries) };
 	}
 
 	/**
@@ -3490,9 +3532,12 @@ export class FretService implements IFretService, Startable {
 	 * - **`foreign`** — a same-network peer *mislabeled* foreign (e.g. identify completed before
 	 *   it registered our protocol handlers) is re-admitted by a successful namespaced ping.
 	 *   Before ring-membership gating this self-healed for free (`probeNeighborLatency` pinged
-	 *   near ring peers regardless of label); gating closed that path. The `peer:update` identify
-	 *   path also re-admits, but only if the remote pushes an update, so this is the dependable
-	 *   backstop.
+	 *   near ring peers regardless of label); gating closed that path. For a peer demoted by
+	 *   negotiate strikes whose latest advertised list still names ours (a same-network peer
+	 *   mid-restart on a host without `identifyPush`) this is the dependable backstop. A peer whose
+	 *   latest list names none of ours is re-probed only until it has refused a full negotiate run
+	 *   (see {@link isSettledForeign}); after that it comes back through identify delivering a list
+	 *   that does, or its own inbound RPC.
 	 * - **`dead`** — a peer marked dead by a run of failed contacts is out of every ring view, so
 	 *   `stabilizeOnce` (which draws its probe targets from `getNeighbors`) never touches it
 	 *   again. Without this arm a peer that recovers but never dials us and never forms a
@@ -3530,6 +3575,21 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * Whether `e` is foreign on both kinds of evidence at once: its latest advertised protocol list
+	 * names none of ours (`advertisedForeign`), *and* a full run of spaced negotiate refusals since
+	 * the last positive proof says it really answers none of them. Neither alone stops re-probing.
+	 * The list can be stale — captured before the remote's FRET registered its handlers, the
+	 * ordinary shape for a host that starts the core service by hand after its node — and without
+	 * `identifyPush` nothing refreshes it: two such peers trusting the list alone would never contact
+	 * each other at all (`test/address-hints.relay.spec.ts` is that rig). A refusal run alone is what
+	 * a same-network peer mid-restart produces, which is what the foreign arm exists to recover.
+	 * Costs a relay {@link NEGOTIATE_FAILURE_THRESHOLD} failed pings per run, then silence.
+	 */
+	private isSettledForeign(e: PeerEntry): boolean {
+		return e.advertisedForeign && e.negotiateFailures >= FretService.NEGOTIATE_FAILURE_THRESHOLD;
+	}
+
+	/**
 	 * Select one bounded re-probe arm's targets — peers matching `isCandidate` — the shared
 	 * mechanics of both arms of {@link reprobeExcludedTargets}: off-backoff and reachable candidates
 	 * only, least-backed-off first, at most `budget` per tick. Selects and returns only; the probing
@@ -3540,11 +3600,19 @@ export class FretService implements IFretService, Startable {
 	 * re-probed at most ~once per backoff window (doubling to a 32× cap) rather than every tick.
 	 * That growing factor is also what rotates the list under tick truncation: a probed peer's
 	 * factor grows, so it sorts behind the ones a truncated tick never reached.
+	 *
+	 * A peer that is foreign on both kinds of evidence ({@link isSettledForeign} — a relay, another
+	 * network's node, once it has refused a run of our probes) is skipped by **both** arms: answering
+	 * our ping cannot make it a ring member, so probing it — and redialing it when disconnected —
+	 * was traffic forever with nothing to recover. If it does start serving this network, identify
+	 * delivers the new list (`identifyPush`, or a reconnect re-running identify), or it contacts us
+	 * itself; a dead one that comes back is revived by `peer:connect`. The filter only removes
+	 * candidates, so the separate per-arm budgets stand.
 	 */
 	private reprobeOffRingTargets(entries: PeerEntry[], isCandidate: (e: PeerEntry) => boolean, budget: number): string[] {
 		const selfStr = this.selfIdStr;
 		const candidates = entries.filter(
-			(e) => e.id !== selfStr && !this.backoff.isBackedOff(e.id) && isCandidate(e)
+			(e) => e.id !== selfStr && !this.isSettledForeign(e) && !this.backoff.isBackedOff(e.id) && isCandidate(e)
 		);
 		if (candidates.length === 0) return [];
 		// Only reachable peers are probeable; prefer connected over has-addresses.

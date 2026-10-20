@@ -39,6 +39,7 @@ function makeEntry(overrides?: Partial<PeerEntry>): PeerEntry {
 		state: 'connected',
 		membership: 'unknown',
 		negotiateFailures: 0,
+		advertisedForeign: false,
 		lastNegotiateFailureAt: 0,
 		contactFailures: 0,
 		lastContactFailureAt: 0,

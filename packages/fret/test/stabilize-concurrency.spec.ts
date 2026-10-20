@@ -356,7 +356,10 @@ describe('stabilization tick: pooled RPCs under one tick budget', function () {
 		}
 	}
 
-	const phaseTwo = (): string[] => (svc as any).phaseTwoTargets() as string[]
+	const phaseTwo = (): string[] => {
+		const { classify, reprobe } = (svc as any).phaseTwoTargets() as { classify: string[], reprobe: string[] }
+		return [...classify, ...reprobe]
+	}
 
 	it('single-node ring: self alone in the table costs zero walks and selects nothing', async () => {
 		// Self is seeded `member` and is never marked dead, so it contributes to none of the three

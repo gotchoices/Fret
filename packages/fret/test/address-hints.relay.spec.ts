@@ -34,7 +34,11 @@ import { FretService as CoreFretService } from '../src/service/fret-service.js'
 //     identify) also reddens it — the relay's identify-stored records for A and B predate their
 //     reservations, so nothing carrying the reserved address ever reaches the sibling. That is
 //     what pins the self-sealed record, and its reseal after the reservation, as the load-bearing
-//     path here rather than identify.
+//     path here rather than identify;
+//   - skipping a peer in the re-probe arms on its advertised protocol list alone, without the
+//     completed negotiate run `FretService.isSettledForeign` also requires, reddens it too: every
+//     node here is identified before its FRET registers, so each holds the others `foreign` off a
+//     stale list, and only the foreign arm's probe ever re-admits them.
 //
 // No identify-push on these nodes, deliberately: with it, a node registering FRET's handlers
 // would push a fresh identify record (post-reservation) to the relay, and the relay could forward

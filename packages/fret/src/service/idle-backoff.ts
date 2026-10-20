@@ -9,7 +9,8 @@
  * base the moment a **change** is noted — anything the next pass could act on (a connection
  * forming or dropping, a new entry, a label or liveness transition, an address becoming known) —
  * and holds at the base, without counting as a change, while a pass left work **pending**
- * (off-ring peers it selected for probing, a redial it outlived).
+ * (unknown peers it selected for classification, a redial it outlived, a phase its tick budget
+ * cut off).
  *
  * A change is recorded as a bump of a monotonic counter, and a pass snapshots that counter when it
  * opens: {@link endPass} compares the two, so a change that lands *during* a pass is seen at that
@@ -73,10 +74,10 @@ export class IdleBackoff {
 	}
 
 	/**
-	 * The open pass left work no event will announce the outcome of — it selected off-ring peers to
-	 * probe, or a redial it started is still running. Holds the next delay at the base. Not a
+	 * The open pass left work no event will announce the outcome of — it selected unknown peers to
+	 * classify, or a redial it started is still running. Holds the next delay at the base. Not a
 	 * change: nothing happened yet, and counting it would reset the quiet count on every pass that
-	 * merely *looked* at a dead peer inside its backoff window.
+	 * merely *selected* a peer to probe.
 	 */
 	notePending(): void {
 		this.pending = true;

@@ -39,6 +39,18 @@ export interface PeerEntry {
 	 */
 	negotiateFailures: number;
 	/**
+	 * Whether the most recent non-empty protocol list libp2p delivered for this peer (identify,
+	 * `peer:update`, or the start walk) named none of this network's protocols.
+	 *
+	 * Independent of `membership`: a confirmed `member` keeps its label when a later list drops our
+	 * protocols (that list may be stale), but the flag still records what the peer now advertises.
+	 * Callers use it, beside a completed `negotiateFailures` run, to stop re-probing an off-ring
+	 * peer that cannot be serving this network. Not serialized — it is re-derived from the
+	 * peerStore — so `false` on insert and on import. Like `membership`, the store only stores and
+	 * exposes it; it never branches on it.
+	 */
+	advertisedForeign: boolean;
+	/**
 	 * Unix ms of the last handshake failure that was *counted* toward `negotiateFailures`.
 	 *
 	 * A run of failures only means "persistently absent" if the observations are separated in
@@ -408,6 +420,7 @@ export class DigitreeStore {
 			state: 'disconnected',
 			membership: 'unknown',
 			negotiateFailures: 0,
+			advertisedForeign: false,
 			lastNegotiateFailureAt: 0,
 			contactFailures: 0,
 			lastContactFailureAt: 0,
@@ -702,6 +715,10 @@ export class DigitreeStore {
 				// too. Reset for the same reason `state` is forced to 'disconnected'.
 				negotiateFailures: 0,
 				lastNegotiateFailureAt: 0,
+				// Re-derived from the peerStore, not restored: the start walk re-applies each peer's
+				// protocol list. A table imported *after* start() therefore re-probes a replaced
+				// foreign entry until its next `peer:update` — a few cheap pings, accepted.
+				advertisedForeign: false,
 				// Likewise unreachability: a peer we could not contact before the restart may be
 				// reachable now. `state` is already forced to 'disconnected', so resetting the
 				// counter alongside it is what stops an imported table from re-killing that peer

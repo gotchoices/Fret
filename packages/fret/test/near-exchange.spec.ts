@@ -21,7 +21,8 @@ import type { FretConfig, NeighborSnapshotV1 } from '../src/index.js'
 //   2. the reproduction — two real memory nodes driven pass by pass, alternately;
 //   3. the idle backoff on that same strand (the issue's suggestion 1): both sides' passive
 //      interval climbs to the cap while they keep pinging each other, and a real change on one
-//      side resets that side alone;
+//      side resets that side alone — and still climbs with a FRET-less third node (a relay) held
+//      off-ring beside it (gotchoices/Fret#3);
 //   4. strike accounting on the stub-connection rig — a skip records nothing, and a peer whose
 //      traffic stops is still struck dead on the usual schedule.
 
@@ -200,6 +201,61 @@ describe('idle two-node strand: the reproduction', function () {
 		// it (pending) and the probe moves its label (a change).
 		await cycle(b.svc)
 		expect(dB.loop.delayMs, "B's next pass arms the base").to.equal(BASE)
+	})
+
+	/**
+	 * The strand above plus C, a plain libp2p node with no FRET service — a relay, say — connected
+	 * to A and held in A's table under `label`. gotchoices/Fret#3: such a peer used to keep A's loop
+	 * from ever reaching the cap. C's probe backoff is cleared before every cycle so the foreign arm
+	 * would select it on every pass; only the rule under test keeps it out, or keeps the climb going
+	 * while it is in. Returns A's failed probes over the climb, which can only have been of C.
+	 */
+	async function climbBesideOffRingPeer(cap: number, label: (svc: CoreFretService, cId: string) => void): Promise<{ delayA: number; delayB: number; failedProbes: number }> {
+		const a = await member({ maxPassiveIntervalMs: cap })
+		const b = await member({ maxPassiveIntervalMs: cap })
+		await a.node.dial(b.node.getMultiaddrs()[0]!)
+		await admit(a.svc, b.node)
+		await admit(b.svc, a.node)
+		const c = await createMemNode()
+		await c.start()
+		nodes.push(c)
+		await c.dial(a.node.getMultiaddrs()[0]!)
+		const cId = c.peerId.toString()
+		a.svc.getStore().upsert(cId, await hashPeerId(c.peerId))
+		label(a.svc, cId)
+		const dA = a.svc.getDiagnostics()
+		const dB = b.svc.getDiagnostics()
+		const failedBefore = dA.pingsFail
+		const cycle = (svc: CoreFretService): Promise<number> => (svc as any).runStabilizationPass()
+		for (let passes = 0; (dA.loop.delayMs < cap || dB.loop.delayMs < cap) && passes < 8; passes++) {
+			(a.svc as any).backoff.clear(cId)
+			await cycle(a.svc); await cycle(b.svc)
+		}
+		return { delayA: dA.loop.delayMs, delayB: dB.loop.delayMs, failedProbes: dA.pingsFail - failedBefore }
+	}
+
+	it('a ring whose only off-ring peer advertises another network and refused a run backs off to the cap and never probes it', async () => {
+		const CAP = 12_000
+		// What identify reports for a node serving none of our protocols (`foreign`, flagged), after
+		// the run of refusals that confirms the list is not merely stale. The case below differs
+		// only in the flag.
+		const r = await climbBesideOffRingPeer(CAP, (svc, cId) => {
+			(svc as any).classifyByProtocols(cId, ['/ipfs/id/1.0.0'])
+			svc.getStore().update(cId, { negotiateFailures: 3 })
+		})
+		expect(r.failedProbes, 'C was never probed').to.equal(0)
+		expect(r.delayA, 'A reached the cap').to.equal(CAP)
+		expect(r.delayB, 'B reached the cap').to.equal(CAP)
+	})
+
+	it('a ring whose only off-ring peer is negotiate-foreign backs off to the cap while still re-probing it', async () => {
+		const CAP = 12_000
+		// A settled run: each further refusal is quiet. Below the threshold, hand-driven passes land
+		// inside the negotiate spacing, so whether a refusal counts as a change would be timing.
+		const r = await climbBesideOffRingPeer(CAP, (svc, cId) => svc.getStore().update(cId, { membership: 'foreign', negotiateFailures: 3 }))
+		expect(r.delayA, 'A reached the cap').to.equal(CAP)
+		expect(r.delayB, 'B reached the cap').to.equal(CAP)
+		expect(r.failedProbes, 'non-vacuity: C was probed during the climb').to.be.greaterThan(0)
 	})
 
 	/**
