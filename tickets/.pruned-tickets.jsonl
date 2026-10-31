@@ -141,3 +141,5 @@
 {"slug":"token-bucket-edge-cases","file":"token-bucket-edge-cases.md","completedAt":"2026-08-15","commit":"82cdb3f187a7e6894dd69bf97dcc94adef0734bc","prunedAt":"2026-09-30T18:47:15.680Z"}
 {"slug":"verify-fret-docs-stream-management","file":"verify-fret-docs-stream-management.md","completedAt":"2026-08-22","commit":"0518d59d73b0860968e6be8b31ade0caf02cda0b","prunedAt":"2026-09-30T18:47:15.680Z"}
 {"slug":"wire-confidence-range-unchecked","file":"wire-confidence-range-unchecked.md","completedAt":"2026-08-21","commit":"90d2640fdaa4a7df9fbde2df3edf3b924b535810","prunedAt":"2026-09-30T18:47:15.680Z"}
+{"slug":"address-hints-live-exchange","file":"10-address-hints-live-exchange.md","completedAt":"2026-09-30","commit":"e27dd741c4897438eecbda30f109b6d251d9095c","prunedAt":"2026-10-31T20:42:10.345Z"}
+{"slug":"address-hints-persisted-table","file":"10.5-address-hints-persisted-table.md","completedAt":"2026-09-30","commit":"d149e738381acc3b40cd13c80584b52e29086a59","prunedAt":"2026-10-31T20:42:10.345Z"}
