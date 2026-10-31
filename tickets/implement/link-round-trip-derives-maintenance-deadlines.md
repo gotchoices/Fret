@@ -2,6 +2,13 @@ description: FRET's deadlines for talking to a peer over an open connection are 
 architecture: docs/fret.md#stabilization-and-churn-handling
 files: packages/fret/src/service/maintenance-deadlines.ts (new), packages/fret/src/index.ts (FretConfig), packages/fret/src/service/fret-service.ts (MAINTENANCE_RPC_TIMEOUT_MS ~501, MAINTENANCE_SNAPSHOT_TIMEOUT_MS ~514, STABILIZE_TICK_BUDGET_MS ~532, STABILIZE_PHASE_ONE_BUDGET_MS ~559, SHUTDOWN_BUDGET_MS ~568, cfg type ~287, constructor config resolution ~703, use sites ~2129 / ~2223 / ~3053 / ~3059 / ~3391 / ~3656 / ~3742, sendMaybeAct sites ~4231 / ~4514 / ~4607), packages/fret/src/rpc/protocols.ts (RPC_TIMEOUT_MS ~27, registerRpcHandler closeBudgetMs ~160), packages/fret/test/stabilize-budget-invariants.spec.ts, packages/fret/test/helpers/maintenance-rig.ts, docs/fret.md
 ----
+<!-- resume-note -->
+RESUME: A prior agent run on this ticket did not complete.
+  Prior run: 2026-10-31T21:06:16.215Z (agent: claude)
+  Log file: C:\projects\Fret\tickets\.logs\link-round-trip-derives-maintenance-deadlines.implement.2026-10-31T21-06-16-215Z.log
+Read the log to see what was done. Resume where it left off.
+If the prior run hit a timeout or repeated error, be cautious not to rush into the same situation.
+<!-- /resume-note -->
 # The declared link round trip sets FRET's maintenance deadlines
 
 Requested by Sereus (`../sereus/tickets/blocked/fret-maintenance-deadlines-below-the-declared-link.md`, GitHub gotchoices/sereus#48). Sereus declares the round trip of the slowest link it supports (`NetworkConfig.linkRoundTripMs`, 3 500 ms by default) and passes it to Optimystic (`NodeOptions.linkRoundTripMs`), which derives its own deadlines from it (`resolveLinkDeadlines` in `../optimystic/packages/db-p2p/src/rpc-deadline.ts`) and already sets FRET's redial budget (`FretConfig.dialTimeoutMs`) from it. FRET's deadlines over an *open* connection are still constants, so on a declared 3.5 s link every maintenance ping times out (2 s budget against ~7 s needed), the peer collects contact strikes, is marked `dead` though its connection is up, and Optimystic leaves it out of every cohort.

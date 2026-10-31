@@ -24,8 +24,9 @@ export interface FretConfig {
 	 * Whole-dial budget, in milliseconds, for a maintenance **redial** — the connection FRET opens
 	 * on its own to a routing-table peer it is not connected to (default 10 000 ms).
 	 *
-	 * A maintenance ping assumes an open connection and is bounded by a 2 s exchange budget; opening
-	 * one is a separate step with this budget, run outside the stabilization tick. The default
+	 * A maintenance ping assumes an open connection and is bounded by the maintenance ping budget
+	 * (2 s, or derived from `linkRoundTripMs`); opening one is a separate step with this budget, run
+	 * outside the stabilization tick. Not derived from `linkRoundTripMs` — see there. The default
 	 * restates libp2p's own `dialTimeout` default (10 s), because libp2p applies that only to a dial
 	 * that carries *no* abort signal — FRET always passes one, so this is the only whole-dial limit
 	 * in force (libp2p's per-address `addressDialTimeout` still applies underneath). A host on slow
@@ -33,6 +34,27 @@ export interface FretConfig {
 	 * ordinary there. Must be a positive finite number; the constructor throws otherwise.
 	 */
 	dialTimeoutMs?: number;
+	/**
+	 * The round trip, in milliseconds, of the slowest link between any two nodes that talk, relayed
+	 * hops included (undeclared by default) — the same sense as Optimystic's
+	 * `NodeOptions.linkRoundTripMs`.
+	 *
+	 * FRET derives every deadline it applies over an *open* connection from it: the maintenance ping
+	 * and announce (2 round trips), the neighbour-snapshot fetch (3), the stabilization tick's phase 1
+	 * and whole-tick budgets (composed from those two, so phase 2 always keeps a one-ping reserve),
+	 * and the budget of an outbound routed request (2 hops of 2 round trips) — see
+	 * `src/service/maintenance-deadlines.ts`. Each derived deadline is floored at today's constant
+	 * (ping 2 s, snapshot 1 s, phase 1 3 s, tick 5 s, route 5 s), so a declaration can only lengthen
+	 * one; absent, every deadline is exactly today's. Without it, a link slower than those constants
+	 * fails every ping and FRET marks a connected peer `dead`.
+	 *
+	 * `dialTimeoutMs` is **not** derived from it: opening a connection is a connection-stack cost
+	 * (Optimystic sets it from its own connection round-trip count), so an explicit `dialTimeoutMs`
+	 * stays the only way to set the redial budget. Must be a positive finite number no larger than
+	 * `MAX_LINK_ROUND_TRIP_MS` (about 306 million ms, where the derived tick budget would overflow
+	 * the 32-bit timer limit); the constructor throws otherwise.
+	 */
+	linkRoundTripMs?: number;
 	/**
 	 * The ceiling, in milliseconds, the passive stabilization interval may grow to while nothing in
 	 * the network changes (default 60 000 ms).

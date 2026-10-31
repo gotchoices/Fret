@@ -69,6 +69,21 @@ export function hangsUntilAbort(opts: StreamOpts, onSettle: () => void): Promise
 	})
 }
 
+/**
+ * A stream open delayed by `ms` — a live peer behind a slow link — that settles early, rejecting,
+ * if the caller's signal aborts first, the same contract as {@link hangsUntilAbort}. The timer is
+ * cleared on abort so a cut-off open leaves nothing for the mocha exit watchdog to find.
+ */
+function delayUnlessAborted(ms: number, opts: StreamOpts): Promise<void> {
+	return new Promise<void>((resolve, reject) => {
+		const signal = opts.signal
+		if (signal?.aborted) { reject(abortReasonError(signal)); return }
+		const onAbort = (): void => { clearTimeout(timer); reject(abortReasonError(signal!)) }
+		const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve() }, ms)
+		signal?.addEventListener('abort', onAbort, { once: true })
+	})
+}
+
 function sleep(ms: number): Promise<void> {
 	return new Promise((r) => setTimeout(r, ms))
 }
@@ -120,6 +135,12 @@ export class PeerRig {
 	 * would — no field on either reply — which is the version-skew path every older spec drives.
 	 */
 	readonly digest = new Map<string, string>()
+	/**
+	 * Per-peer delay, in ms, before every stream open to that peer settles — after which it answers
+	 * per its {@link Behavior}. A live peer behind a slow link, as opposed to `'hangs'`, which never
+	 * answers. An open cut off by the caller's signal first rejects like any other aborted open.
+	 */
+	readonly answerDelayMs = new Map<string, number>()
 
 	constructor(
 		private readonly pingProtocol: string,
@@ -149,7 +170,9 @@ export class PeerRig {
 		const settle = (): void => { this.inFlight-- }
 		const behavior = this.protocolBehavior.get(`${id}|${protocol}`) ?? this.behavior.get(id) ?? 'answers'
 		if (behavior === 'hangs') return hangsUntilAbort(opts, settle)
-		return this.reply(id, protocol, behavior).then(
+		const delayMs = this.answerDelayMs.get(id) ?? 0
+		const answered = delayMs > 0 ? delayUnlessAborted(delayMs, opts) : Promise.resolve()
+		return answered.then(() => this.reply(id, protocol, behavior)).then(
 			(bytes) => stubStream(bytes, this.holdMs, settle),
 			(err: unknown) => { settle(); throw err },
 		)

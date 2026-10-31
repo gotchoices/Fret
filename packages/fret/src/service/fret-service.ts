@@ -17,7 +17,7 @@ import type {
 import { DigitreeStore, type PeerEntry, type PeerPatch } from '../store/digitree-store.js';
 import { hashKey, hashPeerId, coordToBase64url } from '../ring/hash.js';
 import type { Libp2p } from 'libp2p';
-import { makeProtocols, validateTimestamp, type FretProtocols } from '../rpc/protocols.js';
+import { makeProtocols, validateTimestamp, RPC_TIMEOUT_MS, type FretProtocols } from '../rpc/protocols.js';
 import { registerNeighbors, fetchNeighbors, announceNeighbors } from '../rpc/neighbors.js';
 import { registerMaybeAct, sendMaybeAct } from '../rpc/maybe-act.js';
 import {
@@ -62,6 +62,7 @@ import { SizeObserver } from './size-observer.js';
 import { ProbeBackoff } from './probe-backoff.js';
 import { NearExchange, snapshotDigest } from './near-exchange.js';
 import { IdleBackoff } from './idle-backoff.js';
+import { resolveMaintenanceDeadlines, MAX_LINK_ROUND_TRIP_MS, type MaintenanceDeadlines } from './maintenance-deadlines.js';
 import type { PingReplyExtras } from '../rpc/ping.js';
 import type { LocalSizeEstimate } from './size-observer.js';
 import { ringNeighborsBothSides } from '../ring/ring-walk.js';
@@ -237,6 +238,20 @@ function requirePositiveMs(value: number | undefined, fallback: number, name: st
 }
 
 /**
+ * The declared link round trip (`FretConfig.linkRoundTripMs`): absent stays `undefined` — there is
+ * no default, undeclared is its own state — and a present value must be a positive finite number no
+ * larger than {@link MAX_LINK_ROUND_TRIP_MS}, past which the derived tick deadline overflows the
+ * 32-bit timer limit and fires at once.
+ */
+function requireLinkRoundTripMs(value: number | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	if (!Number.isFinite(value) || value <= 0 || value > MAX_LINK_ROUND_TRIP_MS) {
+		throw new Error(`FretService: linkRoundTripMs must be a positive finite number of milliseconds no larger than ${MAX_LINK_ROUND_TRIP_MS}, got ${String(value)}`);
+	}
+	return value;
+}
+
+/**
  * The configured dead-verdict grace ceiling (`FretConfig.maxDeadGraceMs`): a finite number of ms
  * from 0 (the off switch) up to the tenure gap tolerance; absent takes `fallback`. Past the
  * tolerance a grace could hold a peer "not dead" across a silence long enough that its session
@@ -282,15 +297,22 @@ export class FretService implements IFretService, Startable {
 	private mode: FretMode = 'passive';
 	private readonly store = new DigitreeStore();
 	// Every optional field is resolved to a default in the constructor, so the service never
-	// re-derives one at a read site. `privateKey` is the one field with no default — "absent"
-	// is a real state (see the field below) — so it lives beside the config rather than in it.
-	private readonly cfg: Required<Omit<FretConfig, 'privateKey'>>;
+	// re-derives one at a read site. `privateKey` and `linkRoundTripMs` are the fields with no
+	// default — "absent" is a real state for each (see the fields below) — so they live beside the
+	// config rather than in it.
+	private readonly cfg: Required<Omit<FretConfig, 'privateKey' | 'linkRoundTripMs'>>;
 	/**
 	 * The key that seals this node's own address record (`FretConfig.privateKey`); checked in the
 	 * constructor to derive `node.peerId`. `undefined` means this node advertises no record for
 	 * itself — forwarding and ingestion of other peers' records run regardless.
 	 */
 	private readonly privateKey: PrivateKey | undefined;
+	/**
+	 * The declared link round trip (`FretConfig.linkRoundTripMs`), from which {@link deadlines}
+	 * derives every open-connection deadline. `undefined` means undeclared — every deadline is its
+	 * floor, exactly today's behaviour — and is deliberately not a sentinel number.
+	 */
+	private readonly linkRoundTripMs: number | undefined;
 	/** This node's own signed address record, sealed lazily — see {@link SelfAddressRecord}. */
 	private readonly selfRecord = new SelfAddressRecord();
 	private readonly node: Libp2p;
@@ -482,13 +504,15 @@ export class FretService implements IFretService, Startable {
 	private static readonly CONTACT_FAILURE_MIN_SPACING_MS = 500;
 	/**
 	 * Whole-RPC budget for the single-hop maintenance RPCs — ping and announce — **over a
-	 * connection that already exists.**
+	 * connection that already exists**, when no link round trip is declared; and the floor of the
+	 * derived `pingMs` when one is (see {@link deadlines}). Read only through {@link deadlineFloors}.
 	 *
 	 * A ping is a ~50-byte round trip and an announce is a fire-and-forget push with no reply of
 	 * substance, so the default `RPC_TIMEOUT_MS` (5 s) on these paths only ever means "this peer
 	 * is gone" — and they are exactly the paths that must not hold a stabilization or warm-up tick
-	 * open. `sendMaybeAct` deliberately keeps the default: it returns only once the *whole
-	 * remaining route* has completed downstream, so its budget is a route budget, not a link one.
+	 * open. An outbound maybeAct takes the route budget instead (`routeMs`): it returns only once
+	 * the *whole remaining route* has completed downstream, so its budget is a route budget, not a
+	 * link one.
 	 *
 	 * It does **not** cover opening the connection. A relayed dial on a slow link takes 9–21 s
 	 * (Sereus measured both), so a dialing ping under this budget never lands there, and because
@@ -501,7 +525,8 @@ export class FretService implements IFretService, Startable {
 	private static readonly MAINTENANCE_RPC_TIMEOUT_MS = 2000;
 	/**
 	 * Whole-RPC budget for the neighbor-snapshot fetch (`fetchNeighbors` in
-	 * `fetchAndMergeSnapshot`) — deliberately smaller than the route-sized default.
+	 * `fetchAndMergeSnapshot`) — deliberately smaller than the route-sized default — when no link
+	 * round trip is declared, and the floor of the derived `snapshotMs` when one is.
 	 *
 	 * `fetchNeighbors` is `dial: 'never'`, so no dial cost sits inside this budget: it is a stream
 	 * open on an already-multiplexed connection, one write, and a read the wire cap bounds at
@@ -509,11 +534,13 @@ export class FretService implements IFretService, Startable {
 	 * that is not already broken, so exceeding it means "this peer is stalled" — the verdict we
 	 * want promptly, because phase 1 of a tick is bounded by {@link STABILIZE_PHASE_ONE_BUDGET_MS}
 	 * and a stalled snapshot must not eat it. Still well above {@link MAINTENANCE_RPC_TIMEOUT_MS}
-	 * in kind: a snapshot is a real payload, not a ~50-byte ping.
+	 * in kind: a snapshot is a real payload, not a ~50-byte ping. On a declared slow link "orders
+	 * of magnitude above" no longer holds, which is why the derived value takes over there.
 	 */
 	private static readonly MAINTENANCE_SNAPSHOT_TIMEOUT_MS = 1000;
 	/**
-	 * Wall-clock cap on one whole stabilization tick (`stabilizeOnce`).
+	 * Wall-clock cap on one whole stabilization tick (`stabilizeOnce`) when no link round trip is
+	 * declared, and the floor of the derived `tickMs` when one is.
 	 *
 	 * The tick's RPCs run pooled (`maintenanceConcurrency` in flight), each already bounded by its
 	 * own RPC budget, so this is the bound on the *tick*, not on any one peer: when it expires,
@@ -525,9 +552,10 @@ export class FretService implements IFretService, Startable {
 	 * against it through `wasCancelled`, so an expiry records no strike, no backoff and no
 	 * `pingsFail` — exactly as a `stop()` does.
 	 *
-	 * NOTE: active mode ticks every 300 ms, so under mass failure a 5 s budget makes active
-	 * stabilization effectively continuous (the loop awaits the tick before re-arming — true today
-	 * as well). Tighten per mode only if warm-up latency ever measurably suffers.
+	 * NOTE: active mode ticks every 300 ms, so under mass failure a tick lasting up to the resolved
+	 * `tickMs` (5 s undeclared, 24.5 s at a declared 3.5 s link) makes active stabilization
+	 * effectively continuous (the loop awaits the tick before re-arming, so ticks never overlap).
+	 * Tighten per mode only if warm-up latency ever measurably suffers.
 	 */
 	private static readonly STABILIZE_TICK_BUDGET_MS = 5000;
 	/**
@@ -541,20 +569,23 @@ export class FretService implements IFretService, Startable {
 	private static readonly ACTIVE_INTERVAL_MS = 300;
 	/**
 	 * Wall-clock cap on **phase 1** of a stabilization tick (the pooled near-peer ping then
-	 * snapshot-fetch pass), opened as a *child* of the tick deadline.
+	 * snapshot-fetch pass), opened as a *child* of the tick deadline — when no link round trip is
+	 * declared, and the floor of the derived `phaseOneMs` when one is.
 	 *
-	 * Its complement inside {@link STABILIZE_TICK_BUDGET_MS} is phase 2's reserved slice:
-	 * 5000 - 3000 = 2000 ms, exactly one {@link MAINTENANCE_RPC_TIMEOUT_MS} ping, so even a phase 1
-	 * that runs to its own deadline leaves phase 2 able to complete a probe against a peer that is
-	 * genuinely alive — which is the whole purpose of the classification and re-probe arms. Phase 2
-	 * is the *only* path by which a `dead` peer is contacted again or an `unknown` one is
-	 * classified, so a phase-1 straggler must not be able to starve it.
+	 * The rule, over the resolved deadlines: phase 1's complement inside the tick is phase 2's
+	 * reserved slice, `tickMs − phaseOneMs >= pingMs` — undeclared, 5000 − 3000 = 2000 ms, exactly
+	 * one {@link MAINTENANCE_RPC_TIMEOUT_MS} ping — so even a phase 1 that runs to its own deadline
+	 * leaves phase 2 able to complete a probe against a peer that is genuinely alive, which is the
+	 * whole purpose of the classification and re-probe arms. Phase 2 is the *only* path by which a
+	 * `dead` peer is contacted again or an `unknown` one is classified, so a phase-1 straggler must
+	 * not be able to starve it.
 	 *
-	 * 3000 is >= one worst-case phase-1 unit ({@link MAINTENANCE_RPC_TIMEOUT_MS} +
-	 * {@link MAINTENANCE_SNAPSHOT_TIMEOUT_MS}), so a merely-slow peer still completes rather than
-	 * being cut off by the phase budget. Both inequalities are pinned over the declared defaults by
-	 * `test/stabilize-budget-invariants.spec.ts` rather than asserted at runtime — the test rigs
-	 * mutate these statics down to tens of milliseconds, so a runtime assert would throw in them.
+	 * And `phaseOneMs >= pingMs + snapshotMs` — undeclared, 3000 >= 2000 + 1000 — so a merely-slow
+	 * peer still completes rather than being cut off by the phase budget. Undeclared, both
+	 * inequalities are pinned over these constants by `test/stabilize-budget-invariants.spec.ts`
+	 * rather than asserted at runtime — the test rigs mutate these statics down to tens of
+	 * milliseconds, so a runtime assert would throw in them. Declared, both hold by construction
+	 * (see `maintenance-deadlines.ts`), and the same spec checks them at several declarations.
 	 */
 	private static readonly STABILIZE_PHASE_ONE_BUDGET_MS = 3000;
 	/**
@@ -564,10 +595,34 @@ export class FretService implements IFretService, Startable {
 	 * extra, and `isDoomedDial`-filtered, so 3 s is generous for the reachable targets while
 	 * capping a `stop()` that would otherwise serialize several dead dials at a timeout apiece.
 	 * Cannot reuse the run signal — the fan-out runs *after* that aborts, by design.
+	 *
+	 * Deliberately not derived from `linkRoundTripMs`, and neither is the per-notice budget below:
+	 * a leave notice is write-only — on an open connection it returns after a local write with no
+	 * round trip awaited — and this budget is how long `stop()` may take, a host-facing latency
+	 * contract rather than a link one.
+	 * NOTE: a notice to a dialable-but-unconnected neighbour dials inside
+	 * {@link LEAVE_NOTICE_TIMEOUT_MS} (1.5 s) and will not land on a slow relayed link; if graceful
+	 * departures are missed on declared links, derive the per-notice budget from the declaration.
 	 */
 	private static readonly SHUTDOWN_BUDGET_MS = 3000;
 	/** Per-notice budget inside {@link SHUTDOWN_BUDGET_MS}, so one stalled peer cannot eat it whole. */
 	private static readonly LEAVE_NOTICE_TIMEOUT_MS = 1500;
+	/**
+	 * Today's open-connection deadlines, read off the statics (and `RPC_TIMEOUT_MS`) at the moment
+	 * of the call — the floors {@link deadlines} derives from, and the deadlines themselves when no
+	 * link round trip is declared. Read per call rather than captured once because the test rigs
+	 * assign these statics, some after the service is built, to shrink budgets to tens of ms. The
+	 * only reader of the four maintenance statics; every use site goes through {@link deadlines}.
+	 */
+	private static deadlineFloors(): MaintenanceDeadlines {
+		return {
+			pingMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+			snapshotMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,
+			phaseOneMs: FretService.STABILIZE_PHASE_ONE_BUDGET_MS,
+			tickMs: FretService.STABILIZE_TICK_BUDGET_MS,
+			routeMs: RPC_TIMEOUT_MS,
+		};
+	}
 	private firstStabilizeDone = false;
 	/** Resolves once this run's first stabilization pass completes; see `ready()`. */
 	private readyDeferred: { promise: Promise<void>; resolve: () => void } = (() => {
@@ -706,6 +761,7 @@ export class FretService implements IFretService, Startable {
 			maxPassiveIntervalMs: requirePositiveMs(cfg?.maxPassiveIntervalMs, 60_000, 'maxPassiveIntervalMs'),
 			maxDeadGraceMs: requireDeadGraceMs(cfg?.maxDeadGraceMs, 300_000),
 		};
+		this.linkRoundTripMs = requireLinkRoundTripMs(cfg?.linkRoundTripMs);
 		this.idle = new IdleBackoff({ baseMs: FretService.PASSIVE_INTERVAL_MS, capMs: this.cfg.maxPassiveIntervalMs });
 		// A key that does not derive this node's peer id would seal records no receiver accepts
 		// (the signer must equal the labelled id) — a caller bug, so it fails here, not silently
@@ -2119,14 +2175,15 @@ export class FretService implements IFretService, Startable {
 			if (this.isDoomedDial(id)) continue;
 			if (!this.bucketAnnounce.tryTake()) { this.diag.announcementsSkipped++; break; }
 			try {
-				// NOTE: an announce to a non-connected peer dials within MAINTENANCE_RPC_TIMEOUT_MS;
-				// on links where a dial exceeds that (a relayed dial on a slow link takes 9–21 s) it
-				// never lands. Left as is: announces are opportunistic and score nothing, and a
-				// slow dial here must not stall this deliberately serial loop. If announce
+				// NOTE: an announce to a non-connected peer dials within the ping budget (`pingMs`:
+				// 2 s, or 2 round trips of a declared link); on links where a dial exceeds that (a
+				// relayed dial on a slow link takes 9–21 s) it never lands. Left as is: announces
+				// are opportunistic and score nothing, and a slow dial here must not stall this
+				// deliberately serial loop. If announce
 				// delivery to fresh peers ever matters on such links, request a `redial` for the
 				// target and announce on the next pass instead of dialing inline.
 				const out = await announceNeighbors(this.node, id, snap, this.protocols.PROTOCOL_NEIGHBORS_ANNOUNCE, {
-					dial: true, signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+					dial: true, signal: sig, timeoutMs: this.deadlines().pingMs,
 				});
 				if (out.kind === 'ok') this.diag.announcementsSent++;
 				this.noteWriteOnlyOutcome(id, out, 'announce');
@@ -2181,7 +2238,7 @@ export class FretService implements IFretService, Startable {
 	 *
 	 * - **Pooled at {@link maintenanceConcurrency}** (Core 6 / Edge 2), the same cap a tick uses.
 	 * - **Against the run signal, not a tick deadline.** Neither pass runs inside `stabilizeOnce`,
-	 *   so there is no tick budget to inherit; the per-ping {@link MAINTENANCE_RPC_TIMEOUT_MS}
+	 *   so there is no tick budget to inherit; the per-ping budget (`pingMs`, see {@link deadlines})
 	 *   bounds each task and `stop()` collapses the whole fan-out at once.
 	 * - **`isDialable` is filtered before `budget` is applied**, not inside the task, so neither a
 	 *   pool slot nor a slot of the caller's per-pass budget goes to a peer that can only fail to
@@ -2220,7 +2277,7 @@ export class FretService implements IFretService, Startable {
 		const results = await runPooled(targets.map((id) => async () => {
 			try {
 				const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
-					dial: 'never', signal: sig, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+					dial: 'never', signal: sig, timeoutMs: this.deadlines().pingMs,
 				});
 				switch (out.kind) {
 					case 'ok': case 'busy': case 'decode-error':
@@ -3015,6 +3072,17 @@ export class FretService implements IFretService, Startable {
 	}
 
 	/**
+	 * The open-connection deadlines this service runs under: derived from the declared link round
+	 * trip, each floored at today's constant, or exactly those constants when nothing is declared —
+	 * see `maintenance-deadlines.ts`. Resolved at each use, not once in the constructor, so a test
+	 * rig that shrinks a static after construction is honoured; the cost is a few `Math.max` per
+	 * peer per tick.
+	 */
+	private deadlines(): MaintenanceDeadlines {
+		return resolveMaintenanceDeadlines(this.linkRoundTripMs, FretService.deadlineFloors());
+	}
+
+	/**
 	 * One stabilization tick: two pooled phases under one tick-wide budget, with phase 1 further
 	 * bounded by its own sub-budget so it cannot starve phase 2.
 	 *
@@ -3022,15 +3090,16 @@ export class FretService implements IFretService, Startable {
 	 *    pooled across peers. Then one `enforceCapacity` and one announce for everything the
 	 *    merges saw for the first time; neither may run inside the pool (`enforceCapacity` sorts a
 	 *    snapshot of the store and would over-evict if two ran concurrently; a per-task announce
-	 *    would announce a peer once per task). The whole phase runs under
-	 *    {@link STABILIZE_PHASE_ONE_BUDGET_MS}, a *child* of the tick deadline, so a stalled near
-	 *    peer costs phase 1 its slice and leaves the tick signal un-aborted.
+	 *    would announce a peer once per task). The whole phase runs under the resolved
+	 *    `phaseOneMs` ({@link deadlines}), a *child* of the tick deadline, so a stalled near peer
+	 *    costs phase 1 its slice and leaves the tick signal un-aborted.
 	 * 2. The classification and re-probe *targets* — each still selected under its own per-tick
 	 *    budget and ordering (see `classifyTargets` / `reprobeExcludedTargets`; merging the
 	 *    candidate lists would repeal the separate-budgets rule) — pooled together through
 	 *    `probeMembership`, against the **tick** signal. What is left of the tick budget after
-	 *    phase 1's slice is phase 2's reserve (5000 - 3000 = one {@link MAINTENANCE_RPC_TIMEOUT_MS}
-	 *    ping), so phase 2 always gets a turn.
+	 *    phase 1's slice is phase 2's reserve (`tickMs − phaseOneMs`, at least one `pingMs` at every
+	 *    declaration; undeclared, 5000 − 3000 = one {@link MAINTENANCE_RPC_TIMEOUT_MS} ping), so
+	 *    phase 2 always gets a turn.
 	 *
 	 * The four candidate sets are disjoint by construction (near = live member; classify =
 	 * `unknown` non-dead; foreign arm = `foreign` non-dead; dead arm = `dead`), which is what makes
@@ -3048,15 +3117,18 @@ export class FretService implements IFretService, Startable {
 		// Before phase 1, and awaited: these peers are disjoint from every pooled candidate set
 		// (live members, but undialable), so nothing in the pool races these strikes.
 		await this.strikeUncontactable(uncontactable);
+		// Read once per tick: the two budgets below must come from one resolution to keep the
+		// phase-2 reserve the derivation guarantees.
+		const { tickMs, phaseOneMs } = this.deadlines();
 		// `runSignal` is undefined before the first start(); `deadline` accepts that. `cancel()` in
 		// the finally is mandatory — see `deadline`.
-		const budget = deadline(FretService.STABILIZE_TICK_BUDGET_MS, this.runSignal);
+		const budget = deadline(tickMs, this.runSignal);
 		try {
 			// Phase 1 runs under its own sub-deadline, a *child* of the tick's, so phase 1
 			// exhausting its slice leaves the tick signal un-aborted and phase 2 still runs.
 			// `cancel()` is mandatory on every exit path including a throw — same rule as the tick
 			// deadline — or the tick leaks a timer and the mocha exit watchdog fails the run.
-			const phaseOne = deadline(FretService.STABILIZE_PHASE_ONE_BUDGET_MS, budget.signal);
+			const phaseOne = deadline(phaseOneMs, budget.signal);
 			let announced: string[];
 			try {
 				const phaseOnePool = { concurrency: this.maintenanceConcurrency, signal: phaseOne.signal };
@@ -3071,7 +3143,7 @@ export class FretService implements IFretService, Startable {
 			// the last pass, which deliberately never enforce for themselves (two concurrent
 			// enforcements over-evict). `start()` enforces for its own walk and bootstrap seed.
 			// NOTE: accepted cost — the table may sit over capacity between passes and for the span
-			// of phase 1 (bounded by STABILIZE_TICK_BUDGET_MS, 5 s) instead of being trimmed per
+			// of phase 1 (bounded by the tick budget — 5 s undeclared) instead of being trimmed per
 			// insert. Capacity is a soft eviction target, not an allocation bound, and the transient
 			// overshoot is whatever one interval's merges and first-time peerStore records added, not
 			// unbounded growth. Revisit if a deployment ever needs the table to be a hard memory bound.
@@ -3089,9 +3161,8 @@ export class FretService implements IFretService, Startable {
 
 			// Phase 2 tests the **tick** signal, never phase 1's: phase 1 exhausting its own
 			// sub-budget must not skip phase 2 — the reserve between the two budgets
-			// (STABILIZE_TICK_BUDGET_MS - STABILIZE_PHASE_ONE_BUDGET_MS = one ping) is exactly what
-			// buys phase 2 its turn. This return still fires for a `stop()` or a tick that really
-			// is out of time.
+			// (`tickMs − phaseOneMs`, at least one `pingMs`) is exactly what buys phase 2 its turn.
+			// This return still fires for a `stop()` or a tick that really is out of time.
 			if (budget.signal.aborted) {
 				// Work left undone that no event will announce — phase 2 never selected, so nothing
 				// can tell whether unknowns were waiting. Harmless on a `stop()`, which resets the
@@ -3193,10 +3264,11 @@ export class FretService implements IFretService, Startable {
 	 * Open a connection to a routing-table peer we are not connected to — the one place
 	 * maintenance dials, under its own budget, outside the tick that asked.
 	 *
-	 * Why a separate step: every maintenance ping runs under {@link MAINTENANCE_RPC_TIMEOUT_MS}
-	 * (2 s), sized for the exchange on an open connection, and a relayed dial on a slow link takes
-	 * 9–21 s. Inside a tick nothing larger fits either — phase 1 is bounded at 3 s and the tick at
-	 * 5 s, and the tick's signal aborts any dial still running when it expires — so such a peer
+	 * Why a separate step: every maintenance ping runs under the ping budget (`pingMs`, 2 s when no
+	 * link round trip is declared), sized for the exchange on an open connection, and a relayed
+	 * dial on a slow link takes 9–21 s. Inside a tick nothing larger fits either — phase 1 is
+	 * bounded at 3 s and the tick at 5 s when no link round trip is declared, and the tick's
+	 * signal aborts any dial still running when it expires — so such a peer
 	 * was never reconnected: each tick's ping timed out, each timeout was a strike, three strikes
 	 * made it `dead`, and the dead arm re-probed it with the same 2 s. The dial has to run on the
 	 * **run** signal with a host-configurable budget (`FretConfig.dialTimeoutMs`); a tick merely
@@ -3352,7 +3424,7 @@ export class FretService implements IFretService, Startable {
 		// answered gate below so the two can never disagree about a cancelled ping.
 		if (this.wasCancelled(signal)) return [];
 		// A ping that did not answer (`unreachable` / `timeout` / `foreign-protocol`) means the
-		// fetch can only fail too, so it would spend up to MAINTENANCE_SNAPSHOT_TIMEOUT_MS of
+		// fetch can only fail too, so it would spend up to the snapshot budget (`snapshotMs`) of
 		// phase-1 wall time for nothing. This removes an RPC that could not have succeeded; it
 		// scores nothing and changes no verdict.
 		if (!answered) return [];
@@ -3388,7 +3460,7 @@ export class FretService implements IFretService, Startable {
 			// `dial: 'never'`: opening the connection is `redial`'s job under its own budget; a ping
 			// to a peer with no connection is `skipped` here and records nothing.
 			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
-				dial: 'never', signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+				dial: 'never', signal, timeoutMs: this.deadlines().pingMs,
 			});
 			switch (out.kind) {
 				case 'ok':
@@ -3653,7 +3725,7 @@ export class FretService implements IFretService, Startable {
 		}
 		try {
 			const out = await sendPing(this.node, id, this.protocols.PROTOCOL_PING, {
-				dial: 'never', signal, timeoutMs: FretService.MAINTENANCE_RPC_TIMEOUT_MS,
+				dial: 'never', signal, timeoutMs: this.deadlines().pingMs,
 			});
 			switch (out.kind) {
 				case 'ok':
@@ -3736,10 +3808,10 @@ export class FretService implements IFretService, Startable {
 		// Maintenance-sized, not the route-sized default: this fetch runs inside a tick's phase-1
 		// sub-budget, and there is no dial in it (`fetchNeighbors` is connection-only), so the
 		// route budget would let one stalled peer consume the phase. See
-		// MAINTENANCE_SNAPSHOT_TIMEOUT_MS.
+		// MAINTENANCE_SNAPSHOT_TIMEOUT_MS and `deadlines`.
 		const out = await fetchNeighbors(this.node, id, this.protocols.PROTOCOL_NEIGHBORS, {
 			signal,
-			timeoutMs: FretService.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,
+			timeoutMs: this.deadlines().snapshotMs,
 			// The fetch path's single cap enforcement point — the merge loop below does not slice.
 			// Truncating here puts the bound ahead of the parse-and-hash loop instead of inside it.
 			parse: makeSnapshotParser(this.mergeSnapshotCaps()),
@@ -4217,18 +4289,26 @@ export class FretService implements IFretService, Startable {
 					ttl: msg.ttl - 1,
 					breadcrumbs: [...(msg.breadcrumbs ?? []), selfId]
 				};
-				// Default (route) budget — this returns only once the whole downstream route has
+				// Route budget (`routeMs`) — this returns only once the whole downstream route has
 				// completed — but still run-scoped, so a stop() mid-forward does not hold teardown.
-				// NOTE: a forward to a non-connected hop dials inside this 5 s route budget
-				// (`RPC_TIMEOUT_MS`), the same class as the announce case on a slow relayed link,
-				// where a dial alone takes 9–21 s. Left as is: routing mostly goes through the near
-				// peers the stabilization tick now keeps connected through `redial`. If forwards to
-				// non-connected hops ever show up as timeouts on such links, request a `redial` for
-				// the hop and fall through to the NearAnchor below rather than dialing inline.
+				// NOTE: a forward to a non-connected hop dials inside this route budget (5 s, or
+				// 2 hops of 2 round trips of a declared link), the same class as the announce case on
+				// a slow relayed link, where a dial alone takes 9–21 s. Left as is: routing mostly goes
+				// through the near peers the stabilization tick now keeps connected through `redial`.
+				// If forwards to non-connected hops ever show up as timeouts on such links, request a
+				// `redial` for the hop and fall through to the NearAnchor below rather than dialing
+				// inline.
 				const sig = this.runSignal;
 				try {
 					this.diag.maybeActForwarded++;
-					const out = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
+					// NOTE: every hop hands its downstream a full `routeMs`, the same budget its own
+					// caller started with, so nested budgets do not shrink with depth: on a route deeper
+					// than the budget's hop count the originator gives up while inner hops still work.
+					// Pre-existing with the flat 5 s and unchanged in kind; if deep routes time out on
+					// declared links, shrink the budget handed downstream per hop.
+					const out = await sendMaybeAct(this.node, next, fwd, this.protocols.PROTOCOL_MAYBE_ACT, {
+						signal: sig, timeoutMs: this.deadlines().routeMs,
+					});
 					switch (out.kind) {
 						case 'ok': {
 							// No latency sample: `sendMaybeAct` on the forward path returns only once
@@ -4511,7 +4591,9 @@ export class FretService implements IFretService, Startable {
 				signature: '',
 			};
 
-			const out = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig });
+			const out = await sendMaybeAct(this.node, target, msg, this.protocols.PROTOCOL_MAYBE_ACT, {
+				signal: sig, timeoutMs: this.deadlines().routeMs,
+			});
 
 			if (out.kind === 'busy') {
 				// NOTE: `target` is already in `visited`, so a busy peer is retired for the rest
@@ -4605,7 +4687,7 @@ export class FretService implements IFretService, Startable {
 					};
 
 					const actOut = await sendMaybeAct(
-						this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig }
+						this.node, actTarget, actMsg, this.protocols.PROTOCOL_MAYBE_ACT, { signal: sig, timeoutMs: this.deadlines().routeMs }
 					);
 					if (actOut.kind === 'busy') {
 						this.backoff.record(actTarget);

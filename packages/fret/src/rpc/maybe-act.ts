@@ -62,9 +62,11 @@ export async function registerMaybeAct(
  * Route one `RouteAndMaybeAct` to `peerIdStr` and await its answer.
  *
  * `opts.timeoutMs` budgets the whole RPC (dial + open + write + read) and defaults to
- * {@link RPC_TIMEOUT_MS}. It is deliberately left at that default by every call site: this call
- * returns only once the *entire remaining route* has completed downstream, so its budget is a
- * route budget rather than a link budget, and tightening it truncates healthy long routes.
+ * {@link RPC_TIMEOUT_MS}. This call returns only once the *entire remaining route* has completed
+ * downstream, so its budget is a route budget rather than a link budget, and tightening it
+ * truncates healthy long routes. `FretService` passes its derived route budget (`routeMs` — the
+ * default, or longer on a declared slow link; see `service/maintenance-deadlines.ts`); the default
+ * itself stays for callers with no link declaration to read.
  */
 export async function sendMaybeAct(
 	node: Libp2p,

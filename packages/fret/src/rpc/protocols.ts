@@ -23,6 +23,9 @@ const log = createLogger('rpc:handler');
  *
  * Exported so the four outbound RPC families cannot drift apart. Per-call-site overrides are
  * stated at the call site (see the maintenance-ping and announce budgets in `FretService`).
+ * `FretService` also uses it as the floor of its maybeAct route budget, which lengthens on a
+ * declared slow link (`service/maintenance-deadlines.ts`); this default does not, since a library
+ * caller has no declaration to read.
  */
 export const RPC_TIMEOUT_MS = 5000;
 
@@ -157,6 +160,10 @@ export async function registerRpcHandler(
 	serve: (stream: Stream, connection: Connection) => Promise<void>,
 	opts: { closeBudgetMs?: number } & StreamCaps = {}
 ): Promise<void> {
+	// NOTE: not derived from `FretConfig.linkRoundTripMs` — the close waits for the reply to drain
+	// into the local transport, not for a round trip. If "reply close exceeded … remote stopped
+	// reading" lines appear on declared slow links, thread the derived route budget into the
+	// registrars.
 	const closeBudgetMs = opts.closeBudgetMs ?? RPC_TIMEOUT_MS;
 	await node.handle(protocol, async (stream: Stream, connection: Connection) => {
 		let closeBudget: Deadline | undefined;
