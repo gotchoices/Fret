@@ -10,12 +10,13 @@ import { buildMaintenanceRig, type MaintenanceRig } from './helpers/maintenance-
  *
  * Scaled down to keep the run short: the ping floor is shrunk to 100 ms (as `near-exchange.spec.ts`
  * does) and the peer answers after 250 ms. Undeclared, the ping budget is the 100 ms floor; at a
- * declared 150 ms round trip it is 2 × 150 = 300 ms. Every other derived budget stays at its floor
+ * declared 200 ms round trip it is 2 × 200 = 400 ms. Every other derived budget stays at its floor
  * (snapshot 1 s, phase 1 3 s, tick 5 s), so the ping is the only thing that differs between arms.
  *
  * This is the one wiring test for the derivation: it proves the declaration reaches the ping site.
- * The other use sites are covered by the grep rule in the ticket and by inspection; the arithmetic
- * itself is pinned in `stabilize-budget-invariants.spec.ts`.
+ * The other use sites read the same `deadlines()` resolution (each `FretService` RPC call site
+ * passes `this.deadlines().<field>`); the arithmetic itself is pinned in
+ * `stabilize-budget-invariants.spec.ts`.
  */
 describe('declared link round trip reaches the near ping', function () {
 	this.timeout(10000)
@@ -49,9 +50,9 @@ describe('declared link round trip reaches the near ping', function () {
 	})
 
 	it('declared: the derived ping budget covers the link, so the peer answers and is not struck', async () => {
-		const out = await tickAgainstSlowPeer(150)
+		const out = await tickAgainstSlowPeer(200)
 		expect(out.contactFailures, 'no strike').to.equal(0)
-		expect(out.pingsOk, 'the ping answered inside 2 × 150 ms').to.equal(1)
+		expect(out.pingsOk, 'the ping answered inside 2 × 200 ms').to.equal(1)
 		expect(out.pingsFail).to.equal(0)
 	})
 })
