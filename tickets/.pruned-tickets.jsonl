@@ -143,3 +143,4 @@
 {"slug":"wire-confidence-range-unchecked","file":"wire-confidence-range-unchecked.md","completedAt":"2026-08-21","commit":"90d2640fdaa4a7df9fbde2df3edf3b924b535810","prunedAt":"2026-09-30T18:47:15.680Z"}
 {"slug":"address-hints-live-exchange","file":"10-address-hints-live-exchange.md","completedAt":"2026-09-30","commit":"e27dd741c4897438eecbda30f109b6d251d9095c","prunedAt":"2026-10-31T20:42:10.345Z"}
 {"slug":"address-hints-persisted-table","file":"10.5-address-hints-persisted-table.md","completedAt":"2026-09-30","commit":"d149e738381acc3b40cd13c80584b52e29086a59","prunedAt":"2026-10-31T20:42:10.345Z"}
+{"slug":"await-published-waits-for-downloadable-tarballs","file":"await-published-waits-for-downloadable-tarballs.md","completedAt":"2026-10-01","commit":"22f80ab45f1a9a9534a8bc90625e3aa054999879","prunedAt":"2026-11-01T05:31:18.772Z"}
