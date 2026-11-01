@@ -1,5 +1,7 @@
 import { expect } from 'chai'
 import { FretService } from '../src/service/fret-service.js'
+import { RPC_TIMEOUT_MS } from '../src/rpc/protocols.js'
+import { resolveMaintenanceDeadlines, MAX_LINK_ROUND_TRIP_MS, type MaintenanceDeadlines } from '../src/service/maintenance-deadlines.js'
 
 /**
  * The tick-budget arithmetic, pinned over the **declared defaults**.
@@ -18,6 +20,11 @@ import { FretService } from '../src/service/fret-service.js'
  * tick; a tick only waits on it for the rest of its own phase and records nothing when the phase
  * ends first. So a dial budget larger than the whole tick is the intended shape, not a violation —
  * the pooled unit above is a ping and a fetch over a connection that already exists.
+ *
+ * A declared link round trip (`FretConfig.linkRoundTripMs`) replaces these constants with
+ * deadlines derived from it and floored at them (`src/service/maintenance-deadlines.ts`). The
+ * second block checks the same two inequalities over the derived deadlines at several
+ * declarations, with these constants as the floors.
  */
 describe('stabilize budget invariants', () => {
 	const s = FretService as unknown as {
@@ -54,5 +61,39 @@ describe('stabilize budget invariants', () => {
 			`(${s.STABILIZE_TICK_BUDGET_MS}). One of those three numbers moved: phase 2 no longer has a reserved ` +
 			`slice big enough to complete a single probe, so a phase-1 straggler can starve it again.`,
 		).to.be.at.most(s.STABILIZE_TICK_BUDGET_MS)
+	})
+
+	describe('derived from a declared link round trip', () => {
+		// Captured at load time, before any spec's rig can shrink the statics.
+		const floors: MaintenanceDeadlines = {
+			pingMs: s.MAINTENANCE_RPC_TIMEOUT_MS,
+			snapshotMs: s.MAINTENANCE_SNAPSHOT_TIMEOUT_MS,
+			phaseOneMs: s.STABILIZE_PHASE_ONE_BUDGET_MS,
+			tickMs: s.STABILIZE_TICK_BUDGET_MS,
+			routeMs: RPC_TIMEOUT_MS,
+		}
+
+		it('returns exactly the floors when nothing is declared', () => {
+			expect(resolveMaintenanceDeadlines(undefined, floors)).to.deep.equal(floors)
+		})
+
+		for (const r of [0.5, 250, 600, 1000, 3500, 30_000, MAX_LINK_ROUND_TRIP_MS]) {
+			it(`keeps both tick invariants and every floor at ${r} ms`, () => {
+				const d = resolveMaintenanceDeadlines(r, floors)
+				for (const k of Object.keys(floors) as (keyof MaintenanceDeadlines)[]) {
+					expect(d[k], `${k} never drops below its floor`).to.be.at.least(floors[k])
+				}
+				expect(d.pingMs + d.snapshotMs, 'one phase-1 unit fits phase 1').to.be.at.most(d.phaseOneMs)
+				expect(d.phaseOneMs + d.pingMs, 'phase 2 keeps a one-ping reserve').to.be.at.most(d.tickMs)
+				expect(d.tickMs, 'the tick deadline fits a 32-bit timer').to.be.at.most(2 ** 31 - 1)
+			})
+		}
+
+		it('derives the stated deadlines at a declared 3 500 ms link (Sereus\'s default)', () => {
+			// A changed round-trip count should be a visible decision here, not a silent drift.
+			expect(resolveMaintenanceDeadlines(3500, floors)).to.deep.equal({
+				pingMs: 7000, snapshotMs: 10_500, phaseOneMs: 17_500, tickMs: 24_500, routeMs: 14_000,
+			})
+		})
 	})
 })

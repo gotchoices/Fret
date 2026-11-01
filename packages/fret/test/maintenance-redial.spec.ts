@@ -4,6 +4,7 @@ import type { Libp2p } from 'libp2p'
 import { createMemNode, createSlowHandshakeMemNode, stopAll } from './helpers/libp2p.js'
 import { waitFor } from './helpers/wait-for.js'
 import { FretService as CoreFretService } from '../src/service/fret-service.js'
+import { MAX_LINK_ROUND_TRIP_MS } from '../src/service/maintenance-deadlines.js'
 import type { DigitreeStore } from '../src/store/digitree-store.js'
 import type { FretConfig } from '../src/index.js'
 import { backoffOf } from './helpers/backoff.js'
@@ -238,5 +239,15 @@ describe('maintenance redial: opening a connection has its own budget, outside t
 			expect(() => new CoreFretService(a, { profile: 'core', dialTimeoutMs: bad }), `dialTimeoutMs: ${bad}`).to.throw(/dialTimeoutMs/)
 		}
 		expect((new CoreFretService(a, { profile: 'core' }) as any).cfg.dialTimeoutMs, 'the default is libp2p\'s own dialTimeout').to.equal(10_000)
+	})
+
+	it('rejects a linkRoundTripMs that is not a positive finite number within the timer ceiling', async () => {
+		a = await createMemNode()
+		for (const bad of [0, -1, NaN, Infinity, MAX_LINK_ROUND_TRIP_MS + 1]) {
+			expect(() => new CoreFretService(a, { profile: 'core', linkRoundTripMs: bad }), `linkRoundTripMs: ${bad}`).to.throw(/linkRoundTripMs/)
+		}
+		for (const good of [MAX_LINK_ROUND_TRIP_MS, 0.5]) {
+			expect((new CoreFretService(a, { profile: 'core', linkRoundTripMs: good }) as any).linkRoundTripMs, `linkRoundTripMs: ${good}`).to.equal(good)
+		}
 	})
 })

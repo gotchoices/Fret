@@ -11,6 +11,7 @@ Fret/                              # Yarn 4 monorepo (workspace: "packages/*")
 │   │   ├── service/address-records.ts  # Signed peer records: peek, self-seal, forwarding window, persisted-table age + vetting
 │   │   ├── service/near-exchange.ts   # Per-neighbour pass memory + snapshot digest: skips redundant near pings/fetches
 │   │   ├── service/idle-backoff.ts    # Clock-free policy: passive interval doubles while nothing changes, snaps back on a change
+│   │   ├── service/maintenance-deadlines.ts # Pure: open-connection deadlines derived from the declared link round trip, floored at the constants
 │   │   ├── service/{discovery,peer-discovery,dedup-cache,payload-heuristic}.ts
 │   │   ├── store/{digitree-store,relevance,tenure}.ts
 │   │   ├── ring/{distance,hash,ring-walk}.ts
